@@ -1,0 +1,13 @@
+# Cloned repos (large, don't commit)
+repos/
+
+# Scraped raw HTML
+research/raw/
+
+# OS files
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
