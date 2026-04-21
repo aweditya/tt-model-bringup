@@ -13,16 +13,20 @@ from .ops import REGISTRY
 class Interpreter:
     """Execute a Jaxpr on Tenstorrent Blackhole via TT-NN."""
 
-    def __init__(self, device):
+    def __init__(self, device, literal_cache=None):
         self.device = device
         self.env = {}
         self.ops_seen = set()
+        self.literal_cache = literal_cache or {}
 
     def to_device(self, val):
         return tensors.to_device(val, self.device)
 
     def eval_var(self, var):
         if tensors.is_literal(var):
+            fval = float(var.val)
+            if fval in self.literal_cache:
+                return self.literal_cache[fval]
             return self.to_device(var.val)
         return self.env[var]
 

@@ -20,7 +20,6 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tt_jax.interpret import Interpreter
-from tt_jax.trace import TracedExecutor
 import ttnn
 
 
@@ -160,31 +159,13 @@ def main():
             interp.run(jaxpr, args)
         t_interp = (time.perf_counter() - t0) / N
         print(f"Interpreted: {t_interp*1000:.2f} ms/forward")
+        print(f"Throughput:  {1.0/t_interp:.0f} forward passes/sec")
 
-        # ---- Step 5: Benchmark traced execution ----
-        print("\n--- Step 5: Benchmark traced execution ---")
-        executor = TracedExecutor(device)
-        executor.compile(jaxpr, args)
-
-        # Verify traced output
-        traced_result = executor.run(args)
-        traced_err = np.abs(traced_result - ref)
-        print(f"Traced max error:  {traced_err.max():.6f}")
-        print(f"Traced mean error: {traced_err.mean():.6f}")
-
-        # Warmup
-        for _ in range(5):
-            executor.run(args)
-
-        N_trace = 100
-        t0 = time.perf_counter()
-        for _ in range(N_trace):
-            executor.run(args)
-        t_traced = (time.perf_counter() - t0) / N_trace
-        print(f"Traced:      {t_traced*1000:.2f} ms/forward")
-        print(f"Speedup:     {t_interp/t_traced:.2f}x")
-
-        executor.release()
+        # Note: Trace capture is not compatible with this transformer Jaxpr
+        # because broadcast_in_dim and binary ops with shape mismatches
+        # require CPU round-trips (to_device/from_device), which TT-NN
+        # forbids during trace capture. See experiment 12 and 19 for trace
+        # benchmarks on simpler graphs (MLP: 3.23x, transformer direct: 2.23x).
 
         # ---- Step 6: Profile op breakdown ----
         print("\n--- Step 6: Op frequency breakdown ---")
