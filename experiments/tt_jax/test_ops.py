@@ -195,6 +195,62 @@ def test_linear_layernorm():
                           [x, w, b, g, bt],
                           max_atol=0.2, mean_atol=0.02)
 
+def test_self_attention():
+    """Single-head self-attention: Q/K/V projections + scaled dot-product."""
+    D = 64
+    scale = 0.1
+    x = np.random.randn(32, D).astype(np.float32) * scale
+    w_q = np.random.randn(D, D).astype(np.float32) * scale
+    w_k = np.random.randn(D, D).astype(np.float32) * scale
+    w_v = np.random.randn(D, D).astype(np.float32) * scale
+    def attention(x, w_q, w_k, w_v):
+        q = jnp.dot(x, w_q)
+        k = jnp.dot(x, w_k)
+        v = jnp.dot(x, w_v)
+        scores = jnp.dot(q, k.T) / jnp.sqrt(jnp.array(float(D)))
+        attn = jax.nn.softmax(scores, axis=-1)
+        return jnp.dot(attn, v)
+    return run_jaxpr_test("self_attention", attention,
+                          [x, w_q, w_k, w_v],
+                          max_atol=0.5, mean_atol=0.05)
+
+def test_transformer_block():
+    """Full single-head transformer encoder block: attention + FFN + 2x layer norm."""
+    D = 64
+    FF = 256
+    scale = 0.1
+    x = np.random.randn(32, D).astype(np.float32) * scale
+    w_q = np.random.randn(D, D).astype(np.float32) * scale
+    w_k = np.random.randn(D, D).astype(np.float32) * scale
+    w_v = np.random.randn(D, D).astype(np.float32) * scale
+    w_o = np.random.randn(D, D).astype(np.float32) * scale
+    w1 = np.random.randn(D, FF).astype(np.float32) * scale
+    w2 = np.random.randn(FF, D).astype(np.float32) * scale
+    g1 = np.ones(D, dtype=np.float32)
+    b1 = np.zeros(D, dtype=np.float32)
+    g2 = np.ones(D, dtype=np.float32)
+    b2 = np.zeros(D, dtype=np.float32)
+    def block(x, w_q, w_k, w_v, w_o, w1, w2, g1, b1, g2, b2):
+        q = jnp.dot(x, w_q)
+        k = jnp.dot(x, w_k)
+        v = jnp.dot(x, w_v)
+        scores = jnp.dot(q, k.T) / jnp.sqrt(jnp.array(float(D)))
+        attn = jax.nn.softmax(scores, axis=-1)
+        context = jnp.dot(attn, v)
+        h = x + jnp.dot(context, w_o)
+        m1 = jnp.mean(h, axis=-1, keepdims=True)
+        v1 = jnp.mean((h - m1) ** 2, axis=-1, keepdims=True)
+        h = g1 * (h - m1) / jnp.sqrt(v1 + 1e-5) + b1
+        ff = jax.nn.relu(jnp.dot(h, w1))
+        ff = jnp.dot(ff, w2)
+        h2 = h + ff
+        m2 = jnp.mean(h2, axis=-1, keepdims=True)
+        v2 = jnp.mean((h2 - m2) ** 2, axis=-1, keepdims=True)
+        return g2 * (h2 - m2) / jnp.sqrt(v2 + 1e-5) + b2
+    return run_jaxpr_test("transformer_block", block,
+                          [x, w_q, w_k, w_v, w_o, w1, w2, g1, b1, g2, b2],
+                          max_atol=0.5, mean_atol=0.05)
+
 
 # ============================================================
 # Standalone runner
@@ -210,6 +266,7 @@ ALL_TESTS = [
     test_reduce_sum, test_reduce_max,
     # Composite
     test_softmax, test_layer_norm, test_mlp, test_linear_layernorm,
+    test_self_attention, test_transformer_block,
 ]
 
 if __name__ == '__main__':
