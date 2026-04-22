@@ -264,10 +264,7 @@ prompt = "The meaning of life is"
 token_ids = encode_simple(prompt)
 print(f"  Prompt: '{prompt}' ({len(token_ids)} tokens)")
 
-# Full recompute reference (our existing approach)
-from experiments.exp32_ref import gpt2_forward_full_recompute  # Not available, do inline
-
-# Instead, use prefill for the first forward, then compare decode
+# Use prefill for the first forward, then compare decode step against full recompute
 t0 = time.perf_counter()
 prefill_logits = prefill(token_ids)
 t_prefill = time.perf_counter() - t0
