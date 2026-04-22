@@ -96,29 +96,32 @@ batch = 1
 print(f"\nPrompt: '{prompt}'")
 print(f"Token IDs: {input_ids} (len={seq_len})")
 
-# ── HuggingFace reference ───────────────────────────────────
+# ── HuggingFace reference (optional) ─────────────────────────
 print("\n" + "=" * 60)
 print("Running HuggingFace reference...")
 print("=" * 60)
 
-from transformers import AutoModelForCausalLM
-hf_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B", torch_dtype=torch.float32)
-hf_model.eval()
+hf_logits = None
+hf_top5_idx = None
+try:
+    from transformers import AutoModelForCausalLM
+    hf_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B", torch_dtype=torch.float32)
+    hf_model.eval()
 
-with torch.no_grad():
-    hf_input = torch.tensor(input_ids).unsqueeze(0)  # (1, seq_len)
-    hf_output = hf_model(hf_input)
-    hf_logits = hf_output.logits[0, -1].numpy()  # last token logits: (vocab,)
+    with torch.no_grad():
+        hf_input = torch.tensor(input_ids).unsqueeze(0)
+        hf_output = hf_model(hf_input)
+        hf_logits = hf_output.logits[0, -1].numpy()
 
-# Top-5 from HF
-hf_top5_idx = np.argsort(hf_logits)[-5:][::-1]
-print("  HuggingFace top-5 next tokens:")
-for rank, idx in enumerate(hf_top5_idx):
-    token_str = tokenizer.decode([idx])
-    print(f"    {rank+1}. '{token_str}' (id={idx}, logit={hf_logits[idx]:.4f})")
-
-# Free HF model
-del hf_model
+    hf_top5_idx = np.argsort(hf_logits)[-5:][::-1]
+    print("  HuggingFace top-5 next tokens:")
+    for rank, idx in enumerate(hf_top5_idx):
+        token_str = tokenizer.decode([idx])
+        print(f"    {rank+1}. '{token_str}' (id={idx}, logit={hf_logits[idx]:.4f})")
+    del hf_model
+except Exception as e:
+    print(f"  HF reference SKIPPED: {e}")
+    print("  Will still run TT-NN forward and report top-5 predictions.")
 
 # ── Open device ─────────────────────────────────────────────
 print("\n" + "=" * 60)
@@ -301,55 +304,61 @@ print("\n" + "=" * 60)
 print("Comparison: TT-NN vs HuggingFace")
 print("=" * 60)
 
-# Logit cosine similarity (last token)
-logit_cos = cosine(tt_last_logits, hf_logits)
-print(f"  Last-token logit cosine similarity: {logit_cos:.6f}")
-
-# Max/mean error
-max_err = np.abs(tt_last_logits - hf_logits).max()
-mean_err = np.abs(tt_last_logits - hf_logits).mean()
-print(f"  Max absolute error:  {max_err:.4f}")
-print(f"  Mean absolute error: {mean_err:.4f}")
-
-# Top-5 from TT-NN
+# Top-5 from TT-NN (always available)
 tt_top5_idx = np.argsort(tt_last_logits)[-5:][::-1]
 print("\n  TT-NN top-5 next tokens:")
 for rank, idx in enumerate(tt_top5_idx):
     token_str = tokenizer.decode([idx])
     print(f"    {rank+1}. '{token_str}' (id={idx}, logit={tt_last_logits[idx]:.4f})")
 
-print("\n  HuggingFace top-5 (for comparison):")
-for rank, idx in enumerate(hf_top5_idx):
-    token_str = tokenizer.decode([idx])
-    print(f"    {rank+1}. '{token_str}' (id={idx}, logit={hf_logits[idx]:.4f})")
-
-# Check if top-1 matches
 tt_top1 = tt_top5_idx[0]
-hf_top1 = hf_top5_idx[0]
-top1_match = tt_top1 == hf_top1
-print(f"\n  Top-1 match: {'YES' if top1_match else 'NO'} "
-      f"(TT={tokenizer.decode([tt_top1])!r}, HF={tokenizer.decode([hf_top1])!r})")
+print(f"\n  TT-NN prediction: '{tokenizer.decode([tt_top1])}'")
 
-# How many of top-5 overlap?
-tt_top5_set = set(tt_top5_idx.tolist())
-hf_top5_set = set(hf_top5_idx.tolist())
-overlap = len(tt_top5_set & hf_top5_set)
-print(f"  Top-5 overlap: {overlap}/5")
+logit_cos = None
+top1_match = None
+overlap = None
+hf_top1 = None
 
-# ── Per-token logit cosine across sequence ──────────────────
-print("\n  Per-token logit cosine similarity:")
-# Get full HF logits for comparison
-with torch.no_grad():
-    hf_full_logits = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen2.5-0.5B", torch_dtype=torch.float32
-    )(torch.tensor(input_ids).unsqueeze(0)).logits[0].numpy()
+if hf_logits is not None:
+    logit_cos = cosine(tt_last_logits, hf_logits)
+    print(f"\n  Last-token logit cosine similarity: {logit_cos:.6f}")
 
-for t in range(seq_len):
-    tok_cos = cosine(tt_logits[0, t], hf_full_logits[t])
-    tok_str = tokenizer.decode([input_ids[t]])
-    print(f"    Token {t}: '{tok_str:>12s}' -> cosine {tok_cos:.6f}")
+    max_err = np.abs(tt_last_logits - hf_logits).max()
+    mean_err = np.abs(tt_last_logits - hf_logits).mean()
+    print(f"  Max absolute error:  {max_err:.4f}")
+    print(f"  Mean absolute error: {mean_err:.4f}")
 
-del hf_full_logits
+    print("\n  HuggingFace top-5 (for comparison):")
+    for rank, idx in enumerate(hf_top5_idx):
+        token_str = tokenizer.decode([idx])
+        print(f"    {rank+1}. '{token_str}' (id={idx}, logit={hf_logits[idx]:.4f})")
+
+    hf_top1 = hf_top5_idx[0]
+    top1_match = tt_top1 == hf_top1
+    print(f"\n  Top-1 match: {'YES' if top1_match else 'NO'} "
+          f"(TT={tokenizer.decode([tt_top1])!r}, HF={tokenizer.decode([hf_top1])!r})")
+
+    tt_top5_set = set(tt_top5_idx.tolist())
+    hf_top5_set = set(hf_top5_idx.tolist())
+    overlap = len(tt_top5_set & hf_top5_set)
+    print(f"  Top-5 overlap: {overlap}/5")
+
+    # Per-token logit cosine across sequence
+    print("\n  Per-token logit cosine similarity:")
+    try:
+        with torch.no_grad():
+            hf_full_logits = AutoModelForCausalLM.from_pretrained(
+                "Qwen/Qwen2.5-0.5B", torch_dtype=torch.float32
+            )(torch.tensor(input_ids).unsqueeze(0)).logits[0].numpy()
+        for t in range(seq_len):
+            tok_cos = cosine(tt_logits[0, t], hf_full_logits[t])
+            tok_str = tokenizer.decode([input_ids[t]])
+            print(f"    Token {t}: '{tok_str:>12s}' -> cosine {tok_cos:.6f}")
+        del hf_full_logits
+    except Exception as e:
+        print(f"    Skipped per-token comparison: {e}")
+else:
+    print("\n  (HuggingFace reference unavailable — skipping comparison)")
 
 # ── Benchmark ───────────────────────────────────────────────
 print("\n" + "=" * 60)
@@ -373,20 +382,26 @@ print(f"  Per-layer avg: {np.mean(times_ms)/24:.1f}ms")
 print("\n" + "=" * 60)
 print("SUMMARY")
 print("=" * 60)
-print(f"""
+summary = f"""
   Model:              Qwen2.5-0.5B (full 24 layers)
   Prompt:             '{prompt}' ({seq_len} tokens)
+  TT-NN prediction:   '{tokenizer.decode([tt_top1])}'
+  Forward latency:    {np.mean(times_ms):.1f}ms
+  Per-layer latency:  {np.mean(times_ms)/24:.1f}ms
+  Upload time:        {t_upload:.1f}s"""
+
+if logit_cos is not None:
+    summary += f"""
   Logit cosine:       {logit_cos:.6f}
   Top-1 match:        {'YES' if top1_match else 'NO'}
   Top-5 overlap:      {overlap}/5
-  TT-NN prediction:   '{tokenizer.decode([tt_top1])}'
   HF prediction:      '{tokenizer.decode([hf_top1])}'
-  Forward latency:    {np.mean(times_ms):.1f}ms
-  Per-layer latency:  {np.mean(times_ms)/24:.1f}ms
-  Upload time:        {t_upload:.1f}s
+  Status:             {'PASS' if logit_cos > 0.95 else 'NEEDS INVESTIGATION'} (cosine > 0.95)"""
+else:
+    summary += """
+  HF comparison:      SKIPPED (transformers not available)"""
 
-  Status: {'PASS' if logit_cos > 0.95 else 'NEEDS INVESTIGATION'} (cosine > 0.95)
-""")
+print(summary)
 
 ttnn.close_device(device)
 print("Done!")
