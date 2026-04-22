@@ -39,8 +39,8 @@ For every experiment to be reproducible:
 - [ ] Exact prompt and chat template are in the code
 - [ ] Numpy reference produces verifiable ground truth
 - [ ] Token-by-token comparison shows exact match count
-- [ ] Random seed is fixed for sampled generation (currently NOT fixed — should add)
-- [ ] tt-metal version is documented (should add `ttnn.__version__` printing)
+- [x] Random seed is fixed for sampled generation (`np.random.seed(42)` since exp 72)
+- [x] tt-metal version is documented (`ttnn.__version__` printed since exp 75)
 
 ## What Quality Experiments Taught Us
 
@@ -50,7 +50,7 @@ For every experiment to be reproducible:
 
 3. **Base models vs instruct models are fundamentally different.** Our first 4 models (base) always produced degenerate text — this was expected but made it hard to tell if precision was the issue. Should have started with instruct models.
 
-4. **Model size vs decode quality is not linear.** 1B-Instruct degenerates at ~30 tokens, 3B-Instruct sustains ~40-100 tokens for factual content. 8B would likely sustain 200+.
+4. **Model size vs decode quality is not linear.** 1B-Instruct degenerates at ~30 tokens, 3B-Instruct sustains ~40-100 tokens for factual content. 8B with greedy degenerates at ~50 tokens, but with production sampling (temp=0.7 + min_p=0.05 + rep=1.1) produces coherent 70-token factual responses with EOS. However, creative/long-form still degenerates — **investigating whether this is a precision bug or model behavior** (exp 76).
 
 ## Updated Quality Status
 

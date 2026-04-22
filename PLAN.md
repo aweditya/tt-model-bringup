@@ -61,8 +61,8 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 - [x] **Exp 73: Llama-3.1-8B-Instruct** — 19 tok/sec, first 8B model, ~50 tok coherence
 - [x] **Exp 74: KV cache validation** — DEFINITIVE: cache correct, numpy also degenerates
 - [x] **Seed reproducibility** — np.random.seed(42), ttnn version printing (exp 72)
-- [ ] **Min-p sampling (ICLR 2025)** — emerging best practice, dynamic candidate pruning
-- [ ] **Production sampling on 8B** — temp=0.7 + min_p=0.05 + rep_penalty=1.1
+- [x] **Exp 75: Min-p sampling (ICLR 2025)** — implemented, eliminates repetition (48%→2%)
+- [x] **Exp 75: Production sampling on 8B** — temp=0.7 + min_p=0.05 + rep=1.1; short Q&A perfect, long-form still degenerates (investigating)
 - [ ] **SmolLM3-3B-Instruct** — may be stronger at sustained generation
 - [ ] **Qwen3-0.6B-Instruct port** — validate quality on Qwen architecture
 
