@@ -54,6 +54,9 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 - [ ] **Exp: SmolLM3-3B port** — NoPE variant (skip RoPE every 4th layer)
 
 ### Larger Models
+- [x] **Exp 67: Llama-3.2-3B — 34 tok/sec on Blackhole** (29.7ms/tok)
+  - 28 layers, 3072 hidden, 24Q/8KV, head_dim=128. First 3B+ model.
+  - Near-linear scaling: 2.5x params → 2.3x slower.
 - [ ] **Exp: Qwen2.5-3B** — 3x larger, test memory/perf scaling
   - H: Fits in DRAM at bf16; ~40-50 tok/sec estimated
 - [ ] **Exp: Qwen3-8B with bf8 weights** — aggressive quantization for larger model
