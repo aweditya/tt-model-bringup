@@ -222,18 +222,20 @@ exp 49:      35ms/tok   28.6 tok/s    KV-cached decode (1.5x)
 exp 49b:     34ms/tok   29.3 tok/s    Temperature sampling (~free)
 exp 51b:     28ms/tok   35.6 tok/s    On-device RoPE via rotation matrix (1.2x)
 exp 51c:     21ms/tok   46.6 tok/s    Fully on-device decode (1.3x)
-exp 52:       7ms/tok  135.6 tok/s    Trace-captured decode (2.8x)
+exp 52:       7ms/tok  135.6 tok/s    Trace-captured decode (2.8x) — STALE positions
+exp 53e:    7.6ms/tok  131.5 tok/s    Traced + paged KV cache — CORRECT! (2.6x)
 ```
 
-Total speedup: **80x** (582ms → 7ms). The journey involved:
+Total speedup: **77x** (582ms → 7.6ms, correct). The journey involved:
 - One novel hardware bug discovery (kernel config state leak)
 - One critical format correction (half-format RoPE, not interleaved)
 - One precision deep-dive (bfloat16 SDPA softmax as sole error source)
 - One algorithmic trick (rotation matrix for on-device RoPE without ttnn.split)
+- One HEIGHT_SHARDED breakthrough (paged_update_cache with tensor positions)
 - Three architectural improvements (HiFi4 config, KV caching, trace capture)
 
-At 135.6 tok/sec, we exceed the reference Llama-3.2-1B target of 105.9 tok/sec (though on a smaller model). The remaining work is fixing traced position handling for correct generation and HEIGHT_SHARDED layouts for further hardware utilization.
+At 131.5 tok/sec with correct text generation, we exceed the reference Llama-3.2-1B target of 105.9 tok/sec (on a smaller model, single Blackhole P150 chip vs N300 dual Wormhole). The key insight was that `paged_update_cache` with `update_idxs_tensor` accepts device tensors for position updates, making the full decode graph traceable.
 
 ---
 
-*Experiments 41-52. Qwen2.5-0.5B (490M params) on Blackhole P150: 1.7 → 135.6 tok/sec.*
+*Experiments 41-53e. Qwen2.5-0.5B (490M params) on Blackhole P150: 1.7 → 131.5 tok/sec (correct).*
