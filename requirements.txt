@@ -1,0 +1,18 @@
+# TT-XLA experiment dependencies
+# Pinned to versions tested on our Blackhole P150 host (Ubuntu 22.04, AMD Ryzen 9 5900X)
+#
+# TT-NN (ttnn) is installed separately via Tenstorrent's tt-metal package.
+# See: https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md
+
+# Core ML stack
+torch>=2.11.0
+numpy>=1.26.4,<2.0
+
+# Model loading
+safetensors>=0.7.0
+huggingface-hub>=1.10.0
+transformers>=5.5.0
+
+# JAX (only needed for experiments 01-26, the Jaxpr interpreter path)
+# jax>=0.6.0
+# jaxlib>=0.6.0
