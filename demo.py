@@ -167,8 +167,8 @@ def forward_body(x, pad_len):
 
 # ── Trace capture ────────────────────────────────────────────
 # Capture traces for multiple pad lengths to cover typical generation.
-# GPT-2 context window is 1024, but we cover 32, 64, 128 for the demo.
-TRACE_PAD_LENS = [32, 64]
+# All 4 buckets fit simultaneously in device memory (tested in exp 34).
+TRACE_PAD_LENS = [32, 64, 128, 256]
 traces = {}  # pad_len -> (trace_id, input_buf, output_buf)
 
 for pad_len in TRACE_PAD_LENS:
