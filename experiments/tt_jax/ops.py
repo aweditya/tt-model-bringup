@@ -86,8 +86,13 @@ def op_div(interp, invars, params, eqn):
     a = interp.eval_var(invars[0])
     b = interp.eval_var(invars[1])
     in_shapes, out_shape = _get_shapes(eqn)
-    a, b = tensors.broadcast_to_match(a, b, in_shapes[0], in_shapes[1],
-                                       out_shape, interp.device)
+
+    # For div, compute reciprocal first then multiply (avoids ttnn.div broadcast issues)
+    # First broadcast b to output shape, then reciprocal, then multiply
+    if in_shapes[1] != out_shape:
+        b = tensors._broadcast_tensor(b, in_shapes[1], out_shape, interp.device)
+    if in_shapes[0] != out_shape:
+        a = tensors._broadcast_tensor(a, in_shapes[0], out_shape, interp.device)
     return ttnn.mul(a, ttnn.reciprocal(b))
 
 def op_neg(interp, invars, params, eqn):
@@ -135,6 +140,85 @@ def op_integer_pow(interp, invars, params, eqn):
     for _ in range(n - 1):
         result = ttnn.mul(result, a)
     return result
+
+def op_tanh(interp, invars, params, eqn):
+    """Hyperbolic tangent — used in GELU activation."""
+    return ttnn.tanh(interp.eval_var(invars[0]))
+
+
+# ============================================================
+# Comparison and selection ops (needed for causal masking)
+# ============================================================
+
+def op_iota(interp, invars, params, eqn):
+    """Generate an index array. Used for causal mask construction.
+
+    iota(dimension=0, shape=(T,T)) produces [[0,0,...],[1,1,...],...]
+    iota(dimension=1, shape=(T,T)) produces [[0,1,...],[0,1,...],...]
+    """
+    shape = params['shape']
+    dim = params['dimension']
+    # Build on CPU, send to device
+    arr = np.zeros(shape, dtype=np.float32)
+    idx = [slice(None)] * len(shape)
+    for i in range(shape[dim]):
+        idx[dim] = i
+        arr[tuple(idx)] = float(i)
+    return interp.to_device(arr)
+
+def op_ge(interp, invars, params, eqn):
+    """Greater-than-or-equal comparison. Returns 1.0 where a >= b, else 0.0.
+
+    TT-NN doesn't have native bool tensors, so we use float 0/1.
+    """
+    a = interp.eval_var(invars[0])
+    b = interp.eval_var(invars[1])
+    in_shapes, out_shape = _get_shapes(eqn)
+    a, b = tensors.broadcast_to_match(a, b, in_shapes[0], in_shapes[1],
+                                       out_shape, interp.device)
+    return ttnn.ge(a, b)
+
+def op_select_n(interp, invars, params, eqn):
+    """Select between values based on condition.
+
+    select_n(cond, on_false, on_true): where cond is true, pick on_true.
+    JAX convention: select_n(pred, false_val, true_val)
+    """
+    cond = interp.eval_var(invars[0])
+    on_false = interp.eval_var(invars[1])
+    on_true = interp.eval_var(invars[2])
+    return ttnn.where(cond, on_true, on_false)
+
+
+# ============================================================
+# Split op (needed for Q/K/V separation)
+# ============================================================
+
+def op_split(interp, invars, params, eqn):
+    """Split a tensor along an axis into multiple parts.
+
+    Used for splitting QKV projections: (B, T, 3*C) -> 3x (B, T, C).
+    Falls back to CPU slice + re-upload since ttnn lacks native split.
+    """
+    a = interp.eval_var(invars[0])
+    sizes = params['sizes']
+    axis = params['axis']
+
+    in_shape = eqn.invars[0].aval.shape
+
+    # Read back to CPU, split, re-upload
+    a_np = tensors.from_device(a, in_shape)
+
+    results = []
+    offset = 0
+    for size in sizes:
+        slices = [slice(None)] * len(in_shape)
+        slices[axis] = slice(offset, offset + size)
+        chunk = a_np[tuple(slices)].copy()
+        results.append(interp.to_device(chunk))
+        offset += size
+
+    return results
 
 
 # ============================================================
@@ -249,6 +333,13 @@ REGISTRY = {
     'reciprocal': op_reciprocal,
     'max': op_max,
     'integer_pow': op_integer_pow,
+    'tanh': op_tanh,
+    # Comparison / selection
+    'iota': op_iota,
+    'ge': op_ge,
+    'select_n': op_select_n,
+    # Split
+    'split': op_split,
     # Matmul
     'dot_general': op_dot_general,
     # Reductions
