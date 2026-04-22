@@ -62,7 +62,14 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 - [x] **Exp 74: KV cache validation** — DEFINITIVE: cache correct, numpy also degenerates
 - [x] **Seed reproducibility** — np.random.seed(42), ttnn version printing (exp 72)
 - [x] **Exp 75: Min-p sampling (ICLR 2025)** — implemented, eliminates repetition (48%→2%)
-- [x] **Exp 75: Production sampling on 8B** — temp=0.7 + min_p=0.05 + rep=1.1; short Q&A perfect, long-form still degenerates (investigating)
+- [x] **Exp 75: Production sampling on 8B** — temp=0.7 + min_p=0.05 + rep=1.1; short Q&A perfect, long-form degenerates
+- [x] **Exp 76b: 8B correctness check** — cosine 0.9975, 8/8 token match vs numpy float32
+- [x] **Exp 77: Numpy vs TT-NN creative** — BOTH produce coherent text, BOTH stop at ~35 tok
+- [x] **Exp 78b: Length prompts on TT-NN** — greedy has 2 failure modes: premature EOS or attractor loops
+- [x] **Exp 79: Careful sampling (EOS protected)** — same degeneration; not an EOS suppression problem
+- [x] **Exp 80: Diverse Q&A demo** — 8/10 categories perfect with greedy, 18 tok/s, 64% efficiency
+- [x] **Wiki 50: Sampling investigation complete** — root cause is model training, not hardware
+- [ ] **Exp 80b: Low temperature (0.1)** — testing if minimal temp breaks attractor loops (running)
 - [ ] **SmolLM3-3B-Instruct** — may be stronger at sustained generation
 - [ ] **Qwen3-0.6B-Instruct port** — validate quality on Qwen architecture
 
