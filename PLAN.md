@@ -44,24 +44,22 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 
 ## Quality & Correctness (PRIORITY)
 
-All 5 models produce repetitive text — this is expected for base models with greedy decoding,
-but we need to validate precision and add proper sampling.
-
-### Correctness Validation
-- [ ] **Exp: Numpy reference comparison for Qwen2.5-0.5B prefill logits**
-  - Write pure float32 numpy forward pass, compare cosine with TT-NN output
-  - H: Cosine >0.99 (already validated in earlier experiments for Qwen)
-- [ ] **Exp: First-10-token match for all 5 models**
-  - Greedy decode: TT-NN tokens should match numpy reference exactly
-  - If mismatch, ablate per-layer to find precision divergence
+### Correctness Validation (DONE)
+- [x] **Exp 69: Qwen2.5-0.5B-Instruct cosine validation** — 0.999381, top-1 match
+- [x] **Exp 70: Llama-3.2-1B-Instruct** — cosine 0.998, 20/20 token match with numpy
+- [x] **Exp 71: Llama-3.2-3B-Instruct** — cosine 0.9998, 10/10 token match
+  - **First genuinely usable model**: coherent Q&A, structured output, correct facts
+  - Short answers perfect ("The capital of France is Paris.")
+  - Long creative text degenerates ~30-40 tokens (model capacity, not TT-NN)
 
 ### Generation Quality
-- [ ] **Exp: Temperature + top-k sampling**
-  - Add temperature scaling and top-k filtering to decode loop
-  - H: Eliminates repetitive degeneration for base models
-- [ ] **Exp: Instruction-tuned model ports**
-  - Llama-3.2-1B-Instruct, Qwen3-0.6B-Instruct — same weights, chat template
-  - H: Coherent multi-turn responses with greedy decoding
+- [x] **Temperature + top-k sampling** — implemented in exp 69-71
+- [x] **Instruction-tuned Llama-3.2-1B-Instruct** — correct but limited (1B too small)
+- [x] **Instruction-tuned Llama-3.2-3B-Instruct** — usable for short Q&A at 33 tok/sec
+- [ ] **Repetition penalty + nucleus (top-p) sampling** — may improve long-form quality
+- [ ] **Qwen3-0.6B-Instruct port** — validate quality on Qwen architecture
+- [ ] **SmolLM3-3B-Instruct** — may be stronger at sustained generation
+- [ ] **Seed reproducibility** — add np.random.seed, print ttnn version
 
 ---
 
