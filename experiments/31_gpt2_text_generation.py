@@ -120,34 +120,29 @@ t_upload = time.perf_counter() - t0
 print(f"Weight upload: {t_upload*1000:.0f} ms")
 
 
-def layernorm_cpu(x_tt, gamma_tt, beta_tt, x_shape):
-    """LayerNorm via CPU (fast, correct)."""
-    x_np = tensors.from_device(x_tt, x_shape)
-    g_np = tensors.from_device(gamma_tt, (x_shape[-1],))
-    b_np = tensors.from_device(beta_tt, (x_shape[-1],))
-    mean = x_np.mean(axis=-1, keepdims=True)
-    var = ((x_np - mean) ** 2).mean(axis=-1, keepdims=True)
-    return tensors.to_device(g_np * (x_np - mean) / np.sqrt(var + 1e-5) + b_np, device)
+def layernorm_device(x_tt, gamma_tt, beta_tt):
+    """LayerNorm on device via ttnn.layer_norm."""
+    return ttnn.layer_norm(x_tt, weight=gamma_tt, bias=beta_tt, epsilon=1e-5)
 
 
-def gelu_cpu(x_tt, x_shape):
-    """GELU (gelu_new approximation) via CPU."""
-    x_np = tensors.from_device(x_tt, x_shape)
-    result = 0.5 * x_np * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x_np + 0.044715 * x_np ** 3)))
-    return tensors.to_device(result, device)
+def gelu_device(x_tt):
+    """GELU on device — matches GPT-2's gelu_new at bfloat16 precision."""
+    return ttnn.gelu(x_tt, fast_and_approximate_mode=False)
 
 
 def gpt2_layer(x_tt, lw_tt, seq_len):
-    """One GPT-2 layer: LN → Attn → Add → LN → MLP → Add."""
-    x_shape = (1, seq_len, d_model)
+    """One GPT-2 layer: LN → Attn → Add → LN → MLP → Add.
 
-    # LayerNorm 1
-    h = layernorm_cpu(x_tt, lw_tt['ln1_g'], lw_tt['ln1_b'], x_shape)
+    Only 2 CPU round-trips: QKV split and head concat.
+    Everything else runs on Blackhole.
+    """
+    # LayerNorm 1 (on device)
+    h = layernorm_device(x_tt, lw_tt['ln1_g'], lw_tt['ln1_b'])
 
-    # QKV projection
+    # QKV projection (on device)
     qkv = ttnn.add(ttnn.matmul(h, lw_tt['w_attn']), lw_tt['b_attn'])
 
-    # Split QKV and reshape for native attention
+    # Split QKV and reshape for native attention (CPU round-trip #1)
     qkv_np = tensors.from_device(qkv, (1, seq_len, 3 * d_model))
     q_np = qkv_np[:, :, :d_model].reshape(1, seq_len, n_heads, head_dim).transpose(0, 2, 1, 3)
     k_np = qkv_np[:, :, d_model:2*d_model].reshape(1, seq_len, n_heads, head_dim).transpose(0, 2, 1, 3)
@@ -160,10 +155,10 @@ def gpt2_layer(x_tt, lw_tt, seq_len):
     v_tt = ttnn.from_torch(torch.from_numpy(v_np.copy()), dtype=ttnn.bfloat16,
                             device=device, layout=ttnn.TILE_LAYOUT)
 
-    # Native FlashAttention-2
+    # Native FlashAttention-2 (on device)
     attn_out = ttnn.transformer.scaled_dot_product_attention(q_tt, k_tt, v_tt, is_causal=True)
 
-    # Concat heads
+    # Concat heads (CPU round-trip #2)
     try:
         merged = ttnn.transformer.concatenate_heads(attn_out)
         merged_np = tensors.from_device(merged, (1, seq_len, d_model))
@@ -172,16 +167,16 @@ def gpt2_layer(x_tt, lw_tt, seq_len):
         merged_np = attn_np.transpose(0, 2, 1, 3).reshape(1, seq_len, d_model)
     merged_tt = tensors.to_device(merged_np, device)
 
-    # Output projection + residual
+    # Output projection + residual (on device)
     proj = ttnn.add(ttnn.matmul(merged_tt, lw_tt['w_proj']), lw_tt['b_proj'])
     x_tt = ttnn.add(x_tt, proj)
 
-    # LayerNorm 2
-    h2 = layernorm_cpu(x_tt, lw_tt['ln2_g'], lw_tt['ln2_b'], x_shape)
+    # LayerNorm 2 (on device)
+    h2 = layernorm_device(x_tt, lw_tt['ln2_g'], lw_tt['ln2_b'])
 
-    # MLP
+    # MLP (on device)
     ff = ttnn.add(ttnn.matmul(h2, lw_tt['w_fc']), lw_tt['b_fc'])
-    ff = gelu_cpu(ff, (1, seq_len, d_model * 4))
+    ff = gelu_device(ff)
     ff_out = ttnn.add(ttnn.matmul(ff, lw_tt['w_mlp_proj']), lw_tt['b_mlp_proj'])
 
     return ttnn.add(x_tt, ff_out)
@@ -205,8 +200,8 @@ def gpt2_forward(token_ids):
     for i in range(n_layers):
         x_tt = gpt2_layer(x_tt, layer_weights_tt[i], padded_len)
 
-    # Final layernorm
-    x_tt = layernorm_cpu(x_tt, ln_f_g_tt, ln_f_b_tt, (1, padded_len, d_model))
+    # Final layernorm (on device)
+    x_tt = layernorm_device(x_tt, ln_f_g_tt, ln_f_b_tt)
 
     # Get hidden state for last real token
     x_np = tensors.from_device(x_tt, (1, padded_len, d_model))
