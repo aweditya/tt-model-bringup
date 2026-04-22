@@ -29,20 +29,21 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 - [x] Exp 59 batch=64+bf8: 4,867 tok/sec
 
 ### Per-Layer Quantization Ablation
-- [ ] **Exp 61: Quantize ONLY layer i to bf8, keep rest bf16 (24-point sensitivity curve)**
-  - H: Layers 0, 21-23 sensitive; layers 1-20 safe
-  - Enables targeted asymmetric quantization
-- [ ] **Exp 62: Full bf8 (all weights) with traced decode + 100 tokens**
-  - H: Exp 57b showed full bf8 works with full recompute; test in traced path
+- [x] **Exp 61: Per-layer bf8 ablation — ALL 24 layers safe** (min cosine 0.999644)
+- [x] **Exp 62: Full bf8 traced decode — 7.1ms (same)** — NOT bandwidth-bound
+- [x] **Exp 62b: Full bf8 batch=32 — 9.4ms (same)** — NOT bandwidth-bound even at b=32
+- [x] **Exp 63: HiFi2 MLP ablation — 29% faster full recompute, same traced speed**
+- [x] **Exp 63b: HiFi2 MLP in traced decode — 7.1ms (same)** — compute not bottleneck
 
 ---
 
 ## Phase 2: New Models (next 1-2 weeks)
 
 ### Architecture Generality
-- [ ] **Exp: Llama-3.2-1B port** — same op set as Qwen, different sizes
-  - 16 layers, 2048 hidden, 32 Q heads, 8 KV heads (GQA)
-  - H: Zero new ops needed, just parameter changes
+- [x] **Exp 64: Llama-3.2-1B — 78 tok/sec on Blackhole** (12.8ms/tok)
+  - 16 layers, 2048 hidden, 32Q/8KV heads. Zero new ops.
+  - Bug: sdpa_flash_decode only compiles with power-of-2 KV heads.
+    Workaround: split 32Q/8KV → 2×(16Q/4KV), concat output.
 - [ ] **Exp: Phi-4-mini port** — fractional RoPE (75% of head_dim)
   - H: Single-line RoPE modification
 - [ ] **Exp: SmolLM3-3B port** — NoPE variant (skip RoPE every 4th layer)
