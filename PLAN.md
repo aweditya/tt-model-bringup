@@ -4,18 +4,23 @@ Living document. Research → Hypotheses → Experiments. Never run out of thing
 
 ## Current Performance Baseline (2026-04-22)
 
+**IMPORTANT: "Device" = trace execution only. "E2E" = end-to-end including PCIe readback.**
+See wiki/52_benchmark_audit.md for methodology details.
+
 ```
-Qwen2.5-0.5B:    7.1ms/tok  = 140 tok/sec  (bf8 MLP + native RoPE, traced, paged KV)
-Qwen3-0.6B:     13.2ms/tok  =  76 tok/sec  (QK-Norm, head_dim=128, split SDPA)
-Llama-3.2-1B:   12.8ms/tok  =  78 tok/sec  (interleaved RoPE, split SDPA)
-Llama-3.2-3B:   29.7ms/tok  =  34 tok/sec  (first 3B+ model)
-SmolLM3-3B:     26.5ms/tok  =  38 tok/sec  (NoPE, 4 KV no split)
-Llama-3.1-8B:   52.0ms/tok  =  19 tok/sec  (first 8B model, 32 layers, 4096 hidden)
-Batch=8:          7.5ms/step = 1,073 tok/sec (Qwen2.5, bf8 MLP, traced)
-Batch=64:        13.2ms/step = 4,867 tok/sec — PEAK AGGREGATE
+                    Device          End-to-End (est.)
+Qwen2.5-0.5B:    7.1ms = 140t/s    11.9ms =  84t/s  (bf8 MLP + native RoPE, traced)
+Qwen3-0.6B:     13.2ms =  76t/s   ~17.1ms = ~58t/s  (QK-Norm, head_dim=128, split SDPA)
+Llama-3.2-1B:   12.8ms =  78t/s   ~16.7ms = ~60t/s  (interleaved RoPE, split SDPA)
+Llama-3.2-3B:   29.7ms =  34t/s   ~33.6ms = ~30t/s  (first 3B+ model)
+SmolLM3-3B:     26.5ms =  38t/s   ~30.4ms = ~33t/s  (NoPE, 4 KV no split)
+Llama-3.1-8B:   52.0ms =  19t/s    56.0ms =  18t/s  (first 8B, measured exp 80/81)
+Batch=64:        13.2ms/step = 4,867 tok/sec — PEAK AGGREGATE (device-only)
 Continuous batch: 1,042 tok/sec decode (24 requests through 8 slots)
 Models ported:   6 (Qwen2.5, Qwen3, Llama-1B, Llama-3B, SmolLM3, Llama-8B)
-Journey:         582ms → 7.1ms = 82x single-sequence speedup
+
+PCIe readback overhead: ~3.9ms (from_dev/ttnn.to_torch at 155 MB/s effective)
+Biggest optimization: on-device topk + embedding to eliminate PCIe round-trip
 ```
 
 ---
