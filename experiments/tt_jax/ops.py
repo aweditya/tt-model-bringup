@@ -233,10 +233,12 @@ def op_dynamic_slice(interp, invars, params, eqn):
 
     invars[0] = tensor, invars[1:] = start indices for each dim.
     params['slice_sizes'] = size of the window in each dim.
+
+    For per-head Q/K/V extraction: slicing (1, 32, 768) -> (1, 32, 64).
     """
     a = interp.eval_var(invars[0])
     in_shape = eqn.invars[0].aval.shape
-    a_np = tensors.from_device(a, in_shape)
+    out_shape = eqn.outvars[0].aval.shape
 
     sizes = params['slice_sizes']
     starts = []
@@ -247,6 +249,9 @@ def op_dynamic_slice(interp, invars, params, eqn):
             s = tensors.from_device(interp.eval_var(iv), ())
             starts.append(int(s))
 
+    # If slicing only the last dim and shapes are tile-friendly, try on-device
+    # For now, CPU round-trip is reliable
+    a_np = tensors.from_device(a, in_shape)
     slices = [slice(s, s + sz) for s, sz in zip(starts, sizes)]
     result = a_np[tuple(slices)].copy()
     return interp.to_device(result)
@@ -257,14 +262,23 @@ def op_concatenate(interp, invars, params, eqn):
 
     Used to reassemble per-head attention outputs:
       concat([head_0, head_1, ..., head_11], axis=-1)
-    Falls back to CPU since ttnn.concat has shape constraints.
+
+    Tries ttnn.concat on-device first, falls back to CPU if needed.
     """
     dim = params['dimension']
+    tt_tensors = [interp.eval_var(iv) for iv in invars]
+
+    # Try on-device concat
+    try:
+        return ttnn.concat(tt_tensors, dim=dim)
+    except (RuntimeError, Exception):
+        pass
+
+    # CPU fallback: read each tensor back, concat, re-upload
     arrays = []
     for i, iv in enumerate(invars):
         shape = eqn.invars[i].aval.shape
-        t = interp.eval_var(iv)
-        arrays.append(tensors.from_device(t, shape))
+        arrays.append(tensors.from_device(tt_tensors[i], shape))
     result = np.concatenate(arrays, axis=dim)
     return interp.to_device(result)
 
