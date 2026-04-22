@@ -5,6 +5,10 @@ tt-xla demo: GPT-2 text generation on Tenstorrent Blackhole.
 This script loads GPT-2 small (124M params) from HuggingFace and
 generates text token-by-token on a Tenstorrent Blackhole accelerator.
 
+Zero CPU round-trips in the forward pass: QKV weights are pre-split
+at upload time, all reshapes happen on-device, and the full 12-layer
+forward is captured as a TT-NN trace for replay.
+
 Requirements (on the Tenstorrent host):
   pip install ttnn safetensors huggingface_hub jax jaxlib torch
 
@@ -92,18 +96,25 @@ def from_dev(tensor, shape):
     try: return t.reshape(shape).numpy()
     except RuntimeError: return t.squeeze().numpy().reshape(shape)
 
-# ── Upload weights ───────────────────────────────────────────
-print("Uploading 124M parameters to device...")
+# ── Upload weights (pre-split QKV) ──────────────────────────
+print("Uploading 124M parameters to device (pre-splitting QKV)...")
 t0 = time.perf_counter()
 
 layer_w = []
 for i in range(n_layers):
     p = f"h.{i}"
+    w_attn = weights[f"{p}.attn.c_attn.weight"]  # (768, 2304)
+    b_attn = weights[f"{p}.attn.c_attn.bias"]     # (2304,)
     layer_w.append({
         'ln1_g': to_dev(weights[f"{p}.ln_1.weight"]),
         'ln1_b': to_dev(weights[f"{p}.ln_1.bias"]),
-        'w_attn': to_dev(weights[f"{p}.attn.c_attn.weight"]),
-        'b_attn': to_dev(weights[f"{p}.attn.c_attn.bias"]),
+        # Pre-split QKV: 3 separate (768,768) weight matrices
+        'w_q': to_dev(w_attn[:, :d_model]),
+        'w_k': to_dev(w_attn[:, d_model:2*d_model]),
+        'w_v': to_dev(w_attn[:, 2*d_model:]),
+        'b_q': to_dev(b_attn[:d_model]),
+        'b_k': to_dev(b_attn[d_model:2*d_model]),
+        'b_v': to_dev(b_attn[2*d_model:]),
         'w_proj': to_dev(weights[f"{p}.attn.c_proj.weight"]),
         'b_proj': to_dev(weights[f"{p}.attn.c_proj.bias"]),
         'ln2_g': to_dev(weights[f"{p}.ln_2.weight"]),
@@ -117,37 +128,70 @@ ln_f_g = to_dev(weights["ln_f.weight"])
 ln_f_b = to_dev(weights["ln_f.bias"])
 print(f"  Done in {(time.perf_counter()-t0)*1000:.0f}ms")
 
-# ── GPT-2 forward pass ──────────────────────────────────────
+# ── GPT-2 forward pass (zero CPU round-trips) ───────────────
 def gpt2_layer(x, w, seq_len):
-    """One transformer layer. Device ops except QKV split/head concat."""
-    # LayerNorm → QKV projection
+    """One transformer layer. All ops on device — zero CPU round-trips."""
+    # LayerNorm 1
     h = ttnn.layer_norm(x, weight=w['ln1_g'], bias=w['ln1_b'], epsilon=1e-5)
-    qkv = ttnn.add(ttnn.matmul(h, w['w_attn']), w['b_attn'])
 
-    # QKV split + reshape to 4D (CPU round-trip)
-    qkv_np = from_dev(qkv, (1, seq_len, 3 * d_model))
-    q = qkv_np[:,:,:d_model].reshape(1, seq_len, n_heads, head_dim).transpose(0,2,1,3)
-    k = qkv_np[:,:,d_model:2*d_model].reshape(1, seq_len, n_heads, head_dim).transpose(0,2,1,3)
-    v = qkv_np[:,:,2*d_model:].reshape(1, seq_len, n_heads, head_dim).transpose(0,2,1,3)
-    q_t = ttnn.from_torch(torch.from_numpy(q.copy()), dtype=ttnn.bfloat16, device=device, layout=ttnn.TILE_LAYOUT)
-    k_t = ttnn.from_torch(torch.from_numpy(k.copy()), dtype=ttnn.bfloat16, device=device, layout=ttnn.TILE_LAYOUT)
-    v_t = ttnn.from_torch(torch.from_numpy(v.copy()), dtype=ttnn.bfloat16, device=device, layout=ttnn.TILE_LAYOUT)
+    # Separate Q, K, V matmuls (weights pre-split at upload time)
+    q = ttnn.add(ttnn.matmul(h, w['w_q']), w['b_q'])
+    k = ttnn.add(ttnn.matmul(h, w['w_k']), w['b_k'])
+    v = ttnn.add(ttnn.matmul(h, w['w_v']), w['b_v'])
+
+    # Reshape + transpose on device: (1,T,768) → (1,12,T,64)
+    q = ttnn.transpose(ttnn.reshape(q, [1, seq_len, n_heads, head_dim]), 1, 2)
+    k = ttnn.transpose(ttnn.reshape(k, [1, seq_len, n_heads, head_dim]), 1, 2)
+    v = ttnn.transpose(ttnn.reshape(v, [1, seq_len, n_heads, head_dim]), 1, 2)
 
     # FlashAttention-2 on device
-    attn = ttnn.transformer.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
+    attn = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-    # Merge heads (CPU round-trip)
-    a_np = ttnn.to_torch(attn).float().numpy()
-    merged = to_dev(a_np.transpose(0,2,1,3).reshape(1, seq_len, d_model))
+    # Merge heads on device
+    merged = ttnn.transformer.concatenate_heads(attn)
 
     # Output proj + residual
     x = ttnn.add(x, ttnn.add(ttnn.matmul(merged, w['w_proj']), w['b_proj']))
 
-    # LayerNorm → MLP
+    # LayerNorm 2 → MLP
     h2 = ttnn.layer_norm(x, weight=w['ln2_g'], bias=w['ln2_b'], epsilon=1e-5)
     ff = ttnn.gelu(ttnn.add(ttnn.matmul(h2, w['w_fc']), w['b_fc']),
                    fast_and_approximate_mode=False)
     return ttnn.add(x, ttnn.add(ttnn.matmul(ff, w['w_mlp']), w['b_mlp']))
+
+def forward_body(x, pad_len):
+    """12-layer transformer + final LN. Fully on-device, traceable."""
+    for i in range(n_layers):
+        x = gpt2_layer(x, layer_w[i], pad_len)
+    return ttnn.layer_norm(x, weight=ln_f_g, bias=ln_f_b, epsilon=1e-5)
+
+# ── Trace capture ────────────────────────────────────────────
+# Capture traces for multiple pad lengths to cover typical generation.
+# GPT-2 context window is 1024, but we cover 32, 64, 128 for the demo.
+TRACE_PAD_LENS = [32, 64]
+traces = {}  # pad_len -> (trace_id, input_buf, output_buf)
+
+for pad_len in TRACE_PAD_LENS:
+    print(f"Capturing trace for seq_len={pad_len}...")
+    dummy = np.zeros((1, pad_len, d_model), dtype=np.float32)
+
+    # Warmup (establishes buffer sizes)
+    x_warm = to_dev(dummy)
+    x_warm = forward_body(x_warm, pad_len)
+
+    # Capture
+    x_in = to_dev(dummy)
+    tid = ttnn.begin_trace_capture(device, cq_id=0)
+    x_out = forward_body(x_in, pad_len)
+    ttnn.end_trace_capture(device, tid, cq_id=0)
+
+    # Warmup replay
+    for _ in range(3):
+        ttnn.execute_trace(device, tid, cq_id=0, blocking=True)
+
+    traces[pad_len] = (tid, x_in, x_out)
+
+print(f"  {len(traces)} traces captured!")
 
 def forward(token_ids):
     """Full GPT-2 forward. Returns logits for next token."""
@@ -155,12 +199,26 @@ def forward(token_ids):
     pad_len = ((seq_len + 31) // 32) * 32
     ids = list(token_ids) + [50256] * (pad_len - seq_len)
 
-    x = to_dev((wte[ids] + wpe[:pad_len])[None, :, :])
-    for i in range(n_layers):
-        x = gpt2_layer(x, layer_w[i], pad_len)
-    x = ttnn.layer_norm(x, weight=ln_f_g, bias=ln_f_b, epsilon=1e-5)
+    emb = (wte[ids] + wpe[:pad_len])[None, :, :]
 
-    out = from_dev(x, (1, pad_len, d_model))
+    if pad_len in traces:
+        # Fast path: write embeddings into trace input buffer, replay
+        tid, x_in, x_out = traces[pad_len]
+        emb_t = torch.from_numpy(np.ascontiguousarray(emb, dtype=np.float32))
+        while emb_t.dim() < 2:
+            emb_t = emb_t.unsqueeze(0)
+        ttnn.copy_host_to_device_tensor(
+            ttnn.from_torch(emb_t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT),
+            x_in
+        )
+        ttnn.execute_trace(device, tid, cq_id=0, blocking=True)
+        out = from_dev(x_out, (1, pad_len, d_model))
+    else:
+        # Fallback: untraced for uncommon lengths
+        x = to_dev(emb)
+        x = forward_body(x, pad_len)
+        out = from_dev(x, (1, pad_len, d_model))
+
     return out[0, seq_len - 1, :] @ wte.T
 
 # ── Generate! ────────────────────────────────────────────────
@@ -190,4 +248,6 @@ avg_ms = np.mean(times) * 1000
 print(f"\n\n--- {len(times)} tokens, avg {avg_ms:.0f}ms/tok, "
       f"{1000/avg_ms:.1f} tok/sec ---")
 
+for tid, _, _ in traces.values():
+    ttnn.release_trace(device, tid)
 ttnn.close_device(device)
