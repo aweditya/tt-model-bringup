@@ -167,7 +167,7 @@ def op_reduce_sum(interp, invars, params, eqn):
 # ============================================================
 
 def op_broadcast_in_dim(interp, invars, params, eqn):
-    """Handle broadcast_in_dim via CPU round-trip when shapes differ."""
+    """Handle broadcast_in_dim, using on-device repeat when possible."""
     a = interp.eval_var(invars[0])
     in_shape = eqn.invars[0].aval.shape if not tensors.is_literal(eqn.invars[0]) else ()
     out_shape = eqn.outvars[0].aval.shape
@@ -177,11 +177,19 @@ def op_broadcast_in_dim(interp, invars, params, eqn):
 
     broadcast_dims = params.get('broadcast_dimensions', tuple(range(len(in_shape))))
 
+    # Compute intermediate shape (input dims placed at broadcast positions)
     inter_shape = [1] * len(out_shape)
     for i, bd in enumerate(broadcast_dims):
         if i < len(in_shape):
             inter_shape[bd] = in_shape[i]
 
+    # Try on-device broadcast via ttnn.repeat
+    try:
+        return tensors._repeat_broadcast(a, tuple(inter_shape), out_shape)
+    except Exception:
+        pass
+
+    # Fallback: CPU round-trip (needed for complex reshapes)
     t = ttnn.to_torch(a).float()
     while t.dim() < 2:
         t = t.unsqueeze(0)

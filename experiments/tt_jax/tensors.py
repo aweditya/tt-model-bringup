@@ -15,9 +15,9 @@ def to_device(val, device):
     """Convert a host value to a TT-NN tensor on device.
 
     Handles: int, float, numpy array, JAX array, torch tensor.
-    Pads to 32-aligned dimensions for TILE_LAYOUT.
+    ttnn.from_torch handles tile padding internally, preserving the
+    logical shape — critical for correct on-device broadcast via repeat.
     """
-    # Convert to torch tensor
     if isinstance(val, (int, float)):
         val = np.array([[val]], dtype=np.float32)
     if isinstance(val, np.ndarray):
@@ -29,16 +29,8 @@ def to_device(val, device):
     except ImportError:
         pass
 
-    # Ensure at least 2D (TILE_LAYOUT requirement)
     while val.dim() < 2:
         val = val.unsqueeze(0)
-
-    # Pad to tile-aligned (multiples of 32)
-    h, w = val.shape[-2], val.shape[-1]
-    pad_h = (32 - h % 32) % 32
-    pad_w = (32 - w % 32) % 32
-    if pad_h > 0 or pad_w > 0:
-        val = torch.nn.functional.pad(val, (0, pad_w, 0, pad_h))
 
     return ttnn.from_torch(val, dtype=ttnn.bfloat16, device=device,
                            layout=ttnn.TILE_LAYOUT)
@@ -47,20 +39,19 @@ def to_device(val, device):
 def from_device(tensor, shape):
     """Convert a TT-NN tensor back to numpy with correct shape.
 
-    Removes tile padding and restores the original shape.
+    ttnn.to_torch returns the logical shape (no tile padding to remove).
+    We just need to reshape to match the expected JAX output shape.
     """
     t = ttnn.to_torch(tensor).float()
 
     if len(shape) == 0:
         return t.numpy().flatten()[0]
-    elif len(shape) == 1:
-        return t.reshape(-1).numpy()[:shape[0]]
-    elif len(shape) == 2:
-        while t.dim() > 2:
-            t = t.squeeze(0)
-        return t.numpy()[:shape[0], :shape[1]]
-    else:
-        return t.squeeze().numpy()
+
+    # Reshape to target — handles rank mismatches from 2D minimum
+    try:
+        return t.reshape(shape).numpy()
+    except RuntimeError:
+        return t.squeeze().numpy().reshape(shape)
 
 
 def is_literal(var):
@@ -76,8 +67,8 @@ def literal_val(var):
 def broadcast_to_match(a_tt, b_tt, a_shape, b_shape, out_shape, device):
     """Explicitly broadcast tensors to match output shape.
 
-    TT-NN TILE_LAYOUT cannot broadcast mismatched shapes (e.g. (32,1) vs (32,64)).
-    We round-trip through CPU to broadcast when needed.
+    Uses ttnn.repeat for on-device broadcast when possible, falling back
+    to CPU round-trip only when repeat can't handle the shape transformation.
 
     Returns (a_tt, b_tt) with matching shapes.
     """
@@ -87,13 +78,58 @@ def broadcast_to_match(a_tt, b_tt, a_shape, b_shape, out_shape, device):
         return any(i != o for i, o in zip(in_s, out_s))
 
     if needs_broadcast(a_shape, out_shape):
-        a_np = from_device(a_tt, a_shape)
-        a_np = np.broadcast_to(np.array(a_np).reshape(a_shape), out_shape).copy()
-        a_tt = to_device(a_np, device)
+        a_tt = _broadcast_tensor(a_tt, a_shape, out_shape, device)
 
     if needs_broadcast(b_shape, out_shape):
-        b_np = from_device(b_tt, b_shape)
-        b_np = np.broadcast_to(np.array(b_np).reshape(b_shape), out_shape).copy()
-        b_tt = to_device(b_np, device)
+        b_tt = _broadcast_tensor(b_tt, b_shape, out_shape, device)
 
     return a_tt, b_tt
+
+
+def _broadcast_tensor(t_tt, in_shape, out_shape, device):
+    """Broadcast a tensor from in_shape to out_shape, on-device when possible."""
+    # Try on-device repeat first
+    try:
+        return _repeat_broadcast(t_tt, in_shape, out_shape)
+    except Exception:
+        pass
+
+    # Fallback: CPU round-trip
+    t_np = from_device(t_tt, in_shape)
+    t_np = np.broadcast_to(np.array(t_np).reshape(in_shape), out_shape).copy()
+    return to_device(t_np, device)
+
+
+def _repeat_broadcast(t_tt, in_shape, out_shape):
+    """Use ttnn.repeat to broadcast on-device.
+
+    ttnn.repeat takes a shape where each dim is the repeat count.
+    E.g., (1, 64) -> (32, 64) needs repeat shape (32, 1).
+
+    Since ttnn preserves logical shapes (tile padding is internal),
+    we compute repeat counts directly from logical shapes.
+    """
+    import ttnn as _ttnn
+
+    in_padded = list(in_shape)
+    while len(in_padded) < len(out_shape):
+        in_padded.insert(0, 1)
+
+    repeat_counts = []
+    for i_dim, o_dim in zip(in_padded, out_shape):
+        if i_dim == o_dim:
+            repeat_counts.append(1)
+        elif i_dim == 1:
+            repeat_counts.append(o_dim)
+        else:
+            raise ValueError(f"Cannot repeat {in_shape} to {out_shape}")
+
+    if all(r == 1 for r in repeat_counts):
+        return t_tt
+
+    # Pad to match device tensor rank (ttnn may add batch dims)
+    dev_rank = len(t_tt.shape)
+    while len(repeat_counts) < dev_rank:
+        repeat_counts.insert(0, 1)
+
+    return _ttnn.repeat(t_tt, _ttnn.Shape(repeat_counts))
