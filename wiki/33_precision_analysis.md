@@ -47,19 +47,24 @@ The attention score matrix is `(n_heads, T, T)` where T=5. With causal masking, 
 
 ## Q: What are the mitigation options?
 
-**Option 1: Higher precision compute (CONFIRMED WORKING!)**
+**Option 1: HiFi4+fp32 on ALL ops (CONFIRMED — 0.998 final cosine!)**
 ```python
 config = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     fp32_dest_acc_en=True,
     math_approx_mode=False,
 )
+# CRITICAL: Apply to ALL ops, not just SDPA!
+q = ttnn.matmul(h, q_w, compute_kernel_config=config)
 attn = ttnn.transformer.scaled_dot_product_attention(
-    q, k, v, is_causal=True,
-    compute_kernel_config=config
+    q, k, v, is_causal=True, compute_kernel_config=config
 )
+o = ttnn.matmul(attn_merged, o_w, compute_kernel_config=config)
+# ... same for all gate/up/down matmuls
 ```
-**Result:** Cosine improves from 0.980 → 0.996 (+0.016). This nearly eliminates the softmax precision loss. Over 24 layers, this should push final cosine from 0.956 to well above 0.99.
+**Result (exp 46e):** Full 24-layer cosine: **0.998** (was 0.956). Top-1 match: YES. All 24 layers > 0.99. Mean per-layer cosine: 0.9995.
+
+**CRITICAL WARNING:** Applying HiFi4+fp32 to ONLY SDPA but not matmuls causes a **kernel config state leak** on Blackhole — subsequent matmuls get corrupted and cosine drops to 0.87 at layer 3. The config must be applied uniformly to ALL compute ops.
 
 **Option 2: Mixed precision**
 - Keep weights in bfloat16, do softmax in float32 on CPU
@@ -95,4 +100,21 @@ These eliminate the CPU round-trip for RoPE entirely. Combined with HiFi4 SDPA, 
 
 ---
 
-*Experiments 43-45. Root cause: bfloat16 softmax in SDPA. Fix: HiFi4 + fp32_dest_acc. Matmuls are essentially lossless (0.999998).*
+## Q: What's the Blackhole kernel config state leak bug?
+
+**A:** Experiment 46b-d definitively showed that on Blackhole, setting `compute_kernel_config` on one op (e.g., SDPA) but not subsequent ops (e.g., matmul) causes the kernel configuration to "leak" — the matmul runs with corrupted settings and produces garbage output.
+
+**Evidence:**
+| Config combo | Layer 0-2 | Layer 3+ |
+|---|---|---|
+| HiFi4+fp32 SDPA only | 0.997-0.999 | **0.873 (crash!)** |
+| HiFi4+fp32 ALL ops | 0.9995-1.0000 | **0.9995-1.0000** |
+| Default SDPA + HiFi4+fp32 matmuls | 0.992-0.999 | 0.999 (fine) |
+
+The leak is directional: HiFi4+fp32 → default causes corruption; default → HiFi4+fp32 does not. The fix is simple: use the same config everywhere.
+
+This is likely a WormholeComputeKernelConfig bug when used on Blackhole (there's no BlackholeComputeKernelConfig yet).
+
+---
+
+*Experiments 43-46e. Root cause: bfloat16 softmax in SDPA. Fix: HiFi4 + fp32_dest_acc on ALL ops. Full model cosine: 0.998.*
