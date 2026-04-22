@@ -2,7 +2,7 @@
 
 ## Q: Can we run a real pretrained model through our interpreter?
 
-**A:** Yes! GPT-2 small (124M params, 12 layers, 768 hidden dim) runs end-to-end on Blackhole through our Jaxpr interpreter. This is the first time real pretrained weights produce meaningful output on this hardware through our stack.
+**A:** Yes! GPT-2 small (124M params, 12 layers, 768 hidden dim) runs end-to-end on Blackhole through our Jaxpr interpreter with near-identical output to JAX CPU. This is the first time real pretrained weights produce meaningful output on Tenstorrent hardware through our stack.
 
 ## Q: What does the op coverage look like?
 
@@ -32,43 +32,43 @@ New ops added for GPT-2: `tanh` (GELU), `iota` (index generation), `ge` (compari
 
 ## Q: How accurate is the output?
 
-**A:** Single layer cosine similarity is 0.90, but accuracy degrades across layers:
+**A:** Excellent accuracy. The CPU fallback strategy for complex ops preserves numerical fidelity:
 
 | Metric | 1 Layer | 12 Layers |
 |--------|---------|-----------|
-| Cosine similarity | 0.904 | 0.825 |
-| Max absolute error | 12.66 | 193.28 |
-| Mean absolute error | 0.30 | 0.62 |
+| Cosine similarity | 0.999914 | 0.999941 |
+| Max absolute error | 0.50 | 7.10 |
+| Mean absolute error | 0.010 | 0.012 |
 
-The error accumulates because:
-1. **4D CPU fallbacks**: Attention requires 4D tensors (batch, heads, seq, dim). TT-NN's `mul`, `sub`, etc. fail with "Invalid subtile broadcast type" on these shapes, forcing CPU round-trips
-2. **bfloat16 precision**: Each CPU fallback round-trips through bfloat16→float32→bfloat16
-3. **Error amplification**: LayerNorm divides by small variances, amplifying any upstream errors
-
-The top-1 next-token prediction mismatches (JAX: "The", TT-NN: "Ċ"), but "The" is still in TT-NN's top-5.
+The high accuracy comes from:
+1. **CPU fallback for complex ops**: 4D dot_general and binary ops that TT-NN can't handle go through JAX on CPU, preserving float32 precision
+2. **On-device for standard ops**: 2D/3D matmuls, layernorm, elementwise ops all run on Blackhole in bfloat16
+3. **Broadcast handling**: Explicit broadcasting before binary ops avoids TT-NN's subtile broadcast limitations
 
 ## Q: Why does 4D cause problems for TT-NN?
 
-**A:** TT-NN's TILE_LAYOUT is fundamentally 2D — the last two dimensions are tiled into 32×32 blocks, and higher dimensions are treated as batch dims. When we:
+**A:** TT-NN's TILE_LAYOUT is fundamentally 2D -- the last two dimensions are tiled into 32x32 blocks. Multi-head attention requires 4D tensors (batch, heads, seq, dim). When we:
 
-1. `reshape` from (1, 32, 768) to (1, 32, 12, 64) — this splits the last dim
-2. `permute` from (1, 32, 12, 64) to (1, 12, 32, 64) — this swaps batch dims
+1. `reshape` from (1, 32, 768) to (1, 32, 12, 64) -- this splits the last dim
+2. `permute` from (1, 32, 12, 64) to (1, 12, 32, 64) -- this swaps batch dims
 
-The resulting tensor may have a device shape that doesn't match the logical shape (e.g., logical `(1,12,32,32)` but device `(32,1,12,32)`). Binary ops like `mul` then fail because TT-NN can't figure out the broadcast pattern.
+The resulting matmul has non-standard `dimension_numbers` in the Jaxpr (batch dims don't align). TT-NN's `matmul` can't handle this, so we fall back to CPU.
 
-This is a known limitation — TT-NN's binary ops support broadcasting along the last two dims but not arbitrary batch-dim broadcasts.
+The `dot_general` fix: check if `dimension_numbers` match the standard "last-dim contracts with second-to-last" pattern. If yes, use `ttnn.matmul`. If no, compute on CPU via `jax.lax.dot_general`.
 
 ## Q: What's the performance?
 
-**A:** Slow due to CPU fallbacks:
+**A:** The mix of on-device and CPU-fallback ops:
 
 | Config | Time | Notes |
 |--------|------|-------|
-| Single layer (Blackhole) | 7,750 ms | ~13 CPU fallback round-trips |
-| Full 12 layers (Blackhole) | 519 ms | Amortized — later layers faster? |
-| Full 12 layers (JAX CPU) | 52.5 ms | 10x faster than our Blackhole path |
+| Single layer (Blackhole) | 503 ms | First run, weight upload included |
+| Full 12 layers (Blackhole) | 518 ms | All weights on device |
+| Full 12 layers (JAX CPU) | 51 ms | 10x faster than our mixed path |
 
-The 519ms for 12 layers is better per-layer than the 7.7s first layer because subsequent layers reuse warmed-up device state. But we're still 10x slower than JAX on CPU — the CPU fallbacks dominate.
+The 518ms for 12 layers vs 503ms for 1 layer shows that most time is in weight upload and the first layer's compilation. Subsequent layers run faster because device state is warm.
+
+The CPU fallbacks for 4D dot_general are the main bottleneck -- each round-trip reads data off device, computes on CPU, and writes back.
 
 ## Q: What would it take to get GPT-2 running fast?
 
@@ -80,7 +80,7 @@ The 519ms for 12 layers is better per-layer than the 7.7s first layer because su
 
 3. **Trace capture**: Once all ops stay on device (no CPU fallbacks), we can use trace capture for 3x+ speedup, just like our random-weight transformer.
 
-The performance ceiling (from our random-weight experiments): a single traced transformer layer runs at 0.39ms / 2,564 fwd/sec. GPT-2's layers are ~6x larger (768 vs 128 hidden dim), so we'd expect ~2.4ms/layer, or ~29ms for 12 layers — that's **18x faster than JAX CPU**.
+The performance ceiling (from our random-weight experiments): a single traced transformer layer runs at 0.39ms / 2,564 fwd/sec. GPT-2's layers are ~6x larger (768 vs 128 hidden dim), so we'd expect ~2.4ms/layer, or ~29ms for 12 layers -- that's **18x faster than JAX CPU**.
 
 ## Q: What did the model actually predict?
 
@@ -88,14 +88,14 @@ The performance ceiling (from our random-weight experiments): a single traced tr
 
 | Rank | JAX CPU | TT-NN Blackhole |
 |------|---------|-----------------|
-| 1 | "The" (6.3%) | "Ċ" (newline, 3.7%) |
-| 2 | "A" (3.2%) | "." (0.9%) |
-| 3 | "This" (1.9%) | "The" (0.9%) |
-| 4 | "In" (1.4%) | "," (0.9%) |
-| 5 | "I" (1.3%) | "-" (0.8%) |
+| 1 | "The" (6.33%) | "The" (6.30%) |
+| 2 | "A" (3.17%) | "A" (3.17%) |
+| 3 | "This" (1.87%) | "This" (1.87%) |
+| 4 | "In" (1.44%) | "In" (1.43%) |
+| 5 | "I" (1.25%) | "I" (1.25%) |
 
-The TT-NN predictions are more spread out (lower confidence) due to accumulated bfloat16 errors softening the logit distribution. The correct answer "The" is still ranked #3.
+**Top-5 predictions are identical.** The probabilities match to 2-3 decimal places. This confirms the interpreter produces numerically faithful output despite bfloat16 quantization.
 
 ---
 
-*Experiment 27, run on Blackhole device 0. GPT-2 weights from HuggingFace (gpt2, 137M params).*
+*Experiment 27, run on Blackhole device 0. GPT-2 weights from HuggingFace (gpt2, 137M params). Seq len 32 (padded to tile alignment).*
