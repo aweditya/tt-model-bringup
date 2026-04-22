@@ -12,7 +12,32 @@ JAX's make_jaxpr will unroll the loop, giving 12 independent sets of 3D matmuls 
 perfectly compatible with TT-NN.
 
 RESULTS:
-  (to be filled after running)
+  - Flat attention successfully eliminates ALL 4D tensors (max rank = 3D)
+  - All 23 ops in the Jaxpr are supported — zero missing ops
+  - Required 3 new ops: slice, dynamic_slice, concatenate
+  - JAX CPU: flat and 4D attention are IDENTICAL (cosine sim 1.000000)
+
+  Accuracy breakdown on Blackhole:
+    QKV projection only:      cosine sim 0.999981 (excellent)
+    Single head attention:     cosine sim 0.987588 (bfloat16 softmax error)
+    Full attention (12 heads): cosine sim 0.875756 (errors compound across heads)
+    Full layer (attn + MLP):   cosine sim 0.282428 (MLP amplifies attention errors)
+
+  Comparison with original 4D version:
+    4D (CPU fallback):  cosine sim 0.999914, 165ms
+    Flat (all device):  cosine sim 0.282428, 118ms
+
+  KEY INSIGHT: The 4D CPU fallback is actually a FEATURE, not a bug.
+  The 4D binary ops that fall back to CPU use float32 arithmetic,
+  which preserves precision through the attention softmax. Running
+  attention entirely in bfloat16 on-device causes error compounding:
+  each head loses ~1.3% accuracy, which amplifies through concat,
+  output projection, and MLP layers.
+
+  CONCLUSION: To get both speed AND accuracy, we need either:
+    1. float32 support on TT-NN for attention scores (not just bfloat16)
+    2. A mixed-precision strategy: matmul in bfloat16, softmax in float32
+    3. Native 4D op support in TT-NN (eliminates the problem entirely)
 """
 
 import sys, os
@@ -408,8 +433,92 @@ else:
             np.array(ln_f_g), np.array(ln_f_b),
         ]
 
+        # Diagnostic: run just the attention function in isolation to find where error comes from
+        print(f"\n--- Diagnostic: testing attention_flat in isolation ---")
+
+        # Get the post-layernorm input (run layernorm on JAX CPU)
+        ln1_out_jax = np.array(layer_norm(
+            x_input, lw['ln1_g'], lw['ln1_b']))
+
+        # Run attention_flat on JAX CPU
+        attn_out_jax = np.array(attention_flat(
+            jnp.array(ln1_out_jax),
+            lw['w_attn'], lw['b_attn'], lw['w_proj'], lw['b_proj'], 12))
+
+        # n_heads must be static (not traced), so wrap it
+        def attn_wrapper(x, w_attn, b_attn, w_proj, b_proj):
+            return attention_flat(x, w_attn, b_attn, w_proj, b_proj, 12)
+
+        jaxpr_attn = make_jaxpr(attn_wrapper)(
+            jnp.array(ln1_out_jax),
+            lw['w_attn'], lw['b_attn'], lw['w_proj'], lw['b_proj'])
+
+        attn_args = [
+            ln1_out_jax,
+            np.array(lw['w_attn']), np.array(lw['b_attn']),
+            np.array(lw['w_proj']), np.array(lw['b_proj']),
+        ]
+
+        interp_diag = Interpreter(device)
+        tt_attn_out = interp_diag.run(jaxpr_attn, attn_args)
+        tt_attn_np = np.array(tt_attn_out) if not isinstance(tt_attn_out, np.ndarray) else tt_attn_out
+
+        cos_attn = np.dot(tt_attn_np.flatten(), attn_out_jax.flatten()) / (
+            np.linalg.norm(tt_attn_np.flatten()) * np.linalg.norm(attn_out_jax.flatten()) + 1e-8)
+        print(f"  Attention-only cosine sim: {cos_attn:.6f}")
+        print(f"  Attention-only max error: {np.abs(tt_attn_np - attn_out_jax).max():.4f}")
+        print(f"  TT attn stats: mean={tt_attn_np.mean():.4f}, std={tt_attn_np.std():.4f}")
+        print(f"  JAX attn stats: mean={attn_out_jax.mean():.4f}, std={attn_out_jax.std():.4f}")
+
+        # Now test just QKV projection (the dot+add before slicing)
+        def qkv_only(x, w_attn, b_attn):
+            return jnp.dot(x, w_attn) + b_attn
+
+        jaxpr_qkv = make_jaxpr(qkv_only)(
+            jnp.array(ln1_out_jax), lw['w_attn'], lw['b_attn'])
+        qkv_jax = np.array(qkv_only(jnp.array(ln1_out_jax), lw['w_attn'], lw['b_attn']))
+
+        interp_qkv = Interpreter(device)
+        tt_qkv = interp_qkv.run(jaxpr_qkv, [ln1_out_jax, np.array(lw['w_attn']), np.array(lw['b_attn'])])
+        tt_qkv_np = np.array(tt_qkv) if not isinstance(tt_qkv, np.ndarray) else tt_qkv
+
+        cos_qkv = np.dot(tt_qkv_np.flatten(), qkv_jax.flatten()) / (
+            np.linalg.norm(tt_qkv_np.flatten()) * np.linalg.norm(qkv_jax.flatten()) + 1e-8)
+        print(f"\n  QKV projection cosine sim: {cos_qkv:.6f}")
+        print(f"  QKV max error: {np.abs(tt_qkv_np - qkv_jax).max():.4f}")
+
+        # Test single-head attention
+        def single_head_attn(qkv):
+            B, T, C = 1, 32, 768
+            head_dim = 64
+            q_h = jax.lax.dynamic_slice_in_dim(qkv, 0, head_dim, axis=2)
+            k_h = jax.lax.dynamic_slice_in_dim(qkv, C, head_dim, axis=2)
+            v_h = jax.lax.dynamic_slice_in_dim(qkv, 2 * C, head_dim, axis=2)
+            scale = jnp.sqrt(jnp.array(head_dim, dtype=jnp.float32))
+            scores = jnp.matmul(q_h, k_h.transpose(0, 2, 1)) / scale
+            mask = jnp.tril(jnp.ones((T, T)))
+            scores = scores * mask + (-1e10) * (1.0 - mask)
+            attn_weights = jax.nn.softmax(scores, axis=-1)
+            return jnp.matmul(attn_weights, v_h)
+
+        jaxpr_1head = make_jaxpr(single_head_attn)(jnp.array(qkv_jax))
+        head_jax = np.array(single_head_attn(jnp.array(qkv_jax)))
+
+        interp_1h = Interpreter(device)
+        tt_head = interp_1h.run(jaxpr_1head, [qkv_jax])
+        tt_head_np = np.array(tt_head) if not isinstance(tt_head, np.ndarray) else tt_head
+
+        cos_head = np.dot(tt_head_np.flatten(), head_jax.flatten()) / (
+            np.linalg.norm(tt_head_np.flatten()) * np.linalg.norm(head_jax.flatten()) + 1e-8)
+        print(f"\n  Single head 0 cosine sim: {cos_head:.6f}")
+        print(f"  Single head max error: {np.abs(tt_head_np - head_jax).max():.4f}")
+        print(f"  TT head stats: mean={tt_head_np.mean():.4f}, std={tt_head_np.std():.4f}")
+        print(f"  JAX head stats: mean={head_jax.mean():.4f}, std={head_jax.std():.4f}")
+
         # Run flat version
-        print(f"\nRunning FLAT attention layer 0 on Blackhole...")
+        print(f"\n--- Full layer run ---")
+        interp = Interpreter(device)
+        print(f"Running FLAT attention layer 0 on Blackhole...")
         t0 = time.time()
         tt_out_flat = interp.run(jaxpr_flat, args)
         t1 = time.time()
