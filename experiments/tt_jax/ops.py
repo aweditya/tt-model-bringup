@@ -26,8 +26,8 @@ def _get_shapes(eqn):
     return in_shapes, out_shape
 
 
-def _binary_with_broadcast(interp, invars, eqn, tt_fn, scalar_fn=None):
-    """Handle a binary op with scalar detection and broadcast."""
+def _binary_with_broadcast(interp, invars, eqn, tt_fn, np_fn, scalar_fn=None):
+    """Handle a binary op with scalar detection, broadcast, and CPU fallback."""
     if tensors.is_literal(invars[0]):
         b = interp.eval_var(invars[1])
         if scalar_fn:
@@ -45,7 +45,13 @@ def _binary_with_broadcast(interp, invars, eqn, tt_fn, scalar_fn=None):
     in_shapes, out_shape = _get_shapes(eqn)
     a, b = tensors.broadcast_to_match(a, b, in_shapes[0], in_shapes[1],
                                        out_shape, interp.device)
-    return tt_fn(a, b)
+    try:
+        return tt_fn(a, b)
+    except RuntimeError:
+        # CPU fallback for cases TT-NN can't handle (e.g., 4D broadcast)
+        a_np = tensors.from_device(a, out_shape)
+        b_np = tensors.from_device(b, out_shape)
+        return interp.to_device(np_fn(a_np, b_np))
 
 
 # ============================================================
@@ -53,7 +59,7 @@ def _binary_with_broadcast(interp, invars, eqn, tt_fn, scalar_fn=None):
 # ============================================================
 
 def op_add(interp, invars, params, eqn):
-    return _binary_with_broadcast(interp, invars, eqn, ttnn.add,
+    return _binary_with_broadcast(interp, invars, eqn, ttnn.add, np.add,
                                    scalar_fn=lambda t, s: ttnn.add(t, s))
 
 def op_sub(interp, invars, params, eqn):
@@ -63,16 +69,10 @@ def op_sub(interp, invars, params, eqn):
     if tensors.is_literal(invars[1]):
         a = interp.eval_var(invars[0])
         return ttnn.add(a, -tensors.literal_val(invars[1]))
-
-    a = interp.eval_var(invars[0])
-    b = interp.eval_var(invars[1])
-    in_shapes, out_shape = _get_shapes(eqn)
-    a, b = tensors.broadcast_to_match(a, b, in_shapes[0], in_shapes[1],
-                                       out_shape, interp.device)
-    return ttnn.sub(a, b)
+    return _binary_with_broadcast(interp, invars, eqn, ttnn.sub, np.subtract)
 
 def op_mul(interp, invars, params, eqn):
-    return _binary_with_broadcast(interp, invars, eqn, ttnn.mul,
+    return _binary_with_broadcast(interp, invars, eqn, ttnn.mul, np.multiply,
                                    scalar_fn=lambda t, s: ttnn.multiply(t, s))
 
 def op_div(interp, invars, params, eqn):
@@ -82,18 +82,9 @@ def op_div(interp, invars, params, eqn):
     if tensors.is_literal(invars[0]):
         b = interp.eval_var(invars[1])
         return ttnn.multiply(ttnn.reciprocal(b), tensors.literal_val(invars[0]))
-
-    a = interp.eval_var(invars[0])
-    b = interp.eval_var(invars[1])
-    in_shapes, out_shape = _get_shapes(eqn)
-
-    # For div, compute reciprocal first then multiply (avoids ttnn.div broadcast issues)
-    # First broadcast b to output shape, then reciprocal, then multiply
-    if in_shapes[1] != out_shape:
-        b = tensors._broadcast_tensor(b, in_shapes[1], out_shape, interp.device)
-    if in_shapes[0] != out_shape:
-        a = tensors._broadcast_tensor(a, in_shapes[0], out_shape, interp.device)
-    return ttnn.mul(a, ttnn.reciprocal(b))
+    return _binary_with_broadcast(interp, invars, eqn,
+                                   lambda a, b: ttnn.mul(a, ttnn.reciprocal(b)),
+                                   lambda a, b: a / b)
 
 def op_neg(interp, invars, params, eqn):
     return ttnn.neg(interp.eval_var(invars[0]))
@@ -119,7 +110,7 @@ def op_max(interp, invars, params, eqn):
         return ttnn.relu(interp.eval_var(invars[0]))
     if tensors.is_literal(invars[0]) and tensors.literal_val(invars[0]) == 0.0:
         return ttnn.relu(interp.eval_var(invars[1]))
-    return _binary_with_broadcast(interp, invars, eqn, ttnn.maximum)
+    return _binary_with_broadcast(interp, invars, eqn, ttnn.maximum, np.maximum)
 
 def op_integer_pow(interp, invars, params, eqn):
     """x^n for small integer n. Uses repeated multiplication."""
@@ -167,16 +158,9 @@ def op_iota(interp, invars, params, eqn):
     return interp.to_device(arr)
 
 def op_ge(interp, invars, params, eqn):
-    """Greater-than-or-equal comparison. Returns 1.0 where a >= b, else 0.0.
-
-    TT-NN doesn't have native bool tensors, so we use float 0/1.
-    """
-    a = interp.eval_var(invars[0])
-    b = interp.eval_var(invars[1])
-    in_shapes, out_shape = _get_shapes(eqn)
-    a, b = tensors.broadcast_to_match(a, b, in_shapes[0], in_shapes[1],
-                                       out_shape, interp.device)
-    return ttnn.ge(a, b)
+    """Greater-than-or-equal comparison. Returns 1.0 where a >= b, else 0.0."""
+    return _binary_with_broadcast(interp, invars, eqn, ttnn.ge,
+                                   lambda a, b: (a >= b).astype(np.float32))
 
 def op_select_n(interp, invars, params, eqn):
     """Select between values based on condition.
@@ -226,7 +210,44 @@ def op_split(interp, invars, params, eqn):
 # ============================================================
 
 def op_dot_general(interp, invars, params, eqn):
-    return ttnn.matmul(interp.eval_var(invars[0]), interp.eval_var(invars[1]))
+    """General dot product with dimension_numbers support.
+
+    Simple matmuls go through ttnn.matmul on device. Complex contractions
+    (mismatched batch dims, non-standard contraction axes) fall back to CPU.
+    """
+    a = interp.eval_var(invars[0])
+    b = interp.eval_var(invars[1])
+
+    dim_nums = params.get('dimension_numbers', None)
+    a_shape = eqn.invars[0].aval.shape
+    b_shape = eqn.invars[1].aval.shape
+
+    is_simple = True
+    if dim_nums is not None:
+        (ca, cb), (ba, bb) = dim_nums
+        is_simple = (
+            len(ca) == 1 and len(cb) == 1 and
+            ca[0] == len(a_shape) - 1 and
+            cb[0] == len(b_shape) - 2 and
+            tuple(ba) == tuple(bb) and
+            list(ba) == list(range(len(ba)))
+        )
+
+    if is_simple:
+        try:
+            return ttnn.matmul(a, b)
+        except RuntimeError:
+            pass
+
+    # CPU fallback for complex dot_general
+    import jax.lax
+    a_np = tensors.from_device(a, a_shape)
+    b_np = tensors.from_device(b, b_shape)
+    result_np = np.array(jax.lax.dot_general(
+        jax.numpy.array(a_np), jax.numpy.array(b_np),
+        dimension_numbers=dim_nums
+    ))
+    return interp.to_device(result_np)
 
 
 # ============================================================
