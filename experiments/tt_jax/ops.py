@@ -205,6 +205,70 @@ def op_split(interp, invars, params, eqn):
     return results
 
 
+def op_slice(interp, invars, params, eqn):
+    """Slice a tensor along one or more axes.
+
+    JAX's slice primitive takes start_indices, limit_indices, strides.
+    Used for per-head Q/K/V extraction in flat attention:
+      x[:, :, h*d:(h+1)*d] -> slice with start=(0,0,h*d), limit=(B,T,(h+1)*d)
+    Falls back to CPU since ttnn lacks general slicing.
+    """
+    a = interp.eval_var(invars[0])
+    in_shape = eqn.invars[0].aval.shape
+    start = params['start_indices']
+    limit = params['limit_indices']
+    strides = params.get('strides', None)
+
+    a_np = tensors.from_device(a, in_shape)
+    slices = []
+    for i in range(len(start)):
+        s = strides[i] if strides else 1
+        slices.append(slice(start[i], limit[i], s))
+    result = a_np[tuple(slices)].copy()
+    return interp.to_device(result)
+
+
+def op_dynamic_slice(interp, invars, params, eqn):
+    """Dynamic slice: extract a window from a tensor at runtime indices.
+
+    invars[0] = tensor, invars[1:] = start indices for each dim.
+    params['slice_sizes'] = size of the window in each dim.
+    """
+    a = interp.eval_var(invars[0])
+    in_shape = eqn.invars[0].aval.shape
+    a_np = tensors.from_device(a, in_shape)
+
+    sizes = params['slice_sizes']
+    starts = []
+    for iv in invars[1:]:
+        if tensors.is_literal(iv):
+            starts.append(int(tensors.literal_val(iv)))
+        else:
+            s = tensors.from_device(interp.eval_var(iv), ())
+            starts.append(int(s))
+
+    slices = [slice(s, s + sz) for s, sz in zip(starts, sizes)]
+    result = a_np[tuple(slices)].copy()
+    return interp.to_device(result)
+
+
+def op_concatenate(interp, invars, params, eqn):
+    """Concatenate multiple tensors along an axis.
+
+    Used to reassemble per-head attention outputs:
+      concat([head_0, head_1, ..., head_11], axis=-1)
+    Falls back to CPU since ttnn.concat has shape constraints.
+    """
+    dim = params['dimension']
+    arrays = []
+    for i, iv in enumerate(invars):
+        shape = eqn.invars[i].aval.shape
+        t = interp.eval_var(iv)
+        arrays.append(tensors.from_device(t, shape))
+    result = np.concatenate(arrays, axis=dim)
+    return interp.to_device(result)
+
+
 # ============================================================
 # Matmul
 # ============================================================
@@ -359,8 +423,11 @@ REGISTRY = {
     'iota': op_iota,
     'ge': op_ge,
     'select_n': op_select_n,
-    # Split
+    # Split / slice / concat
     'split': op_split,
+    'slice': op_slice,
+    'dynamic_slice': op_dynamic_slice,
+    'concatenate': op_concatenate,
     # Matmul
     'dot_general': op_dot_general,
     # Reductions
