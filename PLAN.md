@@ -5,11 +5,11 @@ Living document. Research → Hypotheses → Experiments. Never run out of thing
 ## Current Performance Baseline (2026-04-22)
 
 ```
-Single sequence:  7.4ms/tok  = 134 tok/sec  (bf8 MLP, traced, paged KV)
+Single sequence:  7.1ms/tok  = 140 tok/sec  (bf8 MLP + native RoPE, traced, paged KV)
 Batch=8:          7.5ms/step = 1,073 tok/sec (bf8 MLP, traced)
 Batch=32:         9.4ms/step = 3,389 tok/sec
 Batch=64:        13.2ms/step = 4,867 tok/sec — PEAK AGGREGATE
-Journey:         582ms → 7.4ms = 78.6x single-sequence speedup
+Journey:         582ms → 7.1ms = 82x single-sequence speedup
 ```
 
 ---
@@ -19,9 +19,9 @@ Journey:         582ms → 7.4ms = 78.6x single-sequence speedup
 ### Native RoPE Integration
 - [x] Exp 58: Confirm half ↔ interleaved equivalence via permutation (cosine=1.0)
 - [x] Exp 59c: `ttnn.experimental.rotary_embedding` = **2.6x faster** (0.053ms vs 0.139ms)
-- [ ] **Exp 60: Integrate native RoPE into traced decode** — drop-in replacement for rotation matrix
-  - H: Saves ~0.086ms × 2 (Q+K) × 24 layers = ~4.1ms/forward → could cut 7.4ms by 50%+
-  - Measure: traced decode latency, correctness vs rotation matrix path
+- [x] **Exp 60: Native RoPE in traced decode — 7.1ms/tok = 140 tok/sec** (5% speedup)
+  - Theoretical 4.1ms savings → actual 0.3ms (ops pipeline in trace, hidden behind matmuls)
+  - Text identical, tokens correct. New single-sequence record!
 
 ### Batch + bf8 Scaling Curve
 - [x] Exp 59 batch=8+bf8: 1,073 tok/sec
