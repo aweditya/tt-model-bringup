@@ -47,21 +47,21 @@ print("Loading Qwen2.5-0.5B (490M params)...")
 model_path = hf_hub_download("Qwen/Qwen2.5-0.5B", "model.safetensors")
 
 all_weights = {}
-with safe_open(model_path, framework="numpy") as f:
+with safe_open(model_path, framework="pt") as f:
     for key in f.keys():
-        all_weights[key] = f.get_tensor(key)
+        all_weights[key] = f.get_tensor(key).float().numpy()
 
-embed_w = all_weights["model.embed_tokens.weight"].astype(np.float32)
-final_norm_g = all_weights["model.norm.weight"].astype(np.float32)
+embed_w = all_weights["model.embed_tokens.weight"]
+final_norm_g = all_weights["model.norm.weight"]
 has_lm_head = "lm_head.weight" in all_weights
-lm_head_w = (all_weights["lm_head.weight"].astype(np.float32).T if has_lm_head
+lm_head_w = (all_weights["lm_head.weight"].T if has_lm_head
              else embed_w.T.copy())
 
 # Per-layer weights (keep on CPU, upload to device below)
 layer_weights = []
 for i in range(n_layers):
     prefix = f"model.layers.{i}."
-    lw = {k[len(prefix):]: v.astype(np.float32)
+    lw = {k[len(prefix):]: v
           for k, v in all_weights.items() if k.startswith(prefix)}
     layer_weights.append(lw)
 del all_weights
