@@ -14,4 +14,5 @@ Architecture:
 """
 
 from .interpret import Interpreter
+from .jit import Executor, CompiledFunction
 from .trace import TracedExecutor
