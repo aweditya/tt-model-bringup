@@ -65,9 +65,40 @@ For every experiment to be reproducible:
 | Qwen3-0.6B | N/A | Pending | Pending | Pending | Needs validation |
 | SmolLM3-3B | N/A | Pending | Pending | Pending | Needs validation |
 
+## Sampling Strategy Results (Exp 72)
+
+Tested 5 strategies on Llama-3.2-3B-Instruct creative writing prompt:
+
+| Strategy | Tokens Before Degeneration | Total Tokens | Quality |
+|----------|---------------------------|--------------|---------|
+| Greedy | ~20 | 43 (EOS) | Good start, collapses |
+| Top-k (temp=0.6) | ~20 | 26 (EOS) | Similar |
+| Top-p (p=0.9) | ~20 | 32 (EOS) | Similar |
+| Top-p + RepPenalty 1.2 | ~15 | 23 (EOS) | Stops even earlier |
+| Top-p + RepPenalty 1.5 | ~20 | 118 | Forced diversity = incoherent |
+
+**Conclusion: Sampling strategies cannot fix the fundamental model capacity limit.**
+The 3B model has enough knowledge to start well but runs out of coherence after ~20-30 tokens regardless of how we sample. Aggressive repetition penalty forces longer output but the content is nonsensical.
+
+## What 3B Models ARE Good For
+
+1. Short Q&A ("The capital of France is Paris.")
+2. Classification and extraction
+3. Code snippets and simple functions
+4. 1-2 sentence summaries
+5. Structured output (markdown headers, numbered lists — the structure is right, content degenerates)
+
+## What Needs 8B+
+
+1. Multi-paragraph explanations
+2. Creative writing (stories, poetry)
+3. Detailed technical descriptions
+4. Sustained reasoning chains
+
 ## Next Steps (Priority)
 
-1. **Fix reproducibility**: Add `np.random.seed()`, print `ttnn.__version__`, document tt-metal version
-2. **Validate remaining models**: Qwen3-0.6B-Instruct, SmolLM3-3B-Instruct (if available)
-3. **Research**: What 3B models are best at sustained generation? (Phi-4-mini? SmolLM3?)
-4. **Long-form quality**: Try repetition penalty, nucleus sampling (top-p), and longer prompts with explicit instructions to write more
+1. ~~Fix reproducibility~~: Done (seed=42, ttnn version printing) in exp 72
+2. **SmolLM3-3B-Instruct**: May be better at sustained generation than Llama-3.2-3B
+3. **Research 8B on Blackhole**: bf8 weights = ~8GB, but KV cache needs space too
+4. **Validate remaining base models**: Qwen3, SmolLM3 cosine checks
+5. **Accept 3B limits**: Focus on use cases where short answers are sufficient
