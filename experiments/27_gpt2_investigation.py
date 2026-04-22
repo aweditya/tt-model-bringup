@@ -11,6 +11,15 @@ actual GPT-2-small (124M params) from HuggingFace and investigates:
 
 GPT-2 small: d_model=768, n_heads=12, n_layers=12, vocab=50257
 Memory: ~248MB in bfloat16
+
+RESULTS:
+  - Required 5 new ops: tanh, iota, ge, select_n, split
+  - Also needed: dot_general with complex dimension_numbers (batched matmul),
+    CPU fallback for binary ops on 4D tensors
+  - Single layer: 502.7ms, cosine similarity 0.999914 vs JAX CPU
+  - Full 12 layers (1,180 Jaxpr ops): 518.0ms, cosine similarity 0.999941
+  - Top-5 next-token predictions MATCH between JAX CPU and Blackhole
+  - "The meaning of life is..." -> next token "The" (both agree, p=0.063)
 """
 
 import sys, os
