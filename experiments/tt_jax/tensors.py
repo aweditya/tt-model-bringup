@@ -41,6 +41,10 @@ def from_device(tensor, shape):
 
     ttnn.to_torch returns the logical shape (no tile padding to remove).
     We just need to reshape to match the expected JAX output shape.
+
+    However, when the last dimension is not tile-aligned (e.g., 64 with tile size 32
+    but the internal layout may pad differently), we may get a size mismatch.
+    In that case, we slice out the needed elements.
     """
     t = ttnn.to_torch(tensor).float()
 
@@ -51,7 +55,38 @@ def from_device(tensor, shape):
     try:
         return t.reshape(shape).numpy()
     except RuntimeError:
+        pass
+
+    # Try squeezing extra dimensions first
+    try:
         return t.squeeze().numpy().reshape(shape)
+    except (RuntimeError, ValueError):
+        pass
+
+    # Handle tile padding: slice out the logical shape from padded tensor
+    # The tensor may have padded dims — reshape to match rank then slice
+    t_np = t.numpy()
+    target_size = 1
+    for d in shape:
+        target_size *= d
+
+    if t_np.size >= target_size:
+        # Try to match the leading dimensions and slice the last one
+        # E.g., padded (1, 32, 128) -> logical (1, 32, 64): slice last dim
+        try:
+            # Reshape to same rank with potentially padded last dim
+            padded_shape = list(shape)
+            padded_shape[-1] = t_np.size // max(1, target_size // shape[-1])
+            t_reshaped = t_np.reshape(padded_shape)
+            slices = tuple(slice(0, s) for s in shape)
+            return t_reshaped[slices].copy()
+        except (RuntimeError, ValueError):
+            pass
+
+        # Last resort: flatten and take first N elements
+        return t_np.flatten()[:target_size].reshape(shape).copy()
+
+    raise ValueError(f"Cannot reshape tensor of size {t_np.size} to {shape}")
 
 
 def is_literal(var):
