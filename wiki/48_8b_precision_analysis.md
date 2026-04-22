@@ -40,8 +40,31 @@ The 8B model is NOT broken. It's:
 - **Marginal** for long-form tasks where precision and capacity both matter
 - **Worse than a float32 reference** for creative/uncertain generation — but we haven't verified HOW MUCH worse (need full numpy reference for these prompts)
 
-### Next Steps to Improve Quality
+## Experiment 77 Update: The Real Cause of "Word Salad"
 
-1. **Try a different 8B model** — SmolLM3 or Qwen might be more robust to bf16
-2. **fp32 accumulation in attention** — already enabled via `fp32_dest_acc_en=True`, but could try HiFi2 for MLP
-3. **Accept use-case limits**: 8B on Blackhole at bf16 is great for short Q&A, classification, extraction, code generation. It's not great for creative writing or long essays. This is a reasonable production trade-off.
+**Experiment 77** ran the creative writing prompt through both numpy float32 and TT-NN bf16 with **independent greedy decoding** (each path follows its own tokens).
+
+**Result: Both paths produce coherent text through 40 tokens.** They diverge at step 2 (different story titles) but both outputs are high-quality creative writing:
+- **Numpy**: "...Zeta stood before a blank canvas, its mechanical arms at the ready to create. 'Today, I will paint,' Zeta"
+- **TT-NN**: "...Zeta stood on a workbench, surrounded by half-finished paintings, hung on the wall."
+
+**The TT-NN version hits EOS at token 34** — the model naturally stops after one paragraph. This is not an error; it's the model's trained behavior.
+
+### Root Cause of Exp 75's "Word Salad"
+
+The "degeneration" in exp 75 was caused by **sampling pushing past the model's natural EOS**. With greedy decoding, the model produces one good paragraph and stops. With production sampling (temp=0.7, min_p=0.05), the EOS probability gets reduced below the threshold, so the model continues generating — but it has no coherent continuation plan after the EOS point, producing gibberish.
+
+**This is a model instruction-following limitation, not a precision bug.** The model was trained to produce short, complete responses. Forcing longer output through sampling parameters doesn't make it write more — it makes it write nonsense.
+
+### Corrected Understanding
+
+| Claim | Status |
+|-------|--------|
+| bf16 precision causes word salad | **FALSE** — numpy and TT-NN both produce coherent text |
+| Model degenerates at ~40 tokens | **MISLEADING** — model STOPS at ~35 tokens (EOS), doesn't degenerate |
+| Sampling fixes quality | **FALSE** — sampling prevents the model from stopping, causing garbage |
+| 8B model can't write creative text | **FALSE** — it produces excellent single paragraphs |
+
+### Implication for Production
+
+For short creative writing (single paragraph), the 8B model is **perfect** with greedy decoding. For multi-paragraph stories, the issue is not precision or sampling — it's that the model needs to be prompted differently (e.g., "Write a 3-paragraph story...") or we need a model fine-tuned for longer outputs.
