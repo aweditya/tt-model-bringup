@@ -1,28 +1,30 @@
-# 23: The jax-mps Approach — Could We Build a PJRT Plugin for TT-NN?
+# 23: Deep Research — The jax-mps-Style PJRT Plugin Approach for TT-NN
 
-## Part 1: How jax-mps Works
+## Part 1: How jax-metal / jax-mps Works
 
-**Q: What is jax-mps and why should we study it?**
+### Q: What is jax-metal and how does Apple's official JAX Metal backend work?
 
-A: jax-mps (https://github.com/tillahoffmann/jax-mps) is a community-built JAX backend for Apple Silicon that maps StableHLO ops to MLX ops via a C++ PJRT plugin. It achieves ~3.7x speedup over CPU for ResNet18 training on an M4 MacBook Air, with 91.5% of JAX tests passing.
+A: There are actually TWO Apple Silicon JAX backends worth studying:
 
-This is the closest analog to what we'd build. Like us, jax-mps:
-- Targets a non-CUDA accelerator with its own tensor library (MLX for them, TT-NN for us)
-- Does NOT use an MLIR compiler pipeline — it interprets StableHLO directly
-- Maps ~70 StableHLO ops to the target library's equivalents
-- Works with `jax.jit`, `vmap`, and `grad` automatically (because it's a real PJRT plugin)
+1. **jax-metal** (official Apple): A closed-source PJRT plugin (`pip install jax-metal`) that uses the OpenXLA compiler to lower StableHLO to Metal Performance Shaders (MPS). It compiles StableHLO into MPSGraph executables and dispatches to the GPU via Metal runtime APIs. Apple reports up to 28x speedup over CPU on M2 Max, with an average of 10x.
 
-There's also an enhanced fork called applejax (https://github.com/danielpcox/applejax) with 71 StableHLO graph ops, 12 CHLO ops, complex number support, full linalg, and 2000+ tests.
+2. **jax-mps / applejax** (community): Open-source PJRT plugins that do NOT use the OpenXLA compiler. Instead, they interpret StableHLO directly by walking the MLIR ops and dispatching to MLX (Apple's open-source tensor library). This is the approach closest to what we'd build.
 
-**Q: What's the architecture of jax-mps?**
+The community approach is our template because:
+- Like us, it targets a non-CUDA accelerator with its own tensor library (MLX for them, TT-NN for us)
+- It does NOT need an MLIR compiler pipeline -- it interprets StableHLO directly
+- It maps ~71 StableHLO ops to the target library's equivalents
+- It works with `jax.jit`, `vmap`, and `grad` automatically (because it's a real PJRT plugin)
 
-A: Three-stage pipeline, nearly identical in spirit to our Jaxpr interpreter:
+### Q: What is the architecture of jax-mps/applejax?
+
+A: Three-stage pipeline:
 
 ```
-JAX Python → jax.jit traces → StableHLO bytecode → PJRT plugin → MLX GPU execution
+JAX Python --> jax.jit traces --> StableHLO bytecode --> PJRT plugin --> MLX GPU execution
 ```
 
-The key files in `src/pjrt_plugin/`:
+The key C++ source files in the plugin:
 
 | File | Purpose | Our equivalent |
 |------|---------|---------------|
@@ -30,20 +32,56 @@ The key files in `src/pjrt_plugin/`:
 | `mlx_client.h/cc` | Device management, CompileStableHLO() | `ttnn.open_device()` |
 | `mlx_executable.h/cc` | Walk StableHLO, dispatch to MLX ops, Execute() | `interpret.py` |
 | `mlx_buffer.h/cc` | Host-device transfers, memory management | `tensors.py` |
-| `stablehlo_parser.h/cc` | Parse StableHLO bytecode/text via MLIR libs | (we skip this — we read Jaxpr) |
-| `ops/arithmetic.cc` | add, mul, div, exp, log, etc. → MLX | `ops.py` elementwise |
-| `ops/shape.cc` | broadcast_in_dim, reshape, transpose → MLX | `ops.py` shape ops |
-| `ops/reduction.cc` | reduce_sum, reduce_max → MLX | `ops.py` reductions |
-| `ops/linalg.cc` | dot_general, cholesky, triangular_solve → MLX | `ops.py` dot_general |
-| `ops/gather_scatter.cc` | gather, scatter → MLX | (we don't have these yet) |
-| `ops/slice.cc` | slice, dynamic_slice → MLX | (we don't have these yet) |
-| `ops/control_flow.cc` | if, while, case → MLX | (we don't have these) |
-| `ops/sort_fft_complex.cc` | sort, fft, complex ops → MLX | (we don't have these) |
+| `stablehlo_parser.h/cc` | Parse StableHLO bytecode/text via MLIR libs | (we skip this -- we read Jaxpr) |
+| `ops/arithmetic.cc` | add, mul, div, exp, log, etc. --> MLX | `ops.py` elementwise |
+| `ops/shape.cc` | broadcast_in_dim, reshape, transpose --> MLX | `ops.py` shape ops |
+| `ops/reduction.cc` | reduce_sum, reduce_max --> MLX | `ops.py` reductions |
+| `ops/linalg.cc` | dot_general, cholesky, triangular_solve --> MLX | `ops.py` dot_general |
+| `ops/gather_scatter.cc` | gather, scatter --> MLX | (we don't have these yet) |
+| `ops/slice.cc` | slice, dynamic_slice --> MLX | (we don't have these yet) |
+| `ops/control_flow.cc` | if, while, case --> MLX | (we don't have these) |
+| `ops/sort_fft_complex.cc` | sort, fft, complex ops --> MLX | (we don't have these) |
 | `passes/` | Optimization passes (fuse_bias_add, fuse_softmax) | (we don't do fusion) |
 
 Language composition: **53% C++, 41% Python, 3% shell, 2% CMake**. Approximately 24 C++ source files for the core plugin.
 
-**Q: How does jax-mps compile StableHLO?**
+### Q: How does jax-mps register as a JAX plugin?
+
+A: Two mechanisms, both standard for PJRT plugins:
+
+**Mechanism 1: Namespace package** -- Place a module under `jax_plugins/` with an `initialize()` function:
+
+```python
+# jax_plugins/mps/__init__.py
+import os
+import jax._src.xla_bridge as xb
+
+def initialize():
+    path = os.path.join(os.path.dirname(__file__), 'pjrt_plugin_mps.so')
+    xb.register_plugin('mps', priority=500, library_path=path)
+```
+
+**Mechanism 2: Entry point** -- Declare in `pyproject.toml`:
+
+```toml
+[project.entry-points.'jax_plugins']
+mps = "jax_plugins.mps"
+```
+
+JAX discovers plugins via `importlib.metadata.entry_points(group='jax_plugins')` on import. The user selects the plugin via `JAX_PLATFORMS=mps` environment variable. Once registered, `jax.devices()` returns the plugin's devices and all JAX operations route through it.
+
+For our TT-NN plugin, this would be:
+
+```python
+# jax_plugins/tt/__init__.py
+def initialize():
+    path = os.path.join(os.path.dirname(__file__), 'pjrt_plugin_tt.so')
+    xb.register_plugin('tt', priority=500, library_path=path)
+```
+
+Then: `JAX_PLATFORMS=tt python -c "import jax; print(jax.devices())"` --> `[TtDevice(id=0)]`
+
+### Q: How does jax-mps compile StableHLO?
 
 A: The `PJRT_Client_Compile` function receives StableHLO bytecode from JAX, then:
 
@@ -51,42 +89,84 @@ A: The `PJRT_Client_Compile` function receives StableHLO bytecode from JAX, then
 
 2. **Walk**: `MlxExecutable::Create()` walks the MLIR operations in the entry function. For each op, it looks up a handler in a static registry (similar to our `REGISTRY` dict).
 
-3. **Build callable**: Each handler maps one StableHLO op to one or more MLX calls. The result is a `std::function<vector<array>(vector<array>)>` — a callable that transforms MLX arrays.
+3. **Build callable**: Each handler maps one StableHLO op to one or more MLX calls. The result is a `std::function<vector<array>(vector<array>)>` -- a callable that transforms MLX arrays.
 
 4. **Optional MLX compile**: On first `Execute()`, it tries `mlx::core::detail::compile()` to fuse the op graph. Falls back to direct interpretation if compilation fails.
 
-This is conceptually identical to our approach — walk an IR, dispatch to a target library — except they walk StableHLO (MLIR) instead of Jaxpr, and they dispatch to MLX instead of TT-NN.
+This is conceptually identical to our Jaxpr interpreter -- walk an IR, dispatch to a target library -- except they walk StableHLO (MLIR) instead of Jaxpr, and dispatch to MLX instead of TT-NN.
 
-**Q: How does their broadcast_in_dim work?**
-
-A: From `ops/shape.cc`, their handler for `stablehlo.broadcast_in_dim`:
-
-1. Build an intermediate shape filled with 1s
-2. Set non-broadcast dimensions to their source sizes
-3. `mlx::core::reshape()` to the intermediate shape
-4. `mlx::core::broadcast_to()` to the final output shape
-
-This works seamlessly because MLX supports implicit broadcasting on its GPU arrays. **We can't do this on TT-NN TILE_LAYOUT** — that's our #1 blocker. More on this in Part 4.
-
-**Q: What shortcuts did jax-mps take?**
+### Q: What shortcuts did jax-mps take?
 
 A: Several pragmatic ones:
-- **No kernel fusion**: Each StableHLO op maps 1:1 to an MLX op (though they added optional fusion passes later)
+- **No kernel fusion**: Each StableHLO op maps 1:1 to an MLX op (though applejax added optional fusion passes later)
 - **Single device only**: No multi-device support
 - **No quantization**: uniform_quantize/dequantize not implemented
 - **No async ops**: Everything is synchronous
-- **CPU fallback**: Some ops (eigendecomposition) fall back to Apple Accelerate on CPU
+- **CPU fallback**: Some ops (eigendecomposition, SVD, Schur) fall back to Apple Accelerate on CPU
 - **Disabled shardy partitioner**: Avoids StableHLO parsing issues with JAX's sharding
 - **No training-specific optimization**: Works but not tuned for backward passes
 
 These are exactly the shortcuts we'd take too.
 
 
-## Part 2: StableHLO vs Jaxpr — The Op Mapping
+## Part 2: StableHLO vs Jaxpr
 
-**Q: How do StableHLO ops map to our existing 20 Jaxpr primitives?**
+### Q: What is StableHLO and how does it differ from Jaxpr?
 
-A: StableHLO has **107 ops** total. Here's how they relate to what we already support:
+A: They are different intermediate representations (IRs) at different levels of the JAX compilation pipeline:
+
+```
+Python function
+    |
+    v
+Jaxpr (JAX's internal IR, Python data structure)
+    |  jax.jit.lower()
+    v
+StableHLO (MLIR dialect, serializable bytecode)
+    |  XLA compiler (or PJRT plugin)
+    v
+Device code (CUDA PTX, Metal shaders, TT-NN ops, etc.)
+```
+
+**Jaxpr** is:
+- A Python data structure (`jax.core.Jaxpr`)
+- Produced by `jax.make_jaxpr(f)(x)` -- tracing the function
+- Contains ~50 primitive operations (JAX-specific naming: `add`, `mul`, `dot_general`, etc.)
+- Includes JAX-specific concepts: `stop_gradient`, `custom_vjp`, `pjit`
+- Not serializable across processes (Python objects with references)
+
+**StableHLO** is:
+- An MLIR dialect with a formal specification (https://openxla.org/stablehlo/spec)
+- Has **98 defined ops** with formal verifiers and type inference
+- Serializable as MLIR bytecode -- can cross process/language boundaries
+- Backward and forward compatible (versioned serialization format)
+- The standard interface between ML frameworks and compilers
+- Used by JAX, PyTorch/XLA, and TensorFlow to communicate with hardware backends
+
+### Q: Why does PJRT use StableHLO instead of Jaxpr?
+
+A: Three reasons:
+
+1. **Language independence**: StableHLO is an MLIR dialect with C++ APIs. PJRT plugins are C/C++ shared libraries. Jaxpr is a Python data structure -- you can't pass it to a C++ library without serialization.
+
+2. **Framework independence**: StableHLO is the common IR for JAX, PyTorch/XLA, and TensorFlow. A PJRT plugin that accepts StableHLO works with all three frameworks automatically.
+
+3. **Stability guarantee**: StableHLO has backward compatibility guarantees. Jaxpr's internal representation can change between JAX versions without notice.
+
+### Q: Could we bypass StableHLO and use Jaxpr in a PJRT plugin?
+
+A: Not within the PJRT protocol. The `PJRT_Client_Compile` function signature expects either StableHLO bytecode or HLO proto. There is no Jaxpr entry point in the PJRT C API.
+
+However, we could build a **hybrid** approach:
+- Register a PJRT plugin (for `jax.devices()` and buffer management)
+- In `Compile()`, receive StableHLO but immediately convert it back to a Jaxpr-like representation
+- Execute using our existing Python-style dispatch
+
+This is essentially what jax-mps does -- it receives StableHLO but doesn't compile it to native code. It walks the ops and dispatches to library calls, which is interpretation, not compilation.
+
+### Q: How do StableHLO ops map to our existing 20 Jaxpr primitives?
+
+A: StableHLO has **98 ops** total. Here's how they relate to what we already support:
 
 | Our Jaxpr primitive | StableHLO equivalent | Notes |
 |---------------------|---------------------|-------|
@@ -114,11 +194,13 @@ A: StableHLO has **107 ops** total. Here's how they relate to what we already su
 
 **Summary: 18 of our 20 Jaxpr primitives map directly to StableHLO ops.** The two that don't (`reciprocal`, `squeeze`) are trivially expressed in StableHLO terms.
 
-**Q: Is StableHLO a strict superset of Jaxpr primitives?**
+### Q: What is the `reduce` op difference between Jaxpr and StableHLO?
 
-A: Not exactly a superset in the formal sense — they're different IRs with different design goals — but **StableHLO covers everything Jaxpr does and much more**:
+A: This is important. In Jaxpr, we have separate primitives `reduce_sum` and `reduce_max`. In StableHLO, there's a single generic `stablehlo.reduce` that takes a **computation body** -- an inner function that defines how elements are combined. For sum, the body is `add`; for max, the body is `maximum`. This means our PJRT plugin would need to parse the reduction body to determine which TT-NN reduction to call.
 
-StableHLO ops we'd need to add beyond our current 20 for a useful backend:
+### Q: What additional StableHLO ops would we need for a useful backend?
+
+A: Beyond our current 20, a minimal PJRT plugin for inference needs approximately **35-40 StableHLO ops**. applejax implements ~71 StableHLO ops + 12 CHLO (custom HLO) ops including erf, top_k, acos, sinh, erf_inv. The extra ops group into categories:
 
 | Category | StableHLO ops | Purpose |
 |----------|--------------|---------|
@@ -132,270 +214,384 @@ StableHLO ops we'd need to add beyond our current 20 for a useful backend:
 | **Communication** | `all_reduce`, `all_gather` | Multi-device (future) |
 | **Advanced** | `fft`, `sort`, `cholesky`, `triangular_solve` | Scientific/linalg |
 
-A minimal PJRT plugin for inference needs approximately **35-40 StableHLO ops** — roughly double our current Jaxpr coverage. jax-mps implements ~71 StableHLO ops + 12 CHLO (custom HLO) ops.
 
-**Q: What is the `reduce` op difference?**
+## Part 3: What Would a TT-NN PJRT Plugin Look Like?
 
-A: This is important. In Jaxpr, we have separate primitives `reduce_sum` and `reduce_max`. In StableHLO, there's a single generic `stablehlo.reduce` that takes a **computation body** — an inner function that defines how elements are combined. For sum, the body is `add`; for max, the body is `maximum`. This means our PJRT plugin would need to parse the reduction body to determine which TT-NN reduction to call.
+### Q: What are the four key components of a TT-NN PJRT plugin?
 
+A: Following the jax-mps architecture:
 
-## Part 3: Concrete Implementation Plan
+**Component 1: Plugin Entry Point** (`pjrt_api.cc`)
+- Exports `GetPjrtApi()` via `dlsym()`
+- Returns a `PJRT_Api` struct filled with ~80 function pointers
+- The C++ wrapper (`pjrt_c_api_wrapper_impl.h`) auto-generates most of these from a `PjRtClient` subclass
+- This is pure boilerplate -- copy from jax-mps and change the class names
 
-**Q: What would a minimal PJRT plugin for TT-NN look like?**
+**Component 2: Client & Device Management** (`tt_client.cc`, `tt_device.cc`)
+- `PJRT_Client_Create` calls `ttnn::open_device(0)`
+- Reports device capabilities (memory size, compute cores, device name "Blackhole")
+- Handles device enumeration (we'd report 1 device, device_id=0)
+- Manages device lifecycle (open on create, close on destroy)
 
-A: Here's the concrete file structure:
+**Component 3: Buffer Management** (`tt_buffer.cc`)
+- `PJRT_Client_BufferFromHostBuffer`: host numpy array --> ttnn tensor with tile padding
+- `PJRT_Buffer_ToHostBuffer`: ttnn tensor --> host numpy array with unpadding
+- Must handle the TILE_LAYOUT 32-alignment requirement (pad shapes to multiples of 32)
+- Must handle dtype conversion (float32 from JAX <--> bfloat16 on device)
+- This maps directly to our `tensors.py` `to_device()` / `from_device()`
+
+**Component 4: Compilation & Execution** (`tt_executable.cc`, `stablehlo_parser.cc`, `ops/*.cc`)
+- `PJRT_Client_Compile`: parse StableHLO bytecode, walk ops, build a dispatch plan
+- `PJRT_LoadedExecutable_Execute`: execute the dispatch plan on TT-NN
+- The op handlers are isomorphic to our Python `REGISTRY` dict
+- Optionally wrap execution in `ttnn::begin_trace_capture` / `ttnn::end_trace_capture`
+
+### Q: What's the concrete file structure?
+
+A:
 
 ```
 pjrt-plugin-tt/
-├── CMakeLists.txt                    # Build system
-├── src/
-│   ├── pjrt_api.cc                   # GetPjrtApi() entry point (~300 lines)
-│   ├── tt_client.h/cc                # Device open/close, CompileStableHLO() (~200 lines)
-│   ├── tt_device.h/cc                # Device description, memory spaces (~100 lines)
-│   ├── tt_buffer.h/cc                # to_device/from_device with tile padding (~250 lines)
-│   ├── tt_executable.h/cc            # Walk StableHLO, dispatch to TT-NN (~400 lines)
-│   ├── stablehlo_parser.h/cc         # Parse StableHLO bytecode via MLIR (~150 lines)
-│   ├── ops/
-│   │   ├── registry.h                # Op handler type + registration (~50 lines)
-│   │   ├── arithmetic.cc             # add, sub, mul, div, exp, log, etc. (~300 lines)
-│   │   ├── shape.cc                  # broadcast_in_dim, reshape, transpose (~250 lines)
-│   │   ├── reduction.cc              # reduce (sum, max, min, prod) (~150 lines)
-│   │   ├── linalg.cc                 # dot_general, conv (~200 lines)
-│   │   └── data.cc                   # constant, iota, select, gather, slice (~300 lines)
-│   └── pjrt_stubs.cc                 # Stubbed PJRT functions (~200 lines)
-├── python/
-│   └── jax_plugins/tt/__init__.py    # Plugin registration (~40 lines)
-├── tests/
-│   └── test_basic.py                 # JAX-level tests (~200 lines)
-└── third_party/
-    ├── mlir/                         # MLIR/StableHLO headers + static libs
-    └── tt-metal/                     # TT-NN headers + libs
+  CMakeLists.txt                    # Build system
+  src/
+    pjrt_api.cc                     # GetPjrtApi() entry point (~300 lines)
+    tt_client.h/cc                  # Device open/close, CompileStableHLO() (~200 lines)
+    tt_device.h/cc                  # Device description, memory spaces (~100 lines)
+    tt_buffer.h/cc                  # to_device/from_device with tile padding (~250 lines)
+    tt_executable.h/cc              # Walk StableHLO, dispatch to TT-NN (~400 lines)
+    stablehlo_parser.h/cc           # Parse StableHLO bytecode via MLIR (~150 lines)
+    ops/
+      registry.h                    # Op handler type + registration (~50 lines)
+      arithmetic.cc                 # add, sub, mul, div, exp, log, etc. (~300 lines)
+      shape.cc                      # broadcast_in_dim, reshape, transpose (~250 lines)
+      reduction.cc                  # reduce (sum, max, min, prod) (~150 lines)
+      linalg.cc                     # dot_general, conv (~200 lines)
+      data.cc                       # constant, iota, select, gather, slice (~300 lines)
+    pjrt_stubs.cc                   # Stubbed PJRT functions (~200 lines)
+  python/
+    jax_plugins/tt/__init__.py      # Plugin registration (~40 lines)
+  tests/
+    test_basic.py                   # JAX-level tests (~200 lines)
+  third_party/
+    mlir/                           # MLIR/StableHLO headers + static libs
+    tt-metal/                       # TT-NN headers + libs
 ```
 
 **Estimated total: ~2,600 lines of C++, ~240 lines of Python.**
 
 For reference, our current Python interpreter is ~585 lines across 4 files. The PJRT plugin would be roughly 4-5x more code, mostly due to C++ boilerplate, PJRT API wiring, and StableHLO parsing.
 
-**Q: What's the build system?**
 
-A: **CMake**, following jax-mps's approach. Key dependencies:
+## Part 4: How Would Compile() Work?
 
-```cmake
-cmake_minimum_required(VERSION 3.20)
-project(pjrt_plugin_tt)
+### Q: What happens when JAX calls Compile() on our plugin?
 
-# Find TT-Metal/TT-NN
-find_package(tt-metal REQUIRED)  # or manual path to libtt_metal.so
-
-# MLIR/StableHLO (pre-built static libraries)
-# These are ~20 MLIR libs + ~14 StableHLO libs
-set(MLIR_LIBS MLIRBytecodeReader MLIRParser MLIRIR MLIRSupport ...)
-set(STABLEHLO_LIBS StablehloOps StablehloAssemblyFormat StablehloBytecode ...)
-
-# Main plugin shared library
-add_library(pjrt_plugin_tt SHARED
-    src/pjrt_api.cc
-    src/tt_client.cc
-    src/tt_device.cc
-    src/tt_buffer.cc
-    src/tt_executable.cc
-    src/stablehlo_parser.cc
-    src/ops/arithmetic.cc
-    src/ops/shape.cc
-    src/ops/reduction.cc
-    src/ops/linalg.cc
-    src/ops/data.cc
-    src/pjrt_stubs.cc
-)
-
-target_link_libraries(pjrt_plugin_tt PRIVATE
-    tt_metal ttnn              # TT-NN
-    ${MLIR_LIBS}               # MLIR bytecode parsing
-    ${STABLEHLO_LIBS}          # StableHLO dialect
-    protobuf abseil            # Dependencies
-)
-```
-
-The hardest part of the build: **getting MLIR/StableHLO static libraries compiled for our Linux host**. jax-mps bundles pre-built MLIR in `third_party/`. We'd need to do the same, or build from source (which takes 30+ minutes).
-
-**Q: How would we link against TT-NN?**
-
-A: TT-NN is already installed on our remote host. We'd link against:
+A: The full pipeline from `jax.jit(f)(x)` to a compiled executable:
 
 ```
-/path/to/tt-metal/build/lib/libtt_metal.so
-/path/to/tt-metal/build/lib/libttnn.so
+Step 1: JAX traces f(x) into Jaxpr (Python-side, automatic)
+Step 2: JAX lowers Jaxpr to StableHLO (Python-side, automatic)
+Step 3: JAX serializes StableHLO to bytecode
+Step 4: JAX calls PJRT_Client_Compile(bytecode) on our plugin
+Step 5: Our plugin parses the StableHLO bytecode back to MLIR ops
+Step 6: Our plugin walks each op and builds a dispatch plan
+Step 7: Returns a PjRtLoadedExecutable handle
 ```
 
-Plus headers from:
-```
-/path/to/tt-metal/tt_metal/include/
-/path/to/tt-metal/ttnn/include/
-```
+Steps 1-4 are done by JAX automatically. We implement steps 5-7.
 
-The TT-NN C++ API mirrors the Python API closely — `ttnn::add()`, `ttnn::matmul()`, `ttnn::reshape()` are all available as C++ functions.
+### Q: What does "build a dispatch plan" mean concretely?
 
-**Q: What's the minimum viable implementation?**
+A: It means creating a list of callable functions, each mapping one StableHLO op to TT-NN calls. In C++:
 
-A: To run `y = jax.jit(lambda x: x @ w + b)(input)`:
+```cpp
+// In tt_executable.cc
+struct OpDispatch {
+    std::function<ttnn::Tensor(std::vector<ttnn::Tensor>&)> handler;
+    std::vector<int> input_indices;   // which intermediate tensors are inputs
+    int output_index;                  // where to store the result
+};
 
-1. `PJRT_Client_Create` → `ttnn::open_device(0)`
-2. `PJRT_Client_BufferFromHostBuffer` → pad to 32-aligned, `ttnn::from_torch(..., TILE_LAYOUT)`
-3. `PJRT_Client_Compile` → parse StableHLO, build op dispatch list
-4. `PJRT_LoadedExecutable_Execute` → walk ops calling ttnn::matmul, ttnn::add
-5. `PJRT_Buffer_ToHostBuffer` → `ttnn::to_torch()`, unpad
-6. Destructors → `ttnn::close_device()`
+class TtExecutable {
+    std::vector<OpDispatch> dispatch_plan_;
 
-For this minimal case, we need handlers for: `constant`, `dot_general`, `add`, `broadcast_in_dim`, and `convert`. That's 5 StableHLO ops.
+    static std::unique_ptr<TtExecutable> Create(mlir::ModuleOp module) {
+        auto exec = std::make_unique<TtExecutable>();
+        auto func = getEntryFunction(module);
 
-
-## Part 4: The Broadcast Problem
-
-**Q: What broadcast capabilities does TT-NN actually have?**
-
-A: More than we thought! TT-NN provides several on-device broadcast operations:
-
-| Operation | What it does | Layout support |
-|-----------|-------------|----------------|
-| `ttnn.bcast(a, b, math_op, dim)` | Binary op with broadcasting b over a | BF16 only, H/W/HW dims |
-| `ttnn.expand(tensor, shape)` | Expand singleton dims (like torch.expand) | Copies data (not a view) |
-| `ttnn.repeat(tensor, reps)` | Tile repetition along dims | General |
-| `ttnn.repeat_interleave(tensor, n, dim)` | Repeat elements along a dim | Works with TILE_LAYOUT |
-
-**The key discovery: `ttnn.bcast` supports ADD, SUB, MUL along H, W, or HW dimensions with specific shape constraints.** And `ttnn.expand` does explicit broadcasting of singleton dimensions.
-
-Constraints for `ttnn.bcast`:
-- Both inputs must be BF16 (we already use BF16)
-- Broadcast dimension can be W (column broadcast), H (row broadcast), or HW (scalar broadcast)
-- Shape rules: for W-broadcast, Y dims must match; for H-broadcast, X dims must match
-
-**Q: Could we use ttnn.expand/repeat to eliminate CPU round-trips?**
-
-A: Yes! Our current `broadcast_to_match()` in `tensors.py` does:
-```
-device → CPU (from_device) → np.broadcast_to → CPU → device (to_device)
+        for (auto& op : func.getOps()) {
+            if (auto add = dyn_cast<stablehlo::AddOp>(op)) {
+                exec->dispatch_plan_.push_back({
+                    .handler = [](auto& tensors) {
+                        return ttnn::add(tensors[0], tensors[1]);
+                    },
+                    .input_indices = getInputIndices(add),
+                    .output_index = getOutputIndex(add),
+                });
+            }
+            // ... similar for mul, matmul, reshape, etc.
+        }
+        return exec;
+    }
+};
 ```
 
-We could replace this with:
-```
-ttnn.expand(tensor, target_shape)  # stays on device!
+This is conceptually identical to our Python interpreter walking Jaxpr equations. The only difference is the source IR (StableHLO MLIR ops vs Jaxpr equations) and the language (C++ vs Python).
+
+### Q: What MLIR libraries do we need for parsing?
+
+A: This is the hardest part of the build. jax-mps links against:
+
+**~20 MLIR libraries**: MLIRBytecodeReader, MLIRParser, MLIRIR, MLIRSupport, MLIRFuncDialect, etc.
+
+**~14 StableHLO libraries**: StablehloOps, StablehloAssemblyFormat, StablehloBytecode, etc.
+
+Plus their transitive dependencies: LLVM support libraries, protobuf, abseil.
+
+Getting these pre-built for our Linux host (Ubuntu on the Tenstorrent machine) is non-trivial. Options:
+1. Build MLIR + StableHLO from source (30+ minutes, complex CMake)
+2. Extract pre-built libs from a matching JAX wheel (hacky but faster)
+3. Use the JAX-bundled XLA compiler libraries (if they're accessible)
+
+
+## Part 5: How Would Execute() Work?
+
+### Q: What happens when the compiled executable runs?
+
+A: Two modes:
+
+**Mode 1: Direct dispatch** (simpler, like our current interpreter)
+```cpp
+void TtExecutable::Execute(std::vector<ttnn::Tensor>& inputs) {
+    std::vector<ttnn::Tensor> intermediates(num_intermediates_);
+
+    // Copy inputs into intermediate slots
+    for (int i = 0; i < inputs.size(); i++)
+        intermediates[i] = inputs[i];
+
+    // Walk the dispatch plan
+    for (auto& dispatch : dispatch_plan_) {
+        std::vector<ttnn::Tensor> args;
+        for (int idx : dispatch.input_indices)
+            args.push_back(intermediates[idx]);
+        intermediates[dispatch.output_index] = dispatch.handler(args);
+    }
+
+    output_ = intermediates.back();
+}
 ```
 
-Or for cases where we need to replicate along a specific axis:
-```
-ttnn.repeat(tensor, repetition_vector)  # stays on device!
+**Mode 2: Trace-wrapped dispatch** (much faster, eliminates C++ dispatch overhead too)
+```cpp
+void TtExecutable::Execute(std::vector<ttnn::Tensor>& inputs) {
+    if (!trace_captured_) {
+        // First run: capture a trace
+        for (int i = 0; i < inputs.size(); i++)
+            input_buffers_[i] = inputs[i];
+
+        uint32_t tid = ttnn::begin_trace_capture(device_, cq_id_);
+        DirectDispatch(input_buffers_);  // run once to record
+        ttnn::end_trace_capture(device_, cq_id_, tid);
+        trace_id_ = tid;
+        trace_captured_ = true;
+    } else {
+        // Subsequent runs: overwrite input buffers and replay
+        for (int i = 0; i < inputs.size(); i++)
+            ttnn::copy_host_to_device_tensor(inputs[i], input_buffers_[i]);
+        ttnn::execute_trace(device_, cq_id_, trace_id_, false);
+    }
+}
 ```
 
-This would eliminate the CPU round-trip that currently breaks trace capture for any graph with broadcasting. The `broadcast_in_dim` handler would become:
+### Q: Can we use ttnn trace capture in the PJRT context?
 
+A: Yes, and this is a key advantage. The PJRT Execute() boundary is the perfect place for trace capture because:
+
+1. **Fixed graph**: After Compile(), the op graph is frozen. Same ops, same shapes every time.
+2. **Clear input/output boundary**: Execute() receives input buffers and returns output buffers. We know exactly what to overwrite.
+3. **No Python in the loop**: The trace replay path has zero Python dispatch overhead AND zero C++ dispatch overhead -- it's pure hardware command replay.
+
+The trace capture approach turns our PJRT plugin into something like CUDA graphs -- record once, replay many times. The transformer encoder's 50+ ops would replay as a single hardware command sequence.
+
+### Q: What about dynamic shapes?
+
+A: Traces are fixed-shape. If JAX sends different input shapes (e.g., different batch sizes), we'd need to either:
+1. Re-capture the trace (detect shape change, discard old trace)
+2. Maintain a cache of traces keyed by input shapes
+3. Pad all inputs to a maximum shape (wasteful but simple)
+
+jax-mps handles this by not using traces -- they re-dispatch every time. For our use case (inference with fixed batch size), trace capture is the right choice.
+
+
+## Part 6: Broadcast Problem in the PJRT Context
+
+### Q: How did jax-mps handle broadcast_in_dim?
+
+A: Their handler in `ops/shape.cc`:
+1. Build an intermediate shape filled with 1s
+2. Set non-broadcast dimensions to their source sizes
+3. `mlx::core::reshape()` to the intermediate shape
+4. `mlx::core::broadcast_to()` to the final output shape
+
+This works seamlessly because MLX supports implicit broadcasting on its GPU arrays. **We cannot do this with TT-NN TILE_LAYOUT implicit broadcasting** -- that was our #1 blocker.
+
+### Q: Does on-device broadcast via ttnn.repeat solve this?
+
+A: Yes. Our experiment 21 discovered that TT-NN provides several on-device broadcast operations:
+
+| Operation | What it does | Works with TILE_LAYOUT? |
+|-----------|-------------|------------------------|
+| `ttnn.repeat(tensor, reps)` | Tile repetition along dims | YES -- confirmed working |
+| `ttnn.repeat_interleave(tensor, n, dim)` | Repeat elements along a dim | YES |
+| `ttnn.expand(tensor, shape)` | Expand singleton dims | Exists, needs testing |
+| `ttnn.bcast(a, b, math_op, dim)` | Fused broadcast + binary op | BF16 only, H/W/HW dims |
+
+The `ttnn.repeat` approach:
 ```python
-def op_broadcast_in_dim(interp, invars, params, eqn):
-    a = interp.eval_var(invars[0])
-    out_shape = eqn.outvars[0].aval.shape
-    in_shape = eqn.invars[0].aval.shape
-    if in_shape == out_shape:
-        return a
-    # Use ttnn.expand instead of CPU round-trip!
-    return ttnn.expand(a, list(out_shape))
+# (1, 1, 1, 64) --> (1, 1, 32, 64) -- entirely on device
+b_expanded = ttnn.repeat(b, ttnn.Shape([1, 1, 32, 1]))  # repeat 32x along dim 2
 ```
 
-**This is potentially a bigger win than switching to PJRT.** If `ttnn.expand` works reliably with TILE_LAYOUT, we could fix the broadcast problem in our current Python interpreter AND make all ops trace-compatible.
+Performance impact:
 
-**Q: How does the official tt-xla (via tt-mlir) handle broadcasts?**
+| Method | Latency | Notes |
+|--------|---------|-------|
+| CPU round-trip (current) | 0.147 ms | Read + broadcast + write |
+| Host pre-expand | 0.084 ms | No read, just write expanded |
+| `ttnn.repeat` (on-device) | ~0 ms | No host transfers at all |
 
-A: The tt-mlir compiler handles `stablehlo.broadcast_in_dim` as a first-class MLIR operation. Their approach:
+With 10 broadcasts per transformer forward pass, CPU round-trips cost 1.47 ms -- **26% of our 5.59 ms forward time**. Eliminating them is the single highest-value optimization.
 
-1. **MLIR lowering**: `stablehlo.broadcast_in_dim` is lowered through TTIR dialect → TTNN dialect
-2. **Op insertion**: The compiler inserts explicit `ttnn.repeat` or reshape operations as needed
-3. **Optimization**: The compiler may fuse the broadcast with the consuming op (e.g., fuse broadcast+add into a single bcast kernel)
+### Q: How would broadcast work in a PJRT plugin specifically?
 
-The tt-torch compatibility table shows `stablehlo.broadcast_in_dim` is supported with 862+ test cases passing. This confirms that TT-NN can handle broadcast patterns — we just need to use the right API calls.
+A: In a PJRT plugin, the `Compile()` step sees the entire graph. We could:
 
-**Q: Could we solve this at the PJRT/compiler level?**
+1. **Simple approach**: For each `stablehlo.broadcast_in_dim`, insert a `ttnn::repeat()` call in the dispatch plan. This keeps shapes matched for all downstream binary ops.
 
-A: Yes, and this is a key insight. In a PJRT plugin, the `Compile()` step sees the entire graph. We could:
+2. **Fused approach**: Pattern-match `broadcast_in_dim` --> `add` sequences and replace with `ttnn::bcast(a, b, BcastOpMath::ADD, dim)` -- a single fused on-device op.
 
-1. **Pattern match**: Detect `broadcast_in_dim` → `add` patterns
-2. **Replace with**: `ttnn.bcast(a, b, BcastOpMath::ADD, dim)` — a single fused on-device op
-3. **Or insert explicit expand**: Before any binary op with mismatched shapes, insert `ttnn.expand()` to pre-broadcast
+3. **Compiler approach**: What the official tt-mlir does -- lower `stablehlo.broadcast_in_dim` through TTIR dialect --> TTNN dialect, inserting optimized repeat/bcast ops.
 
-This is exactly what jax-mps does — their `broadcast_in_dim` handler calls `mlx::core::broadcast_to()` which is an on-device operation. The only reason we do CPU round-trips is that we didn't know about `ttnn.expand`.
+The key insight: **the broadcast fix is independent of the PJRT decision**. Whether we use our Python interpreter or build a PJRT plugin, `ttnn.repeat` eliminates the CPU round-trip. But in the PJRT context, we can also fuse broadcasts with consuming ops since we see the full graph at compile time.
+
+### Q: How does the official tt-xla (via tt-mlir) handle broadcasts?
+
+A: The tt-mlir compiler handles `stablehlo.broadcast_in_dim` as a first-class MLIR operation:
+1. `stablehlo.broadcast_in_dim` is lowered through TTIR dialect --> TTNN dialect
+2. The compiler inserts explicit `ttnn.repeat` or reshape operations as needed
+3. The compiler may fuse the broadcast with the consuming op
+
+The tt-torch compatibility table shows `stablehlo.broadcast_in_dim` passing 862+ test cases. This confirms TT-NN can handle broadcast patterns -- we just need to use the right API calls.
 
 
-## Part 5: Pros and Cons Analysis
+## Part 7: Pros and Cons vs Current Jaxpr Interpreter
 
-**Q: What do we gain and lose with each approach?**
+### Q: What do we gain and lose with each approach?
 
-### Current approach: Python Jaxpr Interpreter
+**Current approach: Python Jaxpr Interpreter**
 
 | Dimension | Assessment |
 |-----------|-----------|
 | **Development effort** | Done for 20 ops. ~585 lines Python. |
-| **Performance ceiling** | Limited. CPU round-trips for broadcast. No fusion. Python dispatch overhead (~21us/op, reduced to ~9us with trace). |
+| **Performance** | 348 fwd/sec with on-device broadcast. Limited by Python dispatch (~21us/op). With trace: ~9us/op. |
 | **jax.jit support** | NO. Must manually call `jax.make_jaxpr()` + `interpreter.run()`. |
 | **vmap/grad** | NO. Would need separate implementation. |
-| **Maintainability** | Excellent. Plain Python dict registry. Anyone can add an op. |
-| **Trace capture** | Works but broken by broadcast CPU round-trips. |
+| **Maintainability** | Excellent. Plain Python dict registry. Anyone can add an op in 5 minutes. |
+| **Trace capture** | Works when all ops stay on-device (requires ttnn.repeat for broadcast). |
 | **Ecosystem integration** | None. Libraries (Flax, Optax) can't use our backend transparently. |
 
-### PJRT Plugin approach (jax-mps style)
+**PJRT Plugin approach (jax-mps style)**
 
 | Dimension | Assessment |
 |-----------|-----------|
 | **Development effort** | ~2,600 lines C++. 2-4 weeks for MVP. Build system complexity. |
-| **Performance ceiling** | Higher. On-device broadcast. Trace-wrapped execution. Optional MLX-style compilation. |
+| **Performance** | Higher ceiling. On-device broadcast. Trace-wrapped execution. <1us C++ dispatch. |
 | **jax.jit support** | YES, automatic. This is the whole point. |
 | **vmap/grad** | YES, automatic. JAX handles transformations before lowering to StableHLO. |
 | **Maintainability** | Harder. C++ compilation, MLIR dependency, CMake. |
-| **Trace capture** | Could wrap entire `Execute()` in trace capture for max speed. |
+| **Trace capture** | Could wrap entire `Execute()` in trace for maximum speed. |
 | **Ecosystem integration** | Full. `jax.devices()` shows "tt", Flax/Optax just work. |
 
-### The critical question: is jax.jit worth 2-4 weeks of C++ work?
-
-**Arguments for yes:**
-- `jax.jit` is not just syntactic sugar — it enables XLA-level optimizations, constant folding, dead code elimination, and CSE before the graph even reaches our plugin
-- `vmap` and `grad` for free means we could do batched inference and potentially training
-- Library compatibility means we could run real models (Flax transformers, etc.) without manual Jaxpr extraction
-- Our op registry (`REGISTRY` dict) translates almost 1:1 to C++ handler functions
-
-**Arguments for no:**
-- We already have 21/21 tests passing and 179 fwd/sec on a transformer encoder
-- The C++ build complexity is significant (MLIR dependencies alone are painful)
-- For a course project, demonstrating the concept matters more than production integration
-- The broadcast fix (ttnn.expand) would benefit our Python interpreter too
-
-**Q: What's the performance comparison in concrete terms?**
+### Q: What's the performance comparison in concrete terms?
 
 Current Python interpreter path:
 ```
-jax.make_jaxpr(model)(x)   →  Jaxpr (Python IR)
-interpreter.run(jaxpr, x)  →  walks 50+ equations, ~21us each
-                            →  50 * 21us = 1.05ms Python dispatch
-                            →  plus actual compute time
-                            →  plus CPU round-trips for broadcast
+jax.make_jaxpr(model)(x)   -->  Jaxpr (Python IR)
+interpreter.run(jaxpr, x)  -->  walks 50+ equations, ~21us each
+                            -->  50 * 21us = 1.05ms Python dispatch
+                            -->  plus actual TT-NN compute time
+                            -->  plus CPU round-trips for broadcast (if not fixed)
 ```
 
 PJRT plugin path:
 ```
-jax.jit(model)(x)          →  StableHLO (compiled once, cached)
-plugin.Execute(x)          →  C++ dispatch, <1us per op
-                            →  or wrapped in trace: near-zero dispatch
-                            →  no CPU round-trips (on-device broadcast)
+jax.jit(model)(x)          -->  StableHLO (compiled once, cached)
+plugin.Execute(x)          -->  C++ dispatch, <1us per op
+                            -->  or wrapped in trace: near-zero dispatch
+                            -->  no CPU round-trips (on-device broadcast)
 ```
 
-The dispatch overhead gap: **21us/op (Python) vs <1us/op (C++) vs ~0us/op (traced)**. With trace capture in our Python interpreter, we already get close to 0us/op for the dispatch — so the real win from PJRT is broadcast elimination and ecosystem integration, not raw dispatch speed.
+The dispatch overhead gap: **21us/op (Python) vs <1us/op (C++) vs ~0us/op (traced)**. With trace capture in our Python interpreter, we already get close to 0us/op -- so the real win from PJRT is **ecosystem integration** (jax.jit, vmap, grad, Flax compatibility), not raw dispatch speed.
+
+### Q: Is jax.jit worth 2-4 weeks of C++ work?
+
+**Arguments for yes:**
+- `jax.jit` enables XLA-level optimizations (constant folding, dead code elimination, CSE) before the graph reaches our plugin
+- `vmap` and `grad` for free means batched inference and potentially training
+- Library compatibility (Flax, Optax) means running real models without manual Jaxpr extraction
+- Our op registry translates almost 1:1 to C++ handler functions
+
+**Arguments for no:**
+- We already have 21/21 tests passing and 348 fwd/sec on a transformer encoder
+- The C++ build complexity is significant (MLIR dependencies alone are painful)
+- For a course project, demonstrating the concept matters more than production integration
+- The broadcast fix benefits our Python interpreter too
 
 
-## Part 6: Hybrid Approaches
+## Part 8: The Three Paths Forward
 
-**Q: Is there a middle ground between Python interpreter and full PJRT plugin?**
+### Q: What are the three paths, and which should we choose?
 
-A: Yes, several options:
+**Path A: Full PJRT with StableHLO Compiler**
 
-### Option A: Fix broadcast first, keep Python interpreter
+```
+JAX --> StableHLO --> our PJRT plugin --> parse StableHLO --> dispatch to TT-NN
+```
 
-The single highest-value change: replace CPU round-trip broadcasts with `ttnn.expand()`:
+- Effort: 2-4 weeks, ~2,600 lines C++
+- Gets: jax.jit, vmap, grad, full ecosystem
+- Risk: MLIR build complexity, C++ debugging on remote host
+- This is the jax-mps approach
 
+**Path B: PJRT with Jaxpr Pass-Through**
+
+```
+JAX --> StableHLO --> our PJRT plugin --> convert back to Jaxpr-like --> dispatch to TT-NN
+```
+
+- Effort: 3-5 weeks (more complex because of the conversion layer)
+- Gets: Same as Path A, but we reuse our Python op handlers
+- Risk: Unnecessary complexity -- if we're parsing StableHLO, just dispatch from there
+- Not recommended. If you're going to parse StableHLO anyway, dispatch directly.
+
+**Path C: Keep Interpreter + Add Trace Capture (recommended)**
+
+```
+JAX --> jax.make_jaxpr --> our Python interpreter --> TT-NN with trace capture
+```
+
+With the key enhancement: replace CPU broadcast with `ttnn.repeat` so trace capture works for ALL ops.
+
+- Effort: 1-2 days for broadcast fix, 1 week for polish
+- Gets: ~2-3x speedup from trace, all ops on-device, potentially 500+ fwd/sec
+- Loses: No jax.jit, no vmap, no Flax compatibility
+- For CS440LX: this is the pragmatic choice
+
+### Q: What's the progressive migration strategy?
+
+A phased approach that starts with the highest-leverage change:
+
+**Phase 1 (1-2 days)**: Fix broadcast with `ttnn.repeat` / `ttnn.expand`
 ```python
 # In tensors.py broadcast_to_match():
 # BEFORE (CPU round-trip):
@@ -404,175 +600,120 @@ a_np = np.broadcast_to(a_np, out_shape).copy()
 a_tt = to_device(a_np, device)
 
 # AFTER (on-device):
-a_tt = ttnn.expand(a_tt, list(out_shape))
+a_tt = ttnn.repeat(a_tt, repeat_shape)
 ```
+If this works, trace capture becomes fully functional. Benchmark the transformer.
 
-If this works, our trace capture becomes fully functional for all ops. We'd get:
-- All ops trace-compatible (no skip_eqns needed)
-- 2-3x additional speedup from trace
-- Still no jax.jit, but much faster execution
+**Phase 2 (1 week, optional)**: Start PJRT plugin skeleton
+- Use the C++ wrapper to auto-generate PJRT function pointers
+- Get `jax.devices()` showing a Tenstorrent device
+- Implement buffer transfer (our `to_device` / `from_device` in C++)
 
-**Estimated effort: 1-2 hours to test, half a day to integrate.**
+**Phase 3 (1 week, optional)**: Port op handlers to C++
+- Logic is identical to our Python handlers, just different syntax
+- Wire up Compile() --> walk StableHLO --> dispatch to TT-NN
 
-### Option B: JAX FFI custom calls
-
-JAX's Foreign Function Interface (`jax.ffi`) lets you register C/C++ functions as JAX custom calls:
-
-```python
-# Register a C++ function
-jax.ffi.register_ffi_target("tt_matmul", capsule_ptr)
-
-# Call it from JAX (works with jax.jit!)
-result = jax.ffi.ffi_call(
-    "tt_matmul",
-    result_shape_dtypes=jax.ShapeDtypeStruct(out_shape, jnp.float32),
-    x, w
-)
-```
-
-This works with `jax.jit` because it becomes a `custom_call` in the HLO graph. But:
-- You'd need to write C++ wrappers for each TT-NN op
-- No automatic vmap support (must provide `vmap_method`)
-- No automatic grad support (must use `jax.custom_vjp`)
-- Essentially building a PJRT plugin piecemeal, with more boilerplate
-
-**Verdict: Not recommended. If you're writing C++ anyway, build the PJRT plugin properly.**
-
-### Option C: Register custom JAX primitives (pure Python)
-
-You can register new JAX primitives that dispatch to TT-NN:
-
-```python
-import jax
-from jax import core
-
-tt_matmul_p = core.Primitive('tt_matmul')
-
-@tt_matmul_p.def_impl
-def tt_matmul_impl(x, w):
-    # Move to device, compute, move back
-    x_tt = tensors.to_device(x, device)
-    w_tt = tensors.to_device(w, device)
-    return tensors.from_device(ttnn.matmul(x_tt, w_tt), out_shape)
-
-@tt_matmul_p.def_abstract_eval
-def tt_matmul_abstract(x, w):
-    return core.ShapedArray((x.shape[0], w.shape[1]), x.dtype)
-```
-
-This gives you `jax.jit` compatibility (the primitive becomes an XLA custom_call). But:
-- Each call does host→device→host round-trip (no persistent device buffers)
-- No graph-level optimization
-- Essentially eager mode with extra steps
-
-**Verdict: Useful for testing individual ops, not viable for performance.**
-
-### Option D: Progressive migration (recommended for our timeline)
-
-A phased approach:
-
-1. **Week 1**: Fix broadcast with `ttnn.expand`. Make all ops trace-compatible. Benchmark the full transformer with trace capture. This alone could double our 179 fwd/sec.
-
-2. **Week 2**: If time permits, start the PJRT plugin skeleton. Use the C→C++ wrapper (`pjrt_c_api_wrapper_impl.h`) that auto-generates C function pointers from a `PjRtClient` subclass. Get `jax.devices()` showing a TT device.
-
-3. **Week 3**: Port our op handlers from Python to C++ (the logic is identical, just different syntax). Wire up Compile → walk StableHLO → dispatch to TT-NN.
-
-4. **Week 4**: Integration testing. Run the transformer encoder through `jax.jit` on the TT device.
-
-**Q: What would Phase 2 look like concretely?**
-
-The minimum skeleton to get `jax.devices()` to show a Tenstorrent device:
-
-```cpp
-// tt_client.h
-class TtClient : public xla::PjRtClient {
- public:
-  TtClient() {
-    device_ = ttnn::open_device(0);
-  }
-
-  absl::string_view platform_name() const override { return "tt"; }
-  int device_count() const override { return 1; }
-  int addressable_device_count() const override { return 1; }
-
-  // The key method — receives StableHLO, returns executable
-  absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> Compile(
-      const XlaComputation& computation,
-      CompileOptions options) override;
-
-  // Host → device
-  absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostBuffer(
-      const void* data, PrimitiveType type,
-      absl::Span<const int64_t> dims, ...) override;
-
- private:
-  ttnn::Device* device_;
-};
-```
-
-```python
-# jax_plugins/tt/__init__.py
-def initialize():
-    path = os.path.join(os.path.dirname(__file__), 'pjrt_plugin_tt.so')
-    xb.register_plugin('tt', priority=500, library_path=path)
-```
-
-Then: `python -c "import jax; print(jax.devices())"` → `[TtDevice(id=0)]`
+**Phase 4 (1 week, optional)**: Integration testing
+- Run the transformer encoder through `jax.jit` on the TT device
+- Compare performance with our Python interpreter
 
 
-## Part 7: Decision Framework
+## Part 9: Minimum Viable PJRT Plugin
 
-**Q: Given where we are (21/21 tests, 179 fwd/sec transformer), what should we do next?**
+### Q: What would the absolute minimum viable PJRT plugin need?
 
-Decision tree:
+A: To run `y = jax.jit(lambda x: x @ w + b)(input)`:
 
-```
-Is broadcast the #1 bottleneck?
-├── YES → Fix broadcast with ttnn.expand (Option A, 1 day)
-│         Then benchmark transformer with full trace capture
-│         ├── If 300+ fwd/sec → Ship it. Write the wiki entry. Move on.
-│         └── If <300 fwd/sec → Investigate other bottlenecks
-│
-└── Is jax.jit ecosystem integration the goal?
-    ├── YES → Build PJRT plugin (Option D phases 2-4, 2-3 weeks)
-    └── NO → Polish the Python interpreter, add more ops, write paper
-```
+1. `PJRT_Client_Create` --> `ttnn::open_device(0)`
+2. `PJRT_Client_BufferFromHostBuffer` --> pad to 32-aligned, `ttnn::from_torch(..., TILE_LAYOUT)`
+3. `PJRT_Client_Compile` --> parse StableHLO, build op dispatch list
+4. `PJRT_LoadedExecutable_Execute` --> walk ops calling `ttnn::matmul`, `ttnn::add`
+5. `PJRT_Buffer_ToHostBuffer` --> `ttnn::to_torch()`, unpad
+6. Destructors --> `ttnn::close_device()`
 
-**The broadcast fix is the highest-leverage change regardless of which path we choose.** If `ttnn.expand` works on-device with TILE_LAYOUT:
-- Python interpreter: trace capture works for ALL ops, 2-3x speedup
-- PJRT plugin: the #1 hard problem is already solved
+For this minimal case, we need handlers for: `constant`, `dot_general`, `add`, `broadcast_in_dim`, and `convert`. That's **5 StableHLO ops**.
 
-**Q: What would convince us to go full PJRT?**
+### Q: How many lines of code, and what are the dependencies?
+
+A: Estimated breakdown:
+
+| Component | Lines (C++) | Difficulty |
+|-----------|------------|------------|
+| PJRT API wiring (pjrt_api.cc + stubs) | ~500 | Low (boilerplate) |
+| Client + device management | ~300 | Low |
+| Buffer management (with tile padding) | ~250 | Medium |
+| StableHLO parser | ~150 | Medium (MLIR linking) |
+| Op handlers (5 ops for MVP) | ~200 | Low (direct translation) |
+| Python registration | ~40 | Low |
+| **Total** | **~1,440** | |
+
+Dependencies:
+- TT-Metal / TT-NN: already installed on remote host
+- MLIR libraries (~20 static libs): must be built or extracted
+- StableHLO libraries (~14 static libs): must be built or extracted
+- Protobuf, Abseil: transitive dependencies of MLIR
+- CMake 3.20+: build system
+
+The hardest part is NOT the code -- it's **getting MLIR/StableHLO libraries compiled for our Linux host**. Building MLIR from source takes 30+ minutes and requires significant disk space. jax-mps bundles pre-built MLIR in `third_party/`.
+
+### Q: Are there other open-source PJRT plugins we can study besides jax-mps?
+
+A: Yes, several:
+
+| Plugin | Target | Approach | Open Source? |
+|--------|--------|----------|-------------|
+| **jax-mps / applejax** | Apple Silicon (MLX) | StableHLO --> MLX ops | Yes |
+| **tt-xla** (official Tenstorrent) | Tenstorrent (tt-mlir) | StableHLO --> TTIR --> TTNN | Yes |
+| **Intel XPU plugin** | Intel GPUs (SYCL) | StableHLO --> SYCL kernels | Yes |
+| **jax-metal** (Apple official) | Apple Silicon (Metal) | StableHLO --> MPSGraph | No (closed source) |
+| **CUDA PJRT** | NVIDIA GPUs | StableHLO --> CUDA via XLA | Yes (part of XLA) |
+| **TPU PJRT** | Google TPUs | StableHLO --> TPU IR | Yes (part of XLA) |
+
+The official tt-xla is particularly instructive: 84% Python / 14% C++, 19 C++ implementation files, delegates compilation to tt-mlir. It does NOT work on our Blackhole because tt-mlir lacks full Blackhole support in released packages.
+
+### Q: What would convince us to go full PJRT?
 
 Three criteria:
 1. We've exhausted Python interpreter performance (broadcast fixed, trace working, still want more)
-2. We need library compatibility (Flax, Optax, etc.) for a specific demo
+2. We need library compatibility (Flax, Optax) for a specific demo
 3. We have 2+ weeks of development time remaining
 
-If all three are true, the PJRT plugin is worth building. jax-mps proved it's feasible for a small team — they went from zero to 91.5% JAX test compatibility.
+If all three are true, the PJRT plugin is worth building. applejax proved it's feasible for a small team -- they went from zero to 91.5% JAX test compatibility with ~71 StableHLO ops.
+
 
 ## Key Takeaways
 
-1. **jax-mps is our template**: ~24 C++ files, ~2,600 lines, walks StableHLO and dispatches to MLX. We'd do the same but dispatch to TT-NN.
+1. **jax-mps/applejax is our template**: ~24 C++ files, ~2,600 lines, walks StableHLO and dispatches to MLX. We'd do the same but dispatch to TT-NN.
 
 2. **Our op registry translates directly**: 18/20 Jaxpr primitives have exact StableHLO equivalents. The code structure is isomorphic.
 
-3. **The broadcast fix is independent of the PJRT decision**: Use `ttnn.expand()` or `ttnn.repeat()` to eliminate CPU round-trips. Test this FIRST.
+3. **The broadcast fix is independent of the PJRT decision**: Use `ttnn.repeat()` to eliminate CPU round-trips. Test this FIRST regardless of which path we take.
 
-4. **PJRT's real value is ecosystem integration**: `jax.jit`, `vmap`, `grad`, and library compatibility. Raw execution speed can be matched by trace capture.
+4. **PJRT's real value is ecosystem integration**: `jax.jit`, `vmap`, `grad`, and library compatibility. Raw execution speed can be matched by trace capture in our Python interpreter.
 
 5. **The build system is the hardest part**: Linking against MLIR (~20 libs), StableHLO (~14 libs), and TT-Metal simultaneously requires careful CMake work.
 
-6. **Progressive migration is possible**: Fix broadcast → add trace → (optionally) build PJRT shell → port handlers to C++.
+6. **Progressive migration is possible and recommended**: Fix broadcast --> add trace --> (optionally) build PJRT shell --> port handlers to C++.
+
+7. **StableHLO has 98 ops; we'd need ~35-40 for inference, ~71 for broad compatibility**. applejax shows this is achievable.
+
 
 ## Sources
 
 - jax-mps: https://github.com/tillahoffmann/jax-mps
 - applejax (enhanced fork): https://github.com/danielpcox/applejax
+- applejax PyPI: https://pypi.org/project/applejax/
 - StableHLO spec: https://openxla.org/stablehlo/spec
+- StableHLO interpreter status: https://openxla.org/stablehlo/interpreter_status
 - PJRT C++ API overview: https://openxla.org/xla/pjrt/cpp_api_overview
 - PJRT plugin integration guide: https://openxla.org/xla/pjrt/pjrt_integration
+- PJRT C API header: https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api.h
+- PJRT C API wrapper: https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api_wrapper_impl.h
+- Apple Metal JAX: https://developer.apple.com/metal/jax/
 - Official tt-xla: https://github.com/tenstorrent/tt-xla
+- tt-xla docs: https://docs.tenstorrent.com/tt-xla/getting_started.html
+- PJRT plugin blog post: https://opensource.googleblog.com/2024/03/pjrt-plugin-to-accelerate-machine-learning.html
 - JAX FFI docs: https://docs.jax.dev/en/latest/ffi.html
 - TT-NN API docs: https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/api.html
 - TT-NN broadcast_in_dim support: https://docs.tenstorrent.com/tt-torch/ops/stablehlo/stablehlo.broadcast_in_dim.html
+- JAX PJRT plugin discussion: https://github.com/jax-ml/jax/discussions/34648

@@ -32,12 +32,12 @@ def _binary_with_broadcast(interp, invars, eqn, tt_fn, scalar_fn=None):
         b = interp.eval_var(invars[1])
         if scalar_fn:
             return scalar_fn(b, tensors.literal_val(invars[0]))
-        return tt_fn(interp.to_device(np.array(tensors.literal_val(invars[0]))), b)
+        return tt_fn(interp.eval_var(invars[0]), b)
     if tensors.is_literal(invars[1]):
         a = interp.eval_var(invars[0])
         if scalar_fn:
             return scalar_fn(a, tensors.literal_val(invars[1]))
-        return tt_fn(a, interp.to_device(np.array(tensors.literal_val(invars[1]))))
+        return tt_fn(a, interp.eval_var(invars[1]))
 
     a = interp.eval_var(invars[0])
     b = interp.eval_var(invars[1])
