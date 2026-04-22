@@ -5,10 +5,12 @@ Living document. Research → Hypotheses → Experiments. Never run out of thing
 ## Current Performance Baseline (2026-04-22)
 
 ```
-Single sequence:  7.1ms/tok  = 140 tok/sec  (bf8 MLP + native RoPE, traced, paged KV)
-Batch=8:          7.5ms/step = 1,073 tok/sec (bf8 MLP, traced)
-Batch=32:         9.4ms/step = 3,389 tok/sec
+Qwen2.5-0.5B:    7.1ms/tok  = 140 tok/sec  (bf8 MLP + native RoPE, traced, paged KV)
+Qwen3-0.6B:     13.2ms/tok  =  76 tok/sec  (QK-Norm, head_dim=128, split SDPA)
+Llama-3.2-1B:   12.8ms/tok  =  78 tok/sec  (interleaved RoPE, split SDPA)
+Batch=8:          7.5ms/step = 1,073 tok/sec (Qwen2.5, bf8 MLP, traced)
 Batch=64:        13.2ms/step = 4,867 tok/sec — PEAK AGGREGATE
+Continuous batch: 1,042 tok/sec decode (24 requests through 8 slots)
 Journey:         582ms → 7.1ms = 82x single-sequence speedup
 ```
 
@@ -44,10 +46,12 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
   - 16 layers, 2048 hidden, 32Q/8KV heads. Zero new ops.
   - Bug: sdpa_flash_decode only compiles with power-of-2 KV heads.
     Workaround: split 32Q/8KV → 2×(16Q/4KV), concat output.
+- [x] **Exp 66: Qwen3-0.6B — 76 tok/sec on Blackhole** (13.2ms/tok)
+  - 28 layers, 1024 hidden, 16Q/8KV heads, head_dim=128. QK-Norm works.
+  - Slower than Qwen2.5-0.5B despite fewer params — head_dim=128 + split SDPA.
 - [ ] **Exp: Phi-4-mini port** — fractional RoPE (75% of head_dim)
   - H: Single-line RoPE modification
 - [ ] **Exp: SmolLM3-3B port** — NoPE variant (skip RoPE every 4th layer)
-- [ ] **Exp: Qwen3-0.6B** — latest Qwen with thinking mode
 
 ### Larger Models
 - [ ] **Exp: Qwen2.5-3B** — 3x larger, test memory/perf scaling
@@ -60,10 +64,11 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 ## Phase 3: Serving Infrastructure (weeks 3-5)
 
 ### Tier 1: Continuous Batching (days of work)
-- [ ] **Per-sequence RoPE** — reshape cos/sin to (1,batch,1,64)
-  - H: <1% overhead, enables mixed-position sequences
-- [ ] **Sequence masking** — zero embeddings for finished sequences
-- [ ] **Host scheduler** — admit/evict at each decode step
+- [x] **Exp 65: Continuous batching prototype — 1,042 tok/sec decode**
+  - 24 requests through 8 batch slots, sequences cycling correctly
+  - Position=-1 skips SDPA compute for empty slots (zero overhead)
+  - End-to-end 488 tok/sec (including CPU prefill pauses)
+- [ ] **Async prefill** — overlap prefill with decode on separate trace/queue
 - [ ] **Max-batch padding** — capture trace at batch=64, mask empty slots
   - H: Wasted compute < re-trace cost (300ms)
 
