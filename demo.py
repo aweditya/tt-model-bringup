@@ -222,15 +222,21 @@ def forward(token_ids):
     return out[0, seq_len - 1, :] @ wte.T
 
 # ── Generate! ────────────────────────────────────────────────
+MAX_TRACED = max(TRACE_PAD_LENS)
 tokens = encode(args.prompt)
+max_gen = min(args.tokens, MAX_TRACED - len(tokens))
+if max_gen < args.tokens:
+    print(f"Note: capping generation at {max_gen} tokens (max context = {MAX_TRACED})")
+    print(f"  Prompt uses {len(tokens)} tokens, {MAX_TRACED - len(tokens)} slots remaining.")
+
 print(f'\nPrompt: "{args.prompt}"')
-print(f"Generating {args.tokens} tokens on Blackhole...\n")
+print(f"Generating {max_gen} tokens on Blackhole...\n")
 
 sys.stdout.write(args.prompt)
 sys.stdout.flush()
 
 times = []
-for i in range(args.tokens):
+for i in range(max_gen):
     t0 = time.perf_counter()
     logits = forward(tokens)
     dt = time.perf_counter() - t0
