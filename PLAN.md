@@ -8,9 +8,12 @@ Living document. Research → Hypotheses → Experiments. Never run out of thing
 Qwen2.5-0.5B:    7.1ms/tok  = 140 tok/sec  (bf8 MLP + native RoPE, traced, paged KV)
 Qwen3-0.6B:     13.2ms/tok  =  76 tok/sec  (QK-Norm, head_dim=128, split SDPA)
 Llama-3.2-1B:   12.8ms/tok  =  78 tok/sec  (interleaved RoPE, split SDPA)
+Llama-3.2-3B:   29.7ms/tok  =  34 tok/sec  (first 3B+ model)
+SmolLM3-3B:     26.5ms/tok  =  38 tok/sec  (NoPE, 4 KV no split)
 Batch=8:          7.5ms/step = 1,073 tok/sec (Qwen2.5, bf8 MLP, traced)
 Batch=64:        13.2ms/step = 4,867 tok/sec — PEAK AGGREGATE
 Continuous batch: 1,042 tok/sec decode (24 requests through 8 slots)
+Models ported:   5 (Qwen2.5, Qwen3, Llama-1B, Llama-3B, SmolLM3)
 Journey:         582ms → 7.1ms = 82x single-sequence speedup
 ```
 
@@ -39,6 +42,29 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 
 ---
 
+## Quality & Correctness (PRIORITY)
+
+All 5 models produce repetitive text — this is expected for base models with greedy decoding,
+but we need to validate precision and add proper sampling.
+
+### Correctness Validation
+- [ ] **Exp: Numpy reference comparison for Qwen2.5-0.5B prefill logits**
+  - Write pure float32 numpy forward pass, compare cosine with TT-NN output
+  - H: Cosine >0.99 (already validated in earlier experiments for Qwen)
+- [ ] **Exp: First-10-token match for all 5 models**
+  - Greedy decode: TT-NN tokens should match numpy reference exactly
+  - If mismatch, ablate per-layer to find precision divergence
+
+### Generation Quality
+- [ ] **Exp: Temperature + top-k sampling**
+  - Add temperature scaling and top-k filtering to decode loop
+  - H: Eliminates repetitive degeneration for base models
+- [ ] **Exp: Instruction-tuned model ports**
+  - Llama-3.2-1B-Instruct, Qwen3-0.6B-Instruct — same weights, chat template
+  - H: Coherent multi-turn responses with greedy decoding
+
+---
+
 ## Phase 2: New Models (next 1-2 weeks)
 
 ### Architecture Generality
@@ -49,9 +75,11 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 - [x] **Exp 66: Qwen3-0.6B — 76 tok/sec on Blackhole** (13.2ms/tok)
   - 28 layers, 1024 hidden, 16Q/8KV heads, head_dim=128. QK-Norm works.
   - Slower than Qwen2.5-0.5B despite fewer params — head_dim=128 + split SDPA.
+- [x] **Exp 68: SmolLM3-3B — 38 tok/sec on Blackhole** (26.5ms/tok)
+  - 36 layers, 2048 hidden, 16Q/4KV, NoPE (skip RoPE for 27/36 layers).
+  - Faster than Llama-3.2-3B: 4 KV heads = no split SDPA + NoPE saves.
 - [ ] **Exp: Phi-4-mini port** — fractional RoPE (75% of head_dim)
   - H: Single-line RoPE modification
-- [ ] **Exp: SmolLM3-3B port** — NoPE variant (skip RoPE every 4th layer)
 
 ### Larger Models
 - [x] **Exp 67: Llama-3.2-3B — 34 tok/sec on Blackhole** (29.7ms/tok)
