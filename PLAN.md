@@ -10,10 +10,11 @@ Qwen3-0.6B:     13.2ms/tok  =  76 tok/sec  (QK-Norm, head_dim=128, split SDPA)
 Llama-3.2-1B:   12.8ms/tok  =  78 tok/sec  (interleaved RoPE, split SDPA)
 Llama-3.2-3B:   29.7ms/tok  =  34 tok/sec  (first 3B+ model)
 SmolLM3-3B:     26.5ms/tok  =  38 tok/sec  (NoPE, 4 KV no split)
+Llama-3.1-8B:   52.0ms/tok  =  19 tok/sec  (first 8B model, 32 layers, 4096 hidden)
 Batch=8:          7.5ms/step = 1,073 tok/sec (Qwen2.5, bf8 MLP, traced)
 Batch=64:        13.2ms/step = 4,867 tok/sec — PEAK AGGREGATE
 Continuous batch: 1,042 tok/sec decode (24 requests through 8 slots)
-Models ported:   5 (Qwen2.5, Qwen3, Llama-1B, Llama-3B, SmolLM3)
+Models ported:   6 (Qwen2.5, Qwen3, Llama-1B, Llama-3B, SmolLM3, Llama-8B)
 Journey:         582ms → 7.1ms = 82x single-sequence speedup
 ```
 
@@ -56,10 +57,14 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 - [x] **Temperature + top-k sampling** — implemented in exp 69-71
 - [x] **Instruction-tuned Llama-3.2-1B-Instruct** — correct but limited (1B too small)
 - [x] **Instruction-tuned Llama-3.2-3B-Instruct** — usable for short Q&A at 33 tok/sec
-- [ ] **Repetition penalty + nucleus (top-p) sampling** — may improve long-form quality
-- [ ] **Qwen3-0.6B-Instruct port** — validate quality on Qwen architecture
+- [x] **Exp 72: Sampling strategies** — top-p, top-k, rep penalty all tested; none fix 3B capacity
+- [x] **Exp 73: Llama-3.1-8B-Instruct** — 19 tok/sec, first 8B model, ~50 tok coherence
+- [x] **Exp 74: KV cache validation** — DEFINITIVE: cache correct, numpy also degenerates
+- [x] **Seed reproducibility** — np.random.seed(42), ttnn version printing (exp 72)
+- [ ] **Min-p sampling (ICLR 2025)** — emerging best practice, dynamic candidate pruning
+- [ ] **Production sampling on 8B** — temp=0.7 + min_p=0.05 + rep_penalty=1.1
 - [ ] **SmolLM3-3B-Instruct** — may be stronger at sustained generation
-- [ ] **Seed reproducibility** — add np.random.seed, print ttnn version
+- [ ] **Qwen3-0.6B-Instruct port** — validate quality on Qwen architecture
 
 ---
 
@@ -83,6 +88,9 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 - [x] **Exp 67: Llama-3.2-3B — 34 tok/sec on Blackhole** (29.7ms/tok)
   - 28 layers, 3072 hidden, 24Q/8KV, head_dim=128. First 3B+ model.
   - Near-linear scaling: 2.5x params → 2.3x slower.
+- [x] **Exp 73: Llama-3.1-8B-Instruct — 19 tok/sec on Blackhole** (52ms/tok)
+  - 32 layers, 4096 hidden, 32Q/8KV, head_dim=128, intermediate=14336
+  - 8.0B params, 16.1 GB bf16, 71s upload. Short answers perfect, long-form ~50 tok.
 - [ ] **Exp: Qwen2.5-3B** — 3x larger, test memory/perf scaling
   - H: Fits in DRAM at bf16; ~40-50 tok/sec estimated
 - [ ] **Exp: Qwen3-8B with bf8 weights** — aggressive quantization for larger model
@@ -207,3 +215,4 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 | TT Community | `research/tt_community_contributions.md` | Bounties, bug reports, CI contributions |
 | TT Metal | `research/tt_metal_contributions.md` | API patterns, kernel development |
 | JAX Paths | `research/jax_infrastructure_paths.md` | Jaxpr interpreter vs PJRT vs TT-MLIR |
+| Long-form Gen | `research/long_form_generation.md` | temp=0.7 + min-p=0.05 + rep_penalty=1.1 is production standard |
