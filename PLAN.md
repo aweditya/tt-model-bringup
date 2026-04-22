@@ -14,13 +14,16 @@ Qwen3-0.6B:     13.2ms =  76t/s   ~17.1ms = ~58t/s  (QK-Norm, head_dim=128, spli
 Llama-3.2-1B:   12.8ms =  78t/s   ~16.7ms = ~60t/s  (interleaved RoPE, split SDPA)
 Llama-3.2-3B:   29.7ms =  34t/s   ~33.6ms = ~30t/s  (first 3B+ model)
 SmolLM3-3B:     26.5ms =  38t/s   ~30.4ms = ~33t/s  (NoPE, 4 KV no split)
-Llama-3.1-8B:   52.0ms =  19t/s    56.0ms =  18t/s  (first 8B, measured exp 80/81)
+Llama-3.1-8B:   52.0ms =  19t/s    56.0ms =  18t/s  (bf16, exp 80/81)
+Llama-3.1-8B:   43.0ms =  23t/s    47.0ms =  21t/s  (bfp8 MLP + HiFi2, exp 84) ★
 Batch=64:        13.2ms/step = 4,867 tok/sec — PEAK AGGREGATE (device-only)
 Continuous batch: 1,042 tok/sec decode (24 requests through 8 slots)
 Models ported:   6 (Qwen2.5, Qwen3, Llama-1B, Llama-3B, SmolLM3, Llama-8B)
 
 PCIe readback overhead: ~3.9ms (from_dev/ttnn.to_torch at 155 MB/s effective)
-Biggest optimization: on-device topk + embedding to eliminate PCIe round-trip
+On-device topk/argmax: TOO SLOW (1890ms/124ms) — not viable for vocab > 65K
+BFP8 MLP: 1.20x speedup on 8B, perfect correctness (exp 84)
+BFP4 MLP: catastrophic quality loss without calibration (exp 83)
 ```
 
 ---
