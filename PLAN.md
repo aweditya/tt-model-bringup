@@ -69,7 +69,7 @@ Journey:         582ms → 7.1ms = 82x single-sequence speedup
 - [x] **Exp 79: Careful sampling (EOS protected)** — same degeneration; not an EOS suppression problem
 - [x] **Exp 80: Diverse Q&A demo** — 8/10 categories perfect with greedy, 18 tok/s, 64% efficiency
 - [x] **Wiki 50: Sampling investigation complete** — root cause is model training, not hardware
-- [ ] **Exp 80b: Low temperature (0.1)** — testing if minimal temp breaks attractor loops (running)
+- [x] **Exp 80b: Low temperature (0.1)** — fixes reasoning loop (5/6 correct), code still loops
 - [ ] **SmolLM3-3B-Instruct** — may be stronger at sustained generation
 - [ ] **Qwen3-0.6B-Instruct port** — validate quality on Qwen architecture
 
