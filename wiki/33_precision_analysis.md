@@ -47,10 +47,19 @@ The attention score matrix is `(n_heads, T, T)` where T=5. With causal masking, 
 
 ## Q: What are the mitigation options?
 
-**Option 1: Higher precision compute**
-- Some TT-NN ops support `compute_kernel_config` for higher precision accumulation
-- `ttnn.MatmulMultiCoreReuseMultiCastProgramConfig` may have float32 accumulation options
-- Try: `math_fidelity=ttnn.MathFidelity.HiFi4` for SDPA if supported
+**Option 1: Higher precision compute (CONFIRMED WORKING!)**
+```python
+config = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4,
+    fp32_dest_acc_en=True,
+    math_approx_mode=False,
+)
+attn = ttnn.transformer.scaled_dot_product_attention(
+    q, k, v, is_causal=True,
+    compute_kernel_config=config
+)
+```
+**Result:** Cosine improves from 0.980 → 0.996 (+0.016). This nearly eliminates the softmax precision loss. Over 24 layers, this should push final cosine from 0.956 to well above 0.99.
 
 **Option 2: Mixed precision**
 - Keep weights in bfloat16, do softmax in float32 on CPU
@@ -75,4 +84,15 @@ The attention score matrix is `(n_heads, T, T)` where T=5. With causal masking, 
 
 ---
 
-*Experiments 43-44. Root cause: bfloat16 softmax in SDPA. Matmuls are essentially lossless (0.999998).*
+## Q: Are there native RoPE APIs on device?
+
+**A:** Yes! Experiment 45 discovered three:
+- `ttnn.experimental.rotary_embedding` — basic RoPE
+- `ttnn.experimental.rotary_embedding_llama` — Llama-style RoPE
+- `ttnn.experimental.rotary_embedding_llama_fused_qk` — fuses Q and K RoPE together
+
+These eliminate the CPU round-trip for RoPE entirely. Combined with HiFi4 SDPA, the full Qwen forward could be zero-CPU-roundtrip (like our GPT-2 demo).
+
+---
+
+*Experiments 43-45. Root cause: bfloat16 softmax in SDPA. Fix: HiFi4 + fp32_dest_acc. Matmuls are essentially lossless (0.999998).*
