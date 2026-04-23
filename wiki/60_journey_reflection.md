@@ -22,7 +22,7 @@ This project started on April 20, 2026 with zero knowledge of Tenstorrent hardwa
 | **Apr 22** | 69-80 | **Quality validation marathon**: numpy float32 references for all models, sampling investigation, EOS behavior understood, diverse Q&A demos. | — |
 | **Apr 22** | 73, 84-85 | **Llama-3.1-8B-Instruct**: first 8B model at 19 tok/s, then 21-23 tok/s with BFP8 MLP. Interactive chat demo. | 23 |
 | **Apr 22** | 81-88 | Benchmark audit (all numbers verified clean), BFP4 failure, flash_decode bug documented, native RoPE for Llama (API works, wrong results). | — |
-| **Apr 22** | 89-91 | **MoE first light**: Qwen1.5-MoE-A2.7B (14.3B params), single-layer cosine 0.999909, full 24-layer eager decode at 13.6 tok/s, Chat model produces coherent text. | 13.6 |
+| **Apr 22** | 89-91 | **MoE first light**: Qwen1.5-MoE-A2.7B (14.3B params), single-layer cosine 0.999909, full 24-layer decode, optimized eager at 20.2 tok/s, Chat model produces coherent text. | 20.2 |
 
 ### What We Accomplished
 
