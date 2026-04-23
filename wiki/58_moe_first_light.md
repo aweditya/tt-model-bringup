@@ -79,22 +79,32 @@ Plus embeddings (~0.6 GB) + KV cache. Fits comfortably in 32 GB DRAM.
 
 ## Performance Analysis
 
-### Eager decode: 73 ms/tok = 13.6 tok/s
+### Eager decode (exp 90): 78 ms/tok = 12.8 tok/s
 - 24 layers × ~3ms/layer ≈ 72ms
 - Per-layer breakdown: attention ~0.3ms, MoE routing 4x expert dispatch ~2.7ms
 - Host round-trip per layer: ~0.5ms (router readback + expert dispatch)
+- Only 10% of time is actual compute; 90% is host-device overhead
+
+### Optimized eager (exp 91): 50 ms/tok = 20.2 tok/s (1.58x speedup)
+- On-device expert accumulation (ttnn.multiply + ttnn.add)
+- Residual connections stay on device (no CPU round-trip)
+- Shared expert gate: CPU sigmoid scalar, device multiply
+- Program cache for faster dispatch
+- Single sync per layer (router logits only, 60 floats = 240 bytes)
+- Remaining bottleneck: ~840 op dispatches per token at ~30μs each
 
 ### Predicted traced decode: ~28-35 tok/s
 - Run all 60 experts, mask 56 unused → fully traceable
 - Bandwidth: 12.5 GB/step at 450 GB/s = ~28ms
 - Plus attention (~8ms) = ~36ms total
 - No host round-trips = zero dispatch overhead
+- Challenge: device-side top-k routing needed (no CPU readback mid-trace)
 
 ## What's Next
 
-1. **Experiment 91** — Traced decode with all-60-experts approach for ~28-35 tok/s target
-2. **Cosine validation** — compare TT-NN output against numpy reference layer by layer
-3. **OLMoE-1B-7B** — alternative MoE model (64 experts, 7B total, only 6.5GB at BFP8)
+1. **Fully traced decode** — Device-side top-k routing for ~30 tok/s target
+2. **OLMoE-1B-7B** — alternative MoE (64 experts, 7B total, only 6.5GB at BFP8)
+3. **Gemma 4** — Google's latest model family, possible MoE variant
 
 ## Bugs Found & Fixed
 
