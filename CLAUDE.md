@@ -34,6 +34,16 @@ tt-xla/
   CLAUDE.md       # This file
 ```
 
+## PJRT Plugin Development (Custom JAX Backend)
+
+Building a custom PJRT plugin to compile JAX programs to Tenstorrent ttnn. Key principles:
+
+1. **Correctness first, performance next.** Every op must pass rigorous unit tests before integration.
+2. **Expanding unit test suite.** Tests grow with every new op/feature. Never skip tests.
+3. **Problem decomposition.** Think through the design before writing C++. Document non-trivial decisions.
+4. **Reflection log.** Note design decisions, trade-offs, and things we'd do differently in `research/pjrt_reflections.md`.
+5. **Reference: applejax.** Use the applejax interpretation-based PJRT plugin as architectural reference.
+
 ## Workflow
 1. Research a topic (scrape, read docs, explore code)
 2. Formulate questions and hypotheses

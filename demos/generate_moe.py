@@ -12,15 +12,15 @@ What this does:
     1. Downloads Qwen1.5-MoE-A2.7B-Chat weights from HuggingFace (cached after first run)
     2. Uploads weights to the Blackhole accelerator (BFP8 experts, bf16 attention)
     3. Wraps prompt in ChatML template
-    4. Runs prefill + eager decode with CPU routing and device expert execution
+    4. Runs prefill + partial-trace decode with device-side routing
     5. Generates text, printing tokens as they arrive (streaming)
 
 Architecture: 14.3B total params, 2.7B active per token
     - 24 layers, 60 experts (top-4 routing), shared expert with gating
     - MHA: 16 Q heads, 16 KV heads, head_dim=128
-    - Eager decode: CPU routing selects top-4 experts, device runs matmuls
+    - Partial trace decode: attention traced, MoE eager with device-side routing
 
-Performance: ~20 tok/s (optimized eager decode with on-device accumulation)
+Performance: ~22 tok/s (partial-trace attention + fused ops + device-side routing)
 Weight memory: ~14.1 GB on device (BFP8 experts save ~40% vs bf16)
 
 Note: First run downloads ~28 GB of weights (8 shards). Subsequent runs use cache.
@@ -314,93 +314,159 @@ def prefill(token_ids):
     return logits[-1]
 
 
+# ── Decode input buffers ─────────────────────────────────────
+decode_cos_buf = to_dev_4d(np.ones((1, 1, 1, head_dim), dtype=np.float32))
+decode_sin_buf = to_dev_4d(np.zeros((1, 1, 1, head_dim), dtype=np.float32))
+decode_pos_buf = ttnn.from_torch(torch.tensor([0], dtype=torch.int32), device=device)
+
+# ── Capture attention traces (partial trace optimization) ────
+# Attention is a static graph — trace it to eliminate dispatch overhead.
+# MoE routing is data-dependent — kept eager.
+
+try:
+    device.enable_program_cache()
+except Exception:
+    pass
+
+print("Capturing attention traces for 24 layers...")
+
+# Warmup attention kernels
+dummy_x = to_dev_4d(np.zeros((1, 1, 1, hidden), dtype=np.float32))
+for i in range(n_layers):
+    dl = dev_layers[i]
+    h = ttnn.rms_norm(dummy_x, weight=dl["ln1_g"], epsilon=rms_eps)
+    q = ttnn.reshape(ttnn.linear(h, dl["q_w"], bias=dl["q_b"], compute_kernel_config=hifi4),
+                     [1, n_q_heads, 1, head_dim])
+    k = ttnn.reshape(ttnn.linear(h, dl["k_w"], bias=dl["k_b"], compute_kernel_config=hifi4),
+                     [1, n_kv_heads, 1, head_dim])
+    v = ttnn.reshape(ttnn.linear(h, dl["v_w"], bias=dl["v_b"], compute_kernel_config=hifi4),
+                     [1, n_kv_heads, 1, head_dim])
+    qr = ttnn.experimental.rotary_embedding(q, decode_cos_buf, decode_sin_buf)
+    kr = ttnn.experimental.rotary_embedding(k, decode_cos_buf, decode_sin_buf)
+    if list(qr.shape)[2] > 1:
+        qr = ttnn.slice(qr, [0,0,0,0], [1,n_q_heads,1,head_dim])
+    if list(kr.shape)[2] > 1:
+        kr = ttnn.slice(kr, [0,0,0,0], [1,n_kv_heads,1,head_dim])
+    ks = ttnn.to_memory_config(ttnn.reshape(kr, [1,1,n_kv_heads,head_dim]), kv_cfg)
+    vs = ttnn.to_memory_config(ttnn.reshape(v, [1,1,n_kv_heads,head_dim]), kv_cfg)
+    ttnn.experimental.paged_update_cache(k_caches[i], ks, update_idxs_tensor=decode_pos_buf)
+    ttnn.experimental.paged_update_cache(v_caches[i], vs, update_idxs_tensor=decode_pos_buf)
+    attn = ttnn.transformer.scaled_dot_product_attention_decode(
+        ttnn.reshape(qr, [1,1,n_q_heads,head_dim]), k_caches[i], v_caches[i],
+        cur_pos_tensor=decode_pos_buf, compute_kernel_config=hifi4)
+    o = ttnn.matmul(ttnn.reshape(attn, [1,1,1,hidden]), dl["o_w"], compute_kernel_config=hifi4)
+    if dl["o_b"] is not None:
+        o = ttnn.add(o, dl["o_b"])
+    _ = ttnn.add(dummy_x, o)
+ttnn.synchronize_device(device)
+
+# Capture per-layer attention traces
+attn_traces = []
+attn_x_ins = []
+attn_x_outs = []
+
+for i in range(n_layers):
+    dl = dev_layers[i]
+    x_in = to_dev_4d(np.zeros((1, 1, 1, hidden), dtype=np.float32))
+    attn_x_ins.append(x_in)
+
+    trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+    h = ttnn.rms_norm(x_in, weight=dl["ln1_g"], epsilon=rms_eps)
+    q = ttnn.reshape(ttnn.linear(h, dl["q_w"], bias=dl["q_b"], compute_kernel_config=hifi4),
+                     [1, n_q_heads, 1, head_dim])
+    k = ttnn.reshape(ttnn.linear(h, dl["k_w"], bias=dl["k_b"], compute_kernel_config=hifi4),
+                     [1, n_kv_heads, 1, head_dim])
+    v = ttnn.reshape(ttnn.linear(h, dl["v_w"], bias=dl["v_b"], compute_kernel_config=hifi4),
+                     [1, n_kv_heads, 1, head_dim])
+    qr = ttnn.experimental.rotary_embedding(q, decode_cos_buf, decode_sin_buf)
+    kr = ttnn.experimental.rotary_embedding(k, decode_cos_buf, decode_sin_buf)
+    if list(qr.shape)[2] > 1:
+        qr = ttnn.slice(qr, [0,0,0,0], [1,n_q_heads,1,head_dim])
+    if list(kr.shape)[2] > 1:
+        kr = ttnn.slice(kr, [0,0,0,0], [1,n_kv_heads,1,head_dim])
+    ks = ttnn.to_memory_config(ttnn.reshape(kr, [1,1,n_kv_heads,head_dim]), kv_cfg)
+    vs = ttnn.to_memory_config(ttnn.reshape(v, [1,1,n_kv_heads,head_dim]), kv_cfg)
+    ttnn.experimental.paged_update_cache(k_caches[i], ks, update_idxs_tensor=decode_pos_buf)
+    ttnn.experimental.paged_update_cache(v_caches[i], vs, update_idxs_tensor=decode_pos_buf)
+    attn = ttnn.transformer.scaled_dot_product_attention_decode(
+        ttnn.reshape(qr, [1,1,n_q_heads,head_dim]), k_caches[i], v_caches[i],
+        cur_pos_tensor=decode_pos_buf, compute_kernel_config=hifi4)
+    o = ttnn.matmul(ttnn.reshape(attn, [1,1,1,hidden]), dl["o_w"], compute_kernel_config=hifi4)
+    if dl["o_b"] is not None:
+        o = ttnn.add(o, dl["o_b"])
+    x_out = ttnn.add(x_in, o)
+    ttnn.end_trace_capture(device, trace_id, cq_id=0)
+
+    attn_traces.append(trace_id)
+    attn_x_outs.append(x_out)
+print(f"  All 24 attention traces captured!")
+
+
 # ── Optimized decode step ────────────────────────────────────
 def decode_step(token_id, pos):
     """
-    Single-token decode with on-device accumulation.
-    CPU only reads router logits (60 floats) + computes gate scalar per layer.
-    All expert outputs, residuals, and weighting stay on device.
+    Single-token decode with partial trace:
+      - Attention: traced (no dispatch overhead)
+      - MoE: eager with device-side routing (softmax + topk on device)
     """
-    x = to_bf16(embed_w[token_id:token_id + 1].reshape(1, 1, hidden))
+    x = to_dev_4d(embed_w[token_id:token_id + 1].reshape(1, 1, 1, hidden))
 
     # RoPE tables for this position
     angles = pos * freqs
     cos_np = np.concatenate([np.cos(angles), np.cos(angles)]).reshape(1, 1, 1, head_dim).astype(np.float32)
     sin_np = np.concatenate([np.sin(angles), np.sin(angles)]).reshape(1, 1, 1, head_dim).astype(np.float32)
-    cos_tt = to_dev_4d(cos_np)
-    sin_tt = to_dev_4d(sin_np)
-    pos_tt = ttnn.from_torch(torch.tensor([pos], dtype=torch.int32), device=device)
+
+    # Update shared RoPE + pos buffers
+    ttnn.copy(to_dev_4d(cos_np), decode_cos_buf)
+    ttnn.copy(to_dev_4d(sin_np), decode_sin_buf)
+    ttnn.copy(ttnn.from_torch(torch.tensor([pos], dtype=torch.int32), device=device), decode_pos_buf)
 
     for i in range(n_layers):
         dl = dev_layers[i]
 
-        # Attention with bias
-        h = ttnn.rms_norm(x, weight=dl["ln1_g"], epsilon=rms_eps)
-        q = ttnn.reshape(ttnn.add(ttnn.matmul(h, dl["q_w"], compute_kernel_config=hifi4), dl["q_b"]),
-                         [1, n_q_heads, 1, head_dim])
-        k = ttnn.reshape(ttnn.add(ttnn.matmul(h, dl["k_w"], compute_kernel_config=hifi4), dl["k_b"]),
-                         [1, n_kv_heads, 1, head_dim])
-        v = ttnn.reshape(ttnn.add(ttnn.matmul(h, dl["v_w"], compute_kernel_config=hifi4), dl["v_b"]),
-                         [1, n_kv_heads, 1, head_dim])
+        # ── Traced attention ─────────────────────────────────
+        ttnn.copy(x, attn_x_ins[i])
+        ttnn.execute_trace(device, attn_traces[i], cq_id=0, blocking=False)
+        x2 = attn_x_outs[i]
 
-        # Native RoPE on device
-        qr = ttnn.experimental.rotary_embedding(q, cos_tt, sin_tt)
-        kr = ttnn.experimental.rotary_embedding(k, cos_tt, sin_tt)
-        if list(qr.shape)[2] > 1:
-            qr = ttnn.slice(qr, [0, 0, 0, 0], [1, n_q_heads, 1, head_dim])
-        if list(kr.shape)[2] > 1:
-            kr = ttnn.slice(kr, [0, 0, 0, 0], [1, n_kv_heads, 1, head_dim])
-
-        # Paged KV cache update
-        ks = ttnn.to_memory_config(ttnn.reshape(kr, [1, 1, n_kv_heads, head_dim]), kv_cfg)
-        vs = ttnn.to_memory_config(ttnn.reshape(v, [1, 1, n_kv_heads, head_dim]), kv_cfg)
-        ttnn.experimental.paged_update_cache(k_caches[i], ks, update_idxs_tensor=pos_tt)
-        ttnn.experimental.paged_update_cache(v_caches[i], vs, update_idxs_tensor=pos_tt)
-
-        # Flash decode
-        attn = ttnn.transformer.scaled_dot_product_attention_decode(
-            ttnn.reshape(qr, [1, 1, n_q_heads, head_dim]), k_caches[i], v_caches[i],
-            cur_pos_tensor=pos_tt, compute_kernel_config=hifi4)
-        o = ttnn.matmul(ttnn.reshape(attn, [1, 1, 1, hidden]), dl["o_w"], compute_kernel_config=hifi4)
-        if dl["o_b"] is not None:
-            o = ttnn.add(o, dl["o_b"])
-        x2 = ttnn.add(x, o)  # Post-attention residual stays ON DEVICE
-
-        # MoE routing: single sync per layer
+        # ── MoE: device-side routing + eager expert dispatch ──
         h2 = ttnn.rms_norm(x2, weight=dl["ln2_g"], epsilon=rms_eps)
+
+        # Device-side routing: softmax + topk on device
         rl = ttnn.matmul(h2, dl["router_w"], compute_kernel_config=hifi4)
+        probs = ttnn.softmax(rl, dim=-1)
+        top4_vals, top4_idxs = ttnn.topk(probs, top_k)
+
         ttnn.synchronize_device(device)
+        top4_vals_np = from_dev(top4_vals, (top_k,))
+        top4_idxs_np = from_dev(top4_idxs, (top_k,)).astype(int)
 
-        # CPU: read 60 floats, compute top-4 + gate scalar
-        rl_np = from_dev(rl, (1, n_experts))[0]
-        rl_np = rl_np - rl_np.max()
-        probs = np.exp(rl_np) / np.exp(rl_np).sum()
-        top4 = np.argsort(probs)[-top_k:]
-
-        if seg_w_np_cache[i] is not None:
-            h2_np = from_dev(h2, (1, hidden))
-            seg_val = float(1.0 / (1.0 + np.exp(-(h2_np @ seg_w_np_cache[i]).item())))
-        else:
-            seg_val = 1.0
-
-        # Top-4 experts: execute + accumulate ON DEVICE
+        # Top-4 experts with fused gate+silu
         moe_acc = None
-        for e in top4:
+        for rank in range(top_k):
+            e = top4_idxs_np[rank]
+            prob = float(top4_vals_np[rank])
             ew = dl["experts"][e]
-            g = ttnn.matmul(h2, ew["g"], compute_kernel_config=hifi4)
+            g = ttnn.linear(h2, ew["g"], activation="silu", compute_kernel_config=hifi4)
             u = ttnn.matmul(h2, ew["u"], compute_kernel_config=hifi4)
-            d = ttnn.matmul(ttnn.mul(ttnn.silu(g), u), ew["d"], compute_kernel_config=hifi4)
-            weighted = ttnn.multiply(d, float(probs[e]))
+            d = ttnn.matmul(ttnn.mul(g, u), ew["d"], compute_kernel_config=hifi4)
+            weighted = ttnn.multiply(d, prob)
             if moe_acc is None:
                 moe_acc = weighted
             else:
                 moe_acc = ttnn.add(moe_acc, weighted)
 
-        # Shared expert: fully on device, gate applied as scalar multiply
-        sg = ttnn.matmul(h2, dl["s_gate_w"], compute_kernel_config=hifi4)
+        # Shared expert with fused gate+silu and device-side gating
+        sg = ttnn.linear(h2, dl["s_gate_w"], activation="silu", compute_kernel_config=hifi4)
         su = ttnn.matmul(h2, dl["s_up_w"], compute_kernel_config=hifi4)
-        sd = ttnn.matmul(ttnn.mul(ttnn.silu(sg), su), dl["s_down_w"], compute_kernel_config=hifi4)
-        moe_acc = ttnn.add(moe_acc, ttnn.multiply(sd, seg_val))
+        sd = ttnn.matmul(ttnn.mul(sg, su), dl["s_down_w"], compute_kernel_config=hifi4)
+        if dl["seg_w"] is not None:
+            seg_logit = ttnn.matmul(h2, dl["seg_w"], compute_kernel_config=hifi4)
+            seg_val = ttnn.sigmoid(seg_logit)
+            shared_gated = ttnn.mul(sd, seg_val)
+            moe_acc = ttnn.add(moe_acc, shared_gated)
+        else:
+            moe_acc = ttnn.add(moe_acc, sd)
 
         # Residual ON DEVICE
         x = ttnn.add(x2, moe_acc)
@@ -508,11 +574,15 @@ total_time = prefill_ms / 1000 + sum(times)
 
 print(f"  Model:       Qwen1.5-MoE-A2.7B-Chat (14.3B total, 2.7B active)")
 print(f"  Weights:     BFP8 experts + bf16 attention (HiFi4)")
-print(f"  Decode:      Optimized eager (on-device accumulation, CPU routing)")
+print(f"  Decode:      Partial trace (traced attention, device-side routing, fused ops)")
 print(f"  Tokens:      {n_generated} generated in {total_time:.1f}s")
 print(f"  Prefill:     {prefill_ms:.0f}ms ({len(tokens)} tokens)")
 print(f"  Decode:      {avg_ms:.0f} ms/tok = {tok_s:.1f} tok/s")
 print(f"  EOS:         {'yes' if hit_eos else 'no'}")
+
+# Clean up attention traces
+for tid in attn_traces:
+    ttnn.release_trace(device, tid)
 
 ttnn.close_device(device)
 print("\nDone!")

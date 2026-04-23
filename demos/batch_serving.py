@@ -100,11 +100,6 @@ def from_dev(tensor, shape):
 # ── RoPE ─────────────────────────────────────────────────────
 freqs = 1.0 / (rope_theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
 
-R_half = np.zeros((head_dim, head_dim), dtype=np.float32)
-for i in range(half_dim):
-    R_half[i, i + half_dim] = -1.0; R_half[i + half_dim, i] = 1.0
-R_tt = to_bf16(R_half)
-
 # ── Upload weights ───────────────────────────────────────────
 print("Uploading weights...")
 t0 = time.perf_counter()
@@ -210,14 +205,15 @@ def decode_forward_batch():
     for i in range(n_layers):
         dl = dev_layers[i]
         h = ttnn.rms_norm(x_tt, weight=dl["ln1_g"], epsilon=rms_eps)
-        q = ttnn.add(ttnn.matmul(h, dl["q_w"], compute_kernel_config=hifi4), dl["q_b"])
-        k = ttnn.add(ttnn.matmul(h, dl["k_w"], compute_kernel_config=hifi4), dl["k_b"])
-        v = ttnn.add(ttnn.matmul(h, dl["v_w"], compute_kernel_config=hifi4), dl["v_b"])
+        q = ttnn.linear(h, dl["q_w"], bias=dl["q_b"], compute_kernel_config=hifi4)
+        k = ttnn.linear(h, dl["k_w"], bias=dl["k_b"], compute_kernel_config=hifi4)
+        v = ttnn.linear(h, dl["v_w"], bias=dl["v_b"], compute_kernel_config=hifi4)
         q_4d = ttnn.reshape(q, [1, batch_size, n_q_heads, head_dim])
         k_4d = ttnn.reshape(k, [1, batch_size, n_kv_heads, head_dim])
         v_4d = ttnn.reshape(v, [1, batch_size, n_kv_heads, head_dim])
-        qr = ttnn.add(ttnn.mul(q_4d, rope_cos_buf), ttnn.mul(ttnn.matmul(q_4d, R_tt), rope_sin_buf))
-        kr = ttnn.add(ttnn.mul(k_4d, rope_cos_buf), ttnn.mul(ttnn.matmul(k_4d, R_tt), rope_sin_buf))
+        # Native RoPE (half-format for Qwen)
+        qr = ttnn.experimental.rotary_embedding(q_4d, rope_cos_buf, rope_sin_buf)
+        kr = ttnn.experimental.rotary_embedding(k_4d, rope_cos_buf, rope_sin_buf)
         k_s = ttnn.to_memory_config(ttnn.reshape(kr, [1, batch_size, n_kv_heads, head_dim]), kv_cfg)
         v_s = ttnn.to_memory_config(ttnn.reshape(v_4d, [1, batch_size, n_kv_heads, head_dim]), kv_cfg)
         ttnn.experimental.paged_update_cache(k_caches[i], k_s, update_idxs_tensor=pos_buf)
@@ -228,10 +224,11 @@ def decode_forward_batch():
             cur_pos_tensor=pos_buf, compute_kernel_config=hifi4)
         o = ttnn.matmul(ttnn.reshape(attn, [1, 1, batch_size, hidden]), dl["o_w"], compute_kernel_config=hifi4)
         x_tt = ttnn.add(x_tt, o)
+        # MLP with fused gate+silu
         h2 = ttnn.rms_norm(x_tt, weight=dl["ln2_g"], epsilon=rms_eps)
-        g = ttnn.matmul(h2, dl["gate_w"], compute_kernel_config=hifi4)
+        g = ttnn.linear(h2, dl["gate_w"], activation="silu", compute_kernel_config=hifi4)
         u = ttnn.matmul(h2, dl["up_w"], compute_kernel_config=hifi4)
-        d = ttnn.matmul(ttnn.mul(ttnn.silu(g), u), dl["down_w"], compute_kernel_config=hifi4)
+        d = ttnn.matmul(ttnn.mul(g, u), dl["down_w"], compute_kernel_config=hifi4)
         x_tt = ttnn.add(x_tt, d)
     return ttnn.matmul(ttnn.rms_norm(x_tt, weight=final_g_tt, epsilon=rms_eps),
                        lm_h_tt, compute_kernel_config=hifi4)

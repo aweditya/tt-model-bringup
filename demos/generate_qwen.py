@@ -204,11 +204,11 @@ def decode_forward():
     for i in range(n_layers):
         dl = dev_layers[i]
         h = ttnn.rms_norm(x, weight=dl["ln1_g"], epsilon=rms_eps)
-        q = ttnn.reshape(ttnn.add(ttnn.matmul(h, dl["q_w"], compute_kernel_config=hifi4), dl["q_b"]),
+        q = ttnn.reshape(ttnn.linear(h, dl["q_w"], bias=dl["q_b"], compute_kernel_config=hifi4),
                          [1, n_q_heads, 1, head_dim])
-        k = ttnn.reshape(ttnn.add(ttnn.matmul(h, dl["k_w"], compute_kernel_config=hifi4), dl["k_b"]),
+        k = ttnn.reshape(ttnn.linear(h, dl["k_w"], bias=dl["k_b"], compute_kernel_config=hifi4),
                          [1, n_kv_heads, 1, head_dim])
-        v = ttnn.reshape(ttnn.add(ttnn.matmul(h, dl["v_w"], compute_kernel_config=hifi4), dl["v_b"]),
+        v = ttnn.reshape(ttnn.linear(h, dl["v_w"], bias=dl["v_b"], compute_kernel_config=hifi4),
                          [1, n_kv_heads, 1, head_dim])
         # Native RoPE: single op per Q and K
         qr = ttnn.experimental.rotary_embedding(q, rope_cos_buf, rope_sin_buf)
@@ -229,11 +229,11 @@ def decode_forward():
             cur_pos_tensor=pos_buf, compute_kernel_config=hifi4)
         o = ttnn.matmul(ttnn.reshape(attn,[1,1,1,hidden]), dl["o_w"], compute_kernel_config=hifi4)
         x = ttnn.add(x, o)
-        # MLP: gate + up + silu + down
+        # MLP: fused gate+silu + up + down
         h2 = ttnn.rms_norm(x, weight=dl["ln2_g"], epsilon=rms_eps)
-        g = ttnn.matmul(h2, dl["gate_w"], compute_kernel_config=hifi4)
+        g = ttnn.linear(h2, dl["gate_w"], activation="silu", compute_kernel_config=hifi4)
         u = ttnn.matmul(h2, dl["up_w"], compute_kernel_config=hifi4)
-        d = ttnn.matmul(ttnn.mul(ttnn.silu(g), u), dl["down_w"], compute_kernel_config=hifi4)
+        d = ttnn.matmul(ttnn.mul(g, u), dl["down_w"], compute_kernel_config=hifi4)
         x = ttnn.add(x, d)
     return ttnn.matmul(ttnn.rms_norm(x, weight=final_g, epsilon=rms_eps), lm_h, compute_kernel_config=hifi4)
 

@@ -14,7 +14,7 @@ What this does:
     4. Runs prefill + traced decode loop with greedy decoding
     5. Generates text, printing tokens as they arrive
 
-Performance: ~21 tok/sec end-to-end on Blackhole P150 (batch=1)
+Performance: ~22 tok/sec end-to-end on Blackhole P150 (batch=1)
 Weight memory: 8.3 GB (BFP8 MLP saves 40% vs bf16)
 
 Note: Requires ~16 GB device DRAM. First run downloads ~16 GB of weights.
@@ -165,13 +165,6 @@ lm_h = to_bf16(lm_head_w)
 del layer_weights_np
 print(f"  Uploaded in {time.perf_counter()-t_upload:.0f}s")
 
-# Rotation matrix for interleaved RoPE on device
-R_interleaved = np.zeros((head_dim, head_dim), dtype=np.float32)
-for i in range(half_dim):
-    R_interleaved[2*i+1, 2*i] = -1.0
-    R_interleaved[2*i, 2*i+1] = 1.0
-R_tt = to_bf16(R_interleaved)
-
 # ── KV caches (split: 8 KV heads → 2 groups of 4) ──────────
 k_caches_lo, v_caches_lo = [], []
 k_caches_hi, v_caches_hi = [], []
@@ -254,15 +247,20 @@ def decode_forward():
     for i in range(n_layers):
         dl = dev_layers[i]
         h = ttnn.rms_norm(x, weight=dl["ln1_g"], epsilon=rms_eps)
-        q = ttnn.matmul(h, dl["q_w"], compute_kernel_config=hifi4)
-        k = ttnn.matmul(h, dl["k_w"], compute_kernel_config=hifi4)
-        v = ttnn.matmul(h, dl["v_w"], compute_kernel_config=hifi4)
-        q = ttnn.reshape(q, [1, n_q_heads, 1, head_dim])
-        k = ttnn.reshape(k, [1, n_kv_heads, 1, head_dim])
-        v = ttnn.reshape(v, [1, n_kv_heads, 1, head_dim])
-        # RoPE via rotation matrix (interleaved format)
-        qr = ttnn.add(ttnn.mul(q, rope_cos_buf), ttnn.mul(ttnn.matmul(q, R_tt), rope_sin_buf))
-        kr = ttnn.add(ttnn.mul(k, rope_cos_buf), ttnn.mul(ttnn.matmul(k, R_tt), rope_sin_buf))
+        q = ttnn.reshape(ttnn.matmul(h, dl["q_w"], compute_kernel_config=hifi4),
+                         [1, n_q_heads, 1, head_dim])
+        k = ttnn.reshape(ttnn.matmul(h, dl["k_w"], compute_kernel_config=hifi4),
+                         [1, n_kv_heads, 1, head_dim])
+        v = ttnn.reshape(ttnn.matmul(h, dl["v_w"], compute_kernel_config=hifi4),
+                         [1, n_kv_heads, 1, head_dim])
+        # Native RoPE: single op per Q and K (interleaved format)
+        qr = ttnn.experimental.rotary_embedding(q, rope_cos_buf, rope_sin_buf)
+        kr = ttnn.experimental.rotary_embedding(k, rope_cos_buf, rope_sin_buf)
+        # Handle tile padding (seq_len 1 → 32)
+        if list(qr.shape)[2] > 1:
+            qr = ttnn.slice(qr, [0,0,0,0], [1,n_q_heads,1,head_dim])
+        if list(kr.shape)[2] > 1:
+            kr = ttnn.slice(kr, [0,0,0,0], [1,n_kv_heads,1,head_dim])
         # KV cache update — split into lo/hi for flash_decode compatibility
         kr_4d = ttnn.reshape(kr, [1, 1, n_kv_heads, head_dim])
         v_4d = ttnn.reshape(v, [1, 1, n_kv_heads, head_dim])
@@ -285,11 +283,11 @@ def decode_forward():
         attn = ttnn.concat([attn_lo, attn_hi], dim=2)
         o = ttnn.matmul(ttnn.reshape(attn, [1,1,1,n_q_heads*head_dim]), dl["o_w"], compute_kernel_config=hifi4)
         x = ttnn.add(x, o)
-        # MLP with HiFi2 (BFP8 weights)
+        # MLP with HiFi2 (BFP8 weights) — fused gate+silu via ttnn.linear
         h2 = ttnn.rms_norm(x, weight=dl["ln2_g"], epsilon=rms_eps)
-        g = ttnn.matmul(h2, dl["gate_w"], compute_kernel_config=hifi2)
+        g = ttnn.linear(h2, dl["gate_w"], activation="silu", compute_kernel_config=hifi2)
         u = ttnn.matmul(h2, dl["up_w"], compute_kernel_config=hifi2)
-        d = ttnn.matmul(ttnn.mul(ttnn.silu(g), u), dl["down_w"], compute_kernel_config=hifi2)
+        d = ttnn.matmul(ttnn.mul(g, u), dl["down_w"], compute_kernel_config=hifi2)
         x = ttnn.add(x, d)
     return ttnn.matmul(ttnn.rms_norm(x, weight=final_g, epsilon=rms_eps), lm_h, compute_kernel_config=hifi4)
 
@@ -401,7 +399,7 @@ eos_count = sum(1 for _, r in results if r['hit_eos'])
 print(f"  Model:      Llama-3.1-8B-Instruct (32 layers, 8B params)")
 print(f"  Weights:    BFP8 MLP (HiFi2) + bf16 attention (HiFi4)")
 print(f"  Device:     Tenstorrent Blackhole P150 (450 GB/s DRAM)")
-print(f"  Decode:     Traced (rotation matrix RoPE + split SDPA + paged KV cache)")
+print(f"  Decode:     Traced (native RoPE + split SDPA + paged KV cache)")
 print(f"  Avg speed:  {avg_ms:.1f} ms/tok = {avg_tps:.0f} tok/sec (end-to-end)")
 print(f"  Total:      {total_tok} tokens across {len(prompts)} prompts")
 print(f"  EOS:        {eos_count}/{len(prompts)} prompts completed naturally")

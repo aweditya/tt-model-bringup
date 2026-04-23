@@ -104,16 +104,6 @@ def from_dev(tensor, shape):
     try: return t.reshape(shape).numpy()
     except RuntimeError: return t.squeeze().numpy().reshape(shape)
 
-# ── On-device RoPE via rotation matrix ───────────────────────
-# Half-format RoPE (Qwen convention): rotate_half, not interleaved.
-# R is a (head_dim, head_dim) permutation that computes rotate_half
-# entirely on device; cos/sin are updated per step via device buffers.
-R = np.zeros((head_dim, head_dim), dtype=np.float32)
-for i in range(half_dim):
-    R[i + half_dim, i] = -1.0
-    R[i, i + half_dim] = 1.0
-R_tt = to_dev(R)
-
 freqs = 1.0 / (rope_theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
 
 def rotate_half_np(x):
@@ -259,21 +249,19 @@ def decode_forward_batch():
 
         h_tt = ttnn.rms_norm(x_tt, weight=dl["ln1_g"], epsilon=rms_eps)
 
-        # Q/K/V projections
-        q_tt = ttnn.add(ttnn.matmul(h_tt, dl["q_w"], compute_kernel_config=hifi4), dl["q_b"])
-        k_tt = ttnn.add(ttnn.matmul(h_tt, dl["k_w"], compute_kernel_config=hifi4), dl["k_b"])
-        v_tt = ttnn.add(ttnn.matmul(h_tt, dl["v_w"], compute_kernel_config=hifi4), dl["v_b"])
+        # Q/K/V projections with fused bias
+        q_tt = ttnn.linear(h_tt, dl["q_w"], bias=dl["q_b"], compute_kernel_config=hifi4)
+        k_tt = ttnn.linear(h_tt, dl["k_w"], bias=dl["k_b"], compute_kernel_config=hifi4)
+        v_tt = ttnn.linear(h_tt, dl["v_w"], bias=dl["v_b"], compute_kernel_config=hifi4)
 
         # Reshape for multi-head attention
         q_4d = ttnn.reshape(q_tt, [1, batch_size, n_q_heads, head_dim])
         k_4d = ttnn.reshape(k_tt, [1, batch_size, n_kv_heads, head_dim])
         v_4d = ttnn.reshape(v_tt, [1, batch_size, n_kv_heads, head_dim])
 
-        # On-device RoPE: x * cos + rotate_half(x) * sin
-        q_rotated = ttnn.matmul(q_4d, R_tt)
-        q_roped = ttnn.add(ttnn.mul(q_4d, rope_cos_buf), ttnn.mul(q_rotated, rope_sin_buf))
-        k_rotated = ttnn.matmul(k_4d, R_tt)
-        k_roped = ttnn.add(ttnn.mul(k_4d, rope_cos_buf), ttnn.mul(k_rotated, rope_sin_buf))
+        # Native RoPE (half-format for Qwen)
+        q_roped = ttnn.experimental.rotary_embedding(q_4d, rope_cos_buf, rope_sin_buf)
+        k_roped = ttnn.experimental.rotary_embedding(k_4d, rope_cos_buf, rope_sin_buf)
 
         # Shard K/V for paged cache update (one shard per batch element)
         k_for_cache = ttnn.reshape(k_roped, [1, batch_size, n_kv_heads, head_dim])
@@ -296,12 +284,11 @@ def decode_forward_batch():
         o_tt = ttnn.matmul(merged, dl["o_w"], compute_kernel_config=hifi4)
         x_tt = ttnn.add(x_tt, o_tt)
 
-        # MLP: SwiGLU
+        # MLP: fused gate+silu
         h2_tt = ttnn.rms_norm(x_tt, weight=dl["ln2_g"], epsilon=rms_eps)
-        gate_tt = ttnn.matmul(h2_tt, dl["gate_w"], compute_kernel_config=hifi4)
+        gate_tt = ttnn.linear(h2_tt, dl["gate_w"], activation="silu", compute_kernel_config=hifi4)
         up_tt = ttnn.matmul(h2_tt, dl["up_w"], compute_kernel_config=hifi4)
-        swiglu_tt = ttnn.mul(ttnn.silu(gate_tt), up_tt)
-        down_tt = ttnn.matmul(swiglu_tt, dl["down_w"], compute_kernel_config=hifi4)
+        down_tt = ttnn.matmul(ttnn.mul(gate_tt, up_tt), dl["down_w"], compute_kernel_config=hifi4)
         x_tt = ttnn.add(x_tt, down_tt)
 
     x_tt = ttnn.rms_norm(x_tt, weight=final_norm_g_tt, epsilon=rms_eps)

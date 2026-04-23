@@ -143,11 +143,6 @@ lm_h = to_bf16(lm_head_w)
 del layer_weights_np
 print(f"  Ready in {time.perf_counter()-t0:.0f}s")
 
-R_interleaved = np.zeros((head_dim, head_dim), dtype=np.float32)
-for i in range(half_dim):
-    R_interleaved[2*i+1, 2*i] = -1.0; R_interleaved[2*i, 2*i+1] = 1.0
-R_tt = to_bf16(R_interleaved)
-
 # ── KV caches ────────────────────────────────────────────────
 k_caches_lo, v_caches_lo = [], []
 k_caches_hi, v_caches_hi = [], []
@@ -228,14 +223,19 @@ def decode_forward():
     for i in range(n_layers):
         dl = dev_layers[i]
         h = ttnn.rms_norm(x, weight=dl["ln1_g"], epsilon=rms_eps)
-        q = ttnn.matmul(h, dl["q_w"], compute_kernel_config=hifi4)
-        k = ttnn.matmul(h, dl["k_w"], compute_kernel_config=hifi4)
-        v = ttnn.matmul(h, dl["v_w"], compute_kernel_config=hifi4)
-        q = ttnn.reshape(q, [1, n_q_heads, 1, head_dim])
-        k = ttnn.reshape(k, [1, n_kv_heads, 1, head_dim])
-        v = ttnn.reshape(v, [1, n_kv_heads, 1, head_dim])
-        qr = ttnn.add(ttnn.mul(q, rope_cos_buf), ttnn.mul(ttnn.matmul(q, R_tt), rope_sin_buf))
-        kr = ttnn.add(ttnn.mul(k, rope_cos_buf), ttnn.mul(ttnn.matmul(k, R_tt), rope_sin_buf))
+        q = ttnn.reshape(ttnn.matmul(h, dl["q_w"], compute_kernel_config=hifi4),
+                         [1, n_q_heads, 1, head_dim])
+        k = ttnn.reshape(ttnn.matmul(h, dl["k_w"], compute_kernel_config=hifi4),
+                         [1, n_kv_heads, 1, head_dim])
+        v = ttnn.reshape(ttnn.matmul(h, dl["v_w"], compute_kernel_config=hifi4),
+                         [1, n_kv_heads, 1, head_dim])
+        # Native RoPE (interleaved format)
+        qr = ttnn.experimental.rotary_embedding(q, rope_cos_buf, rope_sin_buf)
+        kr = ttnn.experimental.rotary_embedding(k, rope_cos_buf, rope_sin_buf)
+        if list(qr.shape)[2] > 1:
+            qr = ttnn.slice(qr, [0,0,0,0], [1,n_q_heads,1,head_dim])
+        if list(kr.shape)[2] > 1:
+            kr = ttnn.slice(kr, [0,0,0,0], [1,n_kv_heads,1,head_dim])
         kr_4d = ttnn.reshape(kr, [1, 1, n_kv_heads, head_dim])
         v_4d = ttnn.reshape(v, [1, 1, n_kv_heads, head_dim])
         kr_lo = ttnn.to_memory_config(ttnn.slice(kr_4d, [0,0,0,0], [1,1,n_kv_split,head_dim]), kv_cfg)
@@ -256,10 +256,11 @@ def decode_forward():
         attn = ttnn.concat([attn_lo, attn_hi], dim=2)
         o = ttnn.matmul(ttnn.reshape(attn, [1,1,1,n_q_heads*head_dim]), dl["o_w"], compute_kernel_config=hifi4)
         x = ttnn.add(x, o)
+        # MLP with HiFi2 (BFP8 weights) — fused gate+silu
         h2 = ttnn.rms_norm(x, weight=dl["ln2_g"], epsilon=rms_eps)
-        g = ttnn.matmul(h2, dl["gate_w"], compute_kernel_config=hifi2)
+        g = ttnn.linear(h2, dl["gate_w"], activation="silu", compute_kernel_config=hifi2)
         u = ttnn.matmul(h2, dl["up_w"], compute_kernel_config=hifi2)
-        d = ttnn.matmul(ttnn.mul(ttnn.silu(g), u), dl["down_w"], compute_kernel_config=hifi2)
+        d = ttnn.matmul(ttnn.mul(g, u), dl["down_w"], compute_kernel_config=hifi2)
         x = ttnn.add(x, d)
     return ttnn.matmul(ttnn.rms_norm(x, weight=final_g, epsilon=rms_eps), lm_h, compute_kernel_config=hifi4)
 
