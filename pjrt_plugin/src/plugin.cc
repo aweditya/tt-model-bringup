@@ -11,8 +11,11 @@
 #include "pjrt_c_api.h"
 #include "client.h"
 
+#include <Python.h>
+
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 
 // ============================================================
 // Error API
@@ -480,6 +483,294 @@ static PJRT_Error* BufferToHostBuffer(
 }
 
 // ============================================================
+// Compile + Execute API (Phase 3)
+// ============================================================
+
+// Store the raw StableHLO program and create an executable.
+// Phase 3: parse MLIR text to extract op list for interpretation.
+static PJRT_Error* ClientCompile(PJRT_Client_Compile_Args* args) {
+  const PJRT_Program* program = args->program;
+
+  // Log format and size for debugging
+  std::string format(program->format, program->format_size);
+  fprintf(stderr, "[TT-PJRT] Compile: format='%s', code_size=%zu\n",
+          format.c_str(), program->code_size);
+
+  // Log first 200 chars of code for debugging
+  size_t preview = program->code_size < 200 ? program->code_size : 200;
+  fprintf(stderr, "[TT-PJRT] Code preview: %.*s\n",
+          (int)preview, program->code);
+
+  // Store the raw program for interpretation during Execute
+  auto* exec = new PJRT_LoadedExecutable;
+  exec->client = args->client;
+  exec->executable.name = "tt_executable";
+  exec->executable.num_outputs = 1;  // TODO: parse from StableHLO
+  exec->deleted = false;
+
+  // Store the program code for later interpretation
+  exec->executable.code.assign(program->code, program->code_size);
+  exec->executable.format = format;
+
+  // Wire up addressable devices
+  exec->addressable_device_ptrs.push_back(&args->client->device);
+
+  args->executable = exec;
+  return nullptr;
+}
+
+// ============================================================
+// Execute: call Python engine to interpret StableHLO
+// ============================================================
+
+// Helper: convert PJRT_Buffer_Type to numpy dtype string
+static const char* PjrtTypeToNumpyDtype(PJRT_Buffer_Type type) {
+  switch (type) {
+    case PJRT_Buffer_Type_F32: return "float32";
+    case PJRT_Buffer_Type_F64: return "float64";
+    case PJRT_Buffer_Type_F16: return "float16";
+    case PJRT_Buffer_Type_BF16: return "float32";  // numpy lacks bf16
+    case PJRT_Buffer_Type_S8: return "int8";
+    case PJRT_Buffer_Type_S16: return "int16";
+    case PJRT_Buffer_Type_S32: return "int32";
+    case PJRT_Buffer_Type_S64: return "int64";
+    case PJRT_Buffer_Type_U8: return "uint8";
+    case PJRT_Buffer_Type_U16: return "uint16";
+    case PJRT_Buffer_Type_U32: return "uint32";
+    case PJRT_Buffer_Type_U64: return "uint64";
+    case PJRT_Buffer_Type_PRED: return "bool";
+    default: return "float32";
+  }
+}
+
+static PJRT_Error* LoadedExecutableExecute(
+    PJRT_LoadedExecutable_Execute_Args* args) {
+
+  auto* loaded_exec = args->executable;
+  const std::string& bytecode = loaded_exec->executable.code;
+
+  if (bytecode.empty()) {
+    return MakeError(PJRT_Error_Code_INTERNAL,
+                     "Executable has no StableHLO bytecode");
+  }
+
+  // Acquire the Python GIL (we're inside a Python process)
+  PyGILState_STATE gstate = PyGILState_Ensure();
+
+  PJRT_Error* error = nullptr;
+
+  do {  // Single-iteration loop for error cleanup
+    // Import the engine module
+    PyObject* engine_mod = PyImport_ImportModule("jax_plugins.tt.engine");
+    if (!engine_mod) {
+      PyErr_Print();
+      error = MakeError(PJRT_Error_Code_INTERNAL,
+                        "Failed to import jax_plugins.tt.engine");
+      break;
+    }
+
+    // Build input list: convert PJRT_Buffers to numpy arrays
+    size_t num_args = args->num_args;
+    PyObject* inputs = PyList_New(num_args);
+
+    for (size_t i = 0; i < num_args; ++i) {
+      PJRT_Buffer* buf = args->argument_lists[0][i];
+
+      // Import numpy
+      PyObject* np_mod = PyImport_ImportModule("numpy");
+      if (!np_mod) {
+        PyErr_Print();
+        Py_DECREF(inputs);
+        Py_DECREF(engine_mod);
+        error = MakeError(PJRT_Error_Code_INTERNAL, "Failed to import numpy");
+        break;
+      }
+
+      // Create numpy array from buffer data
+      // numpy.frombuffer(data, dtype=dtype).reshape(shape)
+      PyObject* frombuffer = PyObject_GetAttrString(np_mod, "frombuffer");
+      PyObject* data_bytes = PyBytes_FromStringAndSize(
+          static_cast<const char*>(buf->tensor), buf->size_bytes);
+      const char* dtype_str = PjrtTypeToNumpyDtype(buf->element_type);
+      PyObject* kwargs = Py_BuildValue("{s:s}", "dtype", dtype_str);
+      PyObject* args_tuple = PyTuple_Pack(1, data_bytes);
+
+      PyObject* flat_arr = PyObject_Call(frombuffer, args_tuple, kwargs);
+      Py_DECREF(args_tuple);
+      Py_DECREF(kwargs);
+      Py_DECREF(data_bytes);
+      Py_DECREF(frombuffer);
+
+      if (!flat_arr) {
+        PyErr_Print();
+        Py_DECREF(np_mod);
+        Py_DECREF(inputs);
+        Py_DECREF(engine_mod);
+        error = MakeError(PJRT_Error_Code_INTERNAL,
+                          "Failed to create numpy array from buffer");
+        break;
+      }
+
+      // Reshape to correct dimensions
+      if (buf->dims.size() > 0) {
+        PyObject* shape_tuple = PyTuple_New(buf->dims.size());
+        for (size_t d = 0; d < buf->dims.size(); ++d) {
+          PyTuple_SetItem(shape_tuple, d, PyLong_FromLongLong(buf->dims[d]));
+        }
+        PyObject* reshaped = PyObject_CallMethod(flat_arr, "reshape", "O",
+                                                  shape_tuple);
+        Py_DECREF(shape_tuple);
+        Py_DECREF(flat_arr);
+
+        if (!reshaped) {
+          PyErr_Print();
+          Py_DECREF(np_mod);
+          Py_DECREF(inputs);
+          Py_DECREF(engine_mod);
+          error = MakeError(PJRT_Error_Code_INTERNAL,
+                            "Failed to reshape numpy array");
+          break;
+        }
+        flat_arr = reshaped;
+      }
+
+      // Make a copy so numpy owns the memory
+      PyObject* arr_copy = PyObject_CallMethod(flat_arr, "copy", nullptr);
+      Py_DECREF(flat_arr);
+      if (!arr_copy) {
+        PyErr_Print();
+        Py_DECREF(np_mod);
+        Py_DECREF(inputs);
+        Py_DECREF(engine_mod);
+        error = MakeError(PJRT_Error_Code_INTERNAL,
+                          "Failed to copy numpy array");
+        break;
+      }
+
+      PyList_SetItem(inputs, i, arr_copy);  // steals ref
+      Py_DECREF(np_mod);
+    }
+
+    if (error) break;
+
+    // Call engine.execute_stablehlo(bytecode, inputs)
+    PyObject* bc_bytes = PyBytes_FromStringAndSize(
+        bytecode.data(), bytecode.size());
+    PyObject* execute_fn = PyObject_GetAttrString(engine_mod,
+                                                   "execute_stablehlo");
+    if (!execute_fn) {
+      PyErr_Print();
+      Py_DECREF(bc_bytes);
+      Py_DECREF(inputs);
+      Py_DECREF(engine_mod);
+      error = MakeError(PJRT_Error_Code_INTERNAL,
+                        "Failed to find execute_stablehlo");
+      break;
+    }
+
+    PyObject* result = PyObject_CallFunction(execute_fn, "OO",
+                                              bc_bytes, inputs);
+    Py_DECREF(execute_fn);
+    Py_DECREF(bc_bytes);
+    Py_DECREF(inputs);
+
+    if (!result) {
+      PyErr_Print();
+      Py_DECREF(engine_mod);
+      error = MakeError(PJRT_Error_Code_INTERNAL,
+                        "execute_stablehlo failed (check stderr)");
+      break;
+    }
+
+    // Convert results back to PJRT_Buffers
+    Py_ssize_t num_outputs = PyList_Size(result);
+
+    // Import numpy for tobytes
+    PyObject* np_mod = PyImport_ImportModule("numpy");
+
+    for (Py_ssize_t i = 0; i < num_outputs; ++i) {
+      PyObject* arr = PyList_GetItem(result, i);  // borrowed ref
+
+      // Get raw bytes via arr.tobytes()
+      PyObject* arr_bytes = PyObject_CallMethod(arr, "tobytes", nullptr);
+      if (!arr_bytes) {
+        PyErr_Print();
+        Py_DECREF(np_mod);
+        Py_DECREF(result);
+        Py_DECREF(engine_mod);
+        error = MakeError(PJRT_Error_Code_INTERNAL,
+                          "Failed to get result bytes");
+        break;
+      }
+
+      char* bytes_data;
+      Py_ssize_t bytes_len;
+      PyBytes_AsStringAndSize(arr_bytes, &bytes_data, &bytes_len);
+
+      // Get shape
+      PyObject* shape = PyObject_GetAttrString(arr, "shape");
+      std::vector<int64_t> dims;
+      if (shape && PyTuple_Check(shape)) {
+        Py_ssize_t ndim = PyTuple_Size(shape);
+        for (Py_ssize_t d = 0; d < ndim; ++d) {
+          dims.push_back(PyLong_AsLongLong(PyTuple_GetItem(shape, d)));
+        }
+      }
+      Py_XDECREF(shape);
+
+      // Get dtype
+      PyObject* dtype_obj = PyObject_GetAttrString(arr, "dtype");
+      PyObject* dtype_name = PyObject_GetAttrString(dtype_obj, "name");
+      const char* dtype_str = PyUnicode_AsUTF8(dtype_name);
+
+      // Map numpy dtype back to PJRT type
+      PJRT_Buffer_Type pjrt_type = PJRT_Buffer_Type_F32;
+      if (strcmp(dtype_str, "float32") == 0) pjrt_type = PJRT_Buffer_Type_F32;
+      else if (strcmp(dtype_str, "float64") == 0) pjrt_type = PJRT_Buffer_Type_F64;
+      else if (strcmp(dtype_str, "float16") == 0) pjrt_type = PJRT_Buffer_Type_F16;
+      else if (strcmp(dtype_str, "int32") == 0) pjrt_type = PJRT_Buffer_Type_S32;
+      else if (strcmp(dtype_str, "int64") == 0) pjrt_type = PJRT_Buffer_Type_S64;
+      else if (strcmp(dtype_str, "int8") == 0) pjrt_type = PJRT_Buffer_Type_S8;
+      else if (strcmp(dtype_str, "int16") == 0) pjrt_type = PJRT_Buffer_Type_S16;
+      else if (strcmp(dtype_str, "uint8") == 0) pjrt_type = PJRT_Buffer_Type_U8;
+      else if (strcmp(dtype_str, "bool") == 0) pjrt_type = PJRT_Buffer_Type_PRED;
+
+      Py_DECREF(dtype_name);
+      Py_DECREF(dtype_obj);
+
+      // Create output buffer
+      auto* out_buf = new PJRT_Buffer;
+      out_buf->element_type = pjrt_type;
+      out_buf->dims = dims;
+      out_buf->size_bytes = bytes_len;
+      out_buf->device = &loaded_exec->client->device;
+      out_buf->memory = &loaded_exec->client->device.dram_memory;
+      out_buf->deleted = false;
+      out_buf->tensor = malloc(bytes_len);
+      memcpy(out_buf->tensor, bytes_data, bytes_len);
+
+      Py_DECREF(arr_bytes);
+
+      // Write to output list
+      args->output_lists[0][i] = out_buf;
+    }
+
+    Py_DECREF(np_mod);
+    Py_DECREF(result);
+    Py_DECREF(engine_mod);
+
+  } while (false);
+
+  // Set completion event
+  if (args->device_complete_events) {
+    args->device_complete_events[0] = MakeReadyEvent();
+  }
+
+  PyGILState_Release(gstate);
+  return error;
+}
+
+// ============================================================
 // Generic UNIMPLEMENTED stubs for functions we haven't built yet.
 // These return UNIMPLEMENTED error instead of crashing on nullptr.
 // ============================================================
@@ -541,8 +832,18 @@ static PJRT_Api BuildApi() {
   api.PJRT_Client_LookupDevice = ClientLookupDevice;
   api.PJRT_Client_LookupAddressableDevice = ClientLookupAddressableDevice;
   api.PJRT_Client_AddressableMemories = ClientAddressableMemories;
-  api.PJRT_Client_Compile = STUB(PJRT_Client_Compile);
-  api.PJRT_Client_DefaultDeviceAssignment = STUB(PJRT_Client_DefaultDeviceAssignment);
+  api.PJRT_Client_Compile = ClientCompile;
+  api.PJRT_Client_DefaultDeviceAssignment =
+      reinterpret_cast<decltype(api.PJRT_Client_DefaultDeviceAssignment)>(
+          +[](PJRT_Client_DefaultDeviceAssignment_Args* args) -> PJRT_Error* {
+            // Single device: all replicas/partitions map to device 0
+            for (size_t i = 0;
+                 i < static_cast<size_t>(args->num_replicas * args->num_partitions);
+                 ++i) {
+              args->default_assignment[i] = 0;
+            }
+            return nullptr;
+          });
   api.PJRT_Client_BufferFromHostBuffer = ClientBufferFromHostBuffer;
 
   // DeviceDescription
@@ -571,8 +872,18 @@ static PJRT_Api BuildApi() {
   // Executable
   api.PJRT_Executable_Destroy = ExecutableDestroy;
   api.PJRT_Executable_Name = ExecutableName;
-  api.PJRT_Executable_NumReplicas = STUB(PJRT_Executable_NumReplicas);
-  api.PJRT_Executable_NumPartitions = STUB(PJRT_Executable_NumPartitions);
+  api.PJRT_Executable_NumReplicas =
+      reinterpret_cast<decltype(api.PJRT_Executable_NumReplicas)>(
+          +[](PJRT_Executable_NumReplicas_Args* args) -> PJRT_Error* {
+            args->num_replicas = 1;
+            return nullptr;
+          });
+  api.PJRT_Executable_NumPartitions =
+      reinterpret_cast<decltype(api.PJRT_Executable_NumPartitions)>(
+          +[](PJRT_Executable_NumPartitions_Args* args) -> PJRT_Error* {
+            args->num_partitions = 1;
+            return nullptr;
+          });
   api.PJRT_Executable_NumOutputs = ExecutableNumOutputs;
   api.PJRT_Executable_SizeOfGeneratedCodeInBytes =
       ExecutableSizeOfGeneratedCodeInBytes;
@@ -588,7 +899,7 @@ static PJRT_Api BuildApi() {
       LoadedExecutableAddressableDevices;
   api.PJRT_LoadedExecutable_Delete = STUB(PJRT_LoadedExecutable_Delete);
   api.PJRT_LoadedExecutable_IsDeleted = STUB(PJRT_LoadedExecutable_IsDeleted);
-  api.PJRT_LoadedExecutable_Execute = STUB(PJRT_LoadedExecutable_Execute);
+  api.PJRT_LoadedExecutable_Execute = LoadedExecutableExecute;
   api.PJRT_Executable_DeserializeAndLoad = STUB(PJRT_Executable_DeserializeAndLoad);
   api.PJRT_LoadedExecutable_Fingerprint = STUB(PJRT_LoadedExecutable_Fingerprint);
 

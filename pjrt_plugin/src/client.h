@@ -98,6 +98,10 @@ struct PJRT_Buffer {
 struct PJRT_Executable {
   std::string name;
   size_t num_outputs = 1;
+
+  // Raw StableHLO program (MLIR text or bytecode)
+  std::string code;
+  std::string format;
 };
 
 // PJRT_LoadedExecutable: an executable bound to devices.
