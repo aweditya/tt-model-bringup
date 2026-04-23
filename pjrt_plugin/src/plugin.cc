@@ -11,8 +11,8 @@
 #include "pjrt_c_api.h"
 #include "client.h"
 
+#include <cstdlib>
 #include <cstring>
-#include <iostream>
 
 // ============================================================
 // Error API
@@ -270,7 +270,13 @@ static PJRT_Error* MemoryKindId(PJRT_Memory_Kind_Id_Args* args) {
 // ============================================================
 
 static PJRT_Error* BufferDestroy(PJRT_Buffer_Destroy_Args* args) {
-  delete args->buffer;
+  if (args->buffer) {
+    // Free host-side data copy (Phase 2)
+    // TODO: Replace with ttnn tensor deallocation when ttnn is linked
+    free(args->buffer->tensor);
+    args->buffer->tensor = nullptr;
+    delete args->buffer;
+  }
   return nullptr;
 }
 
@@ -384,6 +390,96 @@ static PJRT_Error* LoadedExecutableAddressableDevices(
 }
 
 // ============================================================
+// Buffer Transfer API (Phase 2)
+// ============================================================
+
+// Copy host data into a new device buffer.
+// Phase 2: synchronous host-side copy (no ttnn yet).
+// When ttnn is linked, this becomes ttnn::from_torch().
+static PJRT_Error* ClientBufferFromHostBuffer(
+    PJRT_Client_BufferFromHostBuffer_Args* args) {
+  // Compute total size
+  size_t elem_size = PjrtBufferTypeSize(args->type);
+  if (elem_size == 0) {
+    return MakeError(PJRT_Error_Code_INVALID_ARGUMENT,
+                     "Unsupported element type");
+  }
+
+  size_t num_elements = 1;
+  for (size_t i = 0; i < args->num_dims; ++i) {
+    num_elements *= static_cast<size_t>(args->dims[i]);
+  }
+  size_t total_bytes = num_elements * elem_size;
+
+  // Allocate buffer and copy host data
+  auto* buffer = new PJRT_Buffer;
+  buffer->element_type = args->type;
+  buffer->dims.assign(args->dims, args->dims + args->num_dims);
+  buffer->size_bytes = total_bytes;
+  buffer->deleted = false;
+
+  // Wire up device/memory from the client
+  PJRT_Client* client = args->client;
+  buffer->device = &client->device;
+  buffer->memory = &client->device.dram_memory;
+
+  // Copy host data (Phase 2: host-side malloc)
+  // TODO: Replace with ttnn::from_torch() when ttnn is linked
+  if (total_bytes > 0 && args->data) {
+    void* data_copy = malloc(total_bytes);
+    if (!data_copy) {
+      delete buffer;
+      return MakeError(PJRT_Error_Code_RESOURCE_EXHAUSTED,
+                       "Failed to allocate buffer");
+    }
+    memcpy(data_copy, args->data, total_bytes);
+    buffer->tensor = data_copy;
+  }
+
+  // Output: the buffer and a "done with host buffer" event
+  args->buffer = buffer;
+  args->done_with_host_buffer = MakeReadyEvent();
+
+  return nullptr;
+}
+
+// Copy device buffer data back to host.
+// If dst is nullptr, just report the required size.
+static PJRT_Error* BufferToHostBuffer(
+    PJRT_Buffer_ToHostBuffer_Args* args) {
+  PJRT_Buffer* src = args->src;
+  if (!src || src->deleted) {
+    return MakeError(PJRT_Error_Code_INVALID_ARGUMENT,
+                     "Buffer is null or deleted");
+  }
+
+  size_t needed = src->size_bytes;
+
+  // Size query mode: dst is nullptr
+  if (args->dst == nullptr) {
+    args->dst_size = needed;
+    args->event = MakeReadyEvent();
+    return nullptr;
+  }
+
+  // Actual copy mode
+  if (args->dst_size < needed) {
+    return MakeError(PJRT_Error_Code_INVALID_ARGUMENT,
+                     "dst_size too small for buffer data");
+  }
+
+  // Copy data back (Phase 2: memcpy from host-side buffer)
+  // TODO: Replace with ttnn::to_torch() when ttnn is linked
+  if (needed > 0 && src->tensor) {
+    memcpy(args->dst, src->tensor, needed);
+  }
+
+  args->dst_size = needed;
+  args->event = MakeReadyEvent();
+  return nullptr;
+}
+
+// ============================================================
 // Generic UNIMPLEMENTED stubs for functions we haven't built yet.
 // These return UNIMPLEMENTED error instead of crashing on nullptr.
 // ============================================================
@@ -447,7 +543,7 @@ static PJRT_Api BuildApi() {
   api.PJRT_Client_AddressableMemories = ClientAddressableMemories;
   api.PJRT_Client_Compile = STUB(PJRT_Client_Compile);
   api.PJRT_Client_DefaultDeviceAssignment = STUB(PJRT_Client_DefaultDeviceAssignment);
-  api.PJRT_Client_BufferFromHostBuffer = STUB(PJRT_Client_BufferFromHostBuffer);
+  api.PJRT_Client_BufferFromHostBuffer = ClientBufferFromHostBuffer;
 
   // DeviceDescription
   api.PJRT_DeviceDescription_Id = DeviceDescriptionId;
@@ -509,7 +605,7 @@ static PJRT_Api BuildApi() {
   api.PJRT_Buffer_Delete = BufferDelete;
   api.PJRT_Buffer_IsDeleted = BufferIsDeleted;
   api.PJRT_Buffer_CopyToDevice = STUB(PJRT_Buffer_CopyToDevice);
-  api.PJRT_Buffer_ToHostBuffer = STUB(PJRT_Buffer_ToHostBuffer);
+  api.PJRT_Buffer_ToHostBuffer = BufferToHostBuffer;
   api.PJRT_Buffer_IsOnCpu = BufferIsOnCpu;
   api.PJRT_Buffer_ReadyEvent = BufferReadyEvent;
   api.PJRT_Buffer_UnsafePointer = STUB(PJRT_Buffer_UnsafePointer);

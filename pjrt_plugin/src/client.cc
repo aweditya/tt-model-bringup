@@ -82,6 +82,45 @@ PJRT_Error* TtClientCreate(PJRT_Client_Create_Args* args) {
 }
 
 // ============================================================
+// Element type size helper
+// ============================================================
+
+size_t PjrtBufferTypeSize(PJRT_Buffer_Type type) {
+  switch (type) {
+    case PJRT_Buffer_Type_PRED:
+    case PJRT_Buffer_Type_S8:
+    case PJRT_Buffer_Type_U8:
+    case PJRT_Buffer_Type_F8E5M2:
+    case PJRT_Buffer_Type_F8E4M3FN:
+    case PJRT_Buffer_Type_F8E4M3B11FNUZ:
+    case PJRT_Buffer_Type_F8E5M2FNUZ:
+    case PJRT_Buffer_Type_F8E4M3FNUZ:
+    case PJRT_Buffer_Type_F8E4M3:
+    case PJRT_Buffer_Type_F8E3M4:
+    case PJRT_Buffer_Type_F8E8M0FNU:
+      return 1;
+    case PJRT_Buffer_Type_S16:
+    case PJRT_Buffer_Type_U16:
+    case PJRT_Buffer_Type_F16:
+    case PJRT_Buffer_Type_BF16:
+      return 2;
+    case PJRT_Buffer_Type_S32:
+    case PJRT_Buffer_Type_U32:
+    case PJRT_Buffer_Type_F32:
+      return 4;
+    case PJRT_Buffer_Type_S64:
+    case PJRT_Buffer_Type_U64:
+    case PJRT_Buffer_Type_F64:
+    case PJRT_Buffer_Type_C64:
+      return 8;
+    case PJRT_Buffer_Type_C128:
+      return 16;
+    default:
+      return 0;
+  }
+}
+
+// ============================================================
 // Client destruction: close ttnn device
 // ============================================================
 

@@ -183,3 +183,39 @@ The optimization path for batch=1 MoE is essentially exhausted at the ttnn Pytho
 3. **Full-model trace with static expert selection**: If we pick experts based on a pattern (e.g., always same top-4), we can trace the entire model. Loses some accuracy but would be dramatically faster.
 
 This is a pivotal moment: we've exhausted incremental optimizations. The next leap requires architectural change (batching or PJRT).
+
+---
+
+## Phase 1 Completion: What Actually Happened (April 23, 2026)
+
+### The nullptr segfault lesson
+
+The hardest bug in Phase 1 was a segfault on `jax.devices()`. Our plugin loaded fine, `GetPjrtApi()` returned a valid struct, but JAX crashed immediately.
+
+**Root cause**: JAX's C++ wrapper (`PjRtCApiClient`) calls function pointers from the PJRT_Api struct WITHOUT nullptr checks. If even one function pointer is null, JAX segfaults — not on that function, but on whatever code path touches it during initialization. This includes functions you'd think are optional like `PJRT_Client_TopologyDescription` or `PJRT_Executable_Serialize`.
+
+**Fix**: Fill ALL 115 function pointers. Real implementations where we can, `Unimplemented()` stubs everywhere else. The stub returns `PJRT_Error_Code_UNIMPLEMENTED` instead of segfaulting.
+
+**Lesson**: Never leave function pointers null in a C API vtable. Even "unused" ones will be called.
+
+### ABI debugging technique
+
+We validated struct layout by loading both our .so and the official tt-xla .so with ctypes, reading raw bytes at known offsets, and comparing function pointer positions. This caught zero bugs (our layout was correct) but gave us confidence to debug the segfault as a nullptr issue rather than a layout issue.
+
+**Pattern**: `ctypes.c_void_p.from_buffer_copy(raw_bytes, offset).value` to read function pointers from a PJRT_Api struct.
+
+### struct_size matters
+
+PJRT_Api v0.70 has `struct_size = 944` (118 × 8 bytes). The official tt-xla plugin ships v0.68 with `struct_size = 936`. JAX uses struct_size to know which fields are valid. Getting this wrong means JAX reads past the struct or ignores valid fields.
+
+### Consolidation was the right call
+
+We started with separate buffer.h/cc, executable.h/cc, ops/*.h/cc files. Consolidated everything into client.h (struct definitions) + plugin.cc (all callbacks). This eliminated circular dependency issues and made the code much easier to navigate. At 580 lines, plugin.cc is manageable. If it grows past ~1000 lines in Phase 3, we can split again with clear boundaries.
+
+### Phase 1 final state
+
+- 26KB .so, single exported symbol (`GetPjrtApi`)
+- `jax.devices()` → `[TT Blackhole (device 0)]`
+- `jax.default_backend()` → `tt` (priority 500)
+- Build: cmake + g++ on remote host, no ttnn dependency yet
+- All 115 function pointers populated (23 real, 92 stubs)

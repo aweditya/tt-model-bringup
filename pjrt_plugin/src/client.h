@@ -122,4 +122,8 @@ PJRT_Error* TtClientDestroy(PJRT_Client_Destroy_Args* args);
 PJRT_Error* MakeError(PJRT_Error_Code code, const std::string& message);
 PJRT_Event* MakeReadyEvent();
 
+// Returns the size in bytes of a single element of the given type.
+// Returns 0 for unsupported types.
+size_t PjrtBufferTypeSize(PJRT_Buffer_Type type);
+
 #endif  // TT_PJRT_CLIENT_H_
