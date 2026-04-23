@@ -18,7 +18,7 @@ Llama-3.1-8B:   52.0ms =  19t/s    56.0ms =  18t/s  (bf16, exp 80/81)
 Llama-3.1-8B:   43.0ms =  23t/s    47.0ms =  21t/s  (bfp8 MLP + HiFi2, exp 84) ★
 Batch=64:        13.2ms/step = 4,867 tok/sec — PEAK AGGREGATE (device-only)
 Continuous batch: 1,042 tok/sec decode (24 requests through 8 slots)
-Models ported:   6 (Qwen2.5, Qwen3, Llama-1B, Llama-3B, SmolLM3, Llama-8B)
+Models ported:   7 (Qwen2.5, Qwen3, Llama-1B, Llama-3B, SmolLM3, Llama-8B, Qwen-MoE)
 
 PCIe readback overhead: ~3.9ms (from_dev/ttnn.to_torch at 155 MB/s effective)
 On-device topk/argmax: TOO SLOW (1890ms/124ms) — not viable for vocab > 65K
@@ -184,12 +184,17 @@ BFP4 MLP: catastrophic quality loss without calibration (exp 83)
 ## Phase 6: MoE & Multi-Chip
 
 ### Mixture of Experts
-- [ ] **Exp: Qwen1.5-MoE-A2.7B model load** — 14.3B params, 2.7B active
-  - H: Fits in 32GB at INT8; 40-50 tok/sec
-  - Research: `research/moe_deep_dive.md`
-- [ ] **Exp: Router latency** — linear + softmax + top-k on device vs host
-- [ ] **Exp: Host-orchestrated MoE** — dispatch per-expert traces
-  - H: 1-2ms dispatch overhead per MoE layer
+- [x] **Exp 89: Single layer validation** — cosine 0.999909, router works, 60 experts at BFP8
+  - MHA (16Q/16KV) = no split SDPA workaround needed
+  - Full MoE layer non-traced: 9.4ms (MoE = 97% of time)
+- [x] **Exp 90: Full 24-layer eager decode** — 13.6 tok/s with CPU routing
+  - Base model produces garbage (numpy reference confirms — model is weak)
+  - Bug fix: ttnn.to_torch unpads router output (60 experts, not 64)
+- [ ] **Exp 90d: Chat model validation** — Qwen1.5-MoE-A2.7B-Chat with chat template
+  - H: Chat model produces coherent text (base model doesn't)
+- [ ] **Exp 91: All-experts traced decode** — run all 60, mask unused
+  - H: ~28-35 tok/sec (bandwidth = 12.5 GB/step at 450 GB/s = 28ms)
+  - Research: `research/moe_deep_dive.md`, `wiki/57_moe_feasibility.md`
 
 ### Multi-Chip Scaling
 - [ ] **Exp: Cross-chip tensor parallel** — split model across 2 Blackhole chips
