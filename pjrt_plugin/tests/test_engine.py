@@ -552,3 +552,39 @@ class TestBooleanOps:
         y = np.array([1, 1, -1, -1], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x, y])
         np.testing.assert_array_equal(result, (x > 0) & (y > 0))
+
+
+# ============================================================
+# Tests: Scatter + Gather (KV cache update + embedding lookup)
+# ============================================================
+
+class TestScatter:
+    def test_kv_cache_update(self):
+        """cache.at[:, :, 5:6, :].set(new_kv)"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda cache, new_kv: cache.at[:, :, 5:6, :].set(new_kv),
+            np.ones((1, 4, 32, 16), dtype=np.float32),
+            np.ones((1, 4, 1, 16), dtype=np.float32),
+        )
+        cache = np.zeros((1, 4, 32, 16), dtype=np.float32)
+        new_kv = np.ones((1, 4, 1, 16), dtype=np.float32) * 42.0
+        [result] = execute_stablehlo(bc, [cache, new_kv])
+        expected = cache.copy()
+        expected[:, :, 5:6, :] = new_kv
+        np.testing.assert_allclose(result, expected)
+
+
+class TestGather:
+    def test_embedding_lookup(self):
+        """table[ids]"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda table, ids: table[ids],
+            np.ones((100, 64), dtype=np.float32),
+            np.array([1, 2, 3], dtype=np.int32),
+        )
+        table = np.random.randn(100, 64).astype(np.float32)
+        ids = np.array([0, 5, 99], dtype=np.int32)
+        [result] = execute_stablehlo(bc, [table, ids])
+        np.testing.assert_allclose(result, table[ids])

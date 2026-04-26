@@ -58,9 +58,29 @@ def parse_stablehlo(text: str):
     # Parse all functions in the module
     all_functions = []
     current_func = None
+    pending = None  # For multi-line ops (scatter body regions, etc.)
 
     for line in lines:
         line = line.strip()
+
+        # Multi-line op accumulation MUST be checked first — absorbs inner
+        # ^bb0 lines from body regions (e.g. scatter) before they can be
+        # mistaken for new function entry blocks.
+        if pending is not None:
+            pending['lines'].append(line)
+            # Count body region nesting: ({ opens, }) closes
+            if '({' in line:
+                pending['depth'] += line.count('({')
+            if '})' in line:
+                pending['depth'] -= line.count('})')
+            if pending['depth'] <= 0:
+                # End of multi-line op — join and parse
+                full_text = ' '.join(pending['lines'])
+                op_desc = parse_op(pending['name'], full_text)
+                if op_desc:
+                    current_func['ops'].append(op_desc)
+                pending = None
+            continue
 
         # Detect function entry block (with arguments)
         if line.startswith('^bb0('):
@@ -98,6 +118,15 @@ def parse_stablehlo(text: str):
 
         result_name = m.group(1).lstrip('%')
         rest = m.group(2)
+
+        # Check for multi-line op with body region (scatter, etc.)
+        if rest.startswith('"stablehlo.') and '({' in rest:
+            depth = rest.count('({') - rest.count('})')
+            if depth > 0:
+                pending = {
+                    'name': result_name, 'lines': [rest], 'depth': depth,
+                }
+                continue
 
         op_desc = parse_op(result_name, rest)
         if op_desc:
@@ -213,6 +242,14 @@ def parse_op(result_name: str, text: str) -> dict:
 
     if text.startswith('stablehlo.or '):
         return parse_binary_op(result_name, 'or', text)
+
+    # "stablehlo.scatter"(%operand, %indices, %updates) <{...}> ({...}) : (...) -> result
+    if text.startswith('"stablehlo.scatter"'):
+        return parse_scatter(result_name, text)
+
+    # "stablehlo.gather"(%operand, %indices) <{...}> : (...) -> result
+    if text.startswith('"stablehlo.gather"'):
+        return parse_gather(result_name, text)
 
     # "func.call"(%arg) <...> : (...) -> result_type
     if text.startswith('"func.call"'):
@@ -448,6 +485,77 @@ def parse_concatenate(name: str, text: str) -> dict:
     return {
         'name': name, 'op': 'concatenate', 'operands': operands,
         'dim': dim, 'result_type': result_type,
+    }
+
+
+def parse_scatter(name: str, text: str) -> dict:
+    """Parse "stablehlo.scatter"(%operand, %indices, %updates) ...
+
+    For KV cache updates, the body region is always "return new value" (overwrite).
+    We extract: operand, indices, updates, and scatter_dims_to_operand_dims.
+    """
+    # Extract operands from the first part: "stablehlo.scatter"(%a, %b, %c)
+    paren_m = re.search(r'"stablehlo\.scatter"\(([^)]+)\)', text)
+    operands = re.findall(r'%([a-zA-Z0-9_]+)', paren_m.group(1)) if paren_m else []
+
+    # Extract scatter_dims_to_operand_dims from the attribute dict
+    sdto = re.search(r'scatter_dims_to_operand_dims\s*=\s*\[([^\]]*)\]', text)
+    scatter_dims = []
+    if sdto and sdto.group(1).strip():
+        scatter_dims = [int(d.strip()) for d in sdto.group(1).split(',')]
+
+    # Extract update_window_dims
+    uwd = re.search(r'update_window_dims\s*=\s*\[([^\]]*)\]', text)
+    update_window_dims = []
+    if uwd and uwd.group(1).strip():
+        update_window_dims = [int(d.strip()) for d in uwd.group(1).split(',')]
+
+    result_type = extract_result_type(text)
+    return {
+        'name': name, 'op': 'scatter', 'operands': operands,
+        'scatter_dims_to_operand_dims': scatter_dims,
+        'update_window_dims': update_window_dims,
+        'result_type': result_type,
+    }
+
+
+def parse_gather(name: str, text: str) -> dict:
+    """Parse "stablehlo.gather"(%operand, %indices) <{dimension_numbers = ..., slice_sizes = ...}>
+
+    For embedding lookup: operand[indices] with specified dimension mapping.
+    """
+    # Extract operands
+    paren_m = re.search(r'"stablehlo\.gather"\(([^)]+)\)', text)
+    operands = re.findall(r'%([a-zA-Z0-9_]+)', paren_m.group(1)) if paren_m else []
+
+    # Extract slice_sizes = array<i64: 1, 64>
+    ss_m = re.search(r'slice_sizes\s*=\s*array<i64:\s*([^>]+)>', text)
+    slice_sizes = []
+    if ss_m:
+        slice_sizes = [int(d.strip()) for d in ss_m.group(1).split(',')]
+
+    # Extract dimension_numbers
+    od_m = re.search(r'offset_dims\s*=\s*\[([^\]]*)\]', text)
+    offset_dims = [int(d) for d in od_m.group(1).split(',')] if od_m and od_m.group(1).strip() else []
+
+    cd_m = re.search(r'collapsed_slice_dims\s*=\s*\[([^\]]*)\]', text)
+    collapsed_dims = [int(d) for d in cd_m.group(1).split(',')] if cd_m and cd_m.group(1).strip() else []
+
+    sim_m = re.search(r'start_index_map\s*=\s*\[([^\]]*)\]', text)
+    start_index_map = [int(d) for d in sim_m.group(1).split(',')] if sim_m and sim_m.group(1).strip() else []
+
+    ivd_m = re.search(r'index_vector_dim\s*=\s*(\d+)', text)
+    index_vector_dim = int(ivd_m.group(1)) if ivd_m else 1
+
+    result_type = extract_result_type(text)
+    return {
+        'name': name, 'op': 'gather', 'operands': operands,
+        'slice_sizes': slice_sizes,
+        'offset_dims': offset_dims,
+        'collapsed_slice_dims': collapsed_dims,
+        'start_index_map': start_index_map,
+        'index_vector_dim': index_vector_dim,
+        'result_type': result_type,
     }
 
 
@@ -693,6 +801,12 @@ def execute_op(op: dict, values: dict) -> np.ndarray:
         a, b = get_operands(op, values, 2)
         return np.logical_or(a, b)
 
+    if op_type == 'scatter':
+        return execute_scatter(op, values)
+
+    if op_type == 'gather':
+        return execute_gather(op, values)
+
     if op_type == 'func_call':
         return execute_func_call(op, values)
 
@@ -906,6 +1020,79 @@ def execute_concatenate(op: dict, values: dict) -> np.ndarray:
     """Execute stablehlo.concatenate along a dimension."""
     arrays = [values[name] for name in op['operands']]
     return np.concatenate(arrays, axis=op['dim'])
+
+
+def execute_scatter(op: dict, values: dict) -> np.ndarray:
+    """Execute stablehlo.scatter (overwrite mode for KV cache updates).
+
+    Handles the common case: scatter along one operand dimension,
+    body region = "return new value" (overwrite, not accumulate).
+    """
+    operand = values[op['operands'][0]]
+    indices = values[op['operands'][1]]
+    updates = values[op['operands'][2]]
+    scatter_dims = op['scatter_dims_to_operand_dims']
+
+    result = operand.copy()
+    # Simple case: scatter along a single dimension with scalar indices
+    if len(scatter_dims) == 1:
+        dim = scatter_dims[0]
+        # indices is a 1D array of indices (e.g., [5] for pos=5)
+        idx = int(indices.flat[0])
+        # Build a slice tuple to index into the result
+        slices = [slice(None)] * result.ndim
+        slices[dim] = idx
+        # Updates might have the scattered dim as size 1; squeeze if needed
+        upd = updates
+        if upd.shape[dim] == 1:
+            # The update covers exactly 1 position along the scatter dim
+            slices[dim] = slice(idx, idx + 1)
+            result[tuple(slices)] = upd
+        else:
+            result[tuple(slices)] = upd
+    else:
+        raise ValueError(f"Multi-dim scatter not supported: {scatter_dims}")
+
+    return result
+
+
+def execute_gather(op: dict, values: dict) -> np.ndarray:
+    """Execute stablehlo.gather (embedding lookup pattern).
+
+    Handles the common case: gather rows from a 2D table using 1D indices.
+    dimension_numbers = {offset_dims=[1], collapsed_slice_dims=[0],
+                         start_index_map=[0], index_vector_dim=1}
+    """
+    operand = values[op['operands'][0]]
+    indices = values[op['operands'][1]]
+    slice_sizes = op['slice_sizes']
+    start_index_map = op['start_index_map']
+    collapsed_dims = op['collapsed_slice_dims']
+    offset_dims = op['offset_dims']
+    index_vector_dim = op['index_vector_dim']
+    result_shape, result_dtype = parse_tensor_type(op['result_type'])
+
+    # Common embedding lookup: operand[indices[:, 0], :]
+    # indices shape: [N, 1] or [N], start_index_map=[0], collapsed=[0]
+    if (len(start_index_map) == 1 and start_index_map[0] == 0
+            and len(collapsed_dims) == 1 and collapsed_dims[0] == 0):
+        # Extract the actual index values
+        if indices.ndim > 1 and index_vector_dim == indices.ndim - 1:
+            idx = indices[..., 0]
+        else:
+            idx = indices
+        # Gather rows
+        result = operand[idx]
+        # Slice to the specified sizes for non-collapsed dims
+        if len(slice_sizes) > 1:
+            trailing_slices = tuple(
+                slice(0, s) for i, s in enumerate(slice_sizes) if i not in collapsed_dims
+            )
+            result = result[(..., *trailing_slices)]
+        return result.astype(result_dtype)
+
+    raise ValueError(f"Unsupported gather pattern: start_index_map={start_index_map}, "
+                     f"collapsed={collapsed_dims}")
 
 
 # ============================================================
