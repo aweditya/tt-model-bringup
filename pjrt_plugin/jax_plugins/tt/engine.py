@@ -44,26 +44,28 @@ def bytecode_to_text(bytecode: bytes) -> str:
 def parse_stablehlo(text: str):
     """Parse StableHLO text IR into a list of op descriptors.
 
+    Handles modules with multiple functions. Returns the main (first)
+    function's data plus a list of private (subsequent) functions.
+
     Returns:
-        args: list of (name, type_str) for function arguments
-        ops: list of dicts with keys: name, op, operands, attrs, result_type
-        returns: list of SSA value names to return
+        args: list of (name, type_str) for main function arguments
+        ops: list of dicts for main function ops
+        returns: list of SSA value names to return from main
+        private_fns: list of (args, ops, returns) for private functions
     """
-    # Extract function body (between ^bb0 and closing brace)
-    # Handle both "func.func" and "\"func.func\"" syntax
     lines = text.strip().split('\n')
-    in_func = False
-    func_args = []
-    ops = []
-    returns = []
+
+    # Parse all functions in the module
+    all_functions = []
+    current_func = None
 
     for line in lines:
         line = line.strip()
 
         # Detect function entry block
         if line.startswith('^bb0('):
-            in_func = True
-            # Parse arguments: ^bb0(%arg0: tensor<4xf32>, ...):
+            # Start a new function
+            func_args = []
             arg_str = line[len('^bb0('):]
             arg_str = arg_str.rstrip('):')
             for arg in arg_str.split(','):
@@ -71,16 +73,18 @@ def parse_stablehlo(text: str):
                 if ':' in arg:
                     name, type_str = arg.split(':', 1)
                     func_args.append((name.strip().lstrip('%'), type_str.strip()))
+            current_func = {'args': func_args, 'ops': [], 'returns': []}
             continue
 
-        if not in_func:
+        if current_func is None:
             continue
 
-        # Detect return
-        if 'func.return' in line or line.startswith('return '):
-            # "func.return"(%1) : ...  or  return %1 : ...
+        # Detect return — ends the current function
+        if 'func.return' in line or (line.startswith('return ') and '%' in line):
             m = re.findall(r'%[a-zA-Z0-9_]+', line.split(':')[0])
-            returns = [v.lstrip('%') for v in m]
+            current_func['returns'] = [v.lstrip('%') for v in m]
+            all_functions.append(current_func)
+            current_func = None
             continue
 
         # Parse SSA assignment: %name = op operands attrs : type
@@ -93,9 +97,18 @@ def parse_stablehlo(text: str):
 
         op_desc = parse_op(result_name, rest)
         if op_desc:
-            ops.append(op_desc)
+            current_func['ops'].append(op_desc)
 
-    return func_args, ops, returns
+    # First function is main, rest are private
+    if not all_functions:
+        return [], [], [], []
+
+    main = all_functions[0]
+    private_fns = [
+        (f['args'], f['ops'], f['returns']) for f in all_functions[1:]
+    ]
+
+    return main['args'], main['ops'], main['returns'], private_fns
 
 
 def parse_op(result_name: str, text: str) -> dict:
@@ -165,6 +178,14 @@ def parse_op(result_name: str, text: str) -> dict:
     # stablehlo.dot_general
     if text.startswith('stablehlo.dot_general '):
         return parse_dot_general(result_name, text)
+
+    # stablehlo.reduce(%x init: %cst) applies stablehlo.add across dimensions = [1]
+    if text.startswith('stablehlo.reduce'):
+        return parse_reduce(result_name, text)
+
+    # "func.call"(%arg) <...> : (...) -> result_type
+    if text.startswith('"func.call"'):
+        return parse_func_call(result_name, text)
 
     # Unknown op — store for error reporting
     return {
@@ -253,10 +274,11 @@ def parse_reshape(name: str, text: str) -> dict:
 
 
 def parse_transpose(name: str, text: str) -> dict:
-    """Parse: stablehlo.transpose %a, permutation = [1, 0] : (...) -> tensor<3x2xf32>"""
+    """Parse: stablehlo.transpose %a, dims = [1, 0] : (...)  or  permutation = [1, 0]"""
     after_op = re.sub(r'^stablehlo\.transpose\s+', '', text)
     operands = re.findall(r'%([a-zA-Z0-9_]+)', after_op.split(',')[0])
-    perm_m = re.search(r'permutation\s*=\s*\[([^\]]+)\]', text)
+    # Try both "permutation = [...]" and "dims = [...]" (bytecode format uses dims)
+    perm_m = re.search(r'(?:permutation|dims)\s*=\s*\[([^\]]+)\]', text)
     perm = []
     if perm_m:
         perm = [int(d.strip()) for d in perm_m.group(1).split(',')]
@@ -266,6 +288,61 @@ def parse_transpose(name: str, text: str) -> dict:
         'op': 'transpose',
         'operands': operands,
         'permutation': perm,
+        'result_type': result_type,
+    }
+
+
+def parse_reduce(name: str, text: str) -> dict:
+    """Parse stablehlo.reduce with `applies` shorthand.
+
+    Format: stablehlo.reduce(%x init: %cst) applies stablehlo.add
+            across dimensions = [1] : (...) -> tensor<2xf32>
+    """
+    # Extract input operand: first %name after reduce(
+    input_m = re.search(r'reduce\((%[a-zA-Z0-9_]+)', text)
+    input_operand = input_m.group(1).lstrip('%') if input_m else None
+
+    # Extract init value: after "init:"
+    init_m = re.search(r'init:\s*(%[a-zA-Z0-9_]+)', text)
+    init_operand = init_m.group(1).lstrip('%') if init_m else None
+
+    # Extract reduction function: "applies stablehlo.XXX"
+    applies_m = re.search(r'applies\s+stablehlo\.(\w+)', text)
+    reduce_fn = applies_m.group(1) if applies_m else 'add'
+
+    # Extract dimensions: "across dimensions = [1]" or "dimensions = [1]"
+    dims_m = re.search(r'dimensions\s*=\s*\[([^\]]*)\]', text)
+    dims = []
+    if dims_m and dims_m.group(1).strip():
+        dims = [int(d.strip()) for d in dims_m.group(1).split(',')]
+
+    result_type = extract_result_type(text)
+    return {
+        'name': name,
+        'op': 'reduce',
+        'operands': [input_operand] if input_operand else [],
+        'init_operand': init_operand,
+        'reduce_fn': reduce_fn,
+        'dimensions': dims,
+        'result_type': result_type,
+    }
+
+
+def parse_func_call(name: str, text: str) -> dict:
+    """Parse "func.call"(%arg) <...> : (...) -> result_type
+
+    In the bytecode→text format, func.call doesn't include the callee name
+    directly. We track call index to map to the Nth private function.
+    """
+    # Extract operands
+    operand_part = text.split('<')[0] if '<' in text else text.split(':')[0]
+    operands = re.findall(r'%([a-zA-Z0-9_]+)', operand_part)
+
+    result_type = extract_result_type(text)
+    return {
+        'name': name,
+        'op': 'func_call',
+        'operands': operands,
         'result_type': result_type,
     }
 
@@ -380,9 +457,15 @@ def execute_stablehlo(bytecode: bytes, inputs: list) -> list:
     Returns:
         list of numpy arrays (one per return value)
     """
+    global _private_functions, _call_counter
+
     # Parse bytecode → text → op list
     text = bytecode_to_text(bytecode)
-    func_args, ops, returns = parse_stablehlo(text)
+    func_args, ops, returns, private_fns = parse_stablehlo(text)
+
+    # Set up private functions for func.call dispatch
+    _private_functions = private_fns
+    _call_counter = 0
 
     # Build value map: SSA name → numpy array
     values = {}
@@ -479,6 +562,12 @@ def execute_op(op: dict, values: dict) -> np.ndarray:
     if op_type == 'dot_general':
         return execute_dot_general(op, values)
 
+    if op_type == 'reduce':
+        return execute_reduce(op, values)
+
+    if op_type == 'func_call':
+        return execute_func_call(op, values)
+
     raise ValueError(f"Unsupported op: {op_type} (text: {op.get('text', '')})")
 
 
@@ -516,8 +605,17 @@ def execute_constant(op: dict) -> np.ndarray:
             arr = arr.reshape(shape)
         return arr
 
-    # Scalar constant
-    val = float(val_str)
+    # Scalar constant — may be decimal, scientific notation, or hex float
+    if val_str.startswith('0x') or val_str.startswith('0X'):
+        # IEEE 754 hex representation (e.g., 0xFF800000 = -inf for f32)
+        import struct
+        hex_val = int(val_str, 16)
+        if dtype == np.float32 or len(val_str) <= 10:  # 0x + 8 hex digits
+            val = struct.unpack('f', struct.pack('I', hex_val))[0]
+        else:
+            val = struct.unpack('d', struct.pack('Q', hex_val))[0]
+    else:
+        val = float(val_str)
     arr = np.full(shape if shape else (), val, dtype=dtype)
     return arr
 
@@ -577,3 +675,66 @@ def np_einsum_dot_general(a, b, lhs_contract, rhs_contract, lhs_batch, rhs_batch
     # Batched case — move batch dims to front, do batched matmul
     # This is a simplification; full implementation would use einsum
     raise ValueError("Batched dot_general not yet implemented")
+
+
+def execute_reduce(op: dict, values: dict) -> np.ndarray:
+    """Execute stablehlo.reduce.
+
+    Supported reduction functions: add (sum), maximum, minimum.
+    Reduces along specified dimensions.
+    """
+    a = get_operands(op, values, 1)[0]
+    reduce_fn = op['reduce_fn']
+    dims = op['dimensions']
+
+    # Map reduction function name to numpy operation
+    if reduce_fn == 'add':
+        return np.sum(a, axis=tuple(dims))
+    elif reduce_fn == 'maximum':
+        return np.max(a, axis=tuple(dims))
+    elif reduce_fn == 'minimum':
+        return np.min(a, axis=tuple(dims))
+    elif reduce_fn == 'multiply':
+        return np.prod(a, axis=tuple(dims))
+    else:
+        raise ValueError(f"Unsupported reduce function: stablehlo.{reduce_fn}")
+
+
+# ============================================================
+# Multi-function support for func.call
+# ============================================================
+
+# Module-level storage for private functions parsed from the module.
+# Set by execute_stablehlo before executing the main function.
+_private_functions = []
+_call_counter = 0
+
+
+def execute_func_call(op: dict, values: dict) -> np.ndarray:
+    """Execute a func.call by running the corresponding private function."""
+    global _call_counter
+
+    if _call_counter >= len(_private_functions):
+        raise ValueError(
+            f"func.call #{_call_counter} but only {len(_private_functions)} "
+            f"private functions found in module"
+        )
+
+    func_args, func_ops, func_returns = _private_functions[_call_counter]
+    _call_counter += 1
+
+    # Build local value map: function args ← call operands
+    local_values = dict(values)  # inherit outer scope for init values etc.
+    call_operands = [values[name] for name in op['operands']]
+    for i, (arg_name, _type_str) in enumerate(func_args):
+        local_values[arg_name] = call_operands[i]
+
+    # Execute function body
+    for func_op in func_ops:
+        result = execute_op(func_op, local_values)
+        local_values[func_op['name']] = result
+
+    # Return the function's return value(s)
+    if len(func_returns) == 1:
+        return local_values[func_returns[0]]
+    return [local_values[r] for r in func_returns]

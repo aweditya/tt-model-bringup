@@ -219,3 +219,55 @@ We started with separate buffer.h/cc, executable.h/cc, ops/*.h/cc files. Consoli
 - `jax.default_backend()` → `tt` (priority 500)
 - Build: cmake + g++ on remote host, no ttnn dependency yet
 - All 115 function pointers populated (23 real, 92 stubs)
+
+---
+
+## Phase 4: Reduce + Composite Ops (April 26, 2026)
+
+### The "inspect first" approach paid off
+
+Before implementing any new ops, we wrote `inspect_stablehlo.py` to lower softmax, layer norm, RMS norm, MLP, SiLU MLP, and attention to StableHLO and print the IR. Key finding: **only 13 unique ops across all transformer-relevant functions**, and we already supported 12. The only missing op was `stablehlo.reduce`.
+
+This saved us from implementing ops we didn't need (e.g., slice, gather, iota are not needed for these core blocks). The design doc listed ~20 ops for Phase 4 but the actual IR showed only 1 was missing.
+
+### `bytecode_to_text` format differs from `as_text`
+
+We wrote a second inspection script (`inspect_bytecode_format.py`) to check what the engine's actual `bytecode_to_text` path produces vs JAX's `as_text()`. Key differences:
+- Functions use `"func.func"() <...> ({` generic syntax (quoted)
+- Returns use `"func.return"(...)` (quoted)
+- Transpose uses `dims = [...]` not `permutation = [...]`
+- Function calls use `"func.call"(...)` without callee name in text
+
+This was critical — parsing the wrong format would have caused silent failures.
+
+### stablehlo.reduce: simpler than expected
+
+We feared body region parsing (the design doc flagged it as Medium risk). But `bytecode_to_text` produces the compact `applies stablehlo.XXX across dimensions = [N]` shorthand, not the full body region. This made parsing trivial: just regex for the function name.
+
+### Hex float constants
+
+StableHLO uses hex IEEE 754 for special values: `0xFF800000` = -infinity (used as reduce-max init value). We added `struct.unpack` handling for these. This is the kind of edge case that only shows up with real JAX programs, not toy examples.
+
+### func.call: positional dispatch
+
+The bytecode format doesn't include callee names in `"func.call"`. Functions appear in module order: first is main, subsequent are private. Calls map to private functions by order of appearance. This works for current JAX output but is fragile — if JAX reorders functions, we'll need to parse the callee attribute from the `<...>` dict.
+
+### Phase 4 partial state (reduce + composite ops)
+
+- 29 engine tests pass (was 20 before)
+- New ops: reduce (sum, max, min, prod), func.call
+- New composite tests: softmax, layer norm, RMS norm, attention, MLP+relu, SiLU MLP
+- Also fixed: hex float constants, transpose `dims` format
+- Engine still runs on numpy (CPU). No ttnn linked yet.
+
+### What's still missing for a full transformer
+
+Looking at real transformer decode (KV cache updates, multi-head attention with reshapes):
+- `stablehlo.slice` / `stablehlo.dynamic_slice` — head splitting
+- `stablehlo.concatenate` — head reassembly
+- `stablehlo.gather` — embedding lookup
+- `stablehlo.dynamic_update_slice` — KV cache update
+- `stablehlo.compare` + `stablehlo.select` — causal masking
+- `stablehlo.iota` — index generation for masks
+
+These are needed for Phase 4 completion but not for the core compute blocks which are now verified.

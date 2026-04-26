@@ -106,7 +106,7 @@ class TestParser:
         import jax.numpy as jnp
         bc = get_bytecode(lambda x: x + 1.0, jnp.ones(4))
         text = bytecode_to_text(bc)
-        args, ops, returns = parse_stablehlo(text)
+        args, ops, returns, _private = parse_stablehlo(text)
 
         assert len(args) == 1
         assert args[0][0] == "arg0"
@@ -120,7 +120,7 @@ class TestParser:
         import jax.numpy as jnp
         bc = get_bytecode(lambda x, w: x @ w, jnp.ones((2, 3)), jnp.ones((3, 4)))
         text = bytecode_to_text(bc)
-        args, ops, returns = parse_stablehlo(text)
+        args, ops, returns, _private = parse_stablehlo(text)
 
         assert len(args) == 2
         op_types = [op['op'] for op in ops]
@@ -236,3 +236,196 @@ class TestExecution:
         x = np.array([-2.0, -1.0, 0.0, 1.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, np.maximum(x, 0.0))
+
+
+# ============================================================
+# Tests: Reduce ops
+# ============================================================
+
+class TestReduce:
+    def test_reduce_sum(self):
+        """sum(x, axis=-1)"""
+        import jax.numpy as jnp
+        bc = get_bytecode(lambda x: jnp.sum(x, axis=-1), jnp.ones((4, 8)))
+        x = np.random.randn(4, 8).astype(np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_allclose(result, np.sum(x, axis=-1), rtol=1e-5)
+
+    def test_reduce_max(self):
+        """max(x, axis=-1)"""
+        import jax.numpy as jnp
+        bc = get_bytecode(lambda x: jnp.max(x, axis=-1), jnp.ones((4, 8)))
+        x = np.random.randn(4, 8).astype(np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_allclose(result, np.max(x, axis=-1))
+
+    def test_reduce_sum_keepdims(self):
+        """sum with keepdims via mean pattern (sum / N)"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: jnp.mean(x, axis=-1, keepdims=True),
+            jnp.ones((2, 64)),
+        )
+        x = np.random.randn(2, 64).astype(np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_allclose(
+            result, np.mean(x, axis=-1, keepdims=True), rtol=1e-5
+        )
+
+
+# ============================================================
+# Tests: Composite functions (require reduce)
+# ============================================================
+
+class TestComposite:
+    def test_softmax(self):
+        """jax.nn.softmax end-to-end through engine"""
+        import jax
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: jax.nn.softmax(x, axis=-1),
+            jnp.ones((2, 64)),
+        )
+        x = np.random.randn(2, 64).astype(np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        from scipy.special import softmax as scipy_softmax
+        # Use numpy softmax reference instead of scipy to avoid dependency
+        ref = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        ref = ref / np.sum(ref, axis=-1, keepdims=True)
+        np.testing.assert_allclose(result, ref, rtol=1e-5)
+
+    def test_layer_norm(self):
+        """Manual layer norm through engine"""
+        import jax.numpy as jnp
+        def layer_norm(x, g, b):
+            mean = jnp.mean(x, axis=-1, keepdims=True)
+            var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+            return g * (x - mean) / jnp.sqrt(var + 1e-5) + b
+        bc = get_bytecode(
+            layer_norm,
+            jnp.ones((2, 64)),
+            jnp.ones(64),
+            jnp.zeros(64),
+        )
+        x = np.random.randn(2, 64).astype(np.float32)
+        g = np.ones(64, dtype=np.float32)
+        b = np.zeros(64, dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x, g, b])
+        # Numpy reference
+        mean = np.mean(x, axis=-1, keepdims=True)
+        var = np.mean((x - mean) ** 2, axis=-1, keepdims=True)
+        ref = g * (x - mean) / np.sqrt(var + 1e-5) + b
+        np.testing.assert_allclose(result, ref, rtol=1e-5)
+
+    def test_rms_norm(self):
+        """RMS norm (Llama/Qwen style) through engine"""
+        import jax.numpy as jnp
+        def rms_norm(x, g):
+            ms = jnp.mean(x ** 2, axis=-1, keepdims=True)
+            return g * x / jnp.sqrt(ms + 1e-6)
+        bc = get_bytecode(
+            rms_norm,
+            jnp.ones((2, 64)),
+            jnp.ones(64),
+        )
+        x = np.random.randn(2, 64).astype(np.float32)
+        g = np.ones(64, dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x, g])
+        ms = np.mean(x ** 2, axis=-1, keepdims=True)
+        ref = g * x / np.sqrt(ms + 1e-6)
+        np.testing.assert_allclose(result, ref, rtol=1e-5)
+
+    def test_attention(self):
+        """Single-head self-attention through engine"""
+        import jax
+        import jax.numpy as jnp
+        def attention(x, wq, wk, wv, wo):
+            q = x @ wq
+            k = x @ wk
+            v = x @ wv
+            d = jnp.float32(q.shape[-1])
+            scores = jax.nn.softmax(q @ k.T / jnp.sqrt(d), axis=-1)
+            return (scores @ v) @ wo
+        D = 32
+        bc = get_bytecode(
+            attention,
+            jnp.ones((8, D)),
+            jnp.ones((D, D)),
+            jnp.ones((D, D)),
+            jnp.ones((D, D)),
+            jnp.ones((D, D)),
+        )
+        np.random.seed(42)
+        x = np.random.randn(8, D).astype(np.float32) * 0.1
+        wq = np.random.randn(D, D).astype(np.float32) * 0.1
+        wk = np.random.randn(D, D).astype(np.float32) * 0.1
+        wv = np.random.randn(D, D).astype(np.float32) * 0.1
+        wo = np.random.randn(D, D).astype(np.float32) * 0.1
+        [result] = execute_stablehlo(bc, [x, wq, wk, wv, wo])
+        # Numpy reference
+        q = x @ wq
+        k = x @ wk
+        v = x @ wv
+        scores = q @ k.T / np.sqrt(D)
+        scores_exp = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
+        attn = scores_exp / np.sum(scores_exp, axis=-1, keepdims=True)
+        ref = (attn @ v) @ wo
+        np.testing.assert_allclose(result, ref, rtol=1e-4, atol=1e-5)
+
+
+# ============================================================
+# Tests: Function calls (private functions like relu, silu)
+# ============================================================
+
+class TestFuncCall:
+    def test_mlp_with_relu(self):
+        """MLP with relu (relu is a private function)"""
+        import jax
+        import jax.numpy as jnp
+        def mlp(x, w1, b1, w2, b2):
+            h = jax.nn.relu(x @ w1 + b1)
+            return h @ w2 + b2
+        bc = get_bytecode(
+            mlp,
+            jnp.ones((2, 32)),
+            jnp.ones((32, 64)),
+            jnp.ones(64),
+            jnp.ones((64, 32)),
+            jnp.ones(32),
+        )
+        np.random.seed(42)
+        x = np.random.randn(2, 32).astype(np.float32) * 0.1
+        w1 = np.random.randn(32, 64).astype(np.float32) * 0.1
+        b1 = np.zeros(64, dtype=np.float32)
+        w2 = np.random.randn(64, 32).astype(np.float32) * 0.1
+        b2 = np.zeros(32, dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x, w1, b1, w2, b2])
+        ref = np.maximum(x @ w1 + b1, 0) @ w2 + b2
+        np.testing.assert_allclose(result, ref, rtol=1e-4, atol=1e-5)
+
+    def test_silu_mlp(self):
+        """SiLU gated MLP (silu is a private function)"""
+        import jax
+        import jax.numpy as jnp
+        def silu_mlp(x, w_gate, w_up, w_down):
+            gate = jax.nn.silu(x @ w_gate)
+            up = x @ w_up
+            return (gate * up) @ w_down
+        bc = get_bytecode(
+            silu_mlp,
+            jnp.ones((2, 32)),
+            jnp.ones((32, 64)),
+            jnp.ones((32, 64)),
+            jnp.ones((64, 32)),
+        )
+        np.random.seed(42)
+        x = np.random.randn(2, 32).astype(np.float32) * 0.1
+        w_gate = np.random.randn(32, 64).astype(np.float32) * 0.1
+        w_up = np.random.randn(32, 64).astype(np.float32) * 0.1
+        w_down = np.random.randn(64, 32).astype(np.float32) * 0.1
+        [result] = execute_stablehlo(bc, [x, w_gate, w_up, w_down])
+        # SiLU = x * sigmoid(x) = x / (1 + exp(-x))
+        gate_val = x @ w_gate
+        silu = gate_val / (1 + np.exp(-gate_val))
+        ref = (silu * (x @ w_up)) @ w_down
+        np.testing.assert_allclose(result, ref, rtol=1e-4, atol=1e-5)

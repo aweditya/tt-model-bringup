@@ -12,20 +12,26 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
+_plugin_available = False
+
 @pytest.fixture(scope="session", autouse=True)
 def register_plugin():
-    """Register the TT PJRT plugin before any tests run."""
+    """Try to register the TT PJRT plugin. Engine tests don't need it."""
+    global _plugin_available
     from jax_plugins.tt import initialize
 
     try:
         initialize()
-    except RuntimeError as e:
-        pytest.skip(f"Plugin not built: {e}")
+        _plugin_available = True
+    except RuntimeError:
+        _plugin_available = False
 
 
 @pytest.fixture
 def tt_device():
     """Return the first TT device, or skip if not available."""
+    if not _plugin_available:
+        pytest.skip("TT plugin not built")
     import jax
 
     devices = jax.devices("tt")
