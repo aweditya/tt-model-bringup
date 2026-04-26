@@ -271,3 +271,66 @@ Looking at real transformer decode (KV cache updates, multi-head attention with 
 - `stablehlo.iota` — index generation for masks
 
 These are needed for Phase 4 completion but not for the core compute blocks which are now verified.
+
+---
+
+## Phase 4 continued: Transformer decode ops (April 26, 2026)
+
+### Second round of "inspect first"
+
+Wrote `inspect_transformer_decode.py` covering MHA with reshapes, KV cache (slice/scatter), causal masking (tril → iota+compare+select), embedding lookup (gather), argmax, and a full tiny decode step. Found 22 unique ops total, 14 already supported. 8 missing.
+
+Wrote `inspect_bytecode_new_ops.py` to verify the **bytecode format** for each new op — critical since bytecode format can differ from `as_text()`. All new ops matched the `as_text()` format except the portable artifact round-trip failed for one case (MLIR attribute index error) but worked fine via the portable artifact deserializer path.
+
+### Implemented 6 new ops
+
+1. **slice** — `stablehlo.slice %arg0 [0:1, 0:4, 0:8, 0:16]` — static slicing with start:limit:stride per dimension. Maps to `a[tuple(slice(s, l, st))]`.
+2. **compare** — `stablehlo.compare GT, %a, %b, FLOAT` — element-wise comparison (GT/LT/GE/LE/EQ/NE) returning boolean tensor.
+3. **select** — `stablehlo.select %pred, %true, %false` — ternary element-wise selection. Maps to `np.where`.
+4. **iota** — `stablehlo.iota dim = 0 : tensor<4x4xi32>` — sequential indices along a dimension. Used for causal mask generation (tril pattern).
+5. **concatenate** — `stablehlo.concatenate %a, %b, dim = 1` — concatenation along a dimension.
+6. **and/or** — boolean logic ops for compound predicates.
+
+### Fixed batched dot_general
+
+Multi-head attention uses `dot_general` with `batching_dims`, which previously called a non-existent `np.einsum_dot_general`. Fixed by building an einsum string dynamically: assign letters to batch dims (shared), contracting dims (shared), and free dims (unique), then call `np.einsum(subscripts, a, b)`. This generalized approach handles all dot_general patterns.
+
+### Zero-argument functions
+
+`jnp.arange(8)` produces a StableHLO module with a zero-argument function — no `^bb0(...)` entry block. The parser didn't handle this, silently producing no outputs. Fixed by detecting `"func.func"() ... ({` lines and starting a function context with empty args.
+
+### Test suite unification
+
+Removed `JAX_PLATFORMS=cpu` from test_engine.py (was poisoning the process for PJRT tests). Instead: (1) use `np.ones(...)` instead of `jnp.ones(...)` for example args (avoids device placement), (2) force CPU lowering in `get_bytecode` via `jax.default_device(cpu)`. All tests now run together: 72 pass, 2 skip.
+
+### Current state: 72/74 tests pass
+
+- Engine: 38 tests (was 29) — slice, compare, select, iota, concatenate, and, tril, MHA
+- PJRT pipeline: 23 tests (was 18) — slice, where, tril, concatenate, multi-head attention
+- Buffer: 6 tests
+- Device: 5 tests
+- Skipped: 2 (test_matmul.py stubs)
+
+### What's still missing for full transformer decode
+
+Two complex ops that use body regions or generic MLIR syntax:
+
+1. **stablehlo.scatter** — KV cache update (`cache.at[pos].set(value)`). Uses `"stablehlo.scatter"(...)` generic format with a body region. Needed for in-place KV cache updates.
+
+2. **stablehlo.gather** — Embedding lookup (`table[token_ids]`). Uses `"stablehlo.gather"(...)` generic format with dimension_numbers attribute. Needed for token → embedding mapping.
+
+3. **Multi-output C++ support** — `plugin.cc` has `num_outputs` hardcoded to 1. Decode step returns `(out, k_cache, v_cache)` — 3 outputs. Need to parse output count from StableHLO return statement.
+
+4. **argmax** — Greedy decoding uses a complex reduce with body region (not `applies` shorthand). Has 2 inputs, 2 init values, and a multi-op body (compare + select + and + or). This is significantly more complex than our current reduce parser.
+
+### Priorities
+
+For a minimal end-to-end demo (prompt → tokens):
+1. scatter + gather (to run the decode loop)
+2. Multi-output support
+3. argmax (or sample from logits on host)
+
+Alternative: avoid scatter/gather entirely by structuring the JAX code differently:
+- Use `jax.lax.dynamic_update_slice` instead of `.at[].set()` for KV cache
+- Use one-hot matmul instead of gather for embedding
+- Do argmax on host after transferring logits
