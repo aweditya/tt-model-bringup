@@ -259,3 +259,90 @@ class TestComposite:
         attn = scores_exp / np.sum(scores_exp, axis=-1, keepdims=True)
         ref = (attn @ v) @ wo
         np.testing.assert_allclose(result, ref, rtol=1e-4, atol=1e-5)
+
+
+class TestSlice:
+    def test_static_slice(self, tt_device):
+        """Slice through full PJRT pipeline"""
+        import jax
+        f = jax.jit(lambda x: x[:, :, :8, :])
+        x = np.random.randn(1, 4, 32, 16).astype(np.float32)
+        result = jax.device_get(f(jax.device_put(x, tt_device)))
+        np.testing.assert_allclose(result, x[:, :, :8, :])
+
+
+class TestCompareSelect:
+    def test_where(self, tt_device):
+        """jnp.where through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+        f = jax.jit(lambda x: jnp.where(x > 0, x, 0.0))
+        x = np.array([-2, -1, 0, 0.5, 1, 2, -0.5, 3], dtype=np.float32)
+        result = jax.device_get(f(jax.device_put(x, tt_device)))
+        np.testing.assert_allclose(result, np.where(x > 0, x, 0.0))
+
+    def test_tril(self, tt_device):
+        """jnp.tril (iota + compare + select) through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+        f = jax.jit(lambda x: jnp.tril(x))
+        x = np.ones((8, 8), dtype=np.float32)
+        result = jax.device_get(f(jax.device_put(x, tt_device)))
+        np.testing.assert_allclose(result, np.tril(x))
+
+
+class TestConcatenate:
+    def test_concat(self, tt_device):
+        """Concatenate through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+        f = jax.jit(lambda x, y: jnp.concatenate([x, y], axis=-1))
+        x = np.random.randn(2, 3).astype(np.float32)
+        y = np.random.randn(2, 4).astype(np.float32)
+        result = jax.device_get(f(
+            jax.device_put(x, tt_device),
+            jax.device_put(y, tt_device),
+        ))
+        np.testing.assert_allclose(result, np.concatenate([x, y], axis=-1))
+
+
+class TestMHA:
+    def test_multi_head_attention(self, tt_device):
+        """Multi-head attention with reshape/transpose through PJRT"""
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def mha(x, wq, wk, wv, wo):
+            q = (x @ wq).reshape(1, 8, 4, 16).transpose(0, 2, 1, 3)
+            k = (x @ wk).reshape(1, 8, 4, 16).transpose(0, 2, 1, 3)
+            v = (x @ wv).reshape(1, 8, 4, 16).transpose(0, 2, 1, 3)
+            scores = jax.nn.softmax(
+                q @ k.transpose(0, 1, 3, 2) / jnp.sqrt(16.0),
+                axis=-1,
+            )
+            attn = (scores @ v).transpose(0, 2, 1, 3).reshape(1, 8, 64)
+            return attn @ wo
+
+        np.random.seed(42)
+        x = np.random.randn(1, 8, 64).astype(np.float32) * 0.1
+        wq = np.random.randn(64, 64).astype(np.float32) * 0.1
+        wk = np.random.randn(64, 64).astype(np.float32) * 0.1
+        wv = np.random.randn(64, 64).astype(np.float32) * 0.1
+        wo = np.random.randn(64, 64).astype(np.float32) * 0.1
+        result = jax.device_get(mha(
+            jax.device_put(x, tt_device),
+            jax.device_put(wq, tt_device),
+            jax.device_put(wk, tt_device),
+            jax.device_put(wv, tt_device),
+            jax.device_put(wo, tt_device),
+        ))
+        # Numpy reference
+        q = (x @ wq).reshape(1, 8, 4, 16).transpose(0, 2, 1, 3)
+        k = (x @ wk).reshape(1, 8, 4, 16).transpose(0, 2, 1, 3)
+        v = (x @ wv).reshape(1, 8, 4, 16).transpose(0, 2, 1, 3)
+        scores = q @ k.transpose(0, 1, 3, 2) / np.sqrt(16.0)
+        scores_exp = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
+        attn = scores_exp / np.sum(scores_exp, axis=-1, keepdims=True)
+        ref = (attn @ v).transpose(0, 2, 1, 3).reshape(1, 8, 64) @ wo
+        np.testing.assert_allclose(result, ref, rtol=1e-4, atol=1e-5)

@@ -62,9 +62,8 @@ def parse_stablehlo(text: str):
     for line in lines:
         line = line.strip()
 
-        # Detect function entry block
+        # Detect function entry block (with arguments)
         if line.startswith('^bb0('):
-            # Start a new function
             func_args = []
             arg_str = line[len('^bb0('):]
             arg_str = arg_str.rstrip('):')
@@ -74,6 +73,11 @@ def parse_stablehlo(text: str):
                     name, type_str = arg.split(':', 1)
                     func_args.append((name.strip().lstrip('%'), type_str.strip()))
             current_func = {'args': func_args, 'ops': [], 'returns': []}
+            continue
+
+        # Detect no-argument function: "func.func"() ... ({
+        if '"func.func"' in line and '({' in line and current_func is None:
+            current_func = {'args': [], 'ops': [], 'returns': []}
             continue
 
         if current_func is None:
@@ -182,6 +186,33 @@ def parse_op(result_name: str, text: str) -> dict:
     # stablehlo.reduce(%x init: %cst) applies stablehlo.add across dimensions = [1]
     if text.startswith('stablehlo.reduce'):
         return parse_reduce(result_name, text)
+
+    # stablehlo.slice %arg0 [0:1, 0:4, 0:8, 0:16] : (...) -> (...)
+    if text.startswith('stablehlo.slice '):
+        return parse_slice(result_name, text)
+
+    # stablehlo.compare GT, %a, %b, FLOAT : (...) -> tensor<...xi1>
+    if text.startswith('stablehlo.compare '):
+        return parse_compare(result_name, text)
+
+    # stablehlo.select %pred, %true, %false : tensor<...xi1>, tensor<...>
+    if text.startswith('stablehlo.select '):
+        return parse_select(result_name, text)
+
+    # stablehlo.iota dim = 0 : tensor<4x4xi32>
+    if text.startswith('stablehlo.iota '):
+        return parse_iota(result_name, text)
+
+    # stablehlo.concatenate %a, %b, dim = 1 : (...) -> (...)
+    if text.startswith('stablehlo.concatenate '):
+        return parse_concatenate(result_name, text)
+
+    # stablehlo.and / stablehlo.or (boolean logic)
+    if text.startswith('stablehlo.and '):
+        return parse_binary_op(result_name, 'and', text)
+
+    if text.startswith('stablehlo.or '):
+        return parse_binary_op(result_name, 'or', text)
 
     # "func.call"(%arg) <...> : (...) -> result_type
     if text.startswith('"func.call"'):
@@ -344,6 +375,79 @@ def parse_func_call(name: str, text: str) -> dict:
         'op': 'func_call',
         'operands': operands,
         'result_type': result_type,
+    }
+
+
+def parse_slice(name: str, text: str) -> dict:
+    """Parse: stablehlo.slice %arg0 [0:1, 0:4, 0:8, 0:16] : (...) -> (...)"""
+    after_op = re.sub(r'^stablehlo\.slice\s+', '', text)
+    operands = re.findall(r'%([a-zA-Z0-9_]+)', after_op.split('[')[0])
+    # Extract [start:end, start:end, ...] ranges
+    bracket_m = re.search(r'\[([^\]]+)\]', text)
+    starts, limits, strides = [], [], []
+    if bracket_m:
+        for part in bracket_m.group(1).split(','):
+            part = part.strip()
+            pieces = part.split(':')
+            starts.append(int(pieces[0]))
+            limits.append(int(pieces[1]))
+            strides.append(int(pieces[2]) if len(pieces) > 2 else 1)
+    result_type = extract_result_type(text)
+    return {
+        'name': name, 'op': 'slice', 'operands': operands,
+        'starts': starts, 'limits': limits, 'strides': strides,
+        'result_type': result_type,
+    }
+
+
+def parse_compare(name: str, text: str) -> dict:
+    """Parse: stablehlo.compare GT, %a, %b, FLOAT : (...) -> tensor<...xi1>"""
+    after_op = re.sub(r'^stablehlo\.compare\s+', '', text)
+    # Direction is the first word: GT, LT, GE, LE, EQ, NE
+    parts = after_op.split(',')
+    direction = parts[0].strip()
+    operands = re.findall(r'%([a-zA-Z0-9_]+)', after_op.split(':')[0])
+    result_type = extract_result_type(text)
+    return {
+        'name': name, 'op': 'compare', 'operands': operands,
+        'direction': direction, 'result_type': result_type,
+    }
+
+
+def parse_select(name: str, text: str) -> dict:
+    """Parse: stablehlo.select %pred, %true, %false : tensor<...xi1>, tensor<...>"""
+    after_op = re.sub(r'^stablehlo\.select\s+', '', text)
+    operands = re.findall(r'%([a-zA-Z0-9_]+)', after_op.split(':')[0])
+    result_type = extract_result_type(text)
+    return {
+        'name': name, 'op': 'select', 'operands': operands,
+        'result_type': result_type,
+    }
+
+
+def parse_iota(name: str, text: str) -> dict:
+    """Parse: stablehlo.iota dim = 0 : tensor<4x4xi32>"""
+    dim_m = re.search(r'dim\s*=\s*(\d+)', text)
+    dim = int(dim_m.group(1)) if dim_m else 0
+    result_type = extract_result_type(text)
+    return {
+        'name': name, 'op': 'iota', 'operands': [],
+        'dim': dim, 'result_type': result_type,
+    }
+
+
+def parse_concatenate(name: str, text: str) -> dict:
+    """Parse: stablehlo.concatenate %a, %b, dim = 1 : (...) -> (...)"""
+    after_op = re.sub(r'^stablehlo\.concatenate\s+', '', text)
+    # Operands are before "dim ="
+    operand_part = after_op.split('dim')[0] if 'dim' in after_op else after_op.split(':')[0]
+    operands = re.findall(r'%([a-zA-Z0-9_]+)', operand_part)
+    dim_m = re.search(r'dim\s*=\s*(\d+)', text)
+    dim = int(dim_m.group(1)) if dim_m else 0
+    result_type = extract_result_type(text)
+    return {
+        'name': name, 'op': 'concatenate', 'operands': operands,
+        'dim': dim, 'result_type': result_type,
     }
 
 
@@ -565,6 +669,30 @@ def execute_op(op: dict, values: dict) -> np.ndarray:
     if op_type == 'reduce':
         return execute_reduce(op, values)
 
+    if op_type == 'slice':
+        return execute_slice(op, values)
+
+    if op_type == 'compare':
+        return execute_compare(op, values)
+
+    if op_type == 'select':
+        a, b, c = get_operands(op, values, 3)
+        return np.where(a, b, c)
+
+    if op_type == 'iota':
+        return execute_iota(op)
+
+    if op_type == 'concatenate':
+        return execute_concatenate(op, values)
+
+    if op_type == 'and':
+        a, b = get_operands(op, values, 2)
+        return np.logical_and(a, b)
+
+    if op_type == 'or':
+        a, b = get_operands(op, values, 2)
+        return np.logical_or(a, b)
+
     if op_type == 'func_call':
         return execute_func_call(op, values)
 
@@ -648,33 +776,64 @@ def execute_broadcast(op: dict, values: dict) -> np.ndarray:
 
 
 def execute_dot_general(op: dict, values: dict) -> np.ndarray:
-    """Execute stablehlo.dot_general (generalized matmul)."""
+    """Execute stablehlo.dot_general (generalized matmul).
+
+    Uses np.einsum for the general case (batched + multi-contraction).
+    """
     a, b = get_operands(op, values, 2)
     lhs_contract = op['lhs_contracting']
     rhs_contract = op['rhs_contracting']
     lhs_batch = op.get('lhs_batching', [])
     rhs_batch = op.get('rhs_batching', [])
 
-    # Simple case: standard matmul (no batch dims, single contraction)
+    # Simple case: no batch dims, single contraction → tensordot
     if not lhs_batch and len(lhs_contract) == 1 and len(rhs_contract) == 1:
         return np.tensordot(a, b, axes=(lhs_contract, rhs_contract))
 
-    # General case: use np.einsum
-    # Build einsum string
-    # This handles batched matmul and multi-contraction
-    return np.einsum_dot_general(a, b, lhs_contract, rhs_contract,
-                                 lhs_batch, rhs_batch)
+    # General case: build einsum string
+    # Assign letters: a-z for dimensions
+    letters = 'abcdefghijklmnopqrstuvwxyz'
+    idx = [0]
+    def next_letter():
+        c = letters[idx[0]]
+        idx[0] += 1
+        return c
 
+    lhs_labels = [''] * a.ndim
+    rhs_labels = [''] * b.ndim
 
-def np_einsum_dot_general(a, b, lhs_contract, rhs_contract, lhs_batch, rhs_batch):
-    """Implement dot_general using numpy operations."""
-    # For now, handle the common cases
-    if not lhs_batch:
-        return np.tensordot(a, b, axes=(lhs_contract, rhs_contract))
+    # Batch dims share labels
+    for ld, rd in zip(lhs_batch, rhs_batch):
+        c = next_letter()
+        lhs_labels[ld] = c
+        rhs_labels[rd] = c
 
-    # Batched case — move batch dims to front, do batched matmul
-    # This is a simplification; full implementation would use einsum
-    raise ValueError("Batched dot_general not yet implemented")
+    # Contracting dims share labels
+    for ld, rd in zip(lhs_contract, rhs_contract):
+        c = next_letter()
+        lhs_labels[ld] = c
+        rhs_labels[rd] = c
+
+    # Free dims get unique labels
+    for i in range(a.ndim):
+        if not lhs_labels[i]:
+            lhs_labels[i] = next_letter()
+    for i in range(b.ndim):
+        if not rhs_labels[i]:
+            rhs_labels[i] = next_letter()
+
+    # Output: batch dims + lhs free dims + rhs free dims
+    lhs_free = [i for i in range(a.ndim) if i not in lhs_batch and i not in lhs_contract]
+    rhs_free = [i for i in range(b.ndim) if i not in rhs_batch and i not in rhs_contract]
+
+    out_labels = (
+        [lhs_labels[d] for d in lhs_batch] +
+        [lhs_labels[d] for d in lhs_free] +
+        [rhs_labels[d] for d in rhs_free]
+    )
+
+    subscripts = f"{''.join(lhs_labels)},{''.join(rhs_labels)}->{''.join(out_labels)}"
+    return np.einsum(subscripts, a, b)
 
 
 def execute_reduce(op: dict, values: dict) -> np.ndarray:
@@ -698,6 +857,55 @@ def execute_reduce(op: dict, values: dict) -> np.ndarray:
         return np.prod(a, axis=tuple(dims))
     else:
         raise ValueError(f"Unsupported reduce function: stablehlo.{reduce_fn}")
+
+
+def execute_slice(op: dict, values: dict) -> np.ndarray:
+    """Execute stablehlo.slice with static start/limit/strides."""
+    a = get_operands(op, values, 1)[0]
+    slices = tuple(
+        slice(s, l, st)
+        for s, l, st in zip(op['starts'], op['limits'], op['strides'])
+    )
+    return a[slices]
+
+
+def execute_compare(op: dict, values: dict) -> np.ndarray:
+    """Execute stablehlo.compare with direction (GT, LT, GE, LE, EQ, NE)."""
+    a, b = get_operands(op, values, 2)
+    direction = op['direction']
+    if direction == 'GT':
+        return np.greater(a, b)
+    elif direction == 'LT':
+        return np.less(a, b)
+    elif direction == 'GE':
+        return np.greater_equal(a, b)
+    elif direction == 'LE':
+        return np.less_equal(a, b)
+    elif direction == 'EQ':
+        return np.equal(a, b)
+    elif direction == 'NE':
+        return np.not_equal(a, b)
+    else:
+        raise ValueError(f"Unsupported compare direction: {direction}")
+
+
+def execute_iota(op: dict) -> np.ndarray:
+    """Execute stablehlo.iota — generate indices along a dimension."""
+    result_type = op['result_type']
+    shape, dtype = parse_tensor_type(result_type)
+    dim = op['dim']
+    # Create an array where values along `dim` are 0, 1, 2, ...
+    result = np.zeros(shape, dtype=dtype)
+    idx = [np.newaxis] * len(shape)
+    idx[dim] = slice(None)
+    result = np.arange(shape[dim], dtype=dtype)[tuple(idx)] * np.ones(shape, dtype=dtype)
+    return result.astype(dtype)
+
+
+def execute_concatenate(op: dict, values: dict) -> np.ndarray:
+    """Execute stablehlo.concatenate along a dimension."""
+    arrays = [values[name] for name in op['operands']]
+    return np.concatenate(arrays, axis=op['dim'])
 
 
 # ============================================================

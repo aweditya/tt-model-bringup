@@ -433,3 +433,122 @@ class TestFuncCall:
         silu = gate_val / (1 + np.exp(-gate_val))
         ref = (silu * (x @ w_up)) @ w_down
         np.testing.assert_allclose(result, ref, rtol=1e-4, atol=1e-5)
+
+
+# ============================================================
+# Tests: New ops (slice, compare, select, iota, concatenate, and/or)
+# ============================================================
+
+class TestSlice:
+    def test_static_slice(self):
+        """slice x[:, :, :8, :] from a 4D tensor"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: x[:, :, :8, :],
+            np.ones((1, 4, 32, 16), dtype=np.float32),
+        )
+        x = np.random.randn(1, 4, 32, 16).astype(np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_allclose(result, x[:, :, :8, :])
+
+    def test_slice_middle(self):
+        """slice x[1:3] from a 1D tensor"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: x[1:3],
+            np.ones(8, dtype=np.float32),
+        )
+        x = np.arange(8, dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_allclose(result, x[1:3])
+
+
+class TestCompareSelect:
+    def test_where(self):
+        """jnp.where(x > 0, x, 0.0)"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: jnp.where(x > 0, x, 0.0),
+            np.ones(8, dtype=np.float32),
+        )
+        x = np.array([-2, -1, 0, 0.5, 1, 2, -0.5, 3], dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_allclose(result, np.where(x > 0, x, 0.0))
+
+    def test_compare_gt(self):
+        """x > 0.5"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: x > 0.5,
+            np.ones(4, dtype=np.float32),
+        )
+        x = np.array([0.0, 0.5, 0.6, 1.0], dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_array_equal(result, x > 0.5)
+
+    def test_tril(self):
+        """jnp.tril generates iota + compare + select"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: jnp.tril(x),
+            np.ones((4, 4), dtype=np.float32),
+        )
+        x = np.ones((4, 4), dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_allclose(result, np.tril(x))
+
+
+class TestIota:
+    def test_iota_1d(self):
+        """jnp.arange generates iota"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: jnp.arange(x.shape[0]),
+            np.ones(8, dtype=np.float32),
+        )
+        x = np.ones(8, dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_array_equal(result, np.arange(8))
+
+
+class TestConcatenate:
+    def test_concat_1d(self):
+        """concatenate two 1D arrays"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x, y: jnp.concatenate([x, y]),
+            np.ones(3, dtype=np.float32),
+            np.ones(4, dtype=np.float32),
+        )
+        x = np.array([1, 2, 3], dtype=np.float32)
+        y = np.array([4, 5, 6, 7], dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x, y])
+        np.testing.assert_allclose(result, np.concatenate([x, y]))
+
+    def test_concat_axis1(self):
+        """concatenate along axis=1"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x, y: jnp.concatenate([x, y], axis=-1),
+            np.ones((2, 3), dtype=np.float32),
+            np.ones((2, 4), dtype=np.float32),
+        )
+        x = np.random.randn(2, 3).astype(np.float32)
+        y = np.random.randn(2, 4).astype(np.float32)
+        [result] = execute_stablehlo(bc, [x, y])
+        np.testing.assert_allclose(result, np.concatenate([x, y], axis=-1))
+
+
+class TestBooleanOps:
+    def test_and(self):
+        """(x > 0) & (y > 0)"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x, y: (x > 0) & (y > 0),
+            np.ones(4, dtype=np.float32),
+            np.ones(4, dtype=np.float32),
+        )
+        x = np.array([1, -1, 1, -1], dtype=np.float32)
+        y = np.array([1, 1, -1, -1], dtype=np.float32)
+        [result] = execute_stablehlo(bc, [x, y])
+        np.testing.assert_array_equal(result, (x > 0) & (y > 0))
