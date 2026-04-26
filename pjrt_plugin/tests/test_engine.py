@@ -4,15 +4,12 @@ Tests that the engine correctly parses MLIR bytecode and executes
 StableHLO ops on numpy arrays. These tests validate the Python engine
 independently of the C++ PJRT plugin.
 
-IMPORTANT: These tests use CPU-only JAX. The TT plugin must NOT be loaded
-because it would become the default backend and crash on jnp.ones().
+NOTE: Example args use np.ones (not jnp.ones) to avoid device placement
+when the TT plugin is loaded. Lowering is forced to CPU in get_bytecode.
 """
 
 import sys
 import os
-
-# Force CPU-only mode BEFORE importing JAX (prevents TT plugin auto-load)
-os.environ["JAX_PLATFORMS"] = "cpu"
 
 import pytest
 import numpy as np
@@ -34,13 +31,19 @@ from jax_plugins.tt.engine import (
 # ============================================================
 
 def get_bytecode(fn, *example_args):
-    """JIT-lower a function and return its StableHLO bytecode."""
+    """JIT-lower a function and return its StableHLO bytecode.
+
+    Uses CPU for lowering so engine tests work regardless of which
+    backends are registered (TT plugin may or may not be loaded).
+    """
     import jax
     import jax._src.interpreters.mlir as jax_mlir
 
-    lowered = jax.jit(fn).lower(*example_args)
-    module = lowered.compiler_ir(dialect="stablehlo")
-    return jax_mlir.module_to_bytecode(module)
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        lowered = jax.jit(fn).lower(*example_args)
+        module = lowered.compiler_ir(dialect="stablehlo")
+        return jax_mlir.module_to_bytecode(module)
 
 
 # ============================================================
@@ -51,14 +54,15 @@ class TestParser:
     def test_vhlo_portable_artifact(self):
         """Test parsing VHLO portable artifacts (what JAX sends to PJRT)."""
         import jax
-        import jax.numpy as jnp
         from jaxlib.mlir._mlir_libs._stablehlo import (
             serialize_portable_artifact, get_current_version
         )
 
-        f = jax.jit(lambda x: x + 1.0)
-        lowered = f.lower(jnp.ones(4))
-        module = lowered.compiler_ir(dialect="stablehlo")
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            f = jax.jit(lambda x: x + 1.0)
+            lowered = f.lower(np.ones(4, dtype=np.float32))
+            module = lowered.compiler_ir(dialect="stablehlo")
 
         # Serialize as portable artifact (same format JAX sends to PJRT)
         version = get_current_version()
@@ -97,14 +101,14 @@ class TestParser:
 
     def test_bytecode_to_text(self):
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: x + 1.0, jnp.ones(4))
+        bc = get_bytecode(lambda x: x + 1.0, np.ones(4, dtype=np.float32))
         text = bytecode_to_text(bc)
         assert "stablehlo.add" in text
         assert "stablehlo.constant" in text
 
     def test_parse_add_program(self):
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: x + 1.0, jnp.ones(4))
+        bc = get_bytecode(lambda x: x + 1.0, np.ones(4, dtype=np.float32))
         text = bytecode_to_text(bc)
         args, ops, returns, _private = parse_stablehlo(text)
 
@@ -118,7 +122,7 @@ class TestParser:
 
     def test_parse_matmul_program(self):
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x, w: x @ w, jnp.ones((2, 3)), jnp.ones((3, 4)))
+        bc = get_bytecode(lambda x, w: x @ w, np.ones((2, 3), dtype=np.float32), np.ones((3, 4), dtype=np.float32))
         text = bytecode_to_text(bc)
         args, ops, returns, _private = parse_stablehlo(text)
 
@@ -135,7 +139,7 @@ class TestExecution:
     def test_add_scalar(self):
         """x + 1.0"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: x + 1.0, jnp.ones(4))
+        bc = get_bytecode(lambda x: x + 1.0, np.ones(4, dtype=np.float32))
         x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, x + 1.0)
@@ -143,7 +147,7 @@ class TestExecution:
     def test_multiply_add(self):
         """x * 2 + 3"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: x * 2.0 + 3.0, jnp.ones(4))
+        bc = get_bytecode(lambda x: x * 2.0 + 3.0, np.ones(4, dtype=np.float32))
         x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, x * 2.0 + 3.0)
@@ -151,7 +155,7 @@ class TestExecution:
     def test_subtract(self):
         """x - y"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x, y: x - y, jnp.ones(4), jnp.ones(4))
+        bc = get_bytecode(lambda x, y: x - y, np.ones(4, dtype=np.float32), np.ones(4, dtype=np.float32))
         x = np.array([5.0, 4.0, 3.0, 2.0], dtype=np.float32)
         y = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x, y])
@@ -160,7 +164,7 @@ class TestExecution:
     def test_negate(self):
         """-x"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: -x, jnp.ones(4))
+        bc = get_bytecode(lambda x: -x, np.ones(4, dtype=np.float32))
         x = np.array([1.0, -2.0, 3.0, -4.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, -x)
@@ -168,7 +172,7 @@ class TestExecution:
     def test_exp(self):
         """exp(x)"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: jnp.exp(x), jnp.ones(4))
+        bc = get_bytecode(lambda x: jnp.exp(x), np.ones(4, dtype=np.float32))
         x = np.array([0.0, 1.0, 2.0, -1.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, np.exp(x), rtol=1e-6)
@@ -176,7 +180,7 @@ class TestExecution:
     def test_tanh(self):
         """tanh(x)"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: jnp.tanh(x), jnp.ones(4))
+        bc = get_bytecode(lambda x: jnp.tanh(x), np.ones(4, dtype=np.float32))
         x = np.array([0.0, 1.0, -1.0, 3.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, np.tanh(x), rtol=1e-6)
@@ -184,7 +188,7 @@ class TestExecution:
     def test_matmul(self):
         """x @ w"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x, w: x @ w, jnp.ones((2, 3)), jnp.ones((3, 4)))
+        bc = get_bytecode(lambda x, w: x @ w, np.ones((2, 3), dtype=np.float32), np.ones((3, 4), dtype=np.float32))
         x = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
         w = np.eye(3, 4, dtype=np.float32) * 2
         [result] = execute_stablehlo(bc, [x, w])
@@ -195,7 +199,7 @@ class TestExecution:
         import jax.numpy as jnp
         bc = get_bytecode(
             lambda x, w, b: x @ w + b,
-            jnp.ones((2, 3)), jnp.ones((3, 4)), jnp.ones(4)
+            np.ones((2, 3), dtype=np.float32), np.ones((3, 4), dtype=np.float32), np.ones(4, dtype=np.float32)
         )
         x = np.random.randn(2, 3).astype(np.float32)
         w = np.random.randn(3, 4).astype(np.float32)
@@ -206,7 +210,7 @@ class TestExecution:
     def test_larger_array(self):
         """Larger array round-trip through computation."""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: x * 3.14 + 2.71, jnp.ones((32, 64)))
+        bc = get_bytecode(lambda x: x * 3.14 + 2.71, np.ones((32, 64), dtype=np.float32))
         x = np.random.randn(32, 64).astype(np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, x * 3.14 + 2.71, rtol=1e-5)
@@ -214,7 +218,7 @@ class TestExecution:
     def test_element_multiply(self):
         """x * y element-wise"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x, y: x * y, jnp.ones(4), jnp.ones(4))
+        bc = get_bytecode(lambda x, y: x * y, np.ones(4, dtype=np.float32), np.ones(4, dtype=np.float32))
         x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
         y = np.array([2.0, 3.0, 4.0, 5.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x, y])
@@ -223,7 +227,7 @@ class TestExecution:
     def test_divide(self):
         """x / y"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x, y: x / y, jnp.ones(4), jnp.ones(4))
+        bc = get_bytecode(lambda x, y: x / y, np.ones(4, dtype=np.float32), np.ones(4, dtype=np.float32))
         x = np.array([6.0, 8.0, 9.0, 12.0], dtype=np.float32)
         y = np.array([2.0, 4.0, 3.0, 6.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x, y])
@@ -232,7 +236,7 @@ class TestExecution:
     def test_maximum(self):
         """max(x, 0) (relu)"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: jnp.maximum(x, 0.0), jnp.ones(4))
+        bc = get_bytecode(lambda x: jnp.maximum(x, 0.0), np.ones(4, dtype=np.float32))
         x = np.array([-2.0, -1.0, 0.0, 1.0], dtype=np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, np.maximum(x, 0.0))
@@ -246,7 +250,7 @@ class TestReduce:
     def test_reduce_sum(self):
         """sum(x, axis=-1)"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: jnp.sum(x, axis=-1), jnp.ones((4, 8)))
+        bc = get_bytecode(lambda x: jnp.sum(x, axis=-1), np.ones((4, 8), dtype=np.float32))
         x = np.random.randn(4, 8).astype(np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, np.sum(x, axis=-1), rtol=1e-5)
@@ -254,7 +258,7 @@ class TestReduce:
     def test_reduce_max(self):
         """max(x, axis=-1)"""
         import jax.numpy as jnp
-        bc = get_bytecode(lambda x: jnp.max(x, axis=-1), jnp.ones((4, 8)))
+        bc = get_bytecode(lambda x: jnp.max(x, axis=-1), np.ones((4, 8), dtype=np.float32))
         x = np.random.randn(4, 8).astype(np.float32)
         [result] = execute_stablehlo(bc, [x])
         np.testing.assert_allclose(result, np.max(x, axis=-1))
@@ -264,7 +268,7 @@ class TestReduce:
         import jax.numpy as jnp
         bc = get_bytecode(
             lambda x: jnp.mean(x, axis=-1, keepdims=True),
-            jnp.ones((2, 64)),
+            np.ones((2, 64), dtype=np.float32),
         )
         x = np.random.randn(2, 64).astype(np.float32)
         [result] = execute_stablehlo(bc, [x])
@@ -284,7 +288,7 @@ class TestComposite:
         import jax.numpy as jnp
         bc = get_bytecode(
             lambda x: jax.nn.softmax(x, axis=-1),
-            jnp.ones((2, 64)),
+            np.ones((2, 64), dtype=np.float32),
         )
         x = np.random.randn(2, 64).astype(np.float32)
         [result] = execute_stablehlo(bc, [x])
@@ -303,9 +307,9 @@ class TestComposite:
             return g * (x - mean) / jnp.sqrt(var + 1e-5) + b
         bc = get_bytecode(
             layer_norm,
-            jnp.ones((2, 64)),
-            jnp.ones(64),
-            jnp.zeros(64),
+            np.ones((2, 64), dtype=np.float32),
+            np.ones(64, dtype=np.float32),
+            np.zeros(64, dtype=np.float32),
         )
         x = np.random.randn(2, 64).astype(np.float32)
         g = np.ones(64, dtype=np.float32)
@@ -325,8 +329,8 @@ class TestComposite:
             return g * x / jnp.sqrt(ms + 1e-6)
         bc = get_bytecode(
             rms_norm,
-            jnp.ones((2, 64)),
-            jnp.ones(64),
+            np.ones((2, 64), dtype=np.float32),
+            np.ones(64, dtype=np.float32),
         )
         x = np.random.randn(2, 64).astype(np.float32)
         g = np.ones(64, dtype=np.float32)
@@ -349,11 +353,11 @@ class TestComposite:
         D = 32
         bc = get_bytecode(
             attention,
-            jnp.ones((8, D)),
-            jnp.ones((D, D)),
-            jnp.ones((D, D)),
-            jnp.ones((D, D)),
-            jnp.ones((D, D)),
+            np.ones((8, D), dtype=np.float32),
+            np.ones((D, D), dtype=np.float32),
+            np.ones((D, D), dtype=np.float32),
+            np.ones((D, D), dtype=np.float32),
+            np.ones((D, D), dtype=np.float32),
         )
         np.random.seed(42)
         x = np.random.randn(8, D).astype(np.float32) * 0.1
@@ -387,11 +391,11 @@ class TestFuncCall:
             return h @ w2 + b2
         bc = get_bytecode(
             mlp,
-            jnp.ones((2, 32)),
-            jnp.ones((32, 64)),
-            jnp.ones(64),
-            jnp.ones((64, 32)),
-            jnp.ones(32),
+            np.ones((2, 32), dtype=np.float32),
+            np.ones((32, 64), dtype=np.float32),
+            np.ones(64, dtype=np.float32),
+            np.ones((64, 32), dtype=np.float32),
+            np.ones(32, dtype=np.float32),
         )
         np.random.seed(42)
         x = np.random.randn(2, 32).astype(np.float32) * 0.1
@@ -413,10 +417,10 @@ class TestFuncCall:
             return (gate * up) @ w_down
         bc = get_bytecode(
             silu_mlp,
-            jnp.ones((2, 32)),
-            jnp.ones((32, 64)),
-            jnp.ones((32, 64)),
-            jnp.ones((64, 32)),
+            np.ones((2, 32), dtype=np.float32),
+            np.ones((32, 64), dtype=np.float32),
+            np.ones((32, 64), dtype=np.float32),
+            np.ones((64, 32), dtype=np.float32),
         )
         np.random.seed(42)
         x = np.random.randn(2, 32).astype(np.float32) * 0.1

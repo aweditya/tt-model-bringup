@@ -123,3 +123,139 @@ class TestMatmul:
             jax.device_put(w, tt_device),
         ))
         np.testing.assert_allclose(result, x @ w, rtol=1e-4)
+
+
+class TestReduce:
+    def test_sum(self, tt_device):
+        """sum(x, axis=-1) through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+        f = jax.jit(lambda x: jnp.sum(x, axis=-1))
+        x = np.random.randn(4, 8).astype(np.float32)
+        result = jax.device_get(f(jax.device_put(x, tt_device)))
+        np.testing.assert_allclose(result, np.sum(x, axis=-1), rtol=1e-5)
+
+    def test_max(self, tt_device):
+        """max(x, axis=-1) through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+        f = jax.jit(lambda x: jnp.max(x, axis=-1))
+        x = np.random.randn(4, 8).astype(np.float32)
+        result = jax.device_get(f(jax.device_put(x, tt_device)))
+        np.testing.assert_allclose(result, np.max(x, axis=-1))
+
+
+class TestComposite:
+    def test_softmax(self, tt_device):
+        """jax.nn.softmax through full PJRT pipeline"""
+        import jax
+        f = jax.jit(lambda x: jax.nn.softmax(x, axis=-1))
+        x = np.random.randn(2, 64).astype(np.float32)
+        result = jax.device_get(f(jax.device_put(x, tt_device)))
+        ref = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        ref = ref / np.sum(ref, axis=-1, keepdims=True)
+        np.testing.assert_allclose(result, ref, rtol=1e-5)
+
+    def test_layer_norm(self, tt_device):
+        """Manual layer norm through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def layer_norm(x, g, b):
+            mean = jnp.mean(x, axis=-1, keepdims=True)
+            var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+            return g * (x - mean) / jnp.sqrt(var + 1e-5) + b
+
+        x = np.random.randn(2, 64).astype(np.float32)
+        g = np.ones(64, dtype=np.float32)
+        b = np.zeros(64, dtype=np.float32)
+        result = jax.device_get(layer_norm(
+            jax.device_put(x, tt_device),
+            jax.device_put(g, tt_device),
+            jax.device_put(b, tt_device),
+        ))
+        mean = np.mean(x, axis=-1, keepdims=True)
+        var = np.mean((x - mean) ** 2, axis=-1, keepdims=True)
+        ref = g * (x - mean) / np.sqrt(var + 1e-5) + b
+        np.testing.assert_allclose(result, ref, rtol=1e-5)
+
+    def test_rms_norm(self, tt_device):
+        """RMS norm through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def rms_norm(x, g):
+            ms = jnp.mean(x ** 2, axis=-1, keepdims=True)
+            return g * x / jnp.sqrt(ms + 1e-6)
+
+        x = np.random.randn(2, 64).astype(np.float32)
+        g = np.ones(64, dtype=np.float32)
+        result = jax.device_get(rms_norm(
+            jax.device_put(x, tt_device),
+            jax.device_put(g, tt_device),
+        ))
+        ms = np.mean(x ** 2, axis=-1, keepdims=True)
+        ref = g * x / np.sqrt(ms + 1e-6)
+        np.testing.assert_allclose(result, ref, rtol=1e-5)
+
+    def test_mlp_with_relu(self, tt_device):
+        """MLP with relu through full PJRT pipeline"""
+        import jax
+
+        @jax.jit
+        def mlp(x, w1, b1, w2, b2):
+            h = jax.nn.relu(x @ w1 + b1)
+            return h @ w2 + b2
+
+        np.random.seed(42)
+        x = np.random.randn(2, 32).astype(np.float32) * 0.1
+        w1 = np.random.randn(32, 64).astype(np.float32) * 0.1
+        b1 = np.zeros(64, dtype=np.float32)
+        w2 = np.random.randn(64, 32).astype(np.float32) * 0.1
+        b2 = np.zeros(32, dtype=np.float32)
+        result = jax.device_get(mlp(
+            jax.device_put(x, tt_device),
+            jax.device_put(w1, tt_device),
+            jax.device_put(b1, tt_device),
+            jax.device_put(w2, tt_device),
+            jax.device_put(b2, tt_device),
+        ))
+        ref = np.maximum(x @ w1 + b1, 0) @ w2 + b2
+        np.testing.assert_allclose(result, ref, rtol=1e-4, atol=1e-5)
+
+    def test_attention(self, tt_device):
+        """Single-head self-attention through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def attention(x, wq, wk, wv, wo):
+            q = x @ wq
+            k = x @ wk
+            v = x @ wv
+            d = jnp.float32(q.shape[-1])
+            scores = jax.nn.softmax(q @ k.T / jnp.sqrt(d), axis=-1)
+            return (scores @ v) @ wo
+
+        D = 32
+        np.random.seed(42)
+        x = np.random.randn(8, D).astype(np.float32) * 0.1
+        wq = np.random.randn(D, D).astype(np.float32) * 0.1
+        wk = np.random.randn(D, D).astype(np.float32) * 0.1
+        wv = np.random.randn(D, D).astype(np.float32) * 0.1
+        wo = np.random.randn(D, D).astype(np.float32) * 0.1
+        result = jax.device_get(attention(
+            jax.device_put(x, tt_device),
+            jax.device_put(wq, tt_device),
+            jax.device_put(wk, tt_device),
+            jax.device_put(wv, tt_device),
+            jax.device_put(wo, tt_device),
+        ))
+        q = x @ wq; k = x @ wk; v = x @ wv
+        scores = q @ k.T / np.sqrt(D)
+        scores_exp = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
+        attn = scores_exp / np.sum(scores_exp, axis=-1, keepdims=True)
+        ref = (attn @ v) @ wo
+        np.testing.assert_allclose(result, ref, rtol=1e-4, atol=1e-5)
