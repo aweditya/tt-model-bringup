@@ -306,6 +306,73 @@ class TestConcatenate:
         np.testing.assert_allclose(result, np.concatenate([x, y], axis=-1))
 
 
+class TestScatterGather:
+    def test_kv_cache_update(self, tt_device):
+        """scatter (KV cache .at[].set()) through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def kv_update(cache, new_kv):
+            return cache.at[:, :, 5:6, :].set(new_kv)
+
+        cache = np.zeros((1, 4, 32, 16), dtype=np.float32)
+        new_kv = np.ones((1, 4, 1, 16), dtype=np.float32) * 42.0
+        result = jax.device_get(kv_update(
+            jax.device_put(cache, tt_device),
+            jax.device_put(new_kv, tt_device),
+        ))
+        expected = cache.copy()
+        expected[:, :, 5:6, :] = new_kv
+        np.testing.assert_allclose(result, expected)
+
+    def test_embedding_lookup(self, tt_device):
+        """gather (table[ids]) through full PJRT pipeline"""
+        import jax
+
+        @jax.jit
+        def embed(table, ids):
+            return table[ids]
+
+        table = np.random.randn(100, 64).astype(np.float32)
+        ids = np.array([0, 5, 99], dtype=np.int32)
+        result = jax.device_get(embed(
+            jax.device_put(table, tt_device),
+            jax.device_put(ids, tt_device),
+        ))
+        np.testing.assert_allclose(result, table[ids])
+
+
+class TestArgmax:
+    def test_argmax(self, tt_device):
+        """argmax (greedy decoding) through full PJRT pipeline"""
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def greedy(logits):
+            return jnp.argmax(logits, axis=-1)
+
+        x = np.random.randn(1, 100).astype(np.float32)
+        result = jax.device_get(greedy(jax.device_put(x, tt_device)))
+        np.testing.assert_array_equal(result, np.argmax(x, axis=-1))
+
+
+class TestMultiOutput:
+    def test_two_outputs(self, tt_device):
+        """Function returning two values through full PJRT pipeline"""
+        import jax
+
+        @jax.jit
+        def two_out(x):
+            return x + 1.0, x * 2.0
+
+        x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        a, b = jax.device_get(two_out(jax.device_put(x, tt_device)))
+        np.testing.assert_allclose(a, x + 1.0)
+        np.testing.assert_allclose(b, x * 2.0)
+
+
 class TestMHA:
     def test_multi_head_attention(self, tt_device):
         """Multi-head attention with reshape/transpose through PJRT"""

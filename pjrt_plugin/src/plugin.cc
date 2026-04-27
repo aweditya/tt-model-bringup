@@ -505,12 +505,41 @@ static PJRT_Error* ClientCompile(PJRT_Client_Compile_Args* args) {
   auto* exec = new PJRT_LoadedExecutable;
   exec->client = args->client;
   exec->executable.name = "tt_executable";
-  exec->executable.num_outputs = 1;  // TODO: parse from StableHLO
   exec->deleted = false;
 
   // Store the program code for later interpretation
   exec->executable.code.assign(program->code, program->code_size);
   exec->executable.format = format;
+
+  // Parse num_outputs from StableHLO via Python engine
+  {
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PyObject* engine_mod = PyImport_ImportModule("jax_plugins.tt.engine");
+    if (engine_mod) {
+      PyObject* count_fn = PyObject_GetAttrString(engine_mod, "count_outputs");
+      if (count_fn) {
+        PyObject* bc_bytes = PyBytes_FromStringAndSize(
+            program->code, program->code_size);
+        PyObject* result = PyObject_CallFunction(count_fn, "O", bc_bytes);
+        if (result && PyLong_Check(result)) {
+          exec->executable.num_outputs = (int)PyLong_AsLong(result);
+          fprintf(stderr, "[TT-PJRT] Compile: num_outputs=%zu\n",
+                  exec->executable.num_outputs);
+        } else {
+          PyErr_Print();
+          exec->executable.num_outputs = 1;  // Fallback
+        }
+        Py_XDECREF(result);
+        Py_DECREF(bc_bytes);
+        Py_DECREF(count_fn);
+      }
+      Py_DECREF(engine_mod);
+    } else {
+      PyErr_Print();
+      exec->executable.num_outputs = 1;  // Fallback
+    }
+    PyGILState_Release(gstate);
+  }
 
   // Wire up addressable devices
   exec->addressable_device_ptrs.push_back(&args->client->device);

@@ -717,6 +717,16 @@ def dtype_from_str(s: str):
     return mapping.get(s, np.float32)
 
 
+def count_outputs(bytecode: bytes) -> int:
+    """Count the number of outputs from a StableHLO program.
+
+    Called from C++ during PJRT_Client_Compile to set num_outputs correctly.
+    """
+    text = bytecode_to_text(bytecode)
+    _, _, returns, _ = parse_stablehlo(text)
+    return len(returns)
+
+
 def execute_stablehlo(bytecode: bytes, inputs: list) -> list:
     """Execute a StableHLO program on numpy array inputs.
 
