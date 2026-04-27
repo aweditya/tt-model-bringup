@@ -323,14 +323,43 @@ Two complex ops that use body regions or generic MLIR syntax:
 
 4. **argmax** — Greedy decoding uses a complex reduce with body region (not `applies` shorthand). Has 2 inputs, 2 init values, and a multi-op body (compare + select + and + or). This is significantly more complex than our current reduce parser.
 
-### Priorities
+### Priorities (now resolved)
 
-For a minimal end-to-end demo (prompt → tokens):
-1. scatter + gather (to run the decode loop)
-2. Multi-output support
-3. argmax (or sample from logits on host)
+All items completed:
+1. ~~scatter + gather~~ — Done. Multi-line parser fix (move accumulator before ^bb0 detection).
+2. ~~Multi-output support~~ — Done. Python engine handles arbitrary output counts.
+3. ~~argmax~~ — Done. Multi-output reduce with reducer body → np.argmax.
 
-Alternative: avoid scatter/gather entirely by structuring the JAX code differently:
-- Use `jax.lax.dynamic_update_slice` instead of `.at[].set()` for KV cache
-- Use one-hot matmul instead of gather for embedding
-- Do argmax on host after transferring logits
+---
+
+## 2026-04-26: Phase 4 complete — all transformer decode ops working
+
+### Scatter multi-line parser fix
+
+The original parser used function attributes (`parse_stablehlo._pending`) to track multi-line accumulation. The inner `^bb0(%arg2, %arg3):` from scatter's body region was processed before the accumulator, overwriting `current_func` with wrong args. Fix: move accumulator check to be the FIRST thing in the loop, before `^bb0` detection. Also switched to local variable instead of function attributes.
+
+### Brace counting upgrade
+
+The accumulator originally tracked `({` and `})` for scatter's body regions. Multi-output reduce uses plain `{`/`}` without parentheses. Upgraded to count all `{`/`}` characters. Added `seen_open` flag to prevent premature termination when the body starts on the next line (reduce's first line has zero braces, body `{` is on line 2).
+
+### Multi-output reduce (argmax)
+
+JAX compiles `jnp.argmax` as a dual reduce: `%1:2 = stablehlo.reduce(values init: -inf), (indices init: 0)`. The `:2` suffix means 2 outputs. References use `%1#0` (max value) and `%1#1` (argmax index). Rather than implementing a general reducer body interpreter, we pattern-match this as argmax and use `np.argmax`.
+
+Parser changes: (1) SSA regex handles `%name:N`, (2) return parser handles `%name#N`, (3) multi-output results stored as `name#0`, `name#1` in value dict.
+
+### Full decode step validated
+
+The test_decode_step test runs the complete transformer decode loop through the engine:
+RMS norm → QKV projection → split heads → KV cache scatter update → slice active KV → batched dot_general attention → softmax → output projection → residual → MLP → residual.
+Returns 3 outputs (hidden, new_k_cache, new_v_cache). All verified against JAX CPU reference.
+
+### Current state: 44/44 engine tests pass
+
+All 22 unique StableHLO ops needed for transformer inference are implemented.
+
+### Remaining for end-to-end PJRT demo
+
+1. **Multi-output C++ support** — `plugin.cc` has `num_outputs` hardcoded to 1. Need to return multiple buffers from PJRT_LoadedExecutable_Execute.
+2. **Rebuild .so** on remote — scatter/gather/argmax only work in engine tests. Need to rebuild C++ plugin and verify through full PJRT pipeline (jax.jit → C++ → Python engine → result).
+3. **Phase 5: ttnn** — Replace numpy ops with ttnn calls. trace_capture for compilation.
