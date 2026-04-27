@@ -555,6 +555,34 @@ class TestBooleanOps:
 
 
 # ============================================================
+# Tests: Argmax (greedy decoding)
+# ============================================================
+
+class TestArgmax:
+    def test_argmax_1d(self):
+        """jnp.argmax(x)"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: jnp.argmax(x, axis=-1),
+            np.ones((1, 1000), dtype=np.float32),
+        )
+        x = np.random.randn(1, 1000).astype(np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_array_equal(result, np.argmax(x, axis=-1))
+
+    def test_argmax_batch(self):
+        """jnp.argmax over batched logits"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: jnp.argmax(x, axis=-1),
+            np.ones((4, 100), dtype=np.float32),
+        )
+        x = np.random.randn(4, 100).astype(np.float32)
+        [result] = execute_stablehlo(bc, [x])
+        np.testing.assert_array_equal(result, np.argmax(x, axis=-1))
+
+
+# ============================================================
 # Tests: Scatter + Gather (KV cache update + embedding lookup)
 # ============================================================
 
@@ -588,3 +616,109 @@ class TestGather:
         ids = np.array([0, 5, 99], dtype=np.int32)
         [result] = execute_stablehlo(bc, [table, ids])
         np.testing.assert_allclose(result, table[ids])
+
+
+# ============================================================
+# Tests: Multi-output + full decode step
+# ============================================================
+
+class TestMultiOutput:
+    def test_two_outputs(self):
+        """Function returning two values"""
+        import jax.numpy as jnp
+        bc = get_bytecode(
+            lambda x: (x + 1.0, x * 2.0),
+            np.ones(4, dtype=np.float32),
+        )
+        x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        results = execute_stablehlo(bc, [x])
+        assert len(results) == 2
+        np.testing.assert_allclose(results[0], x + 1.0)
+        np.testing.assert_allclose(results[1], x * 2.0)
+
+    def test_decode_step(self):
+        """Full decode step: RMS norm + MHA + KV cache + MLP + residuals.
+
+        Returns (hidden, new_k_cache, new_v_cache) — 3 outputs.
+        This is the core loop body for transformer inference.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        D, NH, DH = 64, 4, 16  # dim, n_heads, d_head
+        SEQ = 32
+        POS = 5
+
+        def decode_step(x, wq, wk, wv, wo, w_up, w_down, k_cache, v_cache):
+            # RMS norm
+            ms = jnp.mean(x ** 2, axis=-1, keepdims=True)
+            x_norm = x / jnp.sqrt(ms + 1e-6)
+            # QKV projections + split heads
+            q = jnp.reshape(x_norm @ wq, (1, 1, NH, DH)).transpose(0, 2, 1, 3)
+            k = jnp.reshape(x_norm @ wk, (1, 1, NH, DH)).transpose(0, 2, 1, 3)
+            v = jnp.reshape(x_norm @ wv, (1, 1, NH, DH)).transpose(0, 2, 1, 3)
+            # KV cache update
+            new_k = k_cache.at[:, :, POS:POS+1, :].set(k)
+            new_v = v_cache.at[:, :, POS:POS+1, :].set(v)
+            # Slice active KV
+            k_active = new_k[:, :, :POS+1, :]
+            v_active = new_v[:, :, :POS+1, :]
+            # Attention
+            scores = (q @ k_active.transpose(0, 1, 3, 2)) / jnp.sqrt(float(DH))
+            attn = jax.nn.softmax(scores, axis=-1)
+            out = (attn @ v_active).transpose(0, 2, 1, 3).reshape(1, D)
+            out = out @ wo
+            h = x + out  # residual
+            # MLP (RMS norm + up + relu + down + residual)
+            ms2 = jnp.mean(h ** 2, axis=-1, keepdims=True)
+            h_norm = h / jnp.sqrt(ms2 + 1e-6)
+            mlp = jax.nn.relu(h_norm @ w_up) @ w_down
+            return h + mlp, new_k, new_v
+
+        bc = get_bytecode(
+            decode_step,
+            np.ones((1, D), dtype=np.float32),           # x
+            np.ones((D, D), dtype=np.float32),            # wq
+            np.ones((D, D), dtype=np.float32),            # wk
+            np.ones((D, D), dtype=np.float32),            # wv
+            np.ones((D, D), dtype=np.float32),            # wo
+            np.ones((D, D * 2), dtype=np.float32),        # w_up
+            np.ones((D * 2, D), dtype=np.float32),        # w_down
+            np.ones((1, NH, SEQ, DH), dtype=np.float32),  # k_cache
+            np.ones((1, NH, SEQ, DH), dtype=np.float32),  # v_cache
+        )
+
+        np.random.seed(42)
+        x = np.random.randn(1, D).astype(np.float32) * 0.1
+        wq = np.random.randn(D, D).astype(np.float32) * 0.05
+        wk = np.random.randn(D, D).astype(np.float32) * 0.05
+        wv = np.random.randn(D, D).astype(np.float32) * 0.05
+        wo = np.random.randn(D, D).astype(np.float32) * 0.05
+        w_up = np.random.randn(D, D * 2).astype(np.float32) * 0.05
+        w_down = np.random.randn(D * 2, D).astype(np.float32) * 0.05
+        k_cache = np.random.randn(1, NH, SEQ, DH).astype(np.float32) * 0.01
+        v_cache = np.random.randn(1, NH, SEQ, DH).astype(np.float32) * 0.01
+
+        results = execute_stablehlo(bc, [x, wq, wk, wv, wo, w_up, w_down, k_cache, v_cache])
+        assert len(results) == 3, f"Expected 3 outputs, got {len(results)}"
+        hidden, new_k, new_v = results
+        assert hidden.shape == (1, D)
+        assert new_k.shape == (1, NH, SEQ, DH)
+        assert new_v.shape == (1, NH, SEQ, DH)
+
+        # Verify KV cache was updated at position 5
+        # new_k[:, :, 5, :] should differ from k_cache[:, :, 5, :]
+        assert not np.allclose(new_k[:, :, POS, :], k_cache[:, :, POS, :])
+
+        # Verify reference — compare against JAX CPU
+        import jax
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            ref = jax.jit(decode_step)(
+                jnp.array(x), jnp.array(wq), jnp.array(wk), jnp.array(wv),
+                jnp.array(wo), jnp.array(w_up), jnp.array(w_down),
+                jnp.array(k_cache), jnp.array(v_cache),
+            )
+        np.testing.assert_allclose(hidden, np.array(ref[0]), rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(new_k, np.array(ref[1]), rtol=1e-5)
+        np.testing.assert_allclose(new_v, np.array(ref[2]), rtol=1e-5)

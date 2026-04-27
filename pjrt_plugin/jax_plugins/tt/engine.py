@@ -64,16 +64,18 @@ def parse_stablehlo(text: str):
         line = line.strip()
 
         # Multi-line op accumulation MUST be checked first — absorbs inner
-        # ^bb0 lines from body regions (e.g. scatter) before they can be
-        # mistaken for new function entry blocks.
+        # ^bb0 lines from body regions (e.g. scatter, reduce with reducer)
+        # before they can be mistaken for new function entry blocks.
         if pending is not None:
             pending['lines'].append(line)
-            # Count body region nesting: ({ opens, }) closes
-            if '({' in line:
-                pending['depth'] += line.count('({')
-            if '})' in line:
-                pending['depth'] -= line.count('})')
-            if pending['depth'] <= 0:
+            # Track brace nesting for both ({ }) and plain { }
+            for ch in line:
+                if ch == '{':
+                    pending['depth'] += 1
+                    pending['seen_open'] = True
+                elif ch == '}':
+                    pending['depth'] -= 1
+            if pending['seen_open'] and pending['depth'] <= 0:
                 # End of multi-line op — join and parse
                 full_text = ' '.join(pending['lines'])
                 op_desc = parse_op(pending['name'], full_text)
@@ -105,26 +107,35 @@ def parse_stablehlo(text: str):
 
         # Detect return — ends the current function
         if 'func.return' in line or (line.startswith('return ') and '%' in line):
-            m = re.findall(r'%[a-zA-Z0-9_]+', line.split(':')[0])
-            current_func['returns'] = [v.lstrip('%') for v in m]
+            # Match %name and %name#N (multi-output element access)
+            m = re.findall(r'%([a-zA-Z0-9_]+(?:#\d+)?)', line.split(':')[0])
+            current_func['returns'] = m
             all_functions.append(current_func)
             current_func = None
             continue
 
-        # Parse SSA assignment: %name = op operands attrs : type
-        m = re.match(r'(%[a-zA-Z0-9_]+)\s*=\s*(.+)', line)
+        # Parse SSA assignment: %name = op  (also handles %name:N for multi-output)
+        m = re.match(r'(%[a-zA-Z0-9_]+(?::\d+)?)\s*=\s*(.+)', line)
         if not m:
             continue
 
         result_name = m.group(1).lstrip('%')
         rest = m.group(2)
 
-        # Check for multi-line op with body region (scatter, etc.)
-        if rest.startswith('"stablehlo.') and '({' in rest:
-            depth = rest.count('({') - rest.count('})')
-            if depth > 0:
+        # Check for multi-line op with body region (scatter, reduce with reducer)
+        # Scatter uses "stablehlo.scatter"(...) ({ ... })
+        # Multi-output reduce uses stablehlo.reduce(...) ... reducer(...) { ... }
+        has_body = '({' in rest
+        is_multi_reduce = rest.startswith('stablehlo.reduce') and ':' in result_name
+        if has_body or is_multi_reduce:
+            depth = sum(1 for c in rest if c == '{') - sum(1 for c in rest if c == '}')
+            if depth > 0 or is_multi_reduce:
                 pending = {
                     'name': result_name, 'lines': [rest], 'depth': depth,
+                    # Multi-output reduce body starts on next line — track if
+                    # we've seen any { yet so we don't terminate at depth=0
+                    # before the body opens.
+                    'seen_open': depth > 0,
                 }
                 continue
 
@@ -361,11 +372,19 @@ def parse_transpose(name: str, text: str) -> dict:
 
 
 def parse_reduce(name: str, text: str) -> dict:
-    """Parse stablehlo.reduce with `applies` shorthand.
+    """Parse stablehlo.reduce — both simple (applies) and complex (reducer body).
 
-    Format: stablehlo.reduce(%x init: %cst) applies stablehlo.add
-            across dimensions = [1] : (...) -> tensor<2xf32>
+    Simple format: stablehlo.reduce(%x init: %cst) applies stablehlo.add
+                   across dimensions = [1] : (...) -> tensor<2xf32>
+
+    Argmax format: stablehlo.reduce(%x init: %cst), (%idx init: %c)
+                   across dimensions = [1] : (...) -> (tensor<f32>, tensor<i32>)
+                   reducer(...) { ...compare/select body... }
     """
+    # Check for multi-output argmax pattern (has 'reducer' body, not 'applies')
+    if 'reducer' in text and ':' in name:
+        return parse_reduce_argmax(name, text)
+
     # Extract input operand: first %name after reduce(
     input_m = re.search(r'reduce\((%[a-zA-Z0-9_]+)', text)
     input_operand = input_m.group(1).lstrip('%') if input_m else None
@@ -393,6 +412,45 @@ def parse_reduce(name: str, text: str) -> dict:
         'reduce_fn': reduce_fn,
         'dimensions': dims,
         'result_type': result_type,
+    }
+
+
+def parse_reduce_argmax(name: str, text: str) -> dict:
+    """Parse multi-output reduce used by jnp.argmax.
+
+    JAX compiles argmax as a dual reduce: track both max value and its index.
+    Format: stablehlo.reduce(%values init: %neg_inf), (%indices init: %zero)
+            across dimensions = [N] : (...) -> (tensor<...xf32>, tensor<...xi32>)
+            reducer(...) { compare+select body }
+
+    We recognize this pattern and map it to np.argmax.
+    """
+    # Extract input: first (operand init: value) pair
+    input_m = re.search(r'reduce\((%[a-zA-Z0-9_]+)', text)
+    input_operand = input_m.group(1).lstrip('%') if input_m else None
+
+    # Extract dimensions
+    dims_m = re.search(r'dimensions\s*=\s*\[([^\]]*)\]', text)
+    dims = []
+    if dims_m and dims_m.group(1).strip():
+        dims = [int(d.strip()) for d in dims_m.group(1).split(',')]
+
+    # Extract result types from -> (type1, type2)
+    arrow_m = re.search(r'->\s*\(([^)]+)\)', text)
+    result_types = []
+    if arrow_m:
+        result_types = [t.strip() for t in arrow_m.group(1).split(',')]
+
+    # Strip the :N from name (e.g., "1:2" -> "1")
+    base_name = name.split(':')[0]
+
+    return {
+        'name': base_name,
+        'op': 'reduce_argmax',
+        'operands': [input_operand] if input_operand else [],
+        'dimensions': dims,
+        'result_types': result_types,
+        'num_outputs': int(name.split(':')[1]) if ':' in name else 2,
     }
 
 
@@ -687,7 +745,11 @@ def execute_stablehlo(bytecode: bytes, inputs: list) -> list:
     # Execute ops
     for op in ops:
         result = execute_op(op, values)
-        values[op['name']] = result
+        if isinstance(result, dict):
+            # Multi-output op (e.g., reduce_argmax): store as name#0, name#1, ...
+            values.update(result)
+        else:
+            values[op['name']] = result
 
     # Gather return values
     return [values[r] for r in returns]
@@ -776,6 +838,9 @@ def execute_op(op: dict, values: dict) -> np.ndarray:
 
     if op_type == 'reduce':
         return execute_reduce(op, values)
+
+    if op_type == 'reduce_argmax':
+        return execute_reduce_argmax(op, values)
 
     if op_type == 'slice':
         return execute_slice(op, values)
@@ -973,6 +1038,34 @@ def execute_reduce(op: dict, values: dict) -> np.ndarray:
         raise ValueError(f"Unsupported reduce function: stablehlo.{reduce_fn}")
 
 
+def execute_reduce_argmax(op: dict, values: dict) -> dict:
+    """Execute multi-output reduce for argmax pattern.
+
+    JAX compiles argmax as a dual reduce returning (max_value, argmax_index).
+    Returns a dict mapping name#0 -> max values, name#1 -> argmax indices.
+    """
+    a = get_operands(op, values, 1)[0]
+    dims = op['dimensions']
+    base_name = op['name']
+    axis = tuple(dims)
+
+    max_vals = np.max(a, axis=axis)
+    argmax_idx = np.argmax(a, axis=axis[0] if len(axis) == 1 else axis)
+
+    # Parse result dtypes
+    result_types = op.get('result_types', [])
+    if len(result_types) >= 2:
+        _, max_dtype = parse_tensor_type(result_types[0])
+        _, idx_dtype = parse_tensor_type(result_types[1])
+        max_vals = max_vals.astype(max_dtype)
+        argmax_idx = argmax_idx.astype(idx_dtype)
+
+    return {
+        f'{base_name}#0': max_vals,
+        f'{base_name}#1': argmax_idx,
+    }
+
+
 def execute_slice(op: dict, values: dict) -> np.ndarray:
     """Execute stablehlo.slice with static start/limit/strides."""
     a = get_operands(op, values, 1)[0]
@@ -1127,7 +1220,10 @@ def execute_func_call(op: dict, values: dict) -> np.ndarray:
     # Execute function body
     for func_op in func_ops:
         result = execute_op(func_op, local_values)
-        local_values[func_op['name']] = result
+        if isinstance(result, dict):
+            local_values.update(result)
+        else:
+            local_values[func_op['name']] = result
 
     # Return the function's return value(s)
     if len(func_returns) == 1:
