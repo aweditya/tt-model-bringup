@@ -1,14 +1,77 @@
 """StableHLO interpreter engine for TT PJRT plugin.
 
-Parses MLIR bytecode from JAX and executes StableHLO ops on numpy arrays.
-This is the "Python engine" in our "thin C++ shell + Python engine" design.
+Parses MLIR bytecode from JAX and executes StableHLO ops.
+Dual-mode: numpy (CPU) by default, ttnn (Blackhole device) when
+TT_PJRT_USE_DEVICE=1 is set.
 
+This is the "Python engine" in our "thin C++ shell + Python engine" design.
 Called from C++ via CPython API during PJRT_LoadedExecutable_Execute.
 """
 
+import atexit
 import numpy as np
+import os
 import re
+import struct
 import sys
+
+# ============================================================
+# Device mode: ttnn on Blackhole when TT_PJRT_USE_DEVICE=1
+# ============================================================
+
+_USE_DEVICE = os.environ.get('TT_PJRT_USE_DEVICE', '0') == '1'
+_device = None
+
+if _USE_DEVICE:
+    try:
+        import ttnn
+        import torch
+    except ImportError:
+        _USE_DEVICE = False
+
+def _get_device():
+    """Lazily open Blackhole device 0 on first use."""
+    global _device
+    if _device is None:
+        _device = ttnn.open_device(device_id=0)
+        atexit.register(lambda: ttnn.close_device(_device))
+    return _device
+
+
+def _to_device(arr):
+    """Convert numpy array to ttnn tensor on device (bf16, TILE_LAYOUT)."""
+    if isinstance(arr, (int, float, np.integer, np.floating)):
+        arr = np.array([[float(arr)]], dtype=np.float32)
+    if not isinstance(arr, np.ndarray):
+        arr = np.array(arr, dtype=np.float32)
+    t = torch.from_numpy(arr.copy()).float()
+    while t.dim() < 2:
+        t = t.unsqueeze(0)
+    return ttnn.from_torch(t, dtype=ttnn.bfloat16, device=_get_device(),
+                           layout=ttnn.TILE_LAYOUT)
+
+
+def _from_device(tensor, shape):
+    """Convert ttnn tensor back to numpy array with correct shape."""
+    t = ttnn.to_torch(tensor).float()
+    if len(shape) == 0:
+        return t.numpy().flatten()[0]
+    try:
+        return t.reshape(shape).numpy()
+    except RuntimeError:
+        pass
+    try:
+        return t.squeeze().numpy().reshape(shape)
+    except (RuntimeError, ValueError):
+        pass
+    # Handle tile padding: flatten and take first N elements
+    t_np = t.numpy()
+    target_size = 1
+    for d in shape:
+        target_size *= d
+    if t_np.size >= target_size:
+        return t_np.flatten()[:target_size].reshape(shape).copy()
+    raise ValueError(f"Cannot reshape tensor of size {t_np.size} to {shape}")
 
 
 def bytecode_to_text(bytecode: bytes) -> str:
@@ -747,10 +810,15 @@ def execute_stablehlo(bytecode: bytes, inputs: list) -> list:
     _private_functions = private_fns
     _call_counter = 0
 
-    # Build value map: SSA name → numpy array
+    # Build value map: SSA name → value (numpy array or ttnn tensor)
     values = {}
+    arg_shapes = {}  # Track original shapes for device→host conversion
     for i, (arg_name, type_str) in enumerate(func_args):
-        values[arg_name] = inputs[i]
+        arg_shapes[arg_name] = inputs[i].shape if hasattr(inputs[i], 'shape') else ()
+        if _USE_DEVICE:
+            values[arg_name] = _to_device(inputs[i])
+        else:
+            values[arg_name] = inputs[i]
 
     # Execute ops
     for op in ops:
@@ -761,12 +829,56 @@ def execute_stablehlo(bytecode: bytes, inputs: list) -> list:
         else:
             values[op['name']] = result
 
-    # Gather return values
-    return [values[r] for r in returns]
+    # Gather return values, converting back to numpy if on device
+    results = []
+    for r in returns:
+        val = values[r]
+        if _USE_DEVICE and not isinstance(val, np.ndarray):
+            # Find the expected shape from the op's result_type
+            shape = _infer_result_shape(r, ops, func_args, returns)
+            val = _from_device(val, shape)
+        results.append(val)
+    return results
 
 
-def execute_op(op: dict, values: dict) -> np.ndarray:
-    """Execute a single StableHLO op."""
+def _infer_result_shape(name, ops, func_args, returns):
+    """Infer the numpy shape for a return value from its op's result_type."""
+    # Check if it's a function argument
+    for arg_name, type_str in func_args:
+        if arg_name == name:
+            shape, _ = parse_tensor_type(type_str)
+            return shape
+
+    # Check ops for this name (handles multi-output name#N too)
+    base_name = name.split('#')[0] if '#' in name else name
+    for op in ops:
+        if op['name'] == name or op['name'] == base_name:
+            rt = op.get('result_type', '')
+            if rt:
+                shape, _ = parse_tensor_type(rt)
+                return shape
+            # Multi-output: check result_types list
+            if '#' in name:
+                idx = int(name.split('#')[1])
+                rts = op.get('result_types', [])
+                if idx < len(rts):
+                    shape, _ = parse_tensor_type(rts[idx])
+                    return shape
+    return ()
+
+
+def execute_op(op: dict, values: dict):
+    """Execute a single StableHLO op.
+
+    Dispatches to ttnn (device) or numpy (CPU) depending on _USE_DEVICE.
+    """
+    if _USE_DEVICE:
+        return _execute_op_device(op, values)
+    return _execute_op_numpy(op, values)
+
+
+def _execute_op_numpy(op: dict, values: dict) -> np.ndarray:
+    """Execute a single StableHLO op on numpy (CPU path)."""
     op_type = op['op']
 
     if op_type == 'constant':
@@ -888,6 +1000,409 @@ def execute_op(op: dict, values: dict) -> np.ndarray:
     raise ValueError(f"Unsupported op: {op_type} (text: {op.get('text', '')})")
 
 
+# ============================================================
+# Device execution path (ttnn on Blackhole)
+# ============================================================
+
+def _device_to_numpy(tensor, op):
+    """Helper: convert ttnn tensor to numpy for CPU-roundtrip ops."""
+    rt = op.get('result_type', '')
+    if rt:
+        shape, _ = parse_tensor_type(rt)
+    else:
+        shape = ()
+    return _from_device(tensor, shape)
+
+
+def _operand_to_numpy(val, shape=None):
+    """Convert a ttnn tensor or numpy value to numpy for CPU fallback."""
+    if isinstance(val, np.ndarray):
+        return val
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return np.array(val)
+    # ttnn tensor — need shape hint
+    if shape is not None:
+        return _from_device(val, shape)
+    # No shape hint: try scalar, then flat
+    t = ttnn.to_torch(val).float()
+    return t.numpy()
+
+
+def _execute_op_device(op: dict, values: dict):
+    """Execute a single StableHLO op on ttnn device."""
+    op_type = op['op']
+
+    # --- Constants: generate on CPU, send to device ---
+    if op_type == 'constant':
+        np_val = execute_constant(op)
+        return _to_device(np_val)
+
+    # --- Tier 1: Elementwise (direct ttnn equivalents) ---
+    if op_type == 'add':
+        a, b = get_operands(op, values, 2)
+        return ttnn.add(a, b)
+
+    if op_type == 'subtract':
+        a, b = get_operands(op, values, 2)
+        return ttnn.sub(a, b)
+
+    if op_type == 'multiply':
+        a, b = get_operands(op, values, 2)
+        return ttnn.mul(a, b)
+
+    if op_type == 'divide':
+        a, b = get_operands(op, values, 2)
+        return ttnn.mul(a, ttnn.reciprocal(b))
+
+    if op_type == 'maximum':
+        a, b = get_operands(op, values, 2)
+        return ttnn.maximum(a, b)
+
+    if op_type == 'minimum':
+        a, b = get_operands(op, values, 2)
+        return ttnn.minimum(a, b)
+
+    if op_type == 'negate':
+        a = get_operands(op, values, 1)[0]
+        return ttnn.neg(a)
+
+    if op_type == 'abs':
+        a = get_operands(op, values, 1)[0]
+        return ttnn.abs(a)
+
+    if op_type == 'exp':
+        a = get_operands(op, values, 1)[0]
+        return ttnn.exp(a)
+
+    if op_type == 'log':
+        a = get_operands(op, values, 1)[0]
+        return ttnn.log(a)
+
+    if op_type == 'tanh':
+        a = get_operands(op, values, 1)[0]
+        return ttnn.tanh(a)
+
+    if op_type == 'rsqrt':
+        a = get_operands(op, values, 1)[0]
+        return ttnn.rsqrt(a)
+
+    if op_type == 'sqrt':
+        a = get_operands(op, values, 1)[0]
+        return ttnn.sqrt(a)
+
+    # --- Tier 2: Shape ops ---
+    if op_type == 'convert':
+        # ttnn handles types internally; bf16 throughout
+        return get_operands(op, values, 1)[0]
+
+    if op_type == 'broadcast_in_dim':
+        return _execute_broadcast_device(op, values)
+
+    if op_type == 'reshape':
+        a = get_operands(op, values, 1)[0]
+        target_shape, _ = parse_tensor_type(op['result_type'])
+        if not target_shape:
+            # Scalar output — keep on device as 1x1
+            return a
+        return ttnn.reshape(a, list(target_shape))
+
+    if op_type == 'transpose':
+        a = get_operands(op, values, 1)[0]
+        return ttnn.permute(a, op['permutation'])
+
+    # --- Tier 3: Matmul ---
+    if op_type == 'dot_general':
+        return _execute_dot_general_device(op, values)
+
+    # --- Tier 2/4: Reductions ---
+    if op_type == 'reduce':
+        return _execute_reduce_device(op, values)
+
+    if op_type == 'reduce_argmax':
+        return _execute_reduce_argmax_device(op, values)
+
+    # --- Tier 4: CPU-roundtrip ops ---
+    if op_type == 'slice':
+        return _execute_slice_device(op, values)
+
+    if op_type == 'compare':
+        return _execute_compare_device(op, values)
+
+    if op_type == 'select':
+        a, b, c = get_operands(op, values, 3)
+        return ttnn.where(a, b, c)
+
+    if op_type == 'iota':
+        np_val = execute_iota(op)
+        return _to_device(np_val)
+
+    if op_type == 'concatenate':
+        return _execute_concatenate_device(op, values)
+
+    if op_type == 'and':
+        return _execute_logical_device(op, values, 'and')
+
+    if op_type == 'or':
+        return _execute_logical_device(op, values, 'or')
+
+    if op_type == 'scatter':
+        return _execute_scatter_device(op, values)
+
+    if op_type == 'gather':
+        return _execute_gather_device(op, values)
+
+    if op_type == 'func_call':
+        return execute_func_call(op, values)
+
+    raise ValueError(f"Unsupported op: {op_type} (text: {op.get('text', '')})")
+
+
+def _execute_broadcast_device(op, values):
+    """Device-mode broadcast_in_dim using ttnn.repeat."""
+    a = get_operands(op, values, 1)[0]
+    dims = op.get('dims', [])
+    result_type = op['result_type']
+    target_shape, _ = parse_tensor_type(result_type)
+
+    if not target_shape:
+        return a
+
+    # Build intermediate shape (source dims placed at broadcast positions)
+    if hasattr(a, 'shape'):
+        # ttnn tensor
+        a_shape = tuple(a.shape)
+    else:
+        a_shape = ()
+
+    inter_shape = [1] * len(target_shape)
+    for src_dim, tgt_dim in enumerate(dims):
+        if src_dim < len(a_shape):
+            inter_shape[tgt_dim] = a_shape[src_dim]
+
+    # Try on-device repeat
+    try:
+        # Reshape to intermediate shape first
+        if list(a_shape) != inter_shape:
+            a = ttnn.reshape(a, inter_shape)
+        # Compute repeat counts
+        repeat_counts = []
+        for i_dim, o_dim in zip(inter_shape, target_shape):
+            if i_dim == o_dim:
+                repeat_counts.append(1)
+            elif i_dim == 1:
+                repeat_counts.append(o_dim)
+            else:
+                raise ValueError(f"Cannot broadcast {inter_shape} to {target_shape}")
+        if all(r == 1 for r in repeat_counts):
+            return a
+        return ttnn.repeat(a, ttnn.Shape(repeat_counts))
+    except Exception:
+        pass
+
+    # CPU fallback for complex broadcasts
+    a_np = _operand_to_numpy(a)
+    if a_np.ndim == 0:
+        result = np.broadcast_to(a_np, target_shape).copy()
+    else:
+        new_shape = [1] * len(target_shape)
+        for src_dim, tgt_dim in enumerate(dims):
+            if src_dim < a_np.ndim:
+                new_shape[tgt_dim] = a_np.shape[src_dim]
+        result = np.broadcast_to(a_np.reshape(new_shape), target_shape).copy()
+    return _to_device(result)
+
+
+def _execute_dot_general_device(op, values):
+    """Device-mode dot_general: ttnn.matmul for simple cases, CPU fallback."""
+    a, b = get_operands(op, values, 2)
+    lhs_contract = op['lhs_contracting']
+    rhs_contract = op['rhs_contracting']
+    lhs_batch = op.get('lhs_batching', [])
+    rhs_batch = op.get('rhs_batching', [])
+
+    a_shape = tuple(a.shape)
+    b_shape = tuple(b.shape)
+
+    # Simple case: standard matmul (contract last of A with second-to-last of B)
+    is_simple = (
+        not lhs_batch and
+        len(lhs_contract) == 1 and len(rhs_contract) == 1 and
+        lhs_contract[0] == len(a_shape) - 1 and
+        rhs_contract[0] == len(b_shape) - 2
+    )
+
+    # Batched matmul: batch dims are leading and aligned
+    is_batched_simple = (
+        len(lhs_contract) == 1 and len(rhs_contract) == 1 and
+        lhs_contract[0] == len(a_shape) - 1 and
+        rhs_contract[0] == len(b_shape) - 2 and
+        tuple(lhs_batch) == tuple(rhs_batch) and
+        list(lhs_batch) == list(range(len(lhs_batch)))
+    )
+
+    if is_simple or is_batched_simple:
+        try:
+            return ttnn.matmul(a, b)
+        except RuntimeError:
+            pass
+
+    # CPU fallback for complex dot_general
+    a_np = _operand_to_numpy(a, a_shape)
+    b_np = _operand_to_numpy(b, b_shape)
+    result_np = execute_dot_general(op, {'__a': a_np, '__b': b_np,
+                                          op['operands'][0]: a_np,
+                                          op['operands'][1]: b_np})
+    return _to_device(result_np)
+
+
+def _execute_reduce_device(op, values):
+    """Device-mode reduce: ttnn.sum/ttnn.max for supported cases."""
+    a = get_operands(op, values, 1)[0]
+    reduce_fn = op['reduce_fn']
+    dims = op['dimensions']
+
+    try:
+        if reduce_fn == 'add':
+            result = a
+            for ax in sorted(dims, reverse=True):
+                result = ttnn.sum(result, dim=ax, keepdim=True)
+            # Squeeze reduced dims to match StableHLO semantics
+            target_shape, _ = parse_tensor_type(op.get('result_type', ''))
+            if target_shape:
+                result = ttnn.reshape(result, list(target_shape))
+            return result
+        elif reduce_fn == 'maximum':
+            result = a
+            for ax in sorted(dims, reverse=True):
+                result = ttnn.max(result, dim=ax, keepdim=True)
+            target_shape, _ = parse_tensor_type(op.get('result_type', ''))
+            if target_shape:
+                result = ttnn.reshape(result, list(target_shape))
+            return result
+    except Exception:
+        pass
+
+    # CPU fallback for min, prod, or on ttnn failure
+    a_np = _operand_to_numpy(a)
+    np_result = execute_reduce(op, {op['operands'][0]: a_np})
+    return _to_device(np_result)
+
+
+def _execute_reduce_argmax_device(op, values):
+    """Device-mode argmax: CPU roundtrip (ttnn lacks native argmax)."""
+    a = get_operands(op, values, 1)[0]
+    a_shape = tuple(a.shape)
+    a_np = _operand_to_numpy(a, a_shape)
+
+    # Reuse numpy path
+    np_result = execute_reduce_argmax(op, {op['operands'][0]: a_np})
+    # np_result is a dict of name#0 → numpy, name#1 → numpy
+    device_result = {}
+    for key, val in np_result.items():
+        if isinstance(val, np.ndarray) and np.issubdtype(val.dtype, np.integer):
+            # Keep integer results as numpy (argmax indices)
+            device_result[key] = val
+        else:
+            device_result[key] = _to_device(val)
+    return device_result
+
+
+def _execute_slice_device(op, values):
+    """Device-mode slice: CPU roundtrip (ttnn lacks general slicing)."""
+    a = get_operands(op, values, 1)[0]
+    a_shape = tuple(a.shape)
+    a_np = _operand_to_numpy(a, a_shape)
+    slices = tuple(
+        slice(s, l, st)
+        for s, l, st in zip(op['starts'], op['limits'], op['strides'])
+    )
+    result = a_np[slices]
+    return _to_device(result)
+
+
+def _execute_compare_device(op, values):
+    """Device-mode compare: try ttnn, fall back to CPU."""
+    a, b = get_operands(op, values, 2)
+    direction = op['direction']
+
+    try:
+        if direction == 'GE':
+            return ttnn.ge(a, b)
+        elif direction == 'GT':
+            return ttnn.gt(a, b)
+        elif direction == 'LE':
+            return ttnn.le(a, b)
+        elif direction == 'LT':
+            return ttnn.lt(a, b)
+        elif direction == 'EQ':
+            return ttnn.eq(a, b)
+        elif direction == 'NE':
+            return ttnn.ne(a, b)
+    except Exception:
+        pass
+
+    # CPU fallback
+    a_np = _operand_to_numpy(a)
+    b_np = _operand_to_numpy(b)
+    np_result = execute_compare(op, {op['operands'][0]: a_np,
+                                      op['operands'][1]: b_np})
+    return _to_device(np_result.astype(np.float32))
+
+
+def _execute_concatenate_device(op, values):
+    """Device-mode concatenate: try ttnn.concat, fall back to CPU."""
+    tensors = [values[name] for name in op['operands']]
+    try:
+        return ttnn.concat(tensors, dim=op['dim'])
+    except Exception:
+        pass
+
+    # CPU fallback
+    arrays = []
+    for name in op['operands']:
+        val = values[name]
+        arrays.append(_operand_to_numpy(val))
+    result = np.concatenate(arrays, axis=op['dim'])
+    return _to_device(result)
+
+
+def _execute_logical_device(op, values, logic_op):
+    """Device-mode and/or: CPU roundtrip."""
+    a, b = get_operands(op, values, 2)
+    a_np = _operand_to_numpy(a)
+    b_np = _operand_to_numpy(b)
+    if logic_op == 'and':
+        result = np.logical_and(a_np, b_np)
+    else:
+        result = np.logical_or(a_np, b_np)
+    return _to_device(result.astype(np.float32))
+
+
+def _execute_scatter_device(op, values):
+    """Device-mode scatter: CPU roundtrip."""
+    operand_names = op['operands']
+    operand = _operand_to_numpy(values[operand_names[0]])
+    indices = _operand_to_numpy(values[operand_names[1]])
+    updates = _operand_to_numpy(values[operand_names[2]])
+
+    # Reuse numpy path
+    np_values = {operand_names[0]: operand, operand_names[1]: indices,
+                 operand_names[2]: updates}
+    result = execute_scatter(op, np_values)
+    return _to_device(result)
+
+
+def _execute_gather_device(op, values):
+    """Device-mode gather: CPU roundtrip."""
+    operand_names = op['operands']
+    operand = _operand_to_numpy(values[operand_names[0]])
+    indices = _operand_to_numpy(values[operand_names[1]])
+
+    np_values = {operand_names[0]: operand, operand_names[1]: indices}
+    result = execute_gather(op, np_values)
+    return _to_device(result)
+
+
 def get_operands(op: dict, values: dict, n: int) -> list:
     """Get n operand arrays from the value map."""
     operands = op.get('operands', [])
@@ -925,7 +1440,6 @@ def execute_constant(op: dict) -> np.ndarray:
     # Scalar constant — may be decimal, scientific notation, or hex float
     if val_str.startswith('0x') or val_str.startswith('0X'):
         # IEEE 754 hex representation (e.g., 0xFF800000 = -inf for f32)
-        import struct
         hex_val = int(val_str, 16)
         if dtype == np.float32 or len(val_str) <= 10:  # 0x + 8 hex digits
             val = struct.unpack('f', struct.pack('I', hex_val))[0]

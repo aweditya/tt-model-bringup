@@ -360,6 +360,75 @@ All 22 unique StableHLO ops needed for transformer inference are implemented.
 
 ### Remaining for end-to-end PJRT demo
 
-1. **Multi-output C++ support** — `plugin.cc` has `num_outputs` hardcoded to 1. Need to return multiple buffers from PJRT_LoadedExecutable_Execute.
+1. ~~**Multi-output C++ support**~~ — Done. `count_outputs()` helper called from C++ Compile.
 2. **Rebuild .so** on remote — scatter/gather/argmax only work in engine tests. Need to rebuild C++ plugin and verify through full PJRT pipeline (jax.jit → C++ → Python engine → result).
-3. **Phase 5: ttnn** — Replace numpy ops with ttnn calls. trace_capture for compilation.
+3. ~~**Phase 5: ttnn**~~ — In progress. See below.
+
+---
+
+## 2026-04-27: Phase 5 — Moving from numpy to ttnn (Blackhole)
+
+### The key architectural decision: Python-side device management
+
+We faced three approaches for getting computation onto the Blackhole:
+
+**A. Change engine.py internally** — keep `execute_stablehlo(bytecode, numpy_inputs) → numpy_outputs` interface, but internally convert to ttnn tensors, run on device, convert back.
+
+**B. Change C++ to manage ttnn buffers** — link ttnn in CMake, use `ttnn::from_torch()` in `BufferFromHostBuffer`, pass device tensors to engine.
+
+**C. Full compiler** — StableHLO → TTIR → TTNN flatbuffer. The "right" approach, 3-6 months.
+
+We chose **A**. Reasoning:
+1. **Zero C++ changes**. The thin shell stays thin. All iteration happens in Python.
+2. **Same interface**. C++ calls `execute_stablehlo(bytecode, inputs)` exactly as before. Returns numpy. All existing tests work unchanged.
+3. **Python can import ttnn directly** — the remote host has ttnn installed. No CMake linking hell.
+4. **Validated by applejax** — their Metal PJRT plugin uses the same pattern: C++ ABI adapter, Python/Swift does the real work.
+
+The cost: extra host↔device copies per Execute call (numpy → ttnn → execute → ttnn → numpy). For Phase 6, we'd move buffer management to C++ to keep data on device between calls. But for correctness validation, the extra copies are fine.
+
+### Dual-mode design
+
+Added `TT_PJRT_USE_DEVICE=1` env var to toggle between numpy (CPU) and ttnn (device) execution. Default is numpy for backward compatibility. All 44 existing tests pass unchanged.
+
+The dispatch is clean: `execute_op()` calls either `_execute_op_numpy()` or `_execute_op_device()`. The numpy path is identical to the old code. The device path maps each StableHLO op to its ttnn equivalent.
+
+### Op migration tiers
+
+Organized ops into tiers by complexity:
+
+**Tier 1 (direct ttnn):** add, sub, mul, div, max, min, neg, exp, log, tanh, rsqrt, sqrt — all have 1:1 ttnn equivalents. `np.add(a,b)` → `ttnn.add(a,b)`.
+
+**Tier 2 (shape ops):** reshape → `ttnn.reshape`, transpose → `ttnn.permute`, broadcast → `ttnn.repeat`. Convert is identity (bf16 throughout). Constants generate on CPU then `_to_device()`.
+
+**Tier 3 (matmul):** Simple and batched matmuls → `ttnn.matmul`. Complex dot_general (non-standard contraction axes) → CPU fallback with einsum.
+
+**Tier 4 (CPU roundtrip):** slice, scatter, gather, iota, argmax, and/or — no good ttnn equivalents. Pattern: `_from_device()` → numpy op → `_to_device()`. This is the same approach as `experiments/tt_jax/ops.py`.
+
+**Key insight from ops.py:** divide maps to `ttnn.mul(a, ttnn.reciprocal(b))`, not a native divide. `max(x, 0)` should map to `ttnn.relu` — haven't added that pattern-match yet but it's a future optimization.
+
+### What went right
+
+1. **Reusing ops.py patterns** — every ttnn mapping was already proven in experiments/tt_jax/ops.py. No guessing.
+2. **Clean separation** — `_execute_op_numpy` and `_execute_op_device` are parallel code paths. Easy to diff, easy to debug.
+3. **All 44 numpy tests pass immediately** — the refactor from `execute_op` → `_execute_op_numpy` + `_execute_op_device` was mechanical.
+
+### What I'm worried about
+
+1. **bf16 precision**: ttnn runs in bf16. Our tests compare against float32 numpy. Softmax with large logits, layer norm variance, attention scores — all sensitive to precision. Need to widen tolerances carefully.
+2. **Tile alignment**: ttnn requires 32x32 tiles. Small test tensors (e.g., `[4]`) become `[1, 32]` after padding. `_from_device` must handle unpadding correctly.
+3. **Reduce shape semantics**: StableHLO reduce removes the reduced dimension. ttnn `sum(dim=, keepdim=True)` keeps it. Need reshape after reduce to match expected output shape.
+4. **Device availability**: The tenstorrent kernel module doesn't auto-load after reboot. Blocked on `sudo modprobe tenstorrent`.
+
+### Current state
+
+- engine.py: dual-mode with all 22 ops migrated to ttnn paths
+- test_engine.py: 44/44 pass (numpy mode, verified on remote host)
+- test_engine_device.py: written, ready to run when device is available
+- smoke_test_device.py: written, blocked on kernel module
+
+### Next steps
+
+1. Load kernel module → run smoke test → run device tests
+2. Fix any device-specific failures (tile alignment, precision, shape mismatches)
+3. Add trace capture (Step 6 in plan)
+4. Benchmark: eager vs traced, compare to native ttnn experiments
