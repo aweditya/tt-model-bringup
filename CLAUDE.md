@@ -5,12 +5,15 @@ Exploratory research project for Stanford CS440LX. The goal is to understand Ten
 
 ## Non-Negotiables
 
-1. **Think first, act next.** No hand-wavy arguments. Every claim must be grounded in an experiment or concrete evidence. If we have a hypothesis, we test it.
+1. **ALWAYS think first, act later.** Plan, plan, and more planning before implementing. No hand-wavy arguments — every claim must be grounded in an experiment or concrete evidence. If we have a hypothesis, we test it.
 2. **Research-driven workflow.** Most work is research, Q&A, and building a wiki of practice-exam-style questions. Learning by building.
 3. **No code bloat.** Spend more time thinking, less time implementing. When we implement, it's correct and concise.
-4. **Remote execution only.** All experiments and code run on the remote host accessed via `ssh tenstorrent`. Use **device 0 only** (there are two Blackhole devices available).
-5. **Frequent commits.** Commit early and often.
-6. **No local execution of device code.** The local machine is for editing, research notes, and wiki content only.
+4. **Remote execution only — `ssh qb1`.** All experiments and code run on the remote host. (Previous host `ssh tenstorrent` is no longer available — Blackhole was disconnected from it.)
+5. **Single device for now.** The qb1 host has two Blackhole chips — stick to ONE device until we've saturated it. Once saturated, scale up to both.
+6. **No inline scripts** unless absolutely necessary. Write permanent files in `pjrt_plugin/scripts/`, `pjrt_plugin/tests/`, or `experiments/`.
+7. **No `/tmp` for anything.** Use project directories for outputs, logs, caches, scratch — anything.
+8. **Frequent commits.** Commit early and often.
+9. **No local execution of device code.** The local machine is for editing, research notes, and wiki content only.
 
 ## Key Resources
 
