@@ -432,3 +432,56 @@ Organized ops into tiers by complexity:
 2. Fix any device-specific failures (tile alignment, precision, shape mismatches)
 3. Add trace capture (Step 6 in plan)
 4. Benchmark: eager vs traced, compare to native ttnn experiments
+
+---
+
+## 2026-05-11: Phase 5 — First light on Blackhole (qb1)
+
+### The bootstrap
+
+The old `ssh tenstorrent` VM lost its Blackhole passthrough (friend disconnected it). New host `ssh qb1` — fresh Ubuntu 22.04 box with the tt-kmd driver loaded and 4 Blackhole chips visible. No Python deps, no tt-metal install.
+
+Bootstrap (split into 5 scripts at `pjrt_plugin/scripts/qb1_phase_*.sh`):
+- Phase A: filesystem prep, env vars in `.bashrc` (TTNN_CACHE_DIR=~/tt-xla/.cache/ttnn)
+- Phase B: clone 17 Tenstorrent repos to `~/tenstorrent/`
+- Phase C: `uv venv` + uv pip install jax==0.6.2 jaxlib==0.6.2 torch numpy pytest
+- Phase D: `uv pip install ttnn==0.69.0` — major finding, ttnn ships a PyPI wheel that matches the source release tag exactly. Skipped the 30-60 min source build.
+- Phase E: rsync project to qb1
+
+Total bootstrap time: ~8 minutes (would have been ~50 minutes if we'd built tt-metal from source).
+
+### First-light results
+
+```
+=== ALL SMOKE TESTS PASSED ===
+23 passed in 17.93s
+```
+
+`test_engine_device.py` runs 23 tests covering:
+- 11 elementwise ops (add, sub, mul, div, neg, exp, log, tanh, rsqrt, sqrt, max)
+- 3 shape ops (reshape, transpose, broadcast)
+- 2 matmul (simple + batched dot_general)
+- 2 reduce (sum, max)
+- slice, compare, concatenate
+- 2 composite (softmax, linear layer)
+
+All pass with `atol=0.05, rtol=0.05` (widened for bf16) on the Blackhole, end-to-end through our dispatch path: numpy → `_to_device` → ttnn op → `_from_device` → numpy.
+
+### What surprised me
+
+1. **JIT cache cold start is brutal.** First test takes ~3 seconds. The kernel JIT pipeline is `mean=489ms` per build, 91 builds total. Once warm, ops run in ms. This is exactly the dispatch-wall problem we ran into in experiments 90-99 — and exactly what trace capture is for.
+2. **The PyPI wheel includes pre-compiled firmware.** `BuildKernels` log: `Using pre-compiled firmware from: /home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/tt_metal/pre-compiled/...`. We didn't need our `~/tenstorrent/tt-metal` source at all for this run — pure wheel install. The source clone is now reference material.
+3. **ttnn opens all 4 chips for topology discovery** even when we only ask for device 0. `MeshDevice(1x1 grid, 1 devices)` confirms the mesh is single-device, but UMD still touches all 4 to map the cluster. Per the "use device 0 only" rule, this is fine — we're just one chip in a discovered cluster.
+
+### What's broken / dirty
+
+1. **ttnn config still has `tmp_dir=/tmp/ttnn`.** TTNN_CACHE_DIR redirects model_cache, but `tmp_dir` is a separate setting we haven't overridden yet. Need to find the env var or call `ttnn.CONFIG.tmp_dir = ...` in `engine.py`.
+2. **bf16 precision drift visible but tolerable.** All tests pass with widened tolerances. Softmax in bf16 is within 2%, matmul within 5%. For decoder correctness we'll need to track this more carefully.
+3. **Cold-start JIT.** First run pays 7s for kernel JIT. Subsequent runs use the kernel cache. We'll need to pre-warm or use trace capture to hide this.
+
+### What this unlocks
+
+- All future device work runs on qb1 — no more "blocked on hardware."
+- The dual-mode engine works as designed: `TT_PJRT_USE_DEVICE=1` flips the switch.
+- We can now move to **Phase 5 Step 6: trace capture** to attack the dispatch wall.
+- We can also try the **full PJRT pipeline** (rebuild .so, run test_basic_ops.py with the device engine).
