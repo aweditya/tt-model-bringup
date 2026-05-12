@@ -59,45 +59,120 @@ Run on qb2 (modifies the local ttnn install):
 import os, re, sys, time, shutil, glob, argparse
 from pathlib import Path
 
-LLK_ROOTS = [
-    "/home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu",
-    "/home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu",
-]
+TTNN_ROOT = "/home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn"
+# Walk the entire ttnn install — the buggy pattern lives in LLK headers under
+# tt_metal/, AND in operation-specific compute kernels under ttnn/cpp/ttnn/operations/.
+# Restricting to .h/.hpp/.cpp keeps the scan fast and avoids touching Python.
+SCAN_EXTENSIONS = {".h", ".hpp", ".cpp"}
 BACKUP_ROOT = os.path.expanduser("~/tt-xla/.cache/ttnn_llk_backup")
 
-# Pattern: match SFPI conversion functions with literal 0 as second arg.
-# Limited to single-identifier first-arg form (all current call sites match).
+# Pattern: match SFPI conversion functions where the LAST argument is a literal 0.
+# Some call sites have nested function calls / arithmetic in the first arg, so
+# regex alone won't work — we use a paren-balance parser.
 CONV_FNS = "(?:int32_to_float|float_to_int16|float_to_int32|float_to_uint8|float_to_uint16|float_to_fp16a|float_to_fp16b)"
-PATTERN = re.compile(
-    r"((?:sfpi::)?" + CONV_FNS + r"\(\s*[A-Za-z_][A-Za-z0-9_]*\s*),\s*0\s*\)"
-)
-REPLACEMENT = r"\1, sfpi::RoundMode::NearestEven)"
+CALL_START = re.compile(r"((?:sfpi::)?" + CONV_FNS + r")\(")
+
+
+def _patch_text(text):
+    """Find every SFPI conversion call ending in `, 0)` and rewrite the trailing
+    literal to `, sfpi::RoundMode::NearestEven)`. Handles nested parens via a
+    depth counter."""
+    out = []
+    i = 0
+    n = len(text)
+    n_changes = 0
+    while i < n:
+        m = CALL_START.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        # Emit text before the match unchanged
+        out.append(text[i:m.start()])
+        fn_name = m.group(1)
+        out.append(fn_name + "(")
+        # Walk from after the opening '(' until we find the matching close at depth 0
+        j = m.end()
+        depth = 1
+        arg_start = j
+        last_comma_at_depth_0 = None
+        while j < n and depth > 0:
+            c = text[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif c == "," and depth == 1:
+                last_comma_at_depth_0 = j
+            j += 1
+        # j now points to the matching ')'
+        if j >= n:
+            # Unbalanced — emit rest as-is
+            out.append(text[m.end():])
+            break
+        # The call body is text[arg_start:j].
+        # Check if the part AFTER the last top-level comma is literal whitespace+'0'+whitespace
+        if last_comma_at_depth_0 is not None:
+            head = text[arg_start:last_comma_at_depth_0]   # all but last arg
+            tail = text[last_comma_at_depth_0+1:j]          # last arg
+            if tail.strip() == "0":
+                # Replace with NearestEven
+                out.append(head + ", sfpi::RoundMode::NearestEven")
+                out.append(")")
+                n_changes += 1
+                i = j + 1
+                continue
+        # No replacement — emit the call as-is
+        out.append(text[m.end():j+1])
+        i = j + 1
+    return "".join(out), n_changes
+
+
+def find_changes_text(content):
+    """Return (count_of_changes, list_of_(line_no, old_line, new_line))."""
+    new_content, n = _patch_text(content)
+    if n == 0:
+        return 0, []
+    # Compute diff by line
+    old_lines = content.splitlines(keepends=False)
+    new_lines = new_content.splitlines(keepends=False)
+    diffs = []
+    for i, (o, nn) in enumerate(zip(old_lines, new_lines)):
+        if o != nn:
+            diffs.append((i + 1, o, nn))
+    return n, diffs
 
 
 def find_target_files():
-    """All .h files under LLK_ROOTS that contain at least one buggy call."""
+    """All .h/.hpp/.cpp files under TTNN_ROOT where the patcher would make changes."""
     targets = []
-    for root in LLK_ROOTS:
-        if not os.path.isdir(root):
-            print(f"WARN: root does not exist: {root}")
-            continue
-        for path in glob.glob(os.path.join(root, "*.h")):
-            with open(path) as f:
-                content = f.read()
-            if PATTERN.search(content):
+    if not os.path.isdir(TTNN_ROOT):
+        print(f"WARN: ttnn root does not exist: {TTNN_ROOT}")
+        return targets
+    for root, _, files in os.walk(TTNN_ROOT):
+        for fname in files:
+            ext = os.path.splitext(fname)[1]
+            if ext not in SCAN_EXTENSIONS:
+                continue
+            path = os.path.join(root, fname)
+            try:
+                with open(path) as f:
+                    content = f.read()
+            except (UnicodeDecodeError, IOError):
+                continue
+            n, _ = find_changes_text(content)
+            if n > 0:
                 targets.append(path)
     return sorted(targets)
 
 
 def show_changes(path):
-    """Print each line that would change (for dry-run)."""
-    changes = []
+    """Return list of (lineno, old_line, new_line) for the patch."""
     with open(path) as f:
-        for lineno, line in enumerate(f, 1):
-            new_line = PATTERN.sub(REPLACEMENT, line)
-            if new_line != line:
-                changes.append((lineno, line.rstrip("\n"), new_line.rstrip("\n")))
-    return changes
+        content = f.read()
+    _, diffs = find_changes_text(content)
+    return diffs
 
 
 def backup_files(targets, ts):
@@ -106,7 +181,7 @@ def backup_files(targets, ts):
     os.makedirs(backup_dir, exist_ok=True)
     for src in targets:
         # Preserve directory structure under backup_dir relative to ttnn root
-        rel = src.replace("/home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/", "")
+        rel = os.path.relpath(src, TTNN_ROOT)
         dst = os.path.join(backup_dir, rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
@@ -115,12 +190,12 @@ def backup_files(targets, ts):
 
 
 def apply_patch(targets):
-    """Apply PATTERN → REPLACEMENT in place."""
+    """Apply the balanced-parens patcher in place."""
     total_changes = 0
     for path in targets:
         with open(path) as f:
             content = f.read()
-        new_content, n = PATTERN.subn(REPLACEMENT, content)
+        new_content, n = _patch_text(content)
         if n > 0:
             with open(path, "w") as f:
                 f.write(new_content)
@@ -138,14 +213,12 @@ def restore_backup(timestamp):
     restored = 0
     for root, _, files in os.walk(backup_dir):
         for fname in files:
-            if not fname.endswith(".h"):
+            ext = os.path.splitext(fname)[1]
+            if ext not in SCAN_EXTENSIONS:
                 continue
             backup_path = os.path.join(root, fname)
             rel = os.path.relpath(backup_path, backup_dir)
-            orig = os.path.join(
-                "/home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn",
-                rel
-            )
+            orig = os.path.join(TTNN_ROOT, rel)
             shutil.copy2(backup_path, orig)
             restored += 1
     print(f"restored {restored} files from {backup_dir}")
@@ -158,7 +231,8 @@ def list_backups():
         return
     for ts in sorted(os.listdir(BACKUP_ROOT)):
         ts_dir = os.path.join(BACKUP_ROOT, ts)
-        n = sum(1 for _ in glob.glob(os.path.join(ts_dir, "**/*.h"), recursive=True))
+        n = sum(1 for _, _, fs in os.walk(ts_dir) for f in fs
+                if os.path.splitext(f)[1] in SCAN_EXTENSIONS)
         print(f"  {ts}  ({n} files)")
 
 

@@ -47,7 +47,10 @@ upload = _91f.upload
 
 MODEL_ID = "Qwen/Qwen3.6-27B"
 EPS = 1e-6
-MAX_POS = 64
+# Match 91l's KV cache size so we reuse the same JIT-cached kernels.
+# (Smaller sizes like 64 trigger fresh kernel variants which hit the
+# upstream ttnn LLK 'int32_to_float' int→RoundMode bug.)
+MAX_POS = 256
 HF_HIDDEN_PATH = os.path.expanduser("~/tt-xla/.cache/hf_per_layer_hidden_states.npz")
 DEFAULT_LAYERS = [0, 1, 2, 3, 7, 11, 15, 31, 47, 63]
 
