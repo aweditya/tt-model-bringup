@@ -47,7 +47,23 @@ Re-reading the CLAUDE.md + persistent memory; these are the rules I will follow 
 
 **A4.** Implement & validate the Gated Attention layer in isolation. This is closer to what we've ported before (GQA + RoPE + sliding-window-like). Probably 2-3 hrs.
 
-Gate: A1-A4 all green, written up. THEN Phase B.
+**A5.** Isolated MoE block (8 experts first to debug, then 256). Validate routing + shared-expert-gate against numpy ref. (~3 hrs)
+
+**A6.** Parallel scan kernel for DeltaNet prefill (Blelloch / Heinsen). Decode uses 1-step recurrence; only prefill needs the scan. Start with chunked-serial (chunks of 64 tokens, parallel within chunk), upgrade to full Blelloch tree if needed. (~5-10 hrs)
+
+**A7.** Multi-chip primitives. Open ttnn mesh device (2 chips first), validate all-gather + all-to-all primitives, replicated vs sharded weight load. Isolated tests, not yet wired to model. (~5-8 hrs)
+
+Gate: A1-A7 all green, written up. THEN Phase B (which is multi-chip from day 1).
+
+## Memory math drove a plan change
+
+Re-did memory accounting after user push: bf8 Qwen3.6-35B is ~37 GB at 4K context — does NOT fit one Blackhole's ~30 GB usable DRAM. Choices:
+
+- B-α: bf4 weights — fits 1 chip, but quality risk (not validated)
+- B-β: 2-chip TP, bf8 — fits comfortably, validates multi-chip earlier
+- B-γ: 4-chip TP, bf16 — best quality, most infra at once
+
+**Choosing B-β.** Phase B is therefore multi-chip from day 1. Pre-builds the infrastructure for Phase C/D which use 4 chips for Qwen3-Coder-Next.
 
 ### Phase B — Single-chip Qwen3.6-35B-A3B (week 2, ~15-25 hrs)
 
