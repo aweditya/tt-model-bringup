@@ -78,6 +78,12 @@ import os, sys, json, time, gc, argparse, statistics, inspect
 from contextlib import contextmanager
 sys.path.insert(0, os.path.expanduser("~"))
 
+# Force line-buffered stdout so SSH-piped runs show progress in real time.
+# Python defaults to block-buffering when stdout isn't a TTY (8KB buffer),
+# which hides progress output for 5-10 minutes during weight load.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import numpy as np
 import torch
 import ttnn
