@@ -164,6 +164,16 @@ def deltanet_step_ondevice(x_tt, w_tt, ssm_state_tt, conv_state_tt, cfg):
     q = ttnn.mul(q, ttnn.rsqrt(ttnn.add(ttnn.sum(qq, dim=-1, keepdim=True), EPS)))
     kk = ttnn.mul(k, k)
     k = ttnn.mul(k, ttnn.rsqrt(ttnn.add(ttnn.sum(kk, dim=-1, keepdim=True), EPS)))
+    # B'9.5 Q-SCALING FIX: HF applies query = query * (1/sqrt(k_head_dim))
+    # before using Q in the recurrence output. We skipped this earlier
+    # ("cosine-invariant"), but at the tiny magnitudes layer 2 produces
+    # (≈ 0.0001 per row), RMSNorm's eps dominates the variance and
+    # RMSNorm becomes NOT scale-invariant. Without Q-scaling, our
+    # recurrence output is sqrt(K_DIM)≈11.3× larger than HF's, which puts
+    # us in a DIFFERENT eps-vs-variance regime than HF. Per-row probe
+    # confirmed the 11.0-11.3× magnitude ratio. Applying this scale
+    # brings us into HF's regime and the per-row directions align.
+    q = ttnn.mul(q, 1.0 / (K_DIM ** 0.5))
 
     softplus_a = ttnn.log(ttnn.add(ttnn.exp(ttnn.add(a_tt, w_tt['dt_bias'])), 1.0))
     g = ttnn.mul(ttnn.neg(ttnn.exp(w_tt['A_log'])), softplus_a)
