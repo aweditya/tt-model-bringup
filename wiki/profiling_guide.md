@@ -66,7 +66,19 @@ The Tracy UI gives you:
 
 ## 3. Device profiler (`--enable-device-profiler`, env: `TT_METAL_DEVICE_PROFILER=1`)
 
-**Pattern:**
+**Status: NOT available on our installed ttnn wheels (qb1 + qb2 verified).**
+
+The ttnn wheel ships with Tracy API hooks (so `start_tracy_zone` / `stop_tracy_zone` calls succeed as no-ops) BUT the underlying tt-metal C++ binary is not Tracy-linked. Setting `TT_METAL_DEVICE_PROFILER=1` triggers a fatal assert at device open:
+
+```
+TT_FATAL: TT_METAL_DEVICE_PROFILER requires a Tracy-enabled build of tt-metal.
+```
+
+To enable device profiling we'd need to **rebuild ttnn from source with Tracy enabled** (or wait for a Tracy-enabled wheel from upstream). This is a separate ~2-4 hour engagement.
+
+For now, **rely on sync-bounded host timing** (mode 1) for cross-phase comparison. The diagnostic signature "device-time << host-time" that would tell us we're dispatch-bound isn't available without device profiler, but we have a proxy: if the layer-type compounding estimate is much LARGER than the measured full-decode time, dispatch overhead within the full step is large (the saving comes from pipelining across ops). Conversely, if compounding estimate ≈ measured full-decode, dispatch is small and trace capture would give modest gains.
+
+**Pattern (for when Tracy-enabled build is available):**
 ```python
 # After running some ops
 ttnn.ReadDeviceProfiler(device)         # flush device-side timestamps to host
@@ -74,14 +86,14 @@ data = ttnn.get_latest_programs_perf_data()   # per-op records
 # data is a sequence of per-program (op) records with on-device cycle counts
 ```
 
-**Correct for:**
+**Correct for (when available):**
 - Pure kernel execution time per op (no host/dispatch noise)
 - Identifying the slowest single op in a region
 - Understanding why a "fast-looking" host timing might hide a slow kernel
 
 **Setup required:**
-- `TT_METAL_DEVICE_PROFILER=1` set BEFORE process start (best) — setting it inside Python may be too late
-- ttnn build must have device profiler compiled in (verified for qb2)
+- `TT_METAL_DEVICE_PROFILER=1` set BEFORE process start
+- **ttnn build must be Tracy-enabled** ← currently not the case for us
 
 **Caveat:** the per-op records measure on-device cycle counts. They DON'T include host-side dispatch or sync time. So if your host timing says 100 ms and device profiler says 30 ms, the missing 70 ms is dispatch + sync (or pipeline gaps).
 

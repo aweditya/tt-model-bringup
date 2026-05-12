@@ -267,12 +267,26 @@ def main():
     _TRACY_ENABLED = args.enable_tracy
     _DEVICE_PROFILER_ENABLED = args.enable_device_profiler
     if _DEVICE_PROFILER_ENABLED:
-        # Must be set BEFORE device open; if user didn't pre-set it, do it now
-        # (may be too late to take effect — print a warning if it wasn't pre-set)
-        if os.environ.get("TT_METAL_DEVICE_PROFILER") != "1":
-            print("  WARNING: TT_METAL_DEVICE_PROFILER not set in process env. "
-                  "Run with `TT_METAL_DEVICE_PROFILER=1 python ...` for full effect.")
-            os.environ["TT_METAL_DEVICE_PROFILER"] = "1"
+        # IMPORTANT: TT_METAL_DEVICE_PROFILER=1 only works on a Tracy-ENABLED
+        # ttnn build. Our installed ttnn wheels on qb1/qb2 have the Tracy
+        # API hooks (start/stop_tracy_zone are valid calls) but the
+        # underlying tt-metal is NOT Tracy-linked. Setting the env var on
+        # a non-Tracy build aborts open_device() with:
+        #
+        #   TT_FATAL: TT_METAL_DEVICE_PROFILER requires a Tracy-enabled
+        #   build of tt-metal.
+        #
+        # Confirmed by experiments/utils/tracy_smoke_test.py on qb1.
+        # To enable: rebuild ttnn from source with Tracy linked in.
+        print("  ⚠ --enable-device-profiler REQUIRES a Tracy-enabled ttnn build.")
+        print("    Current ttnn wheel does NOT have Tracy linked (verified on qb1+qb2).")
+        print("    With this flag, ttnn.open_device() will abort.")
+        print("    To enable: rebuild ttnn from source with Tracy enabled.")
+        print("    For now, the harness will dump empty per-op data; rely on")
+        print("    sync-bounded host timing (default mode) for measurements.")
+        # Don't actually set the env var — let user opt in by setting it
+        # manually if they really want to see the failure
+        _DEVICE_PROFILER_ENABLED = False  # disable downstream no-op dumps
 
     print("=" * 64)
     print(f"Perf baseline harness — phase={args.phase}")
