@@ -45,11 +45,29 @@ The original Phase B plan called for 2-chip TP because Qwen3.6-35B-A3B is 34.7 G
 | Released | 2026-04-24 | 2026-04-24 (same week) |
 | Single-chip bf8 fit | ❌ 34.7 GB | ✅ ~27 GB |
 | Throughput target | 15-25 tok/s on 2 chips | ~10 tok/s on 1 chip (no MoE acceleration) |
-| Architecturally novel | Yes (DeltaNet) | No (dense GQA) |
+| Architecturally novel | Yes (DeltaNet + MoE) | **Yes (DeltaNet, dense MLP)** |
 
 We **keep** all of Phase A's work — DeltaNet, Gated Attention, MoE block validation, parallel scan v1, multi-chip primitives probe. They're still relevant for the day someone wires the fabric. For now we put them on the shelf.
 
-We **start** a new Phase B' on Qwen3.6-27B, which is a much simpler bringup: standard transformer (GQA 32/8 head_dim 128 per typical Qwen3 shape), no DeltaNet, no MoE expert-parallel. Probably 4-6 hours of work given everything Phase A taught us.
+We **start** a new Phase B' on Qwen3.6-27B. **HUGE finding from its config.json**: Qwen3.6-27B is ALSO a hybrid (DeltaNet + Gated Attention) but with DENSE MLP instead of MoE. So:
+
+- Phase A3 (DeltaNet isolated) — applies directly
+- Phase A4 (Gated Attention isolated) — applies directly
+- Phase A6 (parallel scan) — applies directly
+- Phase A5 (MoE block) — not needed (dense MLP instead)
+- Phase A7 (multi-chip) — not needed (fits one chip)
+
+Per-shape diff from 35B-A3B:
+```
+hidden        2048 → 5120
+n_v_heads     32 → 48
+n_attn_heads  16 → 24
+n_kv_heads    2 → 4
+layers        40 → 64
+MoE        → DENSE MLP (intermediate_size 17408)
+```
+
+Essentially: our Phase A pipeline scaled up + dense MLP. 4-6 hours of work given everything Phase A taught us. **This is actually a better outcome than 35B-A3B for our hardware**: we get the architecturally-novel DeltaNet, AND it fits one chip, AND it's simpler (no MoE routing).
 
 ## What could change this verdict
 
