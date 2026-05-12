@@ -204,3 +204,115 @@ Run with `bench_device.py`. Each section is one run.
 | jit: x + 1 | 254.1 | 269.0 |
 | jit: exp(x) | 256.9 | 272.7 |
 | jit: a @ b 64x64 | 312.8 | 331.1 |
+
+## Run 2026-05-11 18:32:19 (sha=, step7-broadcast-on-device)
+
+### Surface 1 — Raw ttnn (tensors on device)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| ttnn.add 1x32 | 165.2 | 188.5 |
+| ttnn.add 32x32 | 153.2 | 182.3 |
+| ttnn.exp 1x32 | 116.0 | 133.5 |
+| ttnn.matmul 64x64 | 57.5 | 75.8 |
+| ttnn.matmul 256x256 | 44.0 | 56.7 |
+
+### Surface 2 — Engine eager (_execute_op_device)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| engine.add 1x32 | 93.3 | 107.3 |
+| engine.exp 1x32 | 75.7 | 91.4 |
+| engine.matmul 64x64 | 56.4 | 70.6 |
+| engine.matmul 256x256 | 56.6 | 67.5 |
+
+### Surface (parse) — bytecode_to_text + parse_stablehlo
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| parse: x + 1 | 1373.6 | 1401.7 |
+| parse: softmax | 1652.6 | 1675.5 |
+
+### Surface 3 — Engine end-to-end (eager, no trace)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| e2e: x + 1 (1-op) | 1949.3 | 2003.2 |
+| e2e: exp(x) (1-op) | 1720.5 | 1744.2 |
+| e2e: a @ b 64x64 | 1804.5 | 1840.8 |
+| e2e: linear (a@w+b) | 2187.5 | 2292.7 |
+| e2e: softmax (1x64) | 2903.6 | 2988.3 |
+
+### Surface 5 — Engine traced (begin/end_trace_capture)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| traced: x + 1 (1-op) | 159.9 | 170.9 |
+| traced: exp(x) (1-op) | 156.1 | 170.3 |
+| traced: a @ b 64x64 | 200.6 | 213.9 |
+| traced: linear (a@w+b) | 228.2 | 240.8 |
+| traced: softmax (1x64) | 198.2 | 209.3 |
+
+### Surface 4 — jax.jit (full PJRT pipeline)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| jit: x + 1 | 257.6 | 273.7 |
+| jit: exp(x) | 253.8 | 265.7 |
+| jit: a @ b 64x64 | 310.0 | 328.6 |
+
+## Run 2026-05-11 18:32:34 (sha=, step7-broadcast-on-device-run2)
+
+### Surface 1 — Raw ttnn (tensors on device)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| ttnn.add 1x32 | 165.7 | 195.5 |
+| ttnn.add 32x32 | 145.3 | 190.7 |
+| ttnn.exp 1x32 | 108.4 | 133.6 |
+| ttnn.matmul 64x64 | 52.6 | 67.8 |
+| ttnn.matmul 256x256 | 56.0 | 70.4 |
+
+### Surface 2 — Engine eager (_execute_op_device)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| engine.add 1x32 | 115.8 | 154.6 |
+| engine.exp 1x32 | 71.8 | 82.5 |
+| engine.matmul 64x64 | 53.0 | 64.6 |
+| engine.matmul 256x256 | 54.2 | 67.3 |
+
+### Surface (parse) — bytecode_to_text + parse_stablehlo
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| parse: x + 1 | 1383.4 | 1406.7 |
+| parse: softmax | 1652.2 | 1681.4 |
+
+### Surface 3 — Engine end-to-end (eager, no trace)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| e2e: x + 1 (1-op) | 1960.0 | 2005.4 |
+| e2e: exp(x) (1-op) | 1719.0 | 1747.5 |
+| e2e: a @ b 64x64 | 1805.9 | 1843.0 |
+| e2e: linear (a@w+b) | 2213.5 | 2270.7 |
+| e2e: softmax (1x64) | 2948.4 | 3034.4 |
+
+### Surface 5 — Engine traced (begin/end_trace_capture)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| traced: x + 1 (1-op) | 159.4 | 172.0 |
+| traced: exp(x) (1-op) | 153.4 | 206.0 |
+| traced: a @ b 64x64 | 196.9 | 213.1 |
+| traced: linear (a@w+b) | 226.6 | 241.8 |
+| traced: softmax (1x64) | 197.0 | 210.6 |
+
+### Surface 4 — jax.jit (full PJRT pipeline)
+
+| op | mean (us) | p99 (us) |
+|---|---:|---:|
+| jit: x + 1 | 257.0 | 274.6 |
+| jit: exp(x) | 253.6 | 267.2 |
+| jit: a @ b 64x64 | 310.1 | 323.5 |

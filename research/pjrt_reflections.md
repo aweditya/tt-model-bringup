@@ -756,3 +756,132 @@ to `ttnn.softmax` directly.
    padding), we silently fall back to eager. The failure record stays
    in the cache so we don't retry — good. But a noisy log would help
    diagnose later.
+
+---
+
+## 2026-05-11 (cont. 4): Phase 5 Step 7 — On-device broadcast lands the whole win
+
+### TL;DR
+
+One-line change to `_HOST_TRANSFER_DEVICE_OPS` (drop `broadcast_in_dim`)
+unblocked trace capture for **every composite program we tested**: softmax,
+linear (a@w+b), layer_norm, RMSNorm, attention. Softmax dropped from
+1012us → **198us** (5.1x), linear from 534us → **228us** (2.3x). All
+54 tests pass (50 baseline + 4 new TestTrace assertions). I did NOT
+implement softmax/RMSNorm pattern-match fusion — the on-device-broadcast
+change alone landed the target.
+
+### What changed
+
+`pjrt_plugin/jax_plugins/tt/engine.py`:
+
+```diff
+ _HOST_TRANSFER_DEVICE_OPS = {
+-    'broadcast_in_dim',
+     'slice', 'gather', 'scatter',
+     'and', 'or', 'reduce_argmax', 'compare',
+ }
+```
+
+That's it. The existing `_execute_broadcast_device` (added during Step 6
+preparation but conservatively kept out of the traceable set) handles all
+five broadcast patterns JAX emits:
+
+- `[] -> [N,M]` (scalar to tensor, e.g. eps, -inf, 0)
+- `[N] -> [N,1]` (rank-up after reduction, `dims=[0]`)
+- `[N,1] -> [N,M]` (broadcast across reduced dim, `dims=[0,1]`)
+- `[K] -> [1,K]` (rank-up for per-channel weights, `dims=[1]`)
+- `[1,K] -> [N,K]` (broadcast weight across batch, `dims=[0,1]`)
+
+All five go through `ttnn.repeat` cleanly, both eager and inside
+trace capture.
+
+### Numbers (qb1, two consecutive bench runs)
+
+|                          | step6-validated | step7-broadcast | speedup vs step6 |
+|--------------------------|----------------:|----------------:|------------------|
+| traced: x + 1            |          156us  |          160us  | ~                |
+| traced: exp(x)           |          157us  |          156us  | ~                |
+| traced: a @ b 64x64      |          200us  |          201us  | ~                |
+| traced: linear (a@w+b)   |          534us  |      **228us**  | **2.3x**         |
+| traced: softmax (1x64)   |         1012us  |      **198us**  | **5.1x**         |
+
+Run 2 (15s later) confirmed: linear 227us, softmax 197us. Reproducible.
+
+### Why this works (and why I was wrong about pattern matching)
+
+Going into Step 7 I assumed softmax fusion was the bigger lever. It isn't.
+The trace replay floor is ~150us — that's the irreducible
+`numpy -> ttnn placeholder -> execute_trace -> ttnn -> numpy` round trip.
+Once a program traces, it pays that floor REGARDLESS of how many ops the
+trace contains. A 13-op softmax trace and a 1-op `x+1` trace BOTH land
+at ~155-200us replay.
+
+What was killing softmax/linear in Step 6 wasn't that they had too many
+ops — it was that broadcast_in_dim blocked trace capture entirely, so
+they ran the full 13-op eager path with parse-cache (saving 1.4ms parse
+but paying 13 x ~80us = ~1040us per-op dispatch + transfer overhead =
+~1.5ms total). Unblocking trace capture eliminates the per-op dispatch.
+
+Per-op fusion (pattern-match -> ttnn.softmax) would save AT MOST ~50us
+(the few extra ops inside the trace body). Not worth pattern-matcher
+brittleness for that.
+
+### What I learned
+
+1. **Trace replay has a hard floor of ~150-200us per call** that's
+   dominated by host transfer (numpy -> ttnn -> numpy). Adding or removing
+   in-trace ops barely moves the needle for small tensors. Phase 6 will
+   need to attack the ABI (keep tensors on-device across calls) to go
+   lower.
+2. **One-line wins exist if the abstractions are right.** The on-device
+   broadcast code had been in place since Step 6 but disabled out of
+   caution. Lifting the gate took ONE LINE and delivered the headline
+   number. Trusting your code requires running it.
+3. **Pattern-match fusion is not the right lever yet.** The eager path
+   benefits from fused ops (ttnn.softmax is faster than 13 separate
+   dispatches). The trace path doesn't — trace eats dispatch cost.
+
+### What I didn't do (and why)
+
+1. **No softmax pattern match -> ttnn.softmax.** Marginal win (~50us at
+   best) for the brittleness cost. The plan said: "IF step 7a lands
+   softmax at <500us, declare victory and commit." We're at 198us.
+2. **No RMSNorm pattern match -> ttnn.rms_norm.** Same reasoning. RMSNorm
+   already traces and runs at trace-replay-floor latency.
+3. **No special-cased constant-broadcast skip-and-pin.** Was a concern in
+   the plan; turned out unnecessary. `ttnn.repeat` on a warmup-pinned
+   constant tensor works fine inside trace capture.
+
+### Risks remaining
+
+1. **Trace cache size.** Every unique bytecode allocates input
+   placeholders + output tensors on device. A model with many distinct
+   shapes (per layer) will fill the cache. We have LRU eviction (cap=64)
+   but it's untested under thrash.
+2. **Decode loops with shape-varying KV cache.** If each token grows the
+   sequence length, every call hits a new bytecode -> new trace.
+   `_capture_trace` cost is ~3s (parse + warmup + capture). This could
+   make the first 10-20 tokens unusably slow. Need to measure.
+3. **Concatenate, reshape edge cases.** Programs with these ops in the
+   data path may still fail trace capture. Not a regression — just an
+   open frontier.
+
+### Done state
+
+- engine.py: broadcast_in_dim moved out of `_HOST_TRANSFER_DEVICE_OPS`.
+- pjrt_plugin/tests/test_engine_device.py: TestTrace class added with
+  4 assertions (softmax, layer_norm, rms_norm, linear). All pass.
+- pjrt_plugin/scripts/inspect_trace_status.py: permanent helper that
+  prints which programs hit trace cache vs fall back. Useful for any
+  future op that breaks the trace path.
+- research/pjrt_phase5_benchmarks.md: two `step7-broadcast-on-device`
+  rows appended.
+- 54/54 device tests pass; 50/50 CPU engine tests still pass.
+
+### Open question for Phase 6
+
+The trace floor at ~150us is 70-75% host transfer. To go below it we
+need an ABI where the C++ shim holds device tensors directly, not
+numpy. JAX's PJRT_Buffer interface supports this — we just haven't
+plumbed it through our Python engine. Phase 6 work.

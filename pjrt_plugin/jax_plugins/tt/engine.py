@@ -866,13 +866,14 @@ _DATA_INDEPENDENT_OPS = {'constant', 'iota'}
 # op in this set is data-dependent in the program, we cannot capture a
 # trace (the cached result would be stale on replay).
 #
-# `broadcast_in_dim` has an on-device path (ttnn.repeat) but it isn't
-# robust enough to be trace-safe in every case. For now we keep it here
-# so trace capture skips programs that include it. Programs reach the
-# eager (parse-cached) path instead — still a ~3x speedup vs no cache.
-# TODO Step 7: make on-device broadcast trace-safe and drop this entry.
+# Step 7a (2026-05-11): `broadcast_in_dim` removed from this set.
+# `_execute_broadcast_device` has an on-device `ttnn.repeat` path that
+# handles the five patterns JAX actually emits (see Step 7 plan). The
+# CPU fallback still exists (raises caught upstream), so any pattern
+# that doesn't work on-device just drops the trace and falls back to
+# parse-cached eager — same behavior as before. Net: softmax / LN /
+# RMSNorm become traceable.
 _HOST_TRANSFER_DEVICE_OPS = {
-    'broadcast_in_dim',
     'slice', 'gather', 'scatter',
     'and', 'or', 'reduce_argmax', 'compare',
 }

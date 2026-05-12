@@ -343,5 +343,107 @@ class TestComposite:
         np.testing.assert_allclose(out_np, ref, atol=0.1, rtol=0.05)
 
 
+# ============================================================
+# Trace capture (Phase 5 Step 7) — JAX → bytecode → trace replay
+# ============================================================
+
+def _serialize_jax(fn, *example_args):
+    """Lower a JAX function to the VHLO bytecode the PJRT plugin receives."""
+    import jax
+    from jaxlib.mlir._mlir_libs._stablehlo import (
+        serialize_portable_artifact, get_current_version,
+    )
+    cpu_dev = jax.devices("cpu")[0]
+    with jax.default_device(cpu_dev):
+        lowered = jax.jit(fn).lower(*example_args)
+        module = lowered.compiler_ir(dialect="stablehlo")
+    return serialize_portable_artifact(module, get_current_version())
+
+
+class TestTrace:
+    """Verify trace cache fires on composite programs (Step 7a).
+
+    Each test runs the program twice through execute_stablehlo and asserts
+    (a) the trace cache entry is `failed=False` (capture succeeded),
+    (b) outputs are numerically correct.
+    """
+
+    def _run_and_check_trace(self, fn, *args, expect_trace=True, atol=0.05, rtol=0.05):
+        _check_device_mode()
+        bc = _serialize_jax(fn, *args)
+        np_args = [np.asarray(a) for a in args]
+
+        r1 = engine.execute_stablehlo(bc, np_args)
+        r2 = engine.execute_stablehlo(bc, np_args)
+
+        entry = engine._trace_cache.get(hash(bc), {})
+        if expect_trace:
+            assert not entry.get('failed', True), (
+                f"trace capture failed: {entry.get('error', '?')}")
+            assert 'trace_id' in entry, f"no trace_id in entry: {entry}"
+        return r1, r2
+
+    def test_trace_softmax(self):
+        """jax.nn.softmax — 13-op decomposition should capture cleanly."""
+        import jax
+        np.random.seed(42)
+        x = np.random.randn(2, 64).astype(np.float32)
+        r1, r2 = self._run_and_check_trace(
+            lambda x: jax.nn.softmax(x, axis=-1), x)
+        ref = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        ref = ref / np.sum(ref, axis=-1, keepdims=True)
+        np.testing.assert_allclose(r1[0], ref, atol=0.05, rtol=0.05)
+        # Replay must match capture
+        np.testing.assert_allclose(r1[0], r2[0], atol=1e-5, rtol=1e-5)
+
+    def test_trace_layer_norm(self):
+        """Manual layer norm — chain of broadcasts + reductions."""
+        import jax.numpy as jnp
+        np.random.seed(42)
+        x = np.random.randn(2, 64).astype(np.float32)
+        g = np.ones(64, dtype=np.float32)
+        b = np.zeros(64, dtype=np.float32)
+
+        def layer_norm(x, g, b):
+            mean = jnp.mean(x, axis=-1, keepdims=True)
+            var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+            return g * (x - mean) / jnp.sqrt(var + 1e-5) + b
+
+        r1, r2 = self._run_and_check_trace(layer_norm, x, g, b)
+        mean = np.mean(x, axis=-1, keepdims=True)
+        var = np.mean((x - mean) ** 2, axis=-1, keepdims=True)
+        ref = g * (x - mean) / np.sqrt(var + 1e-5) + b
+        np.testing.assert_allclose(r1[0], ref, atol=0.05, rtol=0.05)
+        np.testing.assert_allclose(r1[0], r2[0], atol=1e-5, rtol=1e-5)
+
+    def test_trace_rms_norm(self):
+        """RMS norm — pow2 → mean → +eps → sqrt → divide chain."""
+        import jax.numpy as jnp
+        np.random.seed(42)
+        x = np.random.randn(2, 64).astype(np.float32)
+        g = np.ones(64, dtype=np.float32)
+
+        def rms_norm(x, g):
+            ms = jnp.mean(x ** 2, axis=-1, keepdims=True)
+            return g * x / jnp.sqrt(ms + 1e-6)
+
+        r1, r2 = self._run_and_check_trace(rms_norm, x, g)
+        ms = np.mean(x ** 2, axis=-1, keepdims=True)
+        ref = g * x / np.sqrt(ms + 1e-6)
+        np.testing.assert_allclose(r1[0], ref, atol=0.05, rtol=0.05)
+        np.testing.assert_allclose(r1[0], r2[0], atol=1e-5, rtol=1e-5)
+
+    def test_trace_linear_bias(self):
+        """a @ w + b — bias broadcast was the Step 6 blocker for traces."""
+        np.random.seed(42)
+        a = np.random.randn(2, 64).astype(np.float32) * 0.1
+        w = np.random.randn(64, 32).astype(np.float32) * 0.1
+        b = np.random.randn(32).astype(np.float32) * 0.1
+        r1, r2 = self._run_and_check_trace(lambda a, w, b: a @ w + b, a, w, b)
+        ref = a @ w + b
+        np.testing.assert_allclose(r1[0], ref, atol=0.1, rtol=0.1)
+        np.testing.assert_allclose(r1[0], r2[0], atol=1e-5, rtol=1e-5)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

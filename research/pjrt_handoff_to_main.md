@@ -113,3 +113,68 @@ runs.
 
 **Phase 5 is at Step 6 complete (trace capture, 9-13x). Next: Step 7 op
 fusion to extend traceability to softmax/layer-norm/RMS-norm.**
+
+---
+
+## Step 7 result (appended 2026-05-11)
+
+### What fused
+
+Nothing. Step 7 turned out to need ONE LINE — dropping `broadcast_in_dim`
+from `_HOST_TRANSFER_DEVICE_OPS` — because the existing on-device
+`ttnn.repeat` path inside `_execute_broadcast_device` is already robust
+for the five broadcast patterns JAX emits (scalar->tensor, rank-up after
+reduction, broadcast across reduced dim, per-channel rank-up, batch
+broadcast). All trace-capture-safe.
+
+I did NOT implement softmax/RMSNorm pattern-match fusion. The on-device
+broadcast change alone landed the target latency and the cost/risk of a
+pattern matcher wasn't justified.
+
+### New benchmark numbers vs step6-validated
+
+|                          | step6-validated | step7-broadcast | speedup |
+|--------------------------|----------------:|----------------:|--------:|
+| traced: x + 1            |          156us  |          160us  | ~       |
+| traced: exp(x)           |          157us  |          156us  | ~       |
+| traced: a @ b 64x64      |          200us  |          201us  | ~       |
+| traced: linear (a@w+b)   |          534us  |      **228us**  | **2.3x**|
+| traced: softmax (1x64)   |         1012us  |      **198us**  | **5.1x**|
+
+Inspected with `pjrt_plugin/scripts/inspect_trace_status.py`: softmax,
+layer_norm, rms_norm, linear, attention ALL hit trace cache cleanly.
+
+### What didn't fuse (and why we didn't try harder)
+
+The trace replay path has a hard floor of ~150us per call dominated by
+numpy<->ttnn host transfer. A 13-op softmax trace and a 1-op `x+1` trace
+both land at ~155-200us. Per-op fusion (replace 13 ops with 1
+`ttnn.softmax` call) would save ~30-50us in the replay body — not worth
+the brittleness of a pattern matcher that breaks on any JAX lowering
+change.
+
+### Test status
+
+- `test_engine_device.py`: 27/27 (added 4 TestTrace assertions for
+  softmax, layer_norm, rms_norm, linear).
+- `test_basic_ops.py`: 27/27 unchanged.
+- `test_engine.py` + `test_buffer.py`: 50/50 CPU tests unchanged.
+- Together: **54/54 device, 50/50 CPU, all green.**
+
+### Files touched
+
+- `pjrt_plugin/jax_plugins/tt/engine.py` — one-line change to
+  `_HOST_TRANSFER_DEVICE_OPS`.
+- `pjrt_plugin/tests/test_engine_device.py` — new `TestTrace` class.
+- `pjrt_plugin/scripts/inspect_trace_status.py` — new debug helper.
+- `research/pjrt_phase5_step7_plan.md` — design doc.
+- `research/pjrt_phase5_benchmarks.md` — two `step7-broadcast-on-device`
+  rows appended (run + replay).
+- `research/pjrt_reflections.md` — 2026-05-11 (cont. 4) entry.
+
+### One-liner
+
+**Phase 5 is at Step 7 complete (on-device broadcast trace-safe).
+Softmax/linear/LN/RMSNorm now trace. Trace replay floor is ~150us —
+70-75% host transfer. Phase 6 lever is the PJRT ABI: keep device
+tensors across calls.**
