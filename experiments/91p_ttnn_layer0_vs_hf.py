@@ -15,11 +15,17 @@ on device with the fixed kernels, saves x_after_mlp, compares to
 
 Gate: cosine ≥ 0.999. If pass → run 91l with 60 tokens.
 
+CLI flags:
+  --weight-dtype {bf8,bf16,fp32}  (default: bf8)
+    Override the projection/conv1d_weight dtype. Use to ablate whether
+    bf8 quantization is the source of remaining drift. bf16 doubles
+    weight memory but matches HF reference at higher precision.
+
 Run on qb2:
     cd ~/tt-xla && HF_HOME=$HOME/tt-xla/.cache/hf .venv/bin/python \
-        experiments/91p_ttnn_layer0_vs_hf.py
+        experiments/91p_ttnn_layer0_vs_hf.py [--weight-dtype bf16]
 """
-import os, sys, json, time
+import os, sys, json, time, argparse
 import numpy as np
 import torch
 import ttnn
@@ -50,8 +56,15 @@ def cosine(a, b):
 
 
 def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--weight-dtype", choices=["bf8", "bf16", "fp32"], default="bf8",
+                   help="dtype for projection and conv1d weights")
+    args = p.parse_args()
+
+    proj_dtype = {"bf8": ttnn.bfloat8_b, "bf16": ttnn.bfloat16, "fp32": ttnn.float32}[args.weight_dtype]
+
     print("=" * 64)
-    print("Experiment 91p — ttnn layer 0 vs HF reference (post-B'9.5-fixes)")
+    print(f"Experiment 91p — ttnn layer 0 vs HF reference (proj_dtype={args.weight_dtype})")
     print("=" * 64)
     t_total = time.time()
 
@@ -120,13 +133,14 @@ def main():
         if k == 'conv1d_weight' and arr.ndim == 3:
             arr = arr.squeeze(1)
         if 'proj' in k or k == 'conv1d_weight':
-            dt = ttnn.bfloat8_b
+            dt = proj_dtype  # CLI override; default bf8
         elif k in ('A_log', 'dt_bias'):
             dt = ttnn.float32
         else:
             dt = ttnn.bfloat16
         w_tt[k] = upload(arr, device, dtype=dt)
-    print(f"  uploaded {len(w_tt)} weight tensors in {time.time()-t0:.1f}s")
+    print(f"  uploaded {len(w_tt)} weight tensors in {time.time()-t0:.1f}s "
+          f"(proj_dtype={args.weight_dtype})")
 
     # ----- Initialize DeltaNet state (one layer) -----
     ssm_state = upload(
