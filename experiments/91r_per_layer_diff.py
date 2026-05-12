@@ -67,20 +67,25 @@ def cosine(a, b):
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 
 
-def upload_weights(w_np, device):
-    """Apply the 91l dtype policy when uploading per-layer weights."""
+def upload_weights(w_np, device, proj_dtype=ttnn.bfloat8_b):
+    """Apply the 91l dtype policy when uploading per-layer weights.
+    proj_dtype: override for projection + conv1d weights (default bf8,
+    can be bf16 / fp32 to ablate quantization-noise hypothesis)."""
     w_tt = {}
     for k, arr in w_np.items():
         if k == 'conv1d_weight' and arr.ndim == 3:
             arr = arr.squeeze(1)
         if 'proj' in k or k == 'conv1d_weight':
-            dt = ttnn.bfloat8_b
+            dt = proj_dtype
         elif k in ('A_log', 'dt_bias'):
             dt = ttnn.float32
         else:
             dt = ttnn.bfloat16
         w_tt[k] = upload(arr, device, dtype=dt)
     return w_tt
+
+
+_PROJ_DTYPE = ttnn.bfloat8_b  # set in main from CLI
 
 
 def test_linear_attention_layer(layer_idx, hf_in, hf_out, cfg, device):
@@ -91,7 +96,7 @@ def test_linear_attention_layer(layer_idx, hf_in, hf_out, cfg, device):
     CONV_DIM = 2 * KEY_DIM + VAL_DIM
 
     w_np = load_layer_weights_all(layer_idx, 'linear_attention')
-    w_tt = upload_weights(w_np, device)
+    w_tt = upload_weights(w_np, device, proj_dtype=_PROJ_DTYPE)
 
     # Fresh state
     ssm_state = upload(
@@ -120,7 +125,7 @@ def test_full_attention_layer(layer_idx, hf_in, hf_out, cfg, device):
     HIDDEN = cfg['hidden']
 
     w_np = load_layer_weights_all(layer_idx, 'full_attention')
-    w_tt = upload_weights(w_np, device)
+    w_tt = upload_weights(w_np, device, proj_dtype=_PROJ_DTYPE)
 
     # Fresh KV cache
     kv_init = np.zeros((1, cfg['n_kv_heads'], MAX_POS, cfg['head_dim']), dtype=np.float32)
@@ -159,11 +164,17 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--layers", type=str, default=",".join(map(str, DEFAULT_LAYERS)),
                    help="Comma-separated layer indices to test")
+    p.add_argument("--weight-dtype", choices=["bf8", "bf16", "fp32"], default="bf8",
+                   help="Override projection + conv1d weight dtype to ablate "
+                        "quantization-noise hypothesis (default bf8, matches 91l)")
     args = p.parse_args()
     layers_to_test = [int(x) for x in args.layers.split(",")]
+    global _PROJ_DTYPE
+    _PROJ_DTYPE = {"bf8": ttnn.bfloat8_b, "bf16": ttnn.bfloat16, "fp32": ttnn.float32}[args.weight_dtype]
 
     print("=" * 64)
-    print(f"Experiment 91r — per-layer intrinsic cosine (layers {layers_to_test})")
+    print(f"Experiment 91r — per-layer intrinsic cosine "
+          f"(layers {layers_to_test}, weight_dtype={args.weight_dtype})")
     print("=" * 64)
     t_total = time.time()
 
