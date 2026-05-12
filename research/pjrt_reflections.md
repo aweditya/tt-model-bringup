@@ -530,3 +530,97 @@ We have correctness. Time to measure. Plan:
 2. Profile to find the dispatch/transfer/compute split.
 3. Implement trace capture (Phase 5 Step 6) and re-measure.
 4. Then op fusion (Phase 5 Step 7).
+
+---
+
+## 2026-05-11 (cont. 2): Phase 5 Step 5 — Benchmark baseline (eager mode)
+
+### Methodology
+
+Permanent benchmark at `pjrt_plugin/tests/bench_device.py`. Four surfaces,
+each timing the same shapes:
+- Surface 1: raw `ttnn.add/exp/matmul` on tensors already on device.
+- Surface 2: same ops via `engine._execute_op_device` (still on device).
+- Surface (parse): just `bytecode_to_text` + `parse_stablehlo` on a portable artifact.
+- Surface 3: full `engine.execute_stablehlo(bytecode, numpy_inputs)`.
+- Surface 4: `jax.jit(...)` through C++ PJRT.
+
+Warm-up: 10 iters. Timing: 200 iters with `ttnn.synchronize_device` after
+each Surface-1/2 iter (true completion latency). Results appended to
+`research/pjrt_phase5_benchmarks.md`.
+
+### Numbers (qb1, bf16, single device 0, warm kernel cache)
+
+|                          | mean (us) |
+|--------------------------|----------:|
+| ttnn.add 1x32 (raw)      |        91 |
+| ttnn.exp 1x32 (raw)      |        74 |
+| ttnn.matmul 64x64 (raw)  |        43 |
+| ttnn.matmul 256x256 (raw)|        45 |
+| engine.add 1x32          |        95 |
+| engine.matmul 64x64      |        57 |
+| parse: x+1               |     1379  |
+| parse: softmax           |     1656  |
+| e2e: x+1 (1-op)          |     1994  |
+| e2e: a@b 64x64           |     1787  |
+| e2e: linear (3 ops)      |     2424  |
+| e2e: softmax (7 ops)     |     3373  |
+| jit: x+1                 |     2086  |
+| jit: a@b 64x64           |     1829  |
+
+### What the data says
+
+1. **Engine dispatch overhead is negligible.** Surface 2 vs 1 differ by ~5-15us per op
+   — our Python op-table costs basically nothing on top of ttnn's dispatch.
+   The huge `engine.add` ≈ `ttnn.add` confirms this.
+
+2. **Parse dominates eager mode.** 1.4-1.7ms just to convert bytecode →
+   text → op list. On a 1-op program, parse is **70% of total time.**
+   On softmax (7 ops), parse is still 50%.
+
+3. **C++ PJRT shim is free.** Surface 4 (jax.jit) is within 50us of
+   Surface 3 (direct engine call). All the cost is in Python.
+
+4. **Per-op dispatch ~45-95us.** Matches our experiments/tt_jax baseline
+   from MoE work (we estimated 30us; bf16 broadcast + Python wrappers
+   take the rest). Softmax with 7 dispatches → 7 × ~80us = ~560us of
+   the ~3.4ms e2e — only 17%. The rest is parse + transfers.
+
+5. **Matmul is the same cost at 64x64 and 256x256.** Dispatch-bound,
+   not compute-bound at these sizes. Confirms the "dispatch wall" finding
+   from MoE experiments.
+
+### Strategic implications for Step 6 (trace capture)
+
+If we cache parse output keyed on bytecode hash, **parse drops to ~1us**
+for subsequent calls (just a dict lookup). That alone is 1.4-1.7ms off
+every Surface-3 call.
+
+If we additionally capture+replay an actual `ttnn` trace, the per-op
+dispatch (45-95us each) collapses to one `execute_trace` call. For
+softmax (7 ops × ~80us = 560us), that's another ~500us saved.
+
+Expected after Step 6:
+- e2e: x+1 → from ~2ms to ~150-300us (10x)
+- e2e: softmax → from ~3.4ms to ~300-500us (7-10x)
+
+The transfer cost (numpy → ttnn for inputs, ttnn → numpy for outputs)
+is the irreducible floor for the current "C++ passes numpy through" ABI.
+Step 6 doesn't change it. To go below that floor would require a Phase 6
+buffer-on-device design.
+
+### Gotchas hit
+
+1. **Two module instances opening the same device.** The bench script
+   first loaded engine via `importlib.spec_from_file_location` (separate
+   instance) AND JAX auto-imports `jax_plugins.tt.engine` (canonical
+   instance). Two `_device` globals → second open crashes ttnn with
+   `context_id -1982074200 is invalid`. Fix: bench imports
+   `from jax_plugins.tt import engine` (same module instance JAX uses).
+
+2. **Bytecode format matters.** `module.write_bytecode_to_string()`
+   returns raw MLIR bytecode where `func.func` requires the `func`
+   dialect. Our engine only registers `stablehlo`. Solution: serialize
+   with `serialize_portable_artifact` (VHLO format, same as JAX sends
+   to PJRT). The engine's deserialize_portable_artifact code path
+   handles dialect registration.
