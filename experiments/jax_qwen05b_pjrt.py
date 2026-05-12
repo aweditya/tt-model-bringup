@@ -262,7 +262,7 @@ R = build_R(HEAD_DIM)  # [D, D]
 def make_decode_step(weights_packed, R_const):
     """Build the JAX decode function with weights baked in as constants."""
     R_jax = jnp.asarray(R_const)
-    scale = 1.0 / jnp.sqrt(jnp.float32(HEAD_DIM))
+    scale = float(1.0 / np.sqrt(HEAD_DIM))
     groups = N_Q_HEADS // N_KV_HEADS  # 7
 
     # weights_packed: list of dicts (per-layer) holding jnp arrays
