@@ -224,10 +224,14 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     #   is the height dim, to unblock paged_update_cache.
     k_np = ttnn.to_torch(k_tt).float().numpy().reshape(N_KV, HEAD_DIM)
     v_np = ttnn.to_torch(v_tt).float().numpy().reshape(N_KV, HEAD_DIM)
-    kv_k_np = ttnn.to_torch(kv_cache_k_tt).float().numpy().reshape(
-        1, N_KV, MAX_POS, HEAD_DIM)
-    kv_v_np = ttnn.to_torch(kv_cache_v_tt).float().numpy().reshape(
-        1, N_KV, MAX_POS, HEAD_DIM)
+    # Derive cache MAX_POS from the actual tensor — don't trust module-level constant
+    # (callers may use different cache sizes; B'8 uses 256, B'6 used 128).
+    cache_k_flat = ttnn.to_torch(kv_cache_k_tt).float().numpy()
+    cache_v_flat = ttnn.to_torch(kv_cache_v_tt).float().numpy()
+    cache_max_pos = cache_k_flat.size // (N_KV * HEAD_DIM)
+    assert cur_pos < cache_max_pos, f"cur_pos {cur_pos} exceeds cache {cache_max_pos}"
+    kv_k_np = cache_k_flat.reshape(1, N_KV, cache_max_pos, HEAD_DIM)
+    kv_v_np = cache_v_flat.reshape(1, N_KV, cache_max_pos, HEAD_DIM)
     kv_k_np[0, :, cur_pos, :] = k_np
     kv_v_np[0, :, cur_pos, :] = v_np
     kv_cache_k_tt = ttnn.from_torch(torch.from_numpy(kv_k_np), dtype=ttnn.bfloat16,
