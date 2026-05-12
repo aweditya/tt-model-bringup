@@ -181,15 +181,22 @@ def deltanet_step_ondevice(x_tt, w_tt, ssm_state_tt, conv_state_tt, cfg):
                      ttnn.mul(k_col, ttnn.reshape(delta, [1, N_V_HEADS, 1, V_DIM])))
     q_col = ttnn.reshape(q, [1, N_V_HEADS, K_DIM, 1])
     out = ttnn.reshape(ttnn.sum(ttnn.mul(H_new, q_col), dim=-2), [1, VAL_DIM])
-    # B'9.5 fix: per-head Qwen3_5RMSNormGated. core_attn_out is reshaped to
-    # [N_V_HEADS, V_DIM] and normalized over the last dim. linear_attn_norm
-    # weight has shape [V_DIM]. The Qwen3_5RMSNormGated forward is:
-    #   normed = x / sqrt(mean(x²)+eps) * weight    (standard w*x, NOT 1+w)
-    #   out    = normed * silu(z)
+    # B'9.5 fix: per-head Qwen3_5RMSNormGated. Do BOTH the RMSNorm and the
+    # silu(z) gate in [N_V, V_DIM] shape, mirroring HF exactly:
+    #     core_attn_out.reshape(-1, head_v_dim)
+    #     z.reshape(-1, head_v_dim)
+    #     core_attn_out = norm(core_attn_out, z)
+    # Previously we reshape-back-to-flat after rms_norm and gated against
+    # flat-z, which gave cosine 0.81 vs HF (probe-confirmed rms_norm itself
+    # is fine; suspect is the reshape interaction with TILE_LAYOUT for the
+    # gate-mul). Keep the multiplication per-head and reshape only at the
+    # end before out_proj.
     out_per_head = ttnn.reshape(out, [N_V_HEADS, V_DIM])
     out_normed = ttnn.rms_norm(out_per_head, weight=w_tt['linear_attn_norm'], epsilon=EPS)
-    out_normed = ttnn.reshape(out_normed, [1, VAL_DIM])
-    out_gated = ttnn.mul(out_normed, ttnn.silu(z_tt))
+    z_per_head = ttnn.reshape(z_tt, [N_V_HEADS, V_DIM])
+    silu_z_per_head = ttnn.silu(z_per_head)
+    out_gated_per_head = ttnn.mul(out_normed, silu_z_per_head)
+    out_gated = ttnn.reshape(out_gated_per_head, [1, VAL_DIM])
 
     out_proj = ttnn.linear(out_gated, w_tt['out_proj'], compute_kernel_config=hifi4)
     x_out = ttnn.add(x_tt, out_proj)
