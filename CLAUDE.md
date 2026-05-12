@@ -8,8 +8,9 @@ Exploratory research project for Stanford CS440LX. The goal is to understand Ten
 1. **ALWAYS think first, act later.** Plan, plan, and more planning before implementing. No hand-wavy arguments — every claim must be grounded in an experiment or concrete evidence. If we have a hypothesis, we test it.
 2. **Research-driven workflow.** Most work is research, Q&A, and building a wiki of practice-exam-style questions. Learning by building.
 3. **No code bloat.** Spend more time thinking, less time implementing. When we implement, it's correct and concise.
-4. **Remote execution only — `ssh qb1`.** All experiments and code run on the remote host. (Previous host `ssh tenstorrent` is no longer available — Blackhole was disconnected from it.)
-5. **Single device for now.** The qb1 host has two Blackhole chips — stick to ONE device until we've saturated it. Once saturated, scale up to both.
+4. **Remote execution only — `ssh qb1` or `ssh qb2`.** All experiments and code run on a remote host. (Previous host `ssh tenstorrent` is no longer available.)
+5. **Two hosts now available**: `qb1` (4 P150s, NO inter-chip fabric — single-chip workloads only) and `qb2` (4 P150s with working fabric — use for multi-chip work).
+6. **Single device for now.** Both hosts have 4 Blackhole chips — stick to ONE device until we've saturated it. Multi-chip is a real-need decision (memory or throughput), not a workaround for poor single-chip util.
 6. **No inline scripts** unless absolutely necessary. Write permanent files in `pjrt_plugin/scripts/`, `pjrt_plugin/tests/`, or `experiments/`.
 7. **No `/tmp` for anything.** Use project directories for outputs, logs, caches, scratch — anything.
 8. **Frequent commits.** Commit early and often.
