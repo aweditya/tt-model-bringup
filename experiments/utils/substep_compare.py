@@ -36,24 +36,17 @@ TTNN_PATH = os.path.expanduser("~/tt-xla/.cache/ttnn_layer0_substeps.npz")
 # The list below is what we actually capture in both sides.
 LAYOUT = [
     # (logical name, hf_key, hf_slice_kind, ttnn_key)
-    ("embed",                    "__embed__.out",                          "seq2",  "pos{pos}.embed"),
-    ("input_layernorm.in",       "input_layernorm.in",                     "seq2",  "pos{pos}.input_layernorm.in"),
-    ("input_layernorm.out",      "input_layernorm.out",                    "seq2",  "pos{pos}.input_layernorm.out"),
-    ("in_proj_qkv.out",          "linear_attn.in_proj_qkv.out",            "seq2",  "pos{pos}.in_proj_qkv.out"),
-    ("in_proj_z.out",            "linear_attn.in_proj_z.out",              "seq2",  "pos{pos}.in_proj_z.out"),
-    ("in_proj_a.out",            "linear_attn.in_proj_a.out",              "seq2",  "pos{pos}.in_proj_a.out"),
-    ("in_proj_b.out",            "linear_attn.in_proj_b.out",              "seq2",  "pos{pos}.in_proj_b.out"),
-    # linear_attn.norm is reshaped to [seq*n_v, head_v_dim] = (240, 128) in HF
-    # while our ttnn captures per-pos as (48, 128). Compare by per-pos slice.
-    ("linear_attn.norm.in",      "linear_attn.norm.in",                    "240_48", "pos{pos}.norm.in"),
-    ("linear_attn.norm.out",     "linear_attn.norm.out",                   "240_48", "pos{pos}.norm.out_pre_gate"),
-    ("out_proj.out",             "linear_attn.out_proj.out",               "seq2",  "pos{pos}.out_proj.out"),
-    ("linear_attn.full.out",     "linear_attn.out",                        "seq2",  "pos{pos}.linear_attn.out"),
-    ("post_attn_layernorm.out",  "post_attention_layernorm.out",           "seq2",  "pos{pos}.post_attention_layernorm.out"),
-    ("mlp.gate_proj_silu",       "mlp.act_fn.out",                         "seq2",  "pos{pos}.gate_proj_silu"),
-    ("mlp.up_proj.out",          "mlp.up_proj.out",                        "seq2",  "pos{pos}.up_proj.out"),
-    ("mlp.down_proj.out",        "mlp.down_proj.out",                      "seq2",  "pos{pos}.down_proj.out"),
-    ("layer.out",                "__layer__.out",                          "seq2",  "pos{pos}.layer.out"),
+    # NOTE: HF __layer__.out is the FULL layer output (residual + linear_attn + mlp).
+    # To get "post_deltanet" (residual + linear_attn only, before mlp),
+    # we'd need an additional HF capture point. For now, compare:
+    #   - HF __layer__.in (pre-layer) vs ttnn pos{pos}.pre_layer
+    #   - HF __layer__.out (post-mlp) vs ttnn pos{pos}.post_mlp
+    # The post_deltanet capture on the ttnn side is for our own forensics.
+    ("pre_layer",       "__layer__.in",   "seq2",  "pos{pos}.pre_layer"),
+    ("post_mlp",        "__layer__.out",  "seq2",  "pos{pos}.post_mlp"),
+    # Mid-layer reference (HF's linear_attn output = post-residual hidden state after DeltaNet only,
+    # before the MLP block). HF emits this as "linear_attn.out" via the hook.
+    ("post_deltanet",   "linear_attn.out", "seq2", "pos{pos}.post_deltanet"),
 ]
 
 
