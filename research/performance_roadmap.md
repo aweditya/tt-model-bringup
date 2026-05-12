@@ -23,7 +23,33 @@ Without instrumentation we can't know precisely, but the breakdown is roughly:
 
 Total ≈ 307 ms ✓. The KV roundtrip is the biggest fixable chunk.
 
-## Phase order (by expected impact)
+## Revised phase order (2026-05-12 — daily-driver use case explicit)
+
+**Why the order changed**: user clarified the goal is *daily-driver local LLM replacing cloud* (ChatGPT, etc.). That makes **long-context correctness** the binding constraint, not raw decode tok/s. We also discovered that **Phase A6 v1 chunked-serial DeltaNet already exists** (`experiments/85_deltanet_scan_v1.py` at 800 tok/s prefill — measured), so a usable long-context experience is much closer than the original roadmap implied.
+
+Revised order:
+
+| # | Phase | What | Goal |
+|---|---|---|---|
+| ✓ | C'1 | ttnn.scatter for KV cache (DONE, commit 6e365a4) | -57 ms/tok (-21%) |
+| 1 | **C'0.5** | Scale MAX_POS to 32k+: KV cache resize, RoPE extension, build bf16-vs-fp32-reference long-context comparison test | **prereq** for everything else; unblocks real correctness gate |
+| 2 | **C'5a** | Wire A6 v1 chunked-serial DeltaNet (from exp 85) into 91l prefill | 32k prefill: 80 min → ~40 sec |
+| 3 | **C'2 (re-test)** | Re-evaluate bf16 residual ablation against the long-context gate | safely accept or reject the bf16 change |
+| 4 | **C'5b** | Replace within-chunk serial with parallel `(I-attn)^{-1}` via Neumann series — see `research/c5_chunked_prefill_plan.md` | 32k prefill: 40 sec → ~5-10 sec |
+| 5 | **Serve loop** | Chat template, OpenAI/Anthropic-compatible HTTP, tool-call parsing | model becomes daily-driver usable |
+| 6 | C'3 | Native `ttnn.experimental.rotary_embedding` | -5-10 ms/tok decode |
+| 7 | DN-fusion | DeltaNet 4-linear input-projection fusion (see `research/deltanet_4linear_fusion_plan.md`) | -3-5 ms/tok decode |
+| 8 | C'4 | Trace capture for full decode step | -20-50 ms/tok decode (ceiling raised by C'1's pipelining surprise) |
+| 9 | C'6 | DRAM-sharded weights | ~10% bandwidth win |
+| 10 | C'7 | Multi-chip TP across 4 P150s on qb2 | -60%; unlocks larger context cache too |
+
+**Why this ordering**:
+- **C'0.5 first** because every later optimization needs a long-context gate. Without that gate we ship "fast but maybe broken at 32k" code that the user can't actually rely on for daily work.
+- **C'5a before C'2** because we can't even MEASURE bf16 correctness at long context until prefill is fast enough to run the test. A6 v1 at 40 sec/32k makes the test loop feasible.
+- **C'5b before C'4** because long-context usability is a hard prereq; trace capture's win is decode-only and gains relative weight after long-context is solved.
+- **Serve loop before C'3/DN-fusion/C'4** because once the model is usable end-to-end at long context, the user can BENCHMARK it against ChatGPT for actual work, not just synthetic decode metrics. That benchmark informs which further perf phases matter.
+
+## Original phase order (deprecated — kept for diff history)
 
 ### C'1 — KV-cache `paged_update_cache` (target: -80 to -100 ms/tok)
 
