@@ -11,3 +11,6 @@ research/raw/
 __pycache__/
 *.pyc
 .venv/
+
+# Scraped doc corpus — regenerable via pjrt_plugin/scripts/scrape_tt_docs.py
+tt_docs_corpus/
