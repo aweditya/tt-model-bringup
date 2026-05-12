@@ -1959,7 +1959,8 @@ def execute_constant(op: dict) -> np.ndarray:
     shape, dtype = parse_tensor_type(result_type)
 
     # Parse the value string
-    # Formats: "1.0", "1.000000e+00", "[[1, 2], [3, 4]]", "true", "false"
+    # Formats: "1.0", "1.000000e+00", "[[1, 2], [3, 4]]", "true", "false",
+    #          "0xFF800000" (scalar hex float), '"0xABCD1234..."' (packed bytes)
     val_str = val_str.strip()
 
     if val_str in ('true', 'false'):
@@ -1969,8 +1970,32 @@ def execute_constant(op: dict) -> np.ndarray:
 
     if val_str.startswith('['):
         # Array constant — parse nested list
-        # Replace stablehlo syntax with Python syntax
         arr = np.array(eval(val_str), dtype=dtype)
+        if shape:
+            arr = arr.reshape(shape)
+        return arr
+
+    # Packed-hex-bytes array: '"0xAABBCCDD..."'
+    # JAX emits large constants (e.g., RoPE tables baked into the graph)
+    # as a quoted hex string where each tensor element is encoded as
+    # little-endian bytes. Element width is per the result dtype.
+    if val_str.startswith('"0x') and val_str.endswith('"'):
+        hex_chars = val_str[3:-1]
+        raw_bytes = bytes.fromhex(hex_chars)
+        # Extract the *original* dtype name (bf16 / f32 / etc) — parse_tensor_type
+        # maps bf16 → np.float32 since numpy has no native bf16, but the BYTES
+        # in the constant are bf16 (2 bytes each), not fp32 (4 bytes each).
+        type_inner = result_type.strip().lstrip('tensor<').rstrip('>')
+        dtype_name = type_inner.split('x')[-1].strip()
+        if dtype_name == 'bf16':
+            # bf16 = upper 16 bits of fp32. Read as u16, shift left 16,
+            # reinterpret as f32.
+            u16 = np.frombuffer(raw_bytes, dtype=np.uint16)
+            u32 = u16.astype(np.uint32) << 16
+            arr = u32.view(np.float32).copy()
+        else:
+            # f32, i32, etc. — just read directly at the dtype's itemsize
+            arr = np.frombuffer(raw_bytes, dtype=dtype).copy()
         if shape:
             arr = arr.reshape(shape)
         return arr
