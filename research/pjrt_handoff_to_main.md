@@ -178,3 +178,98 @@ change.
 Softmax/linear/LN/RMSNorm now trace. Trace replay floor is ~150us —
 70-75% host transfer. Phase 6 lever is the PJRT ABI: keep device
 tensors across calls.**
+
+---
+
+## Vanilla tt-nn comparison results (appended 2026-05-11)
+
+### The question
+
+"When the same computation is hand-written in native tt-nn, how does it
+compare to running it through our PJRT-traced path?"
+
+This is the answer the entire PJRT effort hinges on. If PJRT is slower
+than vanilla, the plugin is a worse abstraction. If equal, the value
+is convenience. If faster, op fusion / trace logic is paying off.
+
+### Setup
+
+Plan: `research/pjrt_vanilla_comparison_plan.md`. Bench script:
+`pjrt_plugin/tests/bench_vanilla_vs_pjrt.py`. Six programs, three
+implementations each. Median + p90 over 100 measurement iters, 5
+warmup. Two consecutive runs for stability (run1 had cold-cache
+anomaly on P1; run2 is steady-state and the headline).
+
+Cosine-equivalence between all three implementations: 1.0000 for
+5 of 6 programs, 0.9998 for softmax. All paths compute the same
+program.
+
+### Numbers (run2, steady-state)
+
+| Program | Vanilla eager med/p90 (us) | Vanilla traced med/p90 (us) | PJRT traced med/p90 (us) | PJRT / vanilla-traced |
+|---|---:|---:|---:|---:|
+| P1 x + 1 (1x32)        | 229 / 241 | 149 / 157 | 153 / 163 | **1.03** |
+| P2 exp(x) (1x32)       | 216 / 229 | 148 / 156 | 150 / 161 | **1.01** |
+| P3 a @ b (64x64)       | 224 / 235 | 195 / 208 | 200 / 206 | **1.03** |
+| P4 softmax (1x64)      | 181 / 192 | 150 / 158 | 312 / 327 | **2.08** |
+| P5 linear (a@w+b)      | 378 / 479 | 217 / 226 | 227 / 236 | **1.05** |
+| P6 attention (8x32)    | 440 / 452 | 269 / 278 | 328 / 336 | **1.22** |
+
+Mean ratio: 1.23 (dominated by the P4 softmax outlier). Excluding P4,
+mean ratio is 1.07.
+
+### Honest prose answer
+
+**PJRT-traced is at parity with vanilla tt-nn-traced for 4 of 6
+programs.** Ratios 1.01-1.05 for P1, P2, P3, P5 — within 5% of
+vanilla. The engine's parse-cache hit + trace replay add ~3-10us of
+bookkeeping per call, which is essentially free.
+
+**1.22x slower on attention (P6, +58us).** Multi-op programs pay a
+small linear-in-op-count overhead from the engine's per-op dispatch
+during trace replay. Real but bounded.
+
+**2.08x slower on softmax (P4, +161us).** This is the only material
+gap. It's NOT framework overhead — it's the algorithmic difference
+between `ttnn.softmax(dim=-1)` (one fused kernel) and the JAX
+lowering `max → broadcast → sub → exp → sum → broadcast → div`
+(5-13 ops). An expert writing vanilla TT-NN would never write the
+decomposition; JAX users get it because JAX lowers softmax that way.
+Pattern-match fusion in the engine (~1 day of work) would close
+this gap.
+
+### Recommendation
+
+**Don't invest Phase 6 (PJRT ABI / persistent device tensors) for
+raw latency.** The plugin already matches vanilla on real programs
+(P1, P2, P3, P5 at 1.01-1.05x). The remaining engine overhead is
+small, bounded, and scales harmlessly. Phase 6's gain on top of
+parity would be marginal.
+
+**Invest in softmax/RMS-norm/LN pattern-match fusion.** This is the
+one place PJRT loses materially (P4 at 2.08x). For any transformer
+workload — Qwen3-Coder-Next, Gemma4, etc. — JAX will lower softmax
+into the decomposed form and pay 2x vs the fused kernel a hand
+TT-NN engineer would write. Estimated work: ~1 day per fused
+kernel (softmax, then RMSNorm, then LayerNorm). This is the highest
+ROI investment the PJRT track has remaining.
+
+### Files
+
+- `pjrt_plugin/tests/bench_vanilla_vs_pjrt.py` — the comparison bench.
+- `research/pjrt_vanilla_comparison_plan.md` — plan + methodology.
+- `research/pjrt_phase5_benchmarks.md` — full results with run1 + run2
+  numbers and per-bucket prose analysis.
+
+### Test status
+
+50/50 device tests still pass (`test_engine_device.py` +
+`test_basic_ops.py`). Engine unchanged; only added a bench script.
+
+### One-liner
+
+**PJRT-traced is at parity with vanilla tt-nn-traced on 4/6 programs
+(within 5%). The only material slowdown is softmax (2.08x) — JAX
+lowers `softmax` to a 5-13-op graph while vanilla uses
+`ttnn.softmax`. Pattern-match fusion is the next highest-ROI
+PJRT investment.**
