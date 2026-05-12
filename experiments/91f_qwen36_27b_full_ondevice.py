@@ -146,8 +146,18 @@ def deltanet_step_ondevice(x_tt, w_tt, ssm_state_tt, conv_state_tt, cfg):
     q_flat = ttnn.slice(conv_out, [0], [KEY_DIM])
     k_flat = ttnn.slice(conv_out, [KEY_DIM], [2*KEY_DIM])
     v_flat = ttnn.slice(conv_out, [2*KEY_DIM], [CONV_DIM])
-    q = ttnn.repeat(ttnn.reshape(q_flat, [N_K_HEADS, K_DIM]), ttnn.Shape([N_REP, 1]))
-    k = ttnn.repeat(ttnn.reshape(k_flat, [N_K_HEADS, K_DIM]), ttnn.Shape([N_REP, 1]))
+    # B'9.5 fix: ttnn.repeat is TILE semantics (verified in repeat_semantics_probe.py)
+    # but HF uses repeat_interleave to broadcast n_k_heads → n_v_heads. The tile
+    # mapping pairs q-head 0,16,32,... with k-head 0; interleave pairs q-head 0,1,2
+    # with k-head 0. Get this wrong and the recurrence math is silently corrupt.
+    # Workaround: unsqueeze + repeat-singleton + flatten gives interleave semantics
+    # because the repeat axis is singleton.
+    def gqa_interleave(t_flat, n_kh, d):
+        t = ttnn.reshape(t_flat, [n_kh, 1, d])
+        t = ttnn.repeat(t, ttnn.Shape([1, N_REP, 1]))
+        return ttnn.reshape(t, [n_kh * N_REP, d])
+    q = gqa_interleave(q_flat, N_K_HEADS, K_DIM)
+    k = gqa_interleave(k_flat, N_K_HEADS, K_DIM)
     v = ttnn.reshape(v_flat, [N_V_HEADS, V_DIM])
 
     qq = ttnn.mul(q, q)
