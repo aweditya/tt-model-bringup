@@ -239,13 +239,17 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     kv_cache_v_tt = ttnn.from_torch(torch.from_numpy(kv_v_np), dtype=ttnn.bfloat16,
                                      device=device, layout=ttnn.TILE_LAYOUT)
 
-    # 5) SDPA decode on device.
+    # 5) SDPA decode on device. SDPA wants Q in same dtype as KV cache (bf16);
+    # downcast Q for the call, then promote the result back to whatever dtype
+    # the rest of the layer is in (fp32 in B'9, bf16 in B'4-B'7).
     q_for_sdpa = ttnn.reshape(q_tt, [1, 1, N_Q, HEAD_DIM])
+    q_for_sdpa = ttnn.typecast(q_for_sdpa, ttnn.bfloat16)
     attn = ttnn.transformer.scaled_dot_product_attention_decode(
         q_for_sdpa, kv_cache_k_tt, kv_cache_v_tt,
         cur_pos_tensor=cur_pos_tt, compute_kernel_config=hifi4)
-    # Result shape [B=1, T=1, n_q_heads, head_dim] → reshape to [N_Q, HEAD_DIM]
     attn = ttnn.reshape(attn, [N_Q, HEAD_DIM])
+    # Match attn dtype to x_tt dtype so the residual flow stays in fp32 when caller upgrades.
+    attn = ttnn.typecast(attn, x_tt.dtype)
 
     # 6) Sigmoid output gate
     attn = ttnn.mul(attn, ttnn.sigmoid(gate_tt))
