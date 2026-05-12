@@ -28,6 +28,7 @@ Re-reading the CLAUDE.md + persistent memory; these are the rules I will follow 
 | **Benchmark full decode loop** | Per `feedback_benchmark_methodology.md`. Don't time just the trace; from_dev adds 3.9ms. |
 | **EOS sampling care** | Per `feedback_eos_sampling.md`. Test greedy first, then sampling separately. |
 | **bf8 not yet validated past 8B** | Per `feedback_bf8_weights.md`, full bf8 was safe through Llama-8B. At 35B we re-validate with cosine checks at every 4th layer. |
+| **Saturate one P150 before scaling out** | Every kernel benchmark reports **(a) single-chip util %** (bandwidth + compute) and **(b) speedup from 2-chip TP**. Multi-chip is never a workaround for poor single-chip utilization. If a kernel runs at 30% of 1 chip and 45% on 2, that's a single-chip kernel problem. Tenstorrent's pitch is scale-out, but we want to prove we're not just spreading work to hide poor saturation. |
 
 ---
 
