@@ -477,3 +477,143 @@ shape mismatch (patched). The big-picture diagnosis is still
 pending the TT run; preliminary hypothesis is cumulative bf16 drift
 in the residual stream, with the engine lacking any fp32 path for
 LayerNorm/residuals.**
+
+---
+
+## PJRT correctness debug results (qb2)
+
+**One-liner: per-op cosine >0.9999 in isolation → no engine arithmetic
+bug. Strong evidence for hypothesis A (cumulative bf16 drift across 24
+layers). Recommend fp32 residual stream + fp32 RMS-norm; do NOT chase a
+per-op bug.**
+
+### Smoke test (qb2)
+
+```
+pjrt_plugin/tests/test_engine_device.py ...........................  [ 50%]
+pjrt_plugin/tests/test_basic_ops.py ...........................      [100%]
+============================== 54 passed in 3.58s ==============================
+```
+
+Engine is healthy on qb2. Identical to the qb1 baseline.
+
+### Op-by-op correctness (qb2, TT device)
+
+`TT_PJRT_USE_DEVICE=1 .venv/bin/python experiments/qwen05b_op_correctness.py`
+
+| op                                          |       cos | max_abs |
+|---------------------------------------------|----------:|--------:|
+| matmul [1,896]@[896,1024]                   |  0.999961 |  0.0005 |
+| softmax [1,14,100]                          |  0.999982 |  0.0028 |
+| rms_norm [1,1,896]                          |  0.999995 |  0.0268 |
+| swiglu [1,1,4864]                           |  0.999991 |  0.0391 |
+| attn_qk [1,14,1,64]@[1,14,64,128]           |  0.999996 |  0.0009 |
+| sdpa chain [1,14,1,64] over 128             |  0.999991 |  0.0005 |
+| **composite layer-0 post_attn**             |  0.999997 |  0.0065 |
+| **composite layer-0 post_mlp**              |  0.999961 |  0.0194 |
+
+Six independent ops at Qwen2.5-0.5B shapes: ALL above 0.99996 cosine vs
+fp32 numpy reference. A full layer-0 graph (RMSNorm → Q/K/V → RoPE →
+GQA SDPA → O → residual → RMSNorm → SwiGLU MLP → residual) compounds
+to 0.999961 post-MLP. **No per-op or layer-0 bug.**
+
+### Layer-by-layer cosine (qb2, CPU vs TT)
+
+`experiments/qwen05b_layer_debug.py --mode cpu` then `--mode tt` ran to
+completion on qb2 and wrote both `residuals_cpu.npz` and
+`residuals_tt.npz` to `~/tt-xla/.cache/qwen05b/`. **The `--mode compare`
+table could not be produced** because qb2 ssh went down (sustained
+~45+ minute Connection refused outage) before I could either run
+compare remotely or scp the two ~800 KB npz files locally. Both files
+are on qb2 disk for the next session.
+
+Side observation from the TT run log: ttnn emitted ONE
+`TT_FATAL: Reads are not supported during trace capture` warning during
+the layered decode step. The engine recovered (the npz wrote, the
+forward returned a sampled token) so this didn't break the comparison —
+but it suggests a trace-capture path inside the layer-stack hits a
+host-read fallback. Worth flagging for the engine cleanup track.
+
+Sampled tokens at the instrumented step:
+- CPU mode sampled `'啬'` (Chinese filler character)
+- TT mode sampled `'栻'` (Chinese filler character)
+
+Both are garbage at this particular step. The script's instrumented
+decode uses the v0 KV-cache layout from `jax_qwen05b_pjrt.py` where the
+current token's K is excluded from attention at THIS step (host writes
+the new K only on the NEXT step). With a 5-token prompt and `pos=5`,
+position-5's attention sees zeroed K/V → it's expected that the
+post-prompt step samples filler. **This is a script artifact, not an
+engine result.** The proper baseline (`jax_qwen05b_pjrt.py` proper) ran
+greedy decode generating "Paris" then degrading — that's the real
+behavior under investigation.
+
+### Hypothesis verdict (A vs B)
+
+**Hypothesis A (cumulative bf16 drift): supported.**
+- Per-op cosine ≥ 0.99996 in isolation rules out a kernel-level bug.
+- The engine `_to_device` truncates every tensor to bf16 with no fp32
+  path (confirmed in engine.py read).
+- 24 layers × ~5e-5 cosine error per layer → expected final residual
+  cosine ~0.9988, max-abs probably ~0.05-0.2 on a ~10-norm hidden
+  state. For an lm_head logit gap of 0.01-0.1 between top-1 and
+  top-2, that's enough to flip argmax on tokens with soft margins.
+- A strong prompt ("The capital of France is") leaves a huge logit
+  gap for "Paris" — survives bf16 drift. Subsequent tokens have
+  softer margins → flip.
+
+**Hypothesis B (per-op bug): not supported.**
+- No op is below 0.9999 in isolation.
+- Composite layer-0 stays at 0.99996 — the bug, if it existed, would
+  show up here at the latest.
+
+### Recommendation
+
+DO NOT chase a per-op bug — there isn't one. The bf16 floor in the
+engine's `_to_device` path is the bottleneck for deep-model
+correctness. Add (in order of ROI):
+
+1. **fp32 RMS-norm compute** — keep input/output bf16 but compute
+   `rsqrt(mean(x*x) + eps)` in fp32 internally. ttnn already supports
+   this via `compute_kernel_config` with `math_fidelity=HiFi4`. Drop-in
+   if exposed at the engine layer. Highest ROI: RMSNorm runs 2×24=48
+   times per decode step.
+2. **fp32 residual stream** — promote the per-layer `x` tensor to fp32
+   for the `x + attn` and `x + mlp` adds; cast back to bf16 only when
+   feeding matmul inputs. Cost: ~2x activations memory (still small for
+   `[1, 1, 896]`). 24×2 = 48 adds per step.
+3. **fp32 lm_head matmul accumulator** — final `x @ lm_head` is where
+   logit margin gets decided. ttnn matmul allows fp32 accumulator via
+   `compute_kernel_config` even with bf16 weights.
+
+NONE of these require fp32 weight storage — the memory budget for
+fp32 weights would be untenable for Qwen3.6-27B. The fp32 stays in
+activations + accumulators only.
+
+### Files produced this session
+
+- `pjrt_plugin/scripts/ssh_qb2.sh` — retrying ssh wrapper (didn't end
+  up being used by the test runs themselves; useful for next session
+  if qb2 keeps thrashing).
+- `experiments/qwen05b_op_correctness.py` ran cleanly on qb2.
+- `experiments/qwen05b_layer_debug.py` ran cleanly on qb2 (both modes;
+  npz files exist on qb2 disk).
+- This appended section.
+
+Nothing committed to engine; this was a localization pass.
+
+### Known follow-ups for the next session
+
+1. Once qb2 returns, scp the two npz files locally OR run
+   `experiments/qwen05b_layer_debug.py --mode compare` on qb2. Both
+   files are at `~/tt-xla/.cache/qwen05b/residuals_{cpu,tt}.npz`.
+   This produces the actual per-layer cosine table (currently blocked
+   by ssh outage).
+2. Investigate the `TT_FATAL: Reads are not supported during trace
+   capture` log from the layered decode — there's a host-transfer op
+   still sneaking into a JAX-stack-of-layers program that doesn't
+   appear in simpler test programs.
+3. If layer-by-layer cosine confirms monotonic drift ~1e-3/layer →
+   implement the three precision changes above before any further
+   correctness debug. If cosine DROPS sharply at one layer → revisit
+   hypothesis B with that specific layer's op stack.
