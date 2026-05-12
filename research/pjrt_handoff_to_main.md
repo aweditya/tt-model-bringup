@@ -365,3 +365,115 @@ falls back to parse-cached eager, expect 50-100ms/step.
 **Blocked at qb1 ssh outage during validation. JAX implementation is
 correct (verified on JAX-CPU); engine bug fixed (func.call dedup);
 device path needs the final smoke test.**
+
+---
+
+## Correctness-debug agent — partial results (appended 2026-05-11/12)
+
+### What was attempted
+
+Investigation A: layer-by-layer cosine of CPU-fp32 vs TT-bf16 residual
+stream for one decode step.
+Investigation B: independent bf16 op correctness through the engine on
+the shapes Qwen2.5-0.5B uses.
+
+### What was completed
+
+1. **Plan**: `research/pjrt_correctness_debug_plan.md`.
+2. **Scaffolding**:
+   - `experiments/qwen05b_layer_debug.py` — instrumented decode step
+     returning per-layer post-attn and post-mlp residuals + final pre-
+     norm, post-norm, logits. Two-pass `--mode cpu` / `--mode tt` /
+     `--mode compare`. Writes npz snapshots to `.cache/qwen05b/`.
+   - `experiments/qwen05b_op_correctness.py` — independent ops:
+     matmul (Q-proj shape), softmax (attn scores), rms_norm, swiglu,
+     attn Q·Kᵀ, full SDPA chain, plus a composite layer-0 test.
+3. **Incidental fix**: `experiments/jax_qwen05b_pjrt.py` — `scale =
+   1.0 / jnp.sqrt(jnp.float32(HEAD_DIM))` was being lifted as a 0-d
+   captured JAX array, which the current JAX version rejects at
+   StableHLO verification time ("broadcast_dimensions size (0) does
+   not match operand rank (1)"). Replaced with `float(1.0 / np.sqrt(
+   HEAD_DIM))` — passes cleanly. **This means the current
+   `jax_qwen05b_pjrt.py` in main does not jit-lower on this JAX
+   version.** The previous Paris-then-garbage run on TT must have used
+   an older JAX or a different scale form. The bug is unrelated to
+   the gibberish, but blocks running the original script at all today.
+4. **CPU baseline (partial)**: `qwen05b_layer_debug.py --mode cpu` ran
+   to completion on qb1. The numpy prefill produces ` Paris` (correct).
+   The first JAX decode step on JAX-CPU samples `'啬'` — a Chinese
+   character. This is suspicious; it might be the known v0 "current-
+   token-K excluded" quirk biting harder than expected, OR it might
+   indicate the JAX decode step has a logic divergence from the numpy
+   prefill (e.g. position/mask off-by-one). The handoff doc reports
+   that the original `jax_qwen05b_pjrt.py --no-pjrt` produced
+   ` Paris, and the capital of` — that result was either on a
+   different JAX version or with a different `pos`/`mask` layout.
+   **The instrumented script's structure mirrors the original's
+   verbatim; identical inputs should produce identical outputs.**
+
+### What is blocked
+
+`ssh qb1` has been unreachable for ~30+ minutes (sustained Connection
+refused since ~23:39 local). Cannot run:
+- `--mode tt` on the layer-debug script (the TT half of the cosine
+  comparison).
+- The op-correctness script (both CPU-PJRT and TT-PJRT runs).
+- A re-baseline of `jax_qwen05b_pjrt.py --no-pjrt` (CPU) with the
+  scale fix, to confirm whether the JAX-CPU first token really is
+  `'啬'` today or `' ,'`/something coherent.
+
+Until ssh recovers, the layer-by-layer table and the bf16 op-by-op
+table cannot be produced.
+
+### Files left for the next agent / main chat
+
+- `experiments/qwen05b_layer_debug.py`
+- `experiments/qwen05b_op_correctness.py`
+- `research/pjrt_correctness_debug_plan.md`
+- `.cache/qwen05b/residuals_cpu.npz` (lives on qb1 only — the CPU run
+  did complete and the npz was written)
+
+### Suggested next steps (precision strategy, partial)
+
+Even without the layer-by-layer numbers, the engine.py read tells us:
+1. The engine pads/converts everything to bf16 (`ttnn.bfloat16`) at
+   `_to_device`. Every tensor crossing the host→device boundary is
+   truncated bf16. There is no fp32-on-device path.
+2. `_to_device` always goes through torch.float() → bf16. Means even
+   if the StableHLO IR declares fp32, the device payload is bf16.
+3. There is NO mixed-precision policy in the engine — RMS-norm,
+   softmax, residual adds all execute at bf16.
+
+For a 24-layer model, the bf16 residual stream IS likely to drift
+materially over the depth. The native ttnn Qwen2.5-0.5B reference at
+142 tok/s achieves cosine >0.99 first-token with EXPLICIT bf8/bf16
+mixed precision and dedicated fp32 accumulators in SDPA — features the
+engine does not have today. Until layer-by-layer numbers land, my
+**preliminary** recommendation is:
+
+- Hypothesize cumulative bf16 drift is the dominant cause; the per-op
+  cosine is probably fine (cos > 0.999 for matmul/softmax at small
+  shapes), but compounding over 24 layers crosses the argmax-flip
+  threshold by token 2.
+- Cheapest first probe is to compare CPU-fp32 vs TT-bf16 logit cosine
+  for one decode step. If cosine > 0.99 → bf16 noise is small enough
+  in isolation, the gibberish is something else (engine bug). If
+  cosine < 0.95 → precision strategy needed.
+- Precision lever: add an `fp32_high_precision` mode to `_to_device`
+  for the residual stream (`x`) and norm gammas. Keep matmul weights
+  as bf16 (the bandwidth win is large). Cost: ~2x extra memory for
+  the residual.
+- Second lever: do RMS-norm in fp32 (compute the rsqrt in fp32, scale
+  in fp32, then cast). Same trick all major framework backends use.
+
+### One-liner
+
+**Scaffolding for layer-by-layer + bf16 op correctness landed; CPU
+half of A completed but produced a suspicious `'啬'` argmax that
+deserves a sanity-check rerun. Sustained `ssh qb1` outage blocked
+the TT half. Incidental fix: `jax_qwen05b_pjrt.py` no longer
+jit-lowers with the current JAX version due to a captured-scalar
+shape mismatch (patched). The big-picture diagnosis is still
+pending the TT run; preliminary hypothesis is cumulative bf16 drift
+in the residual stream, with the engine lacking any fp32 path for
+LayerNorm/residuals.**
