@@ -63,6 +63,8 @@ def load_layer_weights_all(layer_idx, layer_type):
             'conv1d_weight': f"{base}.linear_attn.conv1d.weight",
             'A_log':         f"{base}.linear_attn.A_log",
             'dt_bias':       f"{base}.linear_attn.dt_bias",
+            # B'9.5 fix: missing per-head RMSNormGated weight inside DeltaNet
+            'linear_attn_norm': f"{base}.linear_attn.norm.weight",
         })
     else:
         needed.update({
@@ -70,7 +72,18 @@ def load_layer_weights_all(layer_idx, layer_type):
             'k_proj': f"{base}.self_attn.k_proj.weight",
             'v_proj': f"{base}.self_attn.v_proj.weight",
             'o_proj': f"{base}.self_attn.o_proj.weight",
+            # B'9.5 fix: missing per-head Q/K RMSNorm weights
+            'q_norm':  f"{base}.self_attn.q_norm.weight",
+            'k_norm':  f"{base}.self_attn.k_norm.weight",
         })
+    # B'9.5 fix: Qwen3_5RMSNorm uses (1.0 + weight), not weight. Pre-add 1 at load
+    # so that ttnn.rms_norm(x, w_loaded) computes the correct (1+w_raw) * x / sqrt(...).
+    # NOT applied to linear_attn_norm — that one is Qwen3_5RMSNormGated which is
+    # standard w * x. The clean separation is visible in weight stats:
+    #   Qwen3_5RMSNorm weights have mean ≈ 0 (offset from 1)
+    #   Qwen3_5RMSNormGated weights have mean ≈ 1 (raw scale)
+    RMSNORM_1PLUS_W_KEYS = {'input_layernorm', 'post_attention_layernorm',
+                             'q_norm', 'k_norm'}
     by_shard = {}
     for key, tname in needed.items():
         if tname in weight_map:
@@ -83,6 +96,8 @@ def load_layer_weights_all(layer_idx, layer_type):
                 t = f.get_tensor(tname).float().numpy()
                 if 'proj' in key:
                     t = t.T
+                if key in RMSNORM_1PLUS_W_KEYS:
+                    t = t + 1.0
                 weights[key] = t.copy()
     return weights
 
@@ -156,7 +171,15 @@ def deltanet_step_ondevice(x_tt, w_tt, ssm_state_tt, conv_state_tt, cfg):
                      ttnn.mul(k_col, ttnn.reshape(delta, [1, N_V_HEADS, 1, V_DIM])))
     q_col = ttnn.reshape(q, [1, N_V_HEADS, K_DIM, 1])
     out = ttnn.reshape(ttnn.sum(ttnn.mul(H_new, q_col), dim=-2), [1, VAL_DIM])
-    out_gated = ttnn.mul(out, ttnn.silu(z_tt))
+    # B'9.5 fix: per-head Qwen3_5RMSNormGated. core_attn_out is reshaped to
+    # [N_V_HEADS, V_DIM] and normalized over the last dim. linear_attn_norm
+    # weight has shape [V_DIM]. The Qwen3_5RMSNormGated forward is:
+    #   normed = x / sqrt(mean(x²)+eps) * weight    (standard w*x, NOT 1+w)
+    #   out    = normed * silu(z)
+    out_per_head = ttnn.reshape(out, [N_V_HEADS, V_DIM])
+    out_normed = ttnn.rms_norm(out_per_head, weight=w_tt['linear_attn_norm'], epsilon=EPS)
+    out_normed = ttnn.reshape(out_normed, [1, VAL_DIM])
+    out_gated = ttnn.mul(out_normed, ttnn.silu(z_tt))
 
     out_proj = ttnn.linear(out_gated, w_tt['out_proj'], compute_kernel_config=hifi4)
     x_out = ttnn.add(x_tt, out_proj)
@@ -197,6 +220,11 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     v_tt = ttnn.reshape(
         ttnn.linear(h_tt, w_tt['v_proj'], compute_kernel_config=hifi4),
         [N_KV, HEAD_DIM])
+
+    # B'9.5 fix: per-head Qwen3_5RMSNorm on Q and K BEFORE RoPE.
+    # Weight shape is [HEAD_DIM], loaded as (1.0 + raw) already.
+    q_tt = ttnn.rms_norm(q_tt, weight=w_tt['q_norm'], epsilon=EPS)
+    k_tt = ttnn.rms_norm(k_tt, weight=w_tt['k_norm'], epsilon=EPS)
 
     # 3) Partial RoPE: rotate first ROTARY_DIM dims; pass-through last (HEAD_DIM - ROTARY_DIM).
     def apply_partial_rope(t, n_heads):

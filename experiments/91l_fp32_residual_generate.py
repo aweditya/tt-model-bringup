@@ -80,6 +80,9 @@ def load_embed_lm_head_weights():
                 t = f.get_tensor(tname).float().numpy()
                 if key == 'lm_head':
                     t = t.T
+                # B'9.5 fix: final_norm is Qwen3_5RMSNorm with (1.0 + w) formula
+                if key == 'final_norm':
+                    t = t + 1.0
                 weights[key] = t.copy()
     return weights
 
