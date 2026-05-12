@@ -18,12 +18,12 @@ os.environ['TT_PJRT_USE_DEVICE'] = '1'
 # Add pjrt_plugin to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-# Direct import to bypass __init__.py (which needs full JAX plugin registration)
-import importlib.util
-_engine_path = os.path.join(os.path.dirname(__file__), '..', 'jax_plugins', 'tt', 'engine.py')
-spec = importlib.util.spec_from_file_location('engine', _engine_path)
-engine = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(engine)
+# Use the SAME engine module instance that the C++ PJRT plugin invokes
+# (`jax_plugins.tt.engine`). If we imported a second copy via
+# importlib.spec_from_file_location, we'd get two `_device` globals →
+# the second one tries to ttnn.open_device(0) again and crashes with
+# `context_id.get() >= 0`.
+from jax_plugins.tt import engine
 
 
 def _check_device_mode():

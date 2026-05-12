@@ -47,8 +47,26 @@ def _get_device():
     global _device
     if _device is None:
         _device = ttnn.open_device(device_id=0)
+        # Release any captured traces BEFORE closing the device.
+        # ttnn keeps trace handles alive on device; closing without
+        # release can corrupt subsequent runs in the same process.
+        atexit.register(_release_trace_cache)
         atexit.register(lambda: ttnn.close_device(_device))
     return _device
+
+
+def _release_trace_cache():
+    """Free every captured trace and clear the cache. Safe to call twice."""
+    global _trace_cache, _parse_cache
+    for key, entry in list(_trace_cache.items()):
+        tid = entry.get('trace_id') if isinstance(entry, dict) else None
+        if tid is not None:
+            try:
+                ttnn.release_trace(_device, tid)
+            except Exception:
+                pass
+    _trace_cache.clear()
+    _parse_cache.clear()
 
 
 def _to_device(arr):
