@@ -32,6 +32,8 @@ def main():
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
     p.add_argument("--top-k", type=int, default=100)
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
+    p.add_argument("--dump-hidden-states", action="store_true",
+                   help="Also dump per-layer hidden states for Plan A diff")
     args = p.parse_args()
 
     print("=" * 64)
@@ -136,7 +138,10 @@ def main():
     print(f"\nForward pass (CPU, may take 1-3 minutes)…")
     t_fwd = time.time()
     with torch.no_grad():
-        out = model(input_ids=input_ids)
+        kwargs = dict(input_ids=input_ids)
+        if args.dump_hidden_states:
+            kwargs['output_hidden_states'] = True
+        out = model(**kwargs)
         if hasattr(out, 'last_hidden_state'):
             hidden = out.last_hidden_state
         elif hasattr(out, 'logits'):
@@ -150,6 +155,22 @@ def main():
             logits = hidden.to(torch.float32) @ lm_head_w.to(torch.float32).t()
     print(f"  forward took {time.time()-t_fwd:.1f}s")
     print(f"  logits shape: {tuple(logits.shape)}")
+
+    # ----- Optional: dump per-layer hidden states -----
+    if args.dump_hidden_states and hasattr(out, 'hidden_states') and out.hidden_states is not None:
+        per_layer_path = os.path.expanduser("~/tt-xla/.cache/hf_per_layer_hidden_states.npz")
+        hidden_states = out.hidden_states  # tuple of (n_layers + 1) tensors
+        print(f"\nDumping {len(hidden_states)} hidden states (embed + {len(hidden_states)-1} layer outputs)…")
+        npz_data = {}
+        for i, h in enumerate(hidden_states):
+            arr = h.float().cpu().numpy()  # [1, seq, hidden]
+            npz_data[f"hidden_{i}"] = arr
+        npz_data["prompt_ids"] = np.array(prompt_ids)
+        # Also save final lm_head output for downstream reference
+        npz_data["logits_last"] = logits[0, -1].float().cpu().numpy()
+        np.savez(per_layer_path, **npz_data)
+        total_mb = sum(v.nbytes for v in npz_data.values()) / 1e6
+        print(f"  saved per-layer hidden states ({total_mb:.1f} MB) → {per_layer_path}")
 
     # ----- Top-K of LAST token's logits -----
     last = logits[0, -1].float()
