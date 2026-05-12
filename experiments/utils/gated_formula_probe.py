@@ -30,6 +30,8 @@ Run on qb2:
 """
 import os, sys, json
 import numpy as np
+import torch
+import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 
@@ -71,9 +73,12 @@ def main():
         weight = f.get_tensor(wk).float().numpy()
     print(f"weight shape: {weight.shape}, mean={weight.mean():+.4f}")
 
-    print(f"\nPer-position diagnostic:")
-    print(f"{'pos':>4s}  {'numpy_vs_ours':>15s}  {'numpy_vs_hf':>15s}  {'ours_vs_hf':>15s}  {'in_cos':>10s}  {'z_cos':>10s}")
-    print("-" * 90)
+    # Mix-and-match test: compute numpy formula with combinations of
+    # {our, hf} norm_in × {our, hf} silu_z. If one combination matches
+    # hf_gated, we know which input is wrong.
+    print(f"\nMix-and-match cosine matrix (formula output vs HF norm.out):")
+    print(f"{'pos':>4s}  {'OUR/OUR':>10s}  {'OUR/HF':>10s}  {'HF/OUR':>10s}  {'HF/HF':>10s}  {'in_cos':>10s}")
+    print("-" * 80)
 
     for pos in range(5):
         # Our captures (per-position)
@@ -102,15 +107,30 @@ def main():
         # Compute numpy_gated using HF's z. Need to derive z. Hmm we don't have HF's silu_z directly.
         # The HF substep dump didn't hook the silu output. Skip this for now.
 
-        # Comparisons
-        c_numpy_vs_ours = cosine(numpy_gated_with_our_siluz, our_gated_2d)
-        c_numpy_vs_hf = cosine(numpy_gated_with_our_siluz, hf_gated_per_head)
-        c_ours_vs_hf = cosine(our_gated_2d, hf_gated_per_head)
+        # Get HF's z for this position. HF stores in_proj_z.out shape [1, 5, 6144].
+        hf_z = hf["linear_attn.in_proj_z.out"][0, pos]   # [6144]
+        hf_z_2d = hf_z.reshape(N_V_HEADS, V_DIM)
+        hf_silu_z = (hf_z_2d / (1.0 + np.exp(-hf_z_2d.astype(np.float64)))).astype(np.float32)
 
-        # Sanity: our norm_in vs HF's norm_in
+        def numpy_formula(norm_in, silu_z):
+            """RMSNorm + weight + silu-gate, fp32 throughout (no bf16 cast)."""
+            x = norm_in.astype(np.float64)
+            var = (x ** 2).mean(axis=-1, keepdims=True)
+            x_normed = x / np.sqrt(var + EPS)
+            return (x_normed * weight.astype(np.float64) * silu_z.astype(np.float64)).astype(np.float32)
+
+        out_our_our = numpy_formula(our_norm_in_2d, our_silu_z_2d)
+        out_our_hf  = numpy_formula(our_norm_in_2d, hf_silu_z)
+        out_hf_our  = numpy_formula(hf_norm_in,     our_silu_z_2d)
+        out_hf_hf   = numpy_formula(hf_norm_in,     hf_silu_z)
+
+        c_our_our = cosine(out_our_our, hf_gated_per_head)
+        c_our_hf  = cosine(out_our_hf,  hf_gated_per_head)
+        c_hf_our  = cosine(out_hf_our,  hf_gated_per_head)
+        c_hf_hf   = cosine(out_hf_hf,   hf_gated_per_head)
         c_norm_in = cosine(our_norm_in_2d, hf_norm_in)
-        print(f"{pos:4d}  {c_numpy_vs_ours:15.6f}  {c_numpy_vs_hf:15.6f}  "
-              f"{c_ours_vs_hf:15.6f}  {c_norm_in:10.6f}")
+        print(f"{pos:4d}  {c_our_our:10.6f}  {c_our_hf:10.6f}  "
+              f"{c_hf_our:10.6f}  {c_hf_hf:10.6f}  {c_norm_in:10.6f}")
 
     print()
     print("Interpretation:")
