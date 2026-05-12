@@ -111,28 +111,129 @@ def bytecode_to_text(bytecode: bytes) -> str:
     JAX sends StableHLO programs as VHLO portable artifacts (not plain MLIR
     bytecode). We first try deserializing as a portable artifact, then fall
     back to plain MLIR bytecode parsing.
+
+    Func.call ops carry their callee name in the assembly form when emitted
+    via the operation tree walk in `_module_to_text_with_callees`. The
+    default `str(module)` printer drops them under `allow_unregistered_dialects`,
+    so for multi-function modules we use the walker.
     """
     from jaxlib.mlir import ir
     from jaxlib.mlir.dialects import stablehlo as stablehlo_dialect
 
-    # Check if this is a StableHLO portable artifact (starts with ML\xefR...StableHLO)
     if b'StableHLO' in bytecode[:30]:
-        # VHLO portable artifact — deserialize to MLIR native bytecode first
         from jaxlib.mlir._mlir_libs._stablehlo import deserialize_portable_artifact_str
         native_bytecode = deserialize_portable_artifact_str(bytecode)
-        # native_bytecode is MLIR native bytecode (bytes), parse it
         with ir.Context() as ctx:
             ctx.allow_unregistered_dialects = True
             stablehlo_dialect.register_dialect(ctx)
             module = ir.Module.parse(native_bytecode, ctx)
-            return str(module)
+            return _module_to_text_with_callees(module)
     else:
-        # Plain MLIR bytecode (from module_to_bytecode in tests)
         with ir.Context() as ctx:
             ctx.allow_unregistered_dialects = True
             stablehlo_dialect.register_dialect(ctx)
             module = ir.Module.parse(bytecode, ctx)
-            return str(module)
+            return _module_to_text_with_callees(module)
+
+
+def _module_to_text_with_callees(module) -> str:
+    """Render an MLIR module to text, annotating each func.call with the
+    callee name in a form our parser can recognize.
+
+    The standard `str(module)` printer drops callee names when the func
+    dialect is unregistered (we use allow_unregistered_dialects=True). We
+    walk the operation tree to extract every (op, callee, sym_name) and
+    splice the callee into the text via a deterministic pattern match.
+    """
+    text = str(module)
+    # Try to harvest (callee, sym_name) pairs by walking the module
+    # operation tree. If the walker can read 'callee' from attributes, we
+    # rewrite the call sites; otherwise the original text is returned and
+    # the engine falls back to single-private-function dispatch.
+    try:
+        calls = []     # list of callee symbol names, in walk order
+        sym_names = [] # list of function symbol names, in walk order
+
+        def _walk(op):
+            if op.name == "func.call":
+                callee = None
+                try:
+                    for attr in op.attributes:
+                        if attr.name == "callee":
+                            s = str(attr.attr)
+                            m = re.match(r'@(\S+)', s)
+                            if m:
+                                callee = m.group(1)
+                            else:
+                                callee = s
+                            break
+                except Exception:
+                    pass
+                calls.append(callee)
+            elif op.name == "func.func":
+                sym = None
+                try:
+                    for attr in op.attributes:
+                        if attr.name == "sym_name":
+                            s = str(attr.attr)
+                            m = re.match(r'"([^"]+)"', s)
+                            sym = m.group(1) if m else s.strip('"')
+                            break
+                except Exception:
+                    pass
+                sym_names.append(sym)
+            for r in op.regions:
+                for blk in r:
+                    for child in blk:
+                        _walk(child)
+
+        _walk(module.operation)
+
+        # Splice callee names into the text by walking call-site lines in
+        # order. Lines containing `"func.call"(...)` and lacking
+        # `callee = ` get rewritten with the corresponding callee.
+        if calls:
+            out_lines = []
+            i = 0  # index into `calls` list
+            for line in text.splitlines():
+                if '"func.call"' in line and 'callee' not in line and i < len(calls):
+                    callee = calls[i]
+                    if callee:
+                        # Insert `<{callee = @CalleeName}>` after the operands
+                        # paren. Pattern: %X = "func.call"(%Y) ...
+                        # Replace the first ' <' or ' :' after the paren with
+                        # ` <{callee = @<name>}>` followed by original tail.
+                        line = re.sub(
+                            r'("func\.call"\([^)]*\))\s*(<|:)',
+                            r'\1 <{callee = @' + callee + r'}> \2',
+                            line,
+                            count=1,
+                        )
+                    i += 1
+                out_lines.append(line)
+
+            # Splice sym_name into func.func definitions too. Same walk order.
+            j = 0
+            new_lines = []
+            for line in out_lines:
+                if '"func.func"' in line and j < len(sym_names) and sym_names[j]:
+                    sym = sym_names[j]
+                    # Make sure the existing func.func line doesn't already include sym_name=
+                    if 'sym_name' not in line:
+                        line = re.sub(
+                            r'("func\.func"\(\))',
+                            r'\1 <{sym_name = "' + sym + r'"}>',
+                            line,
+                            count=1,
+                        )
+                    j += 1
+                elif '"func.func"' in line:
+                    j += 1
+                new_lines.append(line)
+            text = '\n'.join(new_lines)
+    except Exception:
+        pass
+    return text
 
 
 def parse_stablehlo(text: str):
@@ -153,6 +254,7 @@ def parse_stablehlo(text: str):
     all_functions = []
     current_func = None
     pending = None  # For multi-line ops (scatter body regions, etc.)
+    _pending_sym_name = None  # sym_name harvested before ^bb0 line
 
     for line in lines:
         line = line.strip()
@@ -188,12 +290,26 @@ def parse_stablehlo(text: str):
                 if ':' in arg:
                     name, type_str = arg.split(':', 1)
                     func_args.append((name.strip().lstrip('%'), type_str.strip()))
-            current_func = {'args': func_args, 'ops': [], 'returns': []}
+            current_func = {'args': func_args, 'ops': [], 'returns': [],
+                            'sym_name': _pending_sym_name}
+            _pending_sym_name = None
             continue
 
         # Detect no-argument function: "func.func"() ... ({
         if '"func.func"' in line and '({' in line and current_func is None:
-            current_func = {'args': [], 'ops': [], 'returns': []}
+            # Capture sym_name if it's in the func.func line
+            sym_match = re.search(r'sym_name\s*=\s*"([^"]+)"', line)
+            _pending_sym_name = sym_match.group(1) if sym_match else None
+            current_func = {'args': [], 'ops': [], 'returns': [],
+                            'sym_name': _pending_sym_name}
+            _pending_sym_name = None
+            continue
+
+        # Also catch func.func that appears alone (will set sym_name for the
+        # next ^bb0 block).
+        if '"func.func"' in line and current_func is None:
+            sym_match = re.search(r'sym_name\s*=\s*"([^"]+)"', line)
+            _pending_sym_name = sym_match.group(1) if sym_match else None
             continue
 
         if current_func is None:
@@ -237,13 +353,16 @@ def parse_stablehlo(text: str):
         if op_desc:
             current_func['ops'].append(op_desc)
 
-    # First function is main, rest are private
+    # First function is main, rest are private.
+    # Private function tuples are (args, ops, returns, sym_name) when
+    # the sym_name was harvested; sym_name may be None.
     if not all_functions:
         return [], [], [], []
 
     main = all_functions[0]
     private_fns = [
-        (f['args'], f['ops'], f['returns']) for f in all_functions[1:]
+        (f['args'], f['ops'], f['returns'], f.get('sym_name'))
+        for f in all_functions[1:]
     ]
 
     return main['args'], main['ops'], main['returns'], private_fns
@@ -549,20 +668,30 @@ def parse_reduce_argmax(name: str, text: str) -> dict:
 
 
 def parse_func_call(name: str, text: str) -> dict:
-    """Parse "func.call"(%arg) <...> : (...) -> result_type
+    """Parse "func.call"(%arg) <{callee = @sym_name}> : (...) -> result_type
 
-    In the bytecode→text format, func.call doesn't include the callee name
-    directly. We track call index to map to the Nth private function.
+    In the bytecode→text format, func.call carries the callee inside `<...>`:
+        "func.call"(%67) <{callee = @SomeFn}> : (tensor<...>) -> tensor<...>
+    OR the printer may drop the callee (only emitting `<loc(...)>`). We
+    extract it when present; otherwise downstream dispatch falls back to
+    'use the single private function' / positional rules.
     """
     # Extract operands
     operand_part = text.split('<')[0] if '<' in text else text.split(':')[0]
     operands = re.findall(r'%([a-zA-Z0-9_]+)', operand_part)
+
+    # Extract callee from <{callee = @Name}> if present
+    callee = None
+    m = re.search(r'callee\s*=\s*@([A-Za-z_][A-Za-z0-9_$.]*)', text)
+    if m:
+        callee = m.group(1)
 
     result_type = extract_result_type(text)
     return {
         'name': name,
         'op': 'func_call',
         'operands': operands,
+        'callee': callee,
         'result_type': result_type,
     }
 
@@ -2127,6 +2256,14 @@ def execute_gather(op: dict, values: dict) -> np.ndarray:
 
 # Module-level storage for private functions parsed from the module.
 # Set by execute_stablehlo before executing the main function.
+# _private_functions can be either:
+#   - list of (args, ops, returns) tuples (positional dispatch by _call_counter)
+#   - dict {callee_name: (args, ops, returns)} (name-based dispatch)
+# When a func.call op carries a 'callee' field we use the dict form;
+# otherwise we fall back to positional. When there's exactly ONE private
+# function and the call carries no callee, we always dispatch to it
+# (JAX commonly deduplicates a single helper like silu and emits multiple
+# func.calls to the same private function — see research/pjrt_real_model_plan.md).
 _private_functions = []
 _call_counter = 0
 
@@ -2135,14 +2272,40 @@ def execute_func_call(op: dict, values: dict) -> np.ndarray:
     """Execute a func.call by running the corresponding private function."""
     global _call_counter
 
-    if _call_counter >= len(_private_functions):
-        raise ValueError(
-            f"func.call #{_call_counter} but only {len(_private_functions)} "
-            f"private functions found in module"
-        )
+    callee = op.get('callee', None)
+    func_entry = None
 
-    func_args, func_ops, func_returns = _private_functions[_call_counter]
-    _call_counter += 1
+    # private_functions is a list of 4-tuples (args, ops, returns, sym_name)
+    # (legacy 3-tuples are also tolerated)
+    n_private = len(_private_functions)
+
+    def _entry_at(idx):
+        e = _private_functions[idx]
+        return e[:3]  # (args, ops, returns)
+
+    # Try callee-name dispatch first
+    if callee is not None:
+        for entry in _private_functions:
+            if len(entry) >= 4 and entry[3] == callee:
+                func_entry = entry[:3]
+                break
+
+    if func_entry is None:
+        # Common case: bytecode_to_text drops callee names; JAX deduplicates
+        # helpers (e.g. silu) into ONE private function with N callsites.
+        # When there's exactly one private function, dispatch all calls to it.
+        if n_private == 1:
+            func_entry = _entry_at(0)
+        elif _call_counter < n_private:
+            func_entry = _entry_at(_call_counter)
+            _call_counter += 1
+        else:
+            raise ValueError(
+                f"func.call cannot resolve callee={callee!r}; "
+                f"{n_private} private function(s), _call_counter={_call_counter}"
+            )
+
+    func_args, func_ops, func_returns = func_entry
 
     # Build local value map: function args ← call operands
     local_values = dict(values)  # inherit outer scope for init values etc.
