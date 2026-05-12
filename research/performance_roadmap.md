@@ -115,3 +115,71 @@ This is the C'0 deliverable.
 ## When are we done?
 
 When the demo runs end-to-end at ≤ 150 ms/tok with correctness sanity passing, Branch III is "production-grade." Anything beyond is bonus.
+
+## Concrete competitive targets
+
+A friend reports **8 tok/s on single P150, 16 tok/s on multiple chips** for an LLM-class workload. Setting these as motivational targets:
+
+| Goal | Decode latency | tok/s | Means |
+|---|---:|---:|---|
+| C'0 baseline (today) | 267 ms/tok | **3.74** | where we start |
+| Match friend single P150 | 125 ms/tok | **8.0** | C'1+C'2+C'3+C'4 stack |
+| Single-chip floor | 135 ms/tok | 7.4 | physics (memory bandwidth) |
+| Match friend multi-chip | 62 ms/tok | **16.0** | C'7 tensor parallel across 4 P150s |
+| Multi-chip floor | ~33 ms/tok | 30 | 4× aggregate DRAM bandwidth |
+
+Single-chip is squeezed against the memory-bandwidth floor (135 ms/tok). Hitting 8 tok/s means executing close to ideal — every non-bandwidth overhead removed. Multi-chip opens new headroom.
+
+---
+
+# Branch D' — Beyond performance: memory-tier and megamodel work
+
+Motivated by the conversation about exo-explore/exo. qb2/qb1's distinctive advantage: **503 GB of DDR system RAM sits in a separate pool from the chip DRAM**. Mac Studios (exo's hardware target) have unified memory — they can't tier in the same way. Three branches worth pursuing once Branch C' is done:
+
+## D'1 — CPU-RAM-resident weights for super-large models
+
+**Target**: run models that don't fit on 4-chip aggregate DRAM (128 GB).
+
+Approach: keep all weights in 503 GB CPU pool, stream layers to chip DRAM on demand via PCIe.
+
+- PCIe Gen4 ≈ 32 GB/s, Gen5 ≈ 64 GB/s (depending on host hardware)
+- Slower than on-chip DRAM (~200 GB/s) but workable for batch=1
+- Enables Llama-3-405B (bf8 ≈ 200 GB), Qwen3-Max-style models that don't fit on the chips
+
+**Risks**: PCIe bandwidth becomes the new bottleneck. The "effective floor" shifts to ~PCIe-bound (200 GB ÷ 32 GB/s = 6.25 sec/token at Gen4). Probably interactive only at smaller batch sizes or with overlap.
+
+## D'2 — Megacontext via CPU-RAM KV cache
+
+**Target**: 1M+ token context windows.
+
+KV cache memory grows linearly with sequence length. For Qwen3.6-27B at 1M context: cache ≈ 100+ GB, doesn't fit on chip but easily fits in 503 GB system RAM.
+
+PagedAttention-style: cache pages live in CPU RAM, paged into chip per attention layer. Latency increases (PCIe round-trip per layer per query) but the model can SERVICE the long context, which Mac Studios can't.
+
+## D'3 — Heterogeneous compute (CPU + chip together)
+
+**Target**: utilize the 32 CPU cores that sit idle during inference.
+
+Specific opportunities:
+- **Speculative decoding**: a small "draft" model runs on CPU, generates speculation candidates, the chip verifies. Standard technique, well-studied.
+- **Embed table on CPU**: 248320 × 5120 × 4 bytes = 5 GB embed table. Currently CPU-resident anyway in our impl (we look up rows on host). Keep it there — this is free.
+- **Async beam search / sampling state**: keep all the search bookkeeping on CPU while the chip generates.
+
+## D'4 — Multi-host clustering (exo's actual pitch)
+
+**Target**: connect qb1 + qb2 into one tensor-parallel cluster.
+
+Mostly NOT useful for our purposes — they're in the same building but not co-located in a way that would benefit from this. Unless we want to run a model that doesn't fit even on 4 chips (~128 GB), in which case combining qb1 + qb2 gives us 8 chips total.
+
+Probably skip unless a specific workload demands it.
+
+---
+
+## Sequencing for Branch D'
+
+D'1, D'2, D'3 are independent and unlocked once Branch C' lands. Pick based on the workload need:
+- D'2 first if anyone wants 1M context for our 27B
+- D'1 first if anyone wants to run a 200B+ model
+- D'3 (speculative decoding) is high-impact and well-trodden; might actually be a "speed Branch C'" finale rather than a Branch D' branch
+
+D'4 is parked unless a specific need arises.
