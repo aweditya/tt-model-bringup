@@ -270,29 +270,19 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     q_tt = apply_partial_rope(q_tt, N_Q)
     k_tt = apply_partial_rope(k_tt, N_KV)
 
-    # 4) KV cache update — sharded paged_update_cache blocked at n_kv=4
-    # (shard shape (4, 256) fails 32-tile alignment requirement).
-    # Compromise (same as Phase A4): write current K/V into the cache via a
-    # numpy roundtrip (one host write per layer per token, ~50 KB).
-    # The bigger compute (SDPA) still happens on device.
-    # TODO B′6.5: pad n_kv up to 32 internally OR use a 2D shard where head_dim
-    #   is the height dim, to unblock paged_update_cache.
-    k_np = ttnn.to_torch(k_tt).float().numpy().reshape(N_KV, HEAD_DIM)
-    v_np = ttnn.to_torch(v_tt).float().numpy().reshape(N_KV, HEAD_DIM)
-    # Derive cache MAX_POS from the actual tensor — don't trust module-level constant
-    # (callers may use different cache sizes; B'8 uses 256, B'6 used 128).
-    cache_k_flat = ttnn.to_torch(kv_cache_k_tt).float().numpy()
-    cache_v_flat = ttnn.to_torch(kv_cache_v_tt).float().numpy()
-    cache_max_pos = cache_k_flat.size // (N_KV * HEAD_DIM)
-    assert cur_pos < cache_max_pos, f"cur_pos {cur_pos} exceeds cache {cache_max_pos}"
-    kv_k_np = cache_k_flat.reshape(1, N_KV, cache_max_pos, HEAD_DIM)
-    kv_v_np = cache_v_flat.reshape(1, N_KV, cache_max_pos, HEAD_DIM)
-    kv_k_np[0, :, cur_pos, :] = k_np
-    kv_v_np[0, :, cur_pos, :] = v_np
-    kv_cache_k_tt = ttnn.from_torch(torch.from_numpy(kv_k_np), dtype=ttnn.bfloat16,
-                                     device=device, layout=ttnn.TILE_LAYOUT)
-    kv_cache_v_tt = ttnn.from_torch(torch.from_numpy(kv_v_np), dtype=ttnn.bfloat16,
-                                     device=device, layout=ttnn.TILE_LAYOUT)
+    # C'1: KV cache slot write via on-device ttnn.scatter.
+    # Cache shape [1, N_KV, MAX_POS, HEAD_DIM]; write k_tt, v_tt at cur_pos along dim=2.
+    # Replaces the prior numpy roundtrip (6× to_torch/from_torch per layer per token).
+    # ttnn.scatter refuses fp32+TILE source ("Scatter doesn't work for fp32 tiled tensors
+    # yet"). Cache is bf16, so cast K/V to bf16 before scatter — net precision matches the
+    # prior numpy version (which also downcast on cache write).
+    k_for_cache = ttnn.typecast(ttnn.reshape(k_tt, [1, N_KV, 1, HEAD_DIM]), ttnn.bfloat16)
+    v_for_cache = ttnn.typecast(ttnn.reshape(v_tt, [1, N_KV, 1, HEAD_DIM]), ttnn.bfloat16)
+    index_np = np.full((1, N_KV, 1, HEAD_DIM), cur_pos, dtype=np.int32)
+    index_tt = ttnn.from_torch(torch.from_numpy(index_np), dtype=ttnn.int32,
+                                device=device, layout=ttnn.TILE_LAYOUT)
+    kv_cache_k_tt = ttnn.scatter(kv_cache_k_tt, dim=2, index=index_tt, src=k_for_cache)
+    kv_cache_v_tt = ttnn.scatter(kv_cache_v_tt, dim=2, index=index_tt, src=v_for_cache)
 
     # 5) SDPA decode on device. SDPA wants Q in same dtype as KV cache (bf16);
     # downcast Q for the call, then promote the result back to whatever dtype
