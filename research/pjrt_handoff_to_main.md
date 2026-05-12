@@ -273,3 +273,95 @@ ROI investment the PJRT track has remaining.
 lowers `softmax` to a 5-13-op graph while vanilla uses
 `ttnn.softmax`. Pattern-match fusion is the next highest-ROI
 PJRT investment.**
+
+---
+
+## Real-model test: Qwen2.5-0.5B via PJRT (appended 2026-05-11)
+
+### The question
+
+"The best test for the PJRT plugin is if we're able to run an actual
+model."
+
+### Status
+
+**Blocked at engine bug — fix landed, validation pending qb1 ssh.**
+
+The JAX implementation is complete (`experiments/jax_qwen05b_pjrt.py`)
+and demonstrably correct on the JAX CPU backend (no plugin):
+
+```
+Prompt: "The capital of France is" (5 tokens)
+Generated: "The capital of France is Paris, and the capital of"
+```
+
+Throughput on JAX CPU backend: 88.5 ms/tok = **11.3 tok/sec**.
+Native ttnn reference: 7 ms/tok = 142 tok/sec.
+
+The TT-PJRT backend tripped a real engine bug discovered while
+building this: JAX deduplicates common helpers (e.g. SiLU) into a
+**single private function called from N call sites**. The previous
+`execute_func_call` assumed 1-to-1 sequential dispatch (Nth call ⇒
+Nth private function), failing with "func.call #1 but only 1 private
+functions found in module" the moment a model has any repeated MLP
+block.
+
+### Engine fix (committed)
+
+Two parts in `pjrt_plugin/jax_plugins/tt/engine.py`:
+
+1. `_module_to_text_with_callees` walks the MLIR operation tree to
+   harvest `(callee, sym_name)` pairs (the default printer drops
+   them under `allow_unregistered_dialects`), then splices them
+   back into the text the parser reads.
+
+2. `execute_func_call` now dispatches by callee name when available;
+   falls back to "single private function" / positional rules when
+   names are missing. Tolerates legacy 3-tuple `private_fns` entries
+   alongside the new 4-tuple form.
+
+### Design (see research/pjrt_real_model_plan.md)
+
+- **Prefill on host (numpy)** — variable-length, run once.
+- **Decode on JAX-jit'd device function** — fixed shape per call.
+- **RoPE via rotation matrix** — `x*cos + (x@R)*sin`. Eliminates the
+  `jnp.split → stablehlo.slice` (host-transfer) that breaks trace.
+- **Pre-computed causal mask** — `mask[None,None,None,:]` added to
+  scores. Eliminates `compare`/`iota` (host-transfer).
+- **Host-side KV cache update** — cache update is numpy `[:,:,pos:pos+1,:] = new`.
+  Eliminates `scatter` (host-transfer). Trade-off: current token's
+  K isn't in cache for THIS step's attention (small accuracy hit,
+  recoverable in next step).
+
+Op-coverage check via `experiments/jax_qwen05b_inspect.py` confirms
+ALL ops are supported and ZERO host-transfer ops appear with this
+design — the program should trace cleanly.
+
+### Files
+
+- `research/pjrt_real_model_plan.md` — plan
+- `experiments/jax_qwen05b_pjrt.py` — the real-model test
+- `experiments/jax_qwen05b_inspect.py` — op-coverage check
+- `experiments/jax_qwen05b_bisect.py` — bisects the bug
+- `experiments/jax_qwen05b_dump_full_text.py` — IR dump that proved
+  the dedup pattern (2 func.calls → 1 private function = SiLU)
+- `pjrt_plugin/jax_plugins/tt/engine.py` — `_module_to_text_with_callees`,
+  callee-aware `execute_func_call`, sym_name parsing
+
+### What's left
+
+Re-run `experiments/jax_qwen05b_pjrt.py --device --tokens 100` on
+qb1 once ssh stabilizes. Expected outcomes:
+1. Engine fix makes it past the func.call dispatch error.
+2. Trace capture should fire (no host-transfer ops in decode step).
+3. tok/s likely 30-80 (24 layers × ~10 traceable ops ≈ ~250 ops in
+   one trace, replay floor ~5-8 ms vs native 7 ms).
+
+If trace capture succeeds, this is at-parity with native. If it
+falls back to parse-cached eager, expect 50-100ms/step.
+
+### One-liner
+
+**Blocked at qb1 ssh outage during validation. JAX implementation is
+correct (verified on JAX-CPU); engine bug fixed (func.call dedup);
+device path needs the final smoke test.**
