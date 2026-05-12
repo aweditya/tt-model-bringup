@@ -182,52 +182,71 @@ def _serialize_bytecode(fn, *example_args):
     return serialize_portable_artifact(module, version)
 
 
-def bench_engine_end_to_end():
-    results = {}
-    import jax
+_E2E_PROGRAMS = None  # built lazily and shared across eager + traced surfaces
+
+
+def _build_e2e_programs():
+    """Return list of (label, bytecode, [inputs]) tuples used by surfaces 3+5."""
+    global _E2E_PROGRAMS
+    if _E2E_PROGRAMS is not None:
+        return _E2E_PROGRAMS
     import jax.numpy as jnp
 
-    # Program 1: x + 1
     x_4 = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    bc = _serialize_bytecode(lambda x: x + 1.0, x_4)
-    fn = lambda: engine.execute_stablehlo(bc, [x_4])
-    mean, p99 = time_loop(fn, sync_each=False)
-    results["e2e: x + 1 (1-op)"] = (mean, p99)
-
-    # Program 2: exp(x)
-    bc = _serialize_bytecode(lambda x: jnp.exp(x), x_4)
-    fn = lambda: engine.execute_stablehlo(bc, [x_4])
-    mean, p99 = time_loop(fn, sync_each=False)
-    results["e2e: exp(x) (1-op)"] = (mean, p99)
-
-    # Program 3: matmul 64x64
     a64 = np.random.randn(64, 64).astype(np.float32) * 0.1
     b64 = np.random.randn(64, 64).astype(np.float32) * 0.1
-    bc = _serialize_bytecode(lambda a, b: a @ b, a64, b64)
-    fn = lambda: engine.execute_stablehlo(bc, [a64, b64])
-    mean, p99 = time_loop(fn, sync_each=False)
-    results["e2e: a @ b 64x64"] = (mean, p99)
-
-    # Program 4: linear layer
     a64s = np.random.randn(2, 64).astype(np.float32) * 0.1
     w64 = np.random.randn(64, 32).astype(np.float32) * 0.1
     b32 = np.random.randn(32).astype(np.float32) * 0.1
-    bc = _serialize_bytecode(lambda a, w, b: a @ w + b, a64s, w64, b32)
-    fn = lambda: engine.execute_stablehlo(bc, [a64s, w64, b32])
-    mean, p99 = time_loop(fn, sync_each=False)
-    results["e2e: linear (a@w+b)"] = (mean, p99)
-
-    # Program 5: softmax
     x_64 = np.random.randn(1, 64).astype(np.float32)
+
     def softmax(x):
         m = jnp.max(x, axis=-1, keepdims=True)
         e = jnp.exp(x - m)
         return e / jnp.sum(e, axis=-1, keepdims=True)
-    bc = _serialize_bytecode(softmax, x_64)
-    fn = lambda: engine.execute_stablehlo(bc, [x_64])
-    mean, p99 = time_loop(fn, sync_each=False)
-    results["e2e: softmax (1x64)"] = (mean, p99)
 
+    progs = [
+        ("x + 1 (1-op)", _serialize_bytecode(lambda x: x + 1.0, x_4), [x_4]),
+        ("exp(x) (1-op)", _serialize_bytecode(lambda x: jnp.exp(x), x_4), [x_4]),
+        ("a @ b 64x64", _serialize_bytecode(lambda a, b: a @ b, a64, b64),
+         [a64, b64]),
+        ("linear (a@w+b)",
+         _serialize_bytecode(lambda a, w, b: a @ w + b, a64s, w64, b32),
+         [a64s, w64, b32]),
+        ("softmax (1x64)", _serialize_bytecode(softmax, x_64), [x_64]),
+    ]
+    _E2E_PROGRAMS = progs
+    return progs
+
+
+def bench_engine_end_to_end():
+    """Surface 3 — eager-only (trace disabled)."""
+    results = {}
+    # Disable trace cache for this surface so we get true eager numbers.
+    saved = engine._NO_TRACE
+    engine._NO_TRACE = True
+    try:
+        for label, bc, inputs in _build_e2e_programs():
+            fn = lambda bc=bc, inputs=inputs: engine.execute_stablehlo(bc, inputs)
+            mean, p99 = time_loop(fn, sync_each=False)
+            results[f"e2e: {label}"] = (mean, p99)
+    finally:
+        engine._NO_TRACE = saved
+    return results
+
+
+def bench_engine_traced():
+    """Surface 5 — trace capture enabled (cache hit path)."""
+    results = {}
+    engine._NO_TRACE = False
+    for label, bc, inputs in _build_e2e_programs():
+        # First call captures the trace; subsequent calls replay.
+        engine.execute_stablehlo(bc, inputs)  # capture
+        fn = lambda bc=bc, inputs=inputs: engine.execute_stablehlo(bc, inputs)
+        mean, p99 = time_loop(fn, sync_each=False)
+        cache_entry = engine._trace_cache.get(hash(bc), {})
+        suffix = "" if not cache_entry.get('failed') else " [no-trace]"
+        results[f"traced: {label}{suffix}"] = (mean, p99)
     return results
 
 
@@ -356,7 +375,8 @@ def main():
         ("Surface 1 — Raw ttnn (tensors on device)", bench_raw_ttnn),
         ("Surface 2 — Engine eager (_execute_op_device)", bench_engine_eager),
         ("Surface (parse) — bytecode_to_text + parse_stablehlo", bench_parse_only),
-        ("Surface 3 — Engine end-to-end execute_stablehlo", bench_engine_end_to_end),
+        ("Surface 3 — Engine end-to-end (eager, no trace)", bench_engine_end_to_end),
+        ("Surface 5 — Engine traced (begin/end_trace_capture)", bench_engine_traced),
         ("Surface 4 — jax.jit (full PJRT pipeline)", bench_jax_jit),
     ]
     for i, (title, fn) in enumerate(surfaces, 1):

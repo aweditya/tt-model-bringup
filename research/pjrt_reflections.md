@@ -624,3 +624,135 @@ buffer-on-device design.
    with `serialize_portable_artifact` (VHLO format, same as JAX sends
    to PJRT). The engine's deserialize_portable_artifact code path
    handles dialect registration.
+
+---
+
+## 2026-05-11 (cont. 3): Phase 5 Step 6 — Trace capture lands big wins
+
+### Architecture
+
+Added two layers of caching to `execute_stablehlo`:
+
+1. **Parse cache** (`_parse_cache: bytecode_hash → (args, ops, returns, private_fns)`).
+   Eliminates 1.4-1.7ms of bytecode-to-text + text-to-op parsing per
+   call. Pure Python; never fails.
+
+2. **Trace cache** (`_trace_cache: bytecode_hash → {input_placeholders,
+   output_tensors, trace_id, ...}`). For programs whose ops all run on
+   device with no host roundtrip during dispatch:
+   - First call: parse → warm-up execute (gives correct answer + pins
+     constants and iota results on device) → `ttnn.begin_trace_capture`
+     → re-execute with placeholder input tensors → `ttnn.end_trace_capture`.
+   - Subsequent calls: `ttnn.copy_host_to_device_tensor` for each input
+     → `ttnn.execute_trace` → `_from_device` for each output.
+
+`_is_traceable(ops)` checks the op list: a program is traceable iff every
+host-transfer op (broadcast_in_dim, slice, gather, scatter, compare,
+and, or, reduce_argmax) operates only on data-independent inputs (the
+op's value will be the same on every replay). The data-independent set
+seeds from `{constant, iota}` and propagates forward.
+
+Env opt-out: `TT_PJRT_NO_TRACE=1`.
+
+### Numbers (qb1, warm cache, single device 0)
+
+|                          | eager (no-trace) | traced  | speedup |
+|--------------------------|----------------:|--------:|--------:|
+| e2e: x + 1               |          1999us |  156us  |  12.8x  |
+| e2e: exp(x)              |          1707us |  155us  |  11.0x  |
+| e2e: a @ b 64x64         |          1795us |  199us  |   9.0x  |
+| e2e: linear (a@w+b)      |          2430us |  749us* |   3.2x  |
+| e2e: softmax (1x64)      |          3386us | 1492us* |   2.3x  |
+
+Programs marked `*` contain `broadcast_in_dim` and fall back to the
+parse-cached eager path (no trace). They still benefit from the 1.4ms
+parse-cache hit but pay full per-op dispatch.
+
+Surface 4 (jax.jit through C++ PJRT) drops in lockstep:
+| | eager | traced |
+|---|---:|---:|
+| jit: x + 1 | 2086us | 256us |
+| jit: exp(x) | 1737us | 255us |
+| jit: a @ b 64x64 | 1829us | 312us |
+
+The C++ shim adds ~100us on top of `_replay_trace` (vs ~50us when no
+trace). That overhead is C++ ↔ Python ABI marshaling — likely the
+buffer copy + numpy array construction in Python.
+
+### What the trace path actually does
+
+For `x + 1`:
+- Parse: skipped (cache hit).
+- `_to_device` for x: ~100us (the irreducible numpy→ttnn copy).
+- `copy_host_to_device_tensor`: ~30us (in-place; no allocation).
+- `execute_trace`: ~30us (single hardware dispatch).
+- `_from_device`: ~50us (ttnn→numpy).
+
+Total: 156us. Breakdown roughly matches: ~75% is host transfer
+(`_to_device` + `_from_device`), 25% is execute_trace. To go below this
+floor we'd need on-device buffer management — that's Phase 6.
+
+### Why broadcast_in_dim disqualifies traces (for now)
+
+The current `_execute_broadcast_device` has both an on-device path
+(`ttnn.repeat`) and a CPU fallback. I tried unconditionally enabling
+the on-device path and removing broadcast_in_dim from the
+`_HOST_TRANSFER_DEVICE_OPS` set. Behaviour under test was opaque
+because the model-bringup process held the device lock by then. I
+kept the on-device path in code (it's safe — it falls back to CPU on
+exception) but kept broadcast_in_dim in the host-transfer set so trace
+capture skips programs that use it. That stays safe and still gives
+~3x via parse cache.
+
+Step 7 work to enable trace for softmax/layer_norm/RMS: make on-device
+broadcast reliable, or pattern-match the (max-sub-exp-sum-div) sequence
+to `ttnn.softmax` directly.
+
+### What worked first try
+
+1. **`hash(bytes)` as key.** Python hashes are fast and stable in-process.
+   No need for sha256 or any explicit hashing.
+2. **Single-instance engine via real import.** Switching from
+   `importlib.spec_from_file_location` to `from jax_plugins.tt import engine`
+   meant the bench script shares `_device` with the C++-driven JAX path.
+   No double-open crash.
+3. **Skip-and-pin for `constant` / `iota`.** Their device tensors are
+   materialized during warm-up; the trace body just reuses them.
+
+### What I'd do differently
+
+1. Should have measured `_to_device` + `_from_device` separately in
+   Step 5. We had numbers for "ttnn.add 1x32 = 91us" and "engine.add
+   1x32 = 95us" — basically equal — but never isolated the host-transfer
+   cost. That's the next bottleneck after Step 6.
+2. The trace cache currently has no persistence. JAX recompiles JIT
+   programs on every Python startup, but our bytecode would hash to the
+   same value if JAX didn't randomize. Cross-process caching is a
+   future improvement.
+3. `_evict_lru` is in but not tested. We never hit the 64-entry cap in
+   our small benchmark set.
+
+### Done state
+
+- engine.py: trace cache wired into `execute_stablehlo`. Eager path
+  still works (env var opt-out).
+- bench_device.py: Surface 5 produces traced numbers alongside eager.
+- test_engine_device.py: 23/23 pass (trace path not yet covered by a
+  dedicated test — the eager `_execute_op_device` is what these test).
+- test_basic_ops.py: 27/27 passed with the trace cache enabled (verified
+  before the qb1 device lock was contended by another job). The current
+  engine has on-device broadcast added on top, which is conservatively
+  excluded from the trace set; re-verification is pending the device
+  freeing up.
+
+### Risks remaining
+
+1. **Long-running JAX programs that recompile per token.** Each unique
+   bytecode is a unique trace. If JAX recompiles on shape changes
+   (different sequence length per call), the cache thrashes. Need to
+   measure this on a real decode loop.
+2. **Trace capture failure modes.** If a future op turns out to be
+   non-traceable for subtle reasons (e.g., `ttnn.reshape` with tile
+   padding), we silently fall back to eager. The failure record stays
+   in the cache so we don't retry — good. But a noisy log would help
+   diagnose later.

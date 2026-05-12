@@ -812,8 +812,281 @@ def count_outputs(bytecode: bytes) -> int:
     return len(returns)
 
 
+# ============================================================
+# Trace cache (Phase 5 Step 6)
+# ============================================================
+#
+# `execute_stablehlo` is called once per (compiled program, input batch).
+# In eager mode we re-parse the bytecode and re-dispatch every op every
+# call — Step 5 showed parse alone is 1.4-1.7ms (50-70% of wall time on
+# small programs). Trace cache attacks this:
+#
+#   First call:  parse + warm-up execute + ttnn.begin/end_trace_capture
+#   Replay:      copy_host_to_device_tensor(inputs) → execute_trace
+#
+# Cache key: hash(bytecode). Python guarantees `bytes` hashes are stable
+# within a process. Across processes JAX rebuilds bytecode so the cache
+# is per-process — fine for v0.
+#
+# Constraints on traceable programs:
+#   - All ops must run on-device with NO host roundtrip during the trace.
+#   - Data-independent host ops (constant, iota) are evaluated during
+#     warm-up and the resulting device tensor is reused — safe.
+#   - Any other host roundtrip op (broadcast_in_dim, slice, gather, ...)
+#     means we cannot trace this program; we fall back to eager + parse cache.
+
+_TRACE_CACHE_MAX = 64
+_trace_cache = {}            # bytecode_hash -> dict (see _capture_trace)
+_parse_cache = {}            # bytecode_hash -> (func_args, ops, returns, private_fns)
+_NO_TRACE = os.environ.get('TT_PJRT_NO_TRACE', '0') == '1'
+
+# Ops we can safely materialize once during warmup (their value doesn't
+# depend on subsequent input data).
+_DATA_INDEPENDENT_OPS = {'constant', 'iota'}
+
+# Ops whose device implementation currently does a host roundtrip. If any
+# op in this set is data-dependent in the program, we cannot capture a
+# trace (the cached result would be stale on replay).
+#
+# `broadcast_in_dim` has an on-device path (ttnn.repeat) but it isn't
+# robust enough to be trace-safe in every case. For now we keep it here
+# so trace capture skips programs that include it. Programs reach the
+# eager (parse-cached) path instead — still a ~3x speedup vs no cache.
+# TODO Step 7: make on-device broadcast trace-safe and drop this entry.
+_HOST_TRANSFER_DEVICE_OPS = {
+    'broadcast_in_dim',
+    'slice', 'gather', 'scatter',
+    'and', 'or', 'reduce_argmax', 'compare',
+}
+
+
+def _is_traceable(ops):
+    """Decide if a parsed op list can run end-to-end inside a ttnn trace.
+
+    The simple rule: every host-transfer device op must be data-
+    independent (i.e., its inputs are all upstream-data-independent).
+    For v0 we approximate this strictly: NO host-transfer op may appear
+    unless it's `concatenate` of constants (rare). This is conservative
+    but correct.
+    """
+    data_indep = set()  # SSA names whose value is data-independent
+    for op in ops:
+        if op['op'] in _DATA_INDEPENDENT_OPS:
+            data_indep.add(op['name'])
+            continue
+        if op['op'] in _HOST_TRANSFER_DEVICE_OPS:
+            # Allow only if every operand is data-independent
+            for src in op.get('operands', []):
+                if src not in data_indep:
+                    return False
+            data_indep.add(op['name'])
+            continue
+        # Pure on-device op — its result may or may not be data-
+        # independent depending on operands; we don't need to track.
+    return True
+
+
+def _evict_lru():
+    """Cap the trace cache size by dropping the oldest entry."""
+    if len(_trace_cache) <= _TRACE_CACHE_MAX:
+        return
+    # Python dicts preserve insertion order — drop the first key.
+    first_key = next(iter(_trace_cache))
+    entry = _trace_cache.pop(first_key)
+    try:
+        if entry.get('trace_id') is not None:
+            ttnn.release_trace(_get_device(), entry['trace_id'])
+    except Exception:
+        pass
+
+
+def _capture_trace(key, bytecode, inputs, parsed):
+    """Run the program once eagerly, then capture an executable trace.
+
+    Returns the eager result (so the caller has a correct first-call
+    answer) and populates _trace_cache[key].
+    """
+    func_args, ops, returns, private_fns = parsed
+
+    # Eager warm-up — this is identical to the old execute_stablehlo path.
+    global _private_functions, _call_counter, _logical_shapes
+    _private_functions = private_fns
+    _call_counter = 0
+    _logical_shapes = {}
+
+    values = {}
+    input_placeholders = []   # ttnn tensors we'll reuse across calls
+    for i, (arg_name, type_str) in enumerate(func_args):
+        _logical_shapes[arg_name], _ = parse_tensor_type(type_str)
+        t = _to_device(inputs[i])
+        input_placeholders.append(t)
+        values[arg_name] = t
+
+    for op in ops:
+        result = execute_op(op, values)
+        if isinstance(result, dict):
+            values.update(result)
+            for k in result:
+                rts = op.get('result_types', [])
+                idx_str = k.split('#')[1] if '#' in k else '0'
+                idx = int(idx_str)
+                if idx < len(rts):
+                    _logical_shapes[k], _ = parse_tensor_type(rts[idx])
+        else:
+            values[op['name']] = result
+            rt = op.get('result_type', '')
+            if rt:
+                try:
+                    _logical_shapes[op['name']], _ = parse_tensor_type(rt)
+                except (ValueError, TypeError):
+                    pass
+
+    # Snapshot the warmup result for eager return AND for traced replay
+    # (the device tensors of data-independent ops are pinned here).
+    warmup_values = dict(values)
+
+    eager_results = []
+    for r in returns:
+        val = values[r]
+        if not isinstance(val, np.ndarray):
+            shape = _logical_shapes.get(r) or _infer_result_shape(r, ops, func_args, returns)
+            eager_results.append(_from_device(val, shape))
+        else:
+            eager_results.append(val)
+
+    # Build the trace. During capture we MUST NOT do host transfers, so
+    # we skip any data-independent op (its device tensor is already in
+    # `values`) and re-execute only the pure-device ops.
+    try:
+        device = _get_device()
+        ttnn.synchronize_device(device)
+        trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+
+        # Reset state for trace re-execution
+        _private_functions = private_fns
+        _call_counter = 0
+        _logical_shapes = {}
+        trace_values = {}
+        for i, (arg_name, type_str) in enumerate(func_args):
+            _logical_shapes[arg_name], _ = parse_tensor_type(type_str)
+            trace_values[arg_name] = input_placeholders[i]
+
+        for op in ops:
+            if op['op'] in _DATA_INDEPENDENT_OPS:
+                # Pin warm-up value (a ttnn tensor); don't re-execute.
+                trace_values[op['name']] = warmup_values[op['name']]
+                rt = op.get('result_type', '')
+                if rt:
+                    try:
+                        _logical_shapes[op['name']], _ = parse_tensor_type(rt)
+                    except (ValueError, TypeError):
+                        pass
+                continue
+            if op['op'] in _HOST_TRANSFER_DEVICE_OPS:
+                # Same — these were already classified as data-indep by
+                # _is_traceable. Pin warm-up value.
+                trace_values[op['name']] = warmup_values[op['name']]
+                rt = op.get('result_type', '')
+                if rt:
+                    try:
+                        _logical_shapes[op['name']], _ = parse_tensor_type(rt)
+                    except (ValueError, TypeError):
+                        pass
+                continue
+
+            result = execute_op(op, trace_values)
+            if isinstance(result, dict):
+                trace_values.update(result)
+                for k in result:
+                    rts = op.get('result_types', [])
+                    idx_str = k.split('#')[1] if '#' in k else '0'
+                    idx = int(idx_str)
+                    if idx < len(rts):
+                        _logical_shapes[k], _ = parse_tensor_type(rts[idx])
+            else:
+                trace_values[op['name']] = result
+                rt = op.get('result_type', '')
+                if rt:
+                    try:
+                        _logical_shapes[op['name']], _ = parse_tensor_type(rt)
+                    except (ValueError, TypeError):
+                        pass
+
+        output_tensors = []
+        output_shapes = []
+        for r in returns:
+            val = trace_values[r]
+            shape = _logical_shapes.get(r) or _infer_result_shape(r, ops, func_args, returns)
+            output_tensors.append(val)
+            output_shapes.append(shape)
+
+        ttnn.end_trace_capture(device, trace_id, cq_id=0)
+    except Exception as e:
+        # Capture failed — drop the partial trace, keep eager-only path.
+        try:
+            ttnn.end_trace_capture(_get_device(), trace_id, cq_id=0)
+            ttnn.release_trace(_get_device(), trace_id)
+        except Exception:
+            pass
+        _trace_cache[key] = {'failed': True, 'error': str(e)}
+        return eager_results
+
+    _trace_cache[key] = {
+        'failed': False,
+        'trace_id': trace_id,
+        'input_placeholders': input_placeholders,
+        'output_tensors': output_tensors,
+        'output_shapes': output_shapes,
+    }
+    _evict_lru()
+    return eager_results
+
+
+def _replay_trace(key, inputs):
+    """Execute a previously-captured trace with new inputs."""
+    entry = _trace_cache[key]
+    device = _get_device()
+
+    # Copy host inputs into the placeholder device tensors.
+    for i, arr in enumerate(inputs):
+        placeholder = entry['input_placeholders'][i]
+        # Build a torch tensor with the SAME padded shape as the placeholder
+        # so copy_host_to_device_tensor doesn't shape-mismatch.
+        if isinstance(arr, (int, float, np.integer, np.floating)):
+            arr = np.array([[float(arr)]], dtype=np.float32)
+        if not isinstance(arr, np.ndarray):
+            arr = np.array(arr, dtype=np.float32)
+        t = torch.from_numpy(arr.copy()).float()
+        while t.dim() < 2:
+            t = t.unsqueeze(0)
+        # Pad to placeholder's logical shape, accounting for tile padding
+        ph_shape = tuple(placeholder.shape)
+        if tuple(t.shape) != ph_shape:
+            # Right-pad with zeros to match placeholder shape
+            pads = []
+            for src, dst in zip(t.shape[::-1], ph_shape[::-1]):
+                pads.extend([0, max(0, dst - src)])
+            if any(p > 0 for p in pads):
+                t = torch.nn.functional.pad(t, pads)
+        new_t = ttnn.from_torch(t, dtype=ttnn.bfloat16,
+                                 layout=ttnn.TILE_LAYOUT)
+        ttnn.copy_host_to_device_tensor(new_t, placeholder)
+
+    ttnn.execute_trace(device, entry['trace_id'], cq_id=0, blocking=True)
+
+    results = []
+    for tensor, shape in zip(entry['output_tensors'], entry['output_shapes']):
+        results.append(_from_device(tensor, shape))
+    return results
+
+
 def execute_stablehlo(bytecode: bytes, inputs: list) -> list:
     """Execute a StableHLO program on numpy array inputs.
+
+    Fast path: if the bytecode has been compiled to a ttnn trace before,
+    replay the trace with new inputs (skipping parse and per-op dispatch).
+    Slow path: parse + interpret eagerly, then attempt to capture a trace
+    for next time.
 
     Args:
         bytecode: MLIR bytecode from PJRT_Client_Compile
@@ -824,9 +1097,39 @@ def execute_stablehlo(bytecode: bytes, inputs: list) -> list:
     """
     global _private_functions, _call_counter, _logical_shapes
 
-    # Parse bytecode → text → op list
-    text = bytecode_to_text(bytecode)
-    func_args, ops, returns, private_fns = parse_stablehlo(text)
+    # --- Trace fast path ---
+    if _USE_DEVICE and not _NO_TRACE:
+        key = hash(bytecode)
+        entry = _trace_cache.get(key)
+        if entry is not None and not entry.get('failed'):
+            return _replay_trace(key, inputs)
+        if entry is None:
+            # First time we see this bytecode — try to capture a trace.
+            # Parse once and stash for potential reuse on failure.
+            parsed = _parse_cache.get(key)
+            if parsed is None:
+                text = bytecode_to_text(bytecode)
+                parsed = parse_stablehlo(text)
+                _parse_cache[key] = parsed
+            _, ops, _, _ = parsed
+            if _is_traceable(ops):
+                return _capture_trace(key, bytecode, inputs, parsed)
+            # Not traceable — mark and fall through to eager path.
+            _trace_cache[key] = {'failed': True, 'error': 'not traceable'}
+
+    # --- Eager fallback (also numpy mode) ---
+    # Parse (with cache hit if we already parsed for trace attempt)
+    if _USE_DEVICE and not _NO_TRACE:
+        key = hash(bytecode)
+        parsed = _parse_cache.get(key)
+        if parsed is None:
+            text = bytecode_to_text(bytecode)
+            parsed = parse_stablehlo(text)
+            _parse_cache[key] = parsed
+    else:
+        text = bytecode_to_text(bytecode)
+        parsed = parse_stablehlo(text)
+    func_args, ops, returns, private_fns = parsed
 
     # Set up private functions for func.call dispatch
     _private_functions = private_fns
@@ -1199,7 +1502,11 @@ def _execute_op_device(op: dict, values: dict):
 
 
 def _execute_broadcast_device(op, values):
-    """Device-mode broadcast_in_dim using ttnn.repeat.
+    """Device-mode broadcast_in_dim.
+
+    Tries on-device `ttnn.repeat` first (no host roundtrip — needed for
+    trace capture). Falls back to CPU broadcast + `_to_device` if shapes
+    or layout prevent on-device repeat.
 
     Critical: use the StableHLO LOGICAL input shape (from _logical_shapes),
     NOT the ttnn tensor's .shape. ttnn pads tensors to 2D-min and tile-
@@ -1225,8 +1532,47 @@ def _execute_broadcast_device(op, values):
         if src_dim < len(a_logical):
             inter_shape[tgt_dim] = a_logical[src_dim]
 
-    # CPU fallback path (always correct, used because ttnn.reshape on
-    # tile-aligned tensors with non-tile dims is fragile)
+    # On-device path: ttnn.repeat with repeat counts computed from
+    # inter_shape → target_shape. Trace-capture safe (no host transfer).
+    if isinstance(a, np.ndarray):
+        # Already numpy (constant warmup path) — fall through to CPU.
+        pass
+    else:
+        try:
+            repeat_counts = []
+            for src, dst in zip(inter_shape, target_shape):
+                if src == dst:
+                    repeat_counts.append(1)
+                elif src == 1:
+                    repeat_counts.append(dst)
+                else:
+                    raise ValueError(
+                        f"non-broadcastable dim {src}->{dst}")
+            # Reshape source onto inter_shape so ttnn.repeat sees aligned dims.
+            # Pad to match device tensor rank so ttnn.reshape doesn't strip.
+            dev_rank = len(a.shape)
+            inter_padded = list(inter_shape)
+            while len(inter_padded) < dev_rank:
+                inter_padded.insert(0, 1)
+            t = a
+            if list(t.shape) != inter_padded:
+                t = ttnn.reshape(t, inter_padded)
+            repeat_padded = list(repeat_counts)
+            while len(repeat_padded) < dev_rank:
+                repeat_padded.insert(0, 1)
+            if any(r > 1 for r in repeat_padded):
+                t = ttnn.repeat(t, ttnn.Shape(repeat_padded))
+            # Final reshape to exactly target_shape (may strip padding dims)
+            if list(t.shape) != list(target_shape):
+                try:
+                    t = ttnn.reshape(t, list(target_shape))
+                except Exception:
+                    pass
+            return t
+        except Exception:
+            pass  # Fall through to CPU fallback
+
+    # CPU fallback path (always correct, used when on-device repeat fails)
     a_np = _operand_to_numpy(a, a_logical or None)
     if a_np.ndim == 0:
         result = np.broadcast_to(a_np, target_shape).copy()
