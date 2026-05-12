@@ -5,59 +5,76 @@ Performance baseline harness for Qwen3.6-27B (Branch III).
 Used to measure where time goes BEFORE applying any perf phase (C'1, C'2, ...).
 Re-run after each phase to quantify the improvement.
 
-# Why this exists (the async-timing trap)
+# Three measurement modes
 
-Host-side timing of GPU/accelerator ops is BROKEN when you don't synchronize:
+The harness supports three complementary measurement strategies that produce
+different views of the same workload:
 
-    t0 = time.time()
-    result = ttnn.linear(x, weight, ...)   # submits to queue, returns immediately
-    t1 = time.time()
-    # t1 - t0 measures DISPATCH time, NOT kernel execution time!
+  1. SYNC-BOUNDED HOST TIMING (default, always on)
+     - sync(); t0; region; sync(); t1
+     - Measures end-to-end wall time per region (submit + execute + sync)
+     - Pros: works without any extra setup; portable across hardware
+     - Cons: includes sync overhead; breaks async pipelining within the region;
+       can't separate pure kernel time from dispatch time
 
-For slow ops (matmul), dispatch might be 50 µs but kernel execute might be
-50 ms — host reports the 50 µs and you have no idea the op cost 1000× more.
-The measurement is wrong by orders of magnitude and worse, inconsistent.
+  2. TRACY ZONES (optional, via --enable-tracy)
+     - Wraps each measured region in ttnn.start_tracy_zone / stop_tracy_zone
+     - Output: when ttnn is built with Tracy AND a Tracy server is running,
+       events appear in the Tracy timeline UI
+     - Pros: visual timeline of regions; correlates with device-side events;
+       no host-side instrumentation overhead when Tracy server isn't connected
+     - Cons: needs Tracy viewer (downloadable binary); not all builds have Tracy
 
-The fix: synchronize BEFORE and AFTER:
+  3. DEVICE PROFILER (optional, via --enable-device-profiler)
+     - Sets TT_METAL_DEVICE_PROFILER=1, calls ttnn.ReadDeviceProfiler(device)
+       and ttnn.get_latest_programs_perf_data() after each region
+     - Output: per-op data structures with on-device kernel start/end cycles
+     - Pros: PURE KERNEL EXECUTION TIME (no host/dispatch noise!)
+     - Cons: needs env var enabled at process start; data format is per-op
+       (one entry per device program), not per-line-of-Python
 
-    ttnn.synchronize_device(device)   # drain queue
-    t0 = time.time()
-    result = ttnn.linear(...)
-    ttnn.synchronize_device(device)   # block until this op done
-    t1 = time.time()
-    # t1 - t0 = full submit + execute + final-sync. END-TO-END.
+For comparing phase C'0 → C'1, sync-bounded host timing of the FULL decode
+step is correct and sufficient — pipelining within the region is preserved.
+For attributing 'where does this 200ms go internally,' device profiler is
+the right tool.
 
-This harness wraps every measurement region with that sync-before/sync-after
-discipline. It also runs warmup iterations (JIT compile, L1 cold) and reports
-median across repeats (more robust than mean for noisy timing).
+# Why sync-bounded host timing is correct for FULL-region measurements
 
-# What this measures and what it doesn't
+When we wrap the entire 64-layer decode step:
+    sync()    # queue is empty
+    t0; full_decode_step(); sync()   # within full_decode, ops PIPELINE freely
+    t1
+The single final sync() only blocks until the LAST op completes. Inside the
+region, ops dispatch async as fast as possible — same as production. So
+'host overhead' from sync is just the single final-sync cost (~50 µs).
 
-MEASURES (correctly):
-  - End-to-end wall time for a region (submit + execute + final sync)
-  - Median + min + max across repeats so outliers are visible
-
-DOES NOT MEASURE (would need Tracy device profiler):
-  - Pure kernel execution time (separated from submit/sync overhead)
-  - Per-Tensix-core utilization
-  - DRAM bandwidth saturation
-  - PCIe queue depth
-
-For comparing 'before-C'1 vs after-C'1' on the full decode step, end-to-end
-is correct and sufficient. For zooming inside a single matmul we'd need Tracy.
+The pipelining concern matters when measuring INDIVIDUAL ops in isolation
+(our single_deltanet_step / single_gated_attn_step measurements). Those
+serialize each op's full submit→execute→sync cycle, which production code
+wouldn't. So sum(per-layer × count) OVERSTATES the real full-decode cost.
+The compounding-estimate-vs-measured diff captures this.
 
 # Output
 
-  - Markdown table to stdout (human-readable)
+  - Markdown table to stdout (human-readable, end-of-run summary)
   - JSON to ~/tt-xla/.cache/perf_baseline_<phase>_<timestamp>.json
+  - If --enable-device-profiler: per-op data appended into the same JSON
 
 Use the JSON to diff across phases programmatically.
 
 Run on qb2:
+    # Default sync-bounded timing only (no extra setup)
     cd ~/tt-xla && HF_HOME=$HOME/tt-xla/.cache/hf .venv/bin/python \\
         experiments/utils/perf_baseline.py --phase C0
+
+    # With device profiler (per-op kernel timing)
+    TT_METAL_DEVICE_PROFILER=1 .venv/bin/python \\
+        experiments/utils/perf_baseline.py --phase C0 --enable-device-profiler
+
+    # With Tracy zones (requires running Tracy server; events stream to it)
+    .venv/bin/python experiments/utils/perf_baseline.py --phase C0 --enable-tracy
 """
-import os, sys, json, time, gc, argparse, statistics
+import os, sys, json, time, gc, argparse, statistics, inspect
 from contextlib import contextmanager
 sys.path.insert(0, os.path.expanduser("~"))
 
@@ -67,6 +84,68 @@ import ttnn
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from transformers import AutoTokenizer
+
+# --- Tracy + device-profiler integration ----------------------------------
+# These flags get set in main() based on CLI args. The helpers below become
+# no-ops if their respective features aren't enabled.
+_TRACY_ENABLED = False
+_DEVICE_PROFILER_ENABLED = False
+
+# Color palette for tracy zones (just for visual differentiation in the UI)
+TRACY_COLORS = {
+    "prefill":          0xFF6B6B,   # red-ish
+    "decode":           0x4ECDC4,   # teal
+    "deltanet":         0x95E1D3,   # mint
+    "gated_attn":       0xFFD93D,   # yellow
+    "mlp":              0xC9B1FF,   # lavender
+    "lm_head":          0xFFA07A,   # salmon
+    "load":             0x808080,   # gray
+}
+
+
+@contextmanager
+def tracy_zone(name, color=0):
+    """Wrap a region in a ttnn Tracy zone (no-op if --enable-tracy not set).
+
+    When Tracy is enabled AND a Tracy server is running, this region appears
+    in the timeline UI with the given name and color. When Tracy isn't enabled,
+    this is a no-op — zero overhead.
+
+    The ttnn API takes (source, functName, lineNum, color) — we auto-fill
+    those from the caller's frame so the zone links to the right source.
+    """
+    if not _TRACY_ENABLED:
+        yield
+        return
+    frame = inspect.currentframe().f_back.f_back  # one extra hop for contextmanager
+    src = os.path.basename(frame.f_code.co_filename)
+    fn = frame.f_code.co_name
+    line = frame.f_lineno
+    ttnn.start_tracy_zone(src, fn, line, color)
+    try:
+        yield
+    finally:
+        ttnn.stop_tracy_zone(name, color)
+
+
+def dump_device_profiler(device, label, into_dict):
+    """Capture device-profiler per-op data into into_dict[label] (no-op if disabled).
+
+    Calls ReadDeviceProfiler to flush device timestamps, then
+    get_latest_programs_perf_data to retrieve the per-program metrics.
+    """
+    if not _DEVICE_PROFILER_ENABLED:
+        return
+    try:
+        ttnn.ReadDeviceProfiler(device)
+        data = ttnn.get_latest_programs_perf_data()
+    except Exception as e:
+        print(f"  ! device profiler read failed for {label!r}: {e}")
+        return
+    # The data is opaque from the ttnn side; we stringify with repr so it
+    # round-trips through JSON. Downstream analysis can re-parse if needed.
+    into_dict.setdefault("_device_profiler", {})
+    into_dict["_device_profiler"][label] = repr(data)[:5000]  # cap size
 
 # Reuse 91f/91l production kernels (all 7 bug fixes baked in)
 import importlib.util
@@ -121,25 +200,33 @@ def timed(device, label, results_dict, repeats=10, warmup=3):
     results_dict.setdefault(label, []).append(timing.elapsed_ms)
 
 
-def time_function(device, label, fn, results_dict, repeats=10, warmup=3):
+def time_function(device, label, fn, results_dict, repeats=10, warmup=3, color=0):
     """Run `fn()` `warmup + repeats` times. Discard warmups. Record per-call
     elapsed_ms with sync-bounded measurement. fn() may return anything; we
     ignore the value (you're measuring its side-effects).
+
+    Also wraps each timed call in a Tracy zone (if enabled) and calls
+    ReadDeviceProfiler (if enabled) after the last timed run.
     """
-    # Warmup (not measured)
-    for _ in range(warmup):
+    # Warmup (not measured, but still tracy-wrapped if enabled so the timeline
+    # shows them clearly as warmup vs measured)
+    for i in range(warmup):
         ttnn.synchronize_device(device)
-        fn()
+        with tracy_zone(f"{label}.warmup_{i}", color=color):
+            fn()
     ttnn.synchronize_device(device)
     # Timed
     times = []
-    for _ in range(repeats):
+    for i in range(repeats):
         ttnn.synchronize_device(device)
-        t0 = time.time()
-        fn()
-        ttnn.synchronize_device(device)
+        with tracy_zone(f"{label}.run_{i}", color=color):
+            t0 = time.time()
+            fn()
+            ttnn.synchronize_device(device)
         times.append((time.time() - t0) * 1000)
     results_dict[label] = times
+    # Device profiler dump (after the final timed run)
+    dump_device_profiler(device, label, results_dict)
     return times
 
 
@@ -166,11 +253,32 @@ def main():
     p.add_argument("--decode-warmup", type=int, default=5)
     p.add_argument("--per-layer-repeats", type=int, default=10,
                    help="Repeats for per-layer-type sampling")
+    p.add_argument("--enable-tracy", action="store_true",
+                   help="Wrap each measured region in ttnn.start/stop_tracy_zone — "
+                        "events stream to a connected Tracy server (no-op if not connected)")
+    p.add_argument("--enable-device-profiler", action="store_true",
+                   help="Set TT_METAL_DEVICE_PROFILER=1 in process env and dump "
+                        "ttnn.ReadDeviceProfiler + get_latest_programs_perf_data into "
+                        "the output JSON after each timed region — captures per-op "
+                        "device kernel timing (pure execute time, no host/dispatch noise)")
     args = p.parse_args()
+
+    global _TRACY_ENABLED, _DEVICE_PROFILER_ENABLED
+    _TRACY_ENABLED = args.enable_tracy
+    _DEVICE_PROFILER_ENABLED = args.enable_device_profiler
+    if _DEVICE_PROFILER_ENABLED:
+        # Must be set BEFORE device open; if user didn't pre-set it, do it now
+        # (may be too late to take effect — print a warning if it wasn't pre-set)
+        if os.environ.get("TT_METAL_DEVICE_PROFILER") != "1":
+            print("  WARNING: TT_METAL_DEVICE_PROFILER not set in process env. "
+                  "Run with `TT_METAL_DEVICE_PROFILER=1 python ...` for full effect.")
+            os.environ["TT_METAL_DEVICE_PROFILER"] = "1"
 
     print("=" * 64)
     print(f"Perf baseline harness — phase={args.phase}")
     print("=" * 64)
+    print(f"  modes: host-sync=ON  tracy={'ON' if _TRACY_ENABLED else 'off'}  "
+          f"device-profiler={'ON' if _DEVICE_PROFILER_ENABLED else 'off'}")
 
     # ----------------------------------------
     # Config + model load (same as 91l/demo)
@@ -305,7 +413,8 @@ def main():
         for pos, tid in enumerate(prompt_ids):
             _ = forward_token(tid, pos, ssm, cvs, kvc)
     time_function(device, "prefill_5_tokens", do_prefill, results,
-                  repeats=args.prefill_repeats, warmup=1)
+                  repeats=args.prefill_repeats, warmup=1,
+                  color=TRACY_COLORS["prefill"])
 
     # ----- (b) Single decode step (after one prefill, fixed cur_pos) -----
     # We prefill once, then measure repeated single-step decode calls. State
@@ -324,7 +433,8 @@ def main():
     # Each call here is one prefill (5x forward) + one decode step. We'll
     # subtract off prefill timing afterwards to isolate the decode step.
     time_function(device, "prefill_plus_one_decode", do_single_decode, results,
-                  repeats=args.decode_repeats, warmup=args.decode_warmup)
+                  repeats=args.decode_repeats, warmup=args.decode_warmup,
+                  color=TRACY_COLORS["decode"])
 
     # ----- (c) Per-layer-type sample: time ONE DeltaNet step in isolation -----
     print(f"  • single deltanet_step (layer 0 weights, {args.per_layer_repeats} repeats)…")
@@ -337,7 +447,8 @@ def main():
     def do_one_deltanet():
         _ = deltanet_step_ondevice(x_one, w_dn, ssm_one, cvs_one, cfg)
     time_function(device, "single_deltanet_step", do_one_deltanet, results,
-                  repeats=args.per_layer_repeats, warmup=3)
+                  repeats=args.per_layer_repeats, warmup=3,
+                  color=TRACY_COLORS["deltanet"])
 
     # ----- (d) Per-layer-type sample: time ONE full-attention step -----
     print(f"  • single gated_attn_step (layer 3 weights, {args.per_layer_repeats} repeats)…")
@@ -353,14 +464,16 @@ def main():
         _ = gated_attn_step_ondevice(x_one, w_fa, kv_k_one, kv_v_one, None,
                                       cur_pos_one, 0, cos_one, sin_one, cfg, device)
     time_function(device, "single_gated_attn_step", do_one_gated_attn, results,
-                  repeats=args.per_layer_repeats, warmup=3)
+                  repeats=args.per_layer_repeats, warmup=3,
+                  color=TRACY_COLORS["gated_attn"])
 
     # ----- (e) Per-layer-type sample: time ONE MLP step -----
     print(f"  • single mlp_step (layer 0 weights, {args.per_layer_repeats} repeats)…")
     def do_one_mlp():
         _ = mlp_step_ondevice(x_one, w_dn)
     time_function(device, "single_mlp_step", do_one_mlp, results,
-                  repeats=args.per_layer_repeats, warmup=3)
+                  repeats=args.per_layer_repeats, warmup=3,
+                  color=TRACY_COLORS["mlp"])
 
     # ----- (f) lm_head matmul cost -----
     print(f"  • lm_head (rms_norm + linear, {args.per_layer_repeats} repeats)…")
@@ -368,7 +481,8 @@ def main():
         h = ttnn.rms_norm(x_one, weight=final_norm_tt, epsilon=EPS)
         _ = ttnn.linear(h, lm_head_tt, compute_kernel_config=hifi4)
     time_function(device, "lm_head", do_lm_head, results,
-                  repeats=args.per_layer_repeats, warmup=3)
+                  repeats=args.per_layer_repeats, warmup=3,
+                  color=TRACY_COLORS["lm_head"])
 
     # ----------------------------------------
     # Derive
