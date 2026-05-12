@@ -485,3 +485,48 @@ All pass with `atol=0.05, rtol=0.05` (widened for bf16) on the Blackhole, end-to
 - The dual-mode engine works as designed: `TT_PJRT_USE_DEVICE=1` flips the switch.
 - We can now move to **Phase 5 Step 6: trace capture** to attack the dispatch wall.
 - We can also try the **full PJRT pipeline** (rebuild .so, run test_basic_ops.py with the device engine).
+
+---
+
+## 2026-05-11 (cont.): Full PJRT pipeline green on Blackhole
+
+### End-to-end success
+
+After rebuilding the .so on qb1, ran `test_basic_ops.py` in device mode (the canonical end-to-end PJRT test). Initial run: 12/27 pass, 15 fail — all bf16 precision. After fixing tolerances and four engine bugs (below): **27/27 pass**.
+
+Three test suites all green on qb1:
+- `test_engine.py` (numpy mode): 44/44 in 1.0s
+- `test_engine_device.py` (engine direct → ttnn): 23/23 in 2.8s
+- `test_basic_ops.py` (full PJRT pipeline → device): 27/27 in 3.4s
+
+That's 94 tests covering: numpy CPU path, direct ttnn dispatch, and end-to-end `jax.jit(f)(x)` → C++ PJRT plugin → Python engine → ttnn → Blackhole → results back.
+
+### The four engine bugs I had to fix
+
+1. **`assert_close` infinite recursion.** My sed-replace `np.testing.assert_allclose` → `assert_close` caught the call inside the helper itself. RecursionError on every test. One-line fix.
+2. **Plugin double-registration.** JAX auto-discovers `jax_plugins.tt` namespace AND our conftest fixture explicitly registers. The second registration throws `ALREADY_EXISTS`. Fix: tolerate it.
+3. **broadcast_in_dim using ttnn shape, not StableHLO shape.** This was the deep one. `_to_device` unsqueezes 1D tensors to 2D minimum, so a StableHLO `tensor<4xf32>` (logical shape `(4,)`) becomes ttnn shape `(1, 4)`. Using `.shape` to compute the broadcast intermediate shape produces garbage. Fix: track LOGICAL shapes from the IR in a per-execution `_logical_shapes` dict, populated from func args, op result_types, and through `func.call` boundaries.
+4. **`extract_result_type` chokes on multi-type result strings.** Ops like `stablehlo.select` emit `pred_type, val_type` after `:` (no `->`). My helper returned the whole blob; `parse_tensor_type` then raised ValueError. Fix: when there's no `->`, grab the LAST `tensor<...>` from the tail.
+
+Bonus: indices for gather/scatter came back as floats from ttnn (we upload everything as bf16). numpy refuses to index with floats — cast to int64 in the device-mode gather/scatter wrappers.
+
+### What I learned
+
+1. **The impedance mismatch between StableHLO and ttnn is real.** ttnn assumes ≥2D tensors with 32×32 tile alignment. StableHLO has whatever rank/shape JAX produced. Bridging means tracking BOTH the logical shape (for IR semantics) and the device shape (for op dispatch). Doing one without the other gives subtle bugs.
+2. **bf16 contaminates everywhere.** We upload weights, inputs, *and* integer indices as bf16. The indices have to be cast back at the CPU-roundtrip boundary. If we ever want fast on-device gather/scatter, we'll need to preserve integer types end-to-end, which means a dtype-aware upload path.
+3. **Tolerance discipline.** Device mode hits the bf16 floor. A 128-deep matmul drifts ~5%. A scalar add doesn't drift at all. A blanket envelope hides real bugs (test_larger_matmul's `Max relative difference: 24.8` looks alarming but is the relative error on a single near-zero output entry). The right approach is mode-aware `max(test_tol, mode_floor)`.
+4. **Dispatch wall confirmed at warm cache.** Engine-direct test_engine_device.py: 23 tests in 2.78s. Full PJRT pipeline (same compute through more C++ shims): 27 tests in 3.38s. The PJRT overhead is real but small — most of the time is in ttnn dispatch + host transfers. Trace capture is the next attack on this.
+
+### What's still broken / known issues
+
+1. `ttnn.CONFIG.tmp_dir` defaults to `/tmp/ttnn`. We override it in `engine.py` but the override fires only AFTER ttnn module init, which has already printed the default. Cosmetic — the override does take effect for actual writes.
+2. The `Initial ttnn.CONFIG` debug line shows in every test run. Not actionable, just noise.
+3. test_larger_matmul required atol=1.0 — bf16's 7-bit mantissa accumulates over a 128-deep contraction. Real Q/K matmuls in transformers are ~64-128 deep with similar drift expectations.
+
+### Next: performance
+
+We have correctness. Time to measure. Plan:
+1. Microbenchmark the engine: time a single matmul end-to-end (eager). Compare to native ttnn.matmul without our engine.
+2. Profile to find the dispatch/transfer/compute split.
+3. Implement trace capture (Phase 5 Step 6) and re-measure.
+4. Then op fusion (Phase 5 Step 7).

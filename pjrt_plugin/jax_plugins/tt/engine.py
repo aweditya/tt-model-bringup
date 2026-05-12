@@ -21,11 +21,24 @@ import sys
 
 _USE_DEVICE = os.environ.get('TT_PJRT_USE_DEVICE', '0') == '1'
 _device = None
+_logical_shapes = {}  # Per-execution SSA name → StableHLO logical shape
 
 if _USE_DEVICE:
     try:
         import ttnn
         import torch
+        # Redirect ALL ttnn paths off /tmp and into the project cache.
+        # Project rule: nothing under /tmp; everything under ~/tt-xla/.cache/.
+        # We override the in-memory ttnn.CONFIG since non-interactive ssh
+        # doesn't source ~/.bashrc, so env vars set there don't apply.
+        _cache_root = os.environ.get(
+            'TT_PJRT_CACHE_ROOT',
+            os.path.expanduser('~/tt-xla/.cache'))
+        for sub in ('ttnn', 'ttnn/models', 'ttnn-tmp'):
+            os.makedirs(os.path.join(_cache_root, sub), exist_ok=True)
+        ttnn.CONFIG.cache_path = os.path.join(_cache_root, 'ttnn')
+        ttnn.CONFIG.model_cache_path = os.path.join(_cache_root, 'ttnn', 'models')
+        ttnn.CONFIG.tmp_dir = os.path.join(_cache_root, 'ttnn-tmp')
     except ImportError:
         _USE_DEVICE = False
 
@@ -728,13 +741,22 @@ def parse_dot_general(name: str, text: str) -> dict:
 
 def extract_result_type(text: str) -> str:
     """Extract the result type from an op's text.
-    For ops with ->, returns the type after ->. Otherwise the type after last :.
+
+    For ops with ->, returns the type after ->. Otherwise the type(s) after
+    the last `:`. Some ops (e.g. stablehlo.select) put multiple comma-
+    separated types after the colon — the result type is the LAST one
+    (the value type, not the predicate type).
     """
     if '->' in text:
         return text.split('->')[-1].strip().rstrip(')')
     parts = text.rsplit(':', 1)
     if len(parts) > 1:
-        return parts[1].strip()
+        tail = parts[1].strip()
+        # Multi-type case: take the last "tensor<...>" occurrence.
+        matches = re.findall(r'tensor<[^>]+>', tail)
+        if len(matches) > 1:
+            return matches[-1]
+        return tail
     return ''
 
 
@@ -800,7 +822,7 @@ def execute_stablehlo(bytecode: bytes, inputs: list) -> list:
     Returns:
         list of numpy arrays (one per return value)
     """
-    global _private_functions, _call_counter
+    global _private_functions, _call_counter, _logical_shapes
 
     # Parse bytecode → text → op list
     text = bytecode_to_text(bytecode)
@@ -810,32 +832,51 @@ def execute_stablehlo(bytecode: bytes, inputs: list) -> list:
     _private_functions = private_fns
     _call_counter = 0
 
+    # Track LOGICAL shapes (from StableHLO IR) for each SSA value.
+    # ttnn pads tensors to 2D-min and tile-aligned, so the device tensor's
+    # .shape doesn't match the StableHLO type. Ops like broadcast_in_dim
+    # need the logical input shape to be correct.
+    _logical_shapes = {}
+
     # Build value map: SSA name → value (numpy array or ttnn tensor)
     values = {}
-    arg_shapes = {}  # Track original shapes for device→host conversion
     for i, (arg_name, type_str) in enumerate(func_args):
-        arg_shapes[arg_name] = inputs[i].shape if hasattr(inputs[i], 'shape') else ()
+        _logical_shapes[arg_name], _ = parse_tensor_type(type_str)
         if _USE_DEVICE:
             values[arg_name] = _to_device(inputs[i])
         else:
             values[arg_name] = inputs[i]
 
-    # Execute ops
+    # Execute ops, populating logical shapes as we go.
     for op in ops:
         result = execute_op(op, values)
         if isinstance(result, dict):
             # Multi-output op (e.g., reduce_argmax): store as name#0, name#1, ...
             values.update(result)
+            for k in result:
+                # Multi-output result types are in op['result_types'] list
+                rts = op.get('result_types', [])
+                idx_str = k.split('#')[1] if '#' in k else '0'
+                idx = int(idx_str)
+                if idx < len(rts):
+                    _logical_shapes[k], _ = parse_tensor_type(rts[idx])
         else:
             values[op['name']] = result
+            rt = op.get('result_type', '')
+            if rt:
+                try:
+                    _logical_shapes[op['name']], _ = parse_tensor_type(rt)
+                except (ValueError, TypeError):
+                    # Multi-output result_type like "(tensor<a>, tensor<b>)" —
+                    # the multi-output branch above handles result_types list.
+                    pass
 
     # Gather return values, converting back to numpy if on device
     results = []
     for r in returns:
         val = values[r]
         if _USE_DEVICE and not isinstance(val, np.ndarray):
-            # Find the expected shape from the op's result_type
-            shape = _infer_result_shape(r, ops, func_args, returns)
+            shape = _logical_shapes.get(r) or _infer_result_shape(r, ops, func_args, returns)
             val = _from_device(val, shape)
         results.append(val)
     return results
@@ -1158,7 +1199,14 @@ def _execute_op_device(op: dict, values: dict):
 
 
 def _execute_broadcast_device(op, values):
-    """Device-mode broadcast_in_dim using ttnn.repeat."""
+    """Device-mode broadcast_in_dim using ttnn.repeat.
+
+    Critical: use the StableHLO LOGICAL input shape (from _logical_shapes),
+    NOT the ttnn tensor's .shape. ttnn pads tensors to 2D-min and tile-
+    aligned, so the device tensor's shape is misleading. For example, an
+    operand declared as tensor<4xf32> in StableHLO has logical shape (4,)
+    but ttnn .shape reports (1, 4) after our _to_device unsqueeze.
+    """
     a = get_operands(op, values, 1)[0]
     dims = op.get('dims', [])
     result_type = op['result_type']
@@ -1167,48 +1215,32 @@ def _execute_broadcast_device(op, values):
     if not target_shape:
         return a
 
-    # Build intermediate shape (source dims placed at broadcast positions)
-    if hasattr(a, 'shape'):
-        # ttnn tensor
-        a_shape = tuple(a.shape)
-    else:
-        a_shape = ()
+    # Get the LOGICAL source shape from the StableHLO IR, not from ttnn.
+    operand_name = op['operands'][0] if op.get('operands') else None
+    a_logical = _logical_shapes.get(operand_name, ())
 
+    # Build intermediate shape: source dim i → target dim dims[i]
     inter_shape = [1] * len(target_shape)
     for src_dim, tgt_dim in enumerate(dims):
-        if src_dim < len(a_shape):
-            inter_shape[tgt_dim] = a_shape[src_dim]
+        if src_dim < len(a_logical):
+            inter_shape[tgt_dim] = a_logical[src_dim]
 
-    # Try on-device repeat
-    try:
-        # Reshape to intermediate shape first
-        if list(a_shape) != inter_shape:
-            a = ttnn.reshape(a, inter_shape)
-        # Compute repeat counts
-        repeat_counts = []
-        for i_dim, o_dim in zip(inter_shape, target_shape):
-            if i_dim == o_dim:
-                repeat_counts.append(1)
-            elif i_dim == 1:
-                repeat_counts.append(o_dim)
-            else:
-                raise ValueError(f"Cannot broadcast {inter_shape} to {target_shape}")
-        if all(r == 1 for r in repeat_counts):
-            return a
-        return ttnn.repeat(a, ttnn.Shape(repeat_counts))
-    except Exception:
-        pass
-
-    # CPU fallback for complex broadcasts
-    a_np = _operand_to_numpy(a)
+    # CPU fallback path (always correct, used because ttnn.reshape on
+    # tile-aligned tensors with non-tile dims is fragile)
+    a_np = _operand_to_numpy(a, a_logical or None)
     if a_np.ndim == 0:
         result = np.broadcast_to(a_np, target_shape).copy()
     else:
-        new_shape = [1] * len(target_shape)
-        for src_dim, tgt_dim in enumerate(dims):
-            if src_dim < a_np.ndim:
-                new_shape[tgt_dim] = a_np.shape[src_dim]
-        result = np.broadcast_to(a_np.reshape(new_shape), target_shape).copy()
+        # Reshape to logical source shape first, then to intermediate
+        try:
+            a_np = a_np.reshape(a_logical) if a_logical else a_np
+        except ValueError:
+            # ttnn padding may have left extra elements; truncate to logical size
+            n = 1
+            for d in a_logical:
+                n *= d
+            a_np = a_np.flatten()[:n].reshape(a_logical)
+        result = np.broadcast_to(a_np.reshape(inter_shape), target_shape).copy()
     return _to_device(result)
 
 
@@ -1379,13 +1411,17 @@ def _execute_logical_device(op, values, logic_op):
 
 
 def _execute_scatter_device(op, values):
-    """Device-mode scatter: CPU roundtrip."""
+    """Device-mode scatter: CPU roundtrip with shape-aware reads."""
     operand_names = op['operands']
-    operand = _operand_to_numpy(values[operand_names[0]])
-    indices = _operand_to_numpy(values[operand_names[1]])
-    updates = _operand_to_numpy(values[operand_names[2]])
+    operand = _operand_to_numpy(values[operand_names[0]],
+                                 _logical_shapes.get(operand_names[0]))
+    indices = _operand_to_numpy(values[operand_names[1]],
+                                 _logical_shapes.get(operand_names[1]))
+    updates = _operand_to_numpy(values[operand_names[2]],
+                                 _logical_shapes.get(operand_names[2]))
+    if not np.issubdtype(indices.dtype, np.integer):
+        indices = indices.astype(np.int64)
 
-    # Reuse numpy path
     np_values = {operand_names[0]: operand, operand_names[1]: indices,
                  operand_names[2]: updates}
     result = execute_scatter(op, np_values)
@@ -1393,10 +1429,18 @@ def _execute_scatter_device(op, values):
 
 
 def _execute_gather_device(op, values):
-    """Device-mode gather: CPU roundtrip."""
+    """Device-mode gather: CPU roundtrip.
+
+    Indices come back as floats from ttnn (we always upload as bf16), so
+    we must cast them to int before using them as numpy indices.
+    """
     operand_names = op['operands']
-    operand = _operand_to_numpy(values[operand_names[0]])
-    indices = _operand_to_numpy(values[operand_names[1]])
+    operand_shape = _logical_shapes.get(operand_names[0])
+    indices_shape = _logical_shapes.get(operand_names[1])
+    operand = _operand_to_numpy(values[operand_names[0]], operand_shape)
+    indices = _operand_to_numpy(values[operand_names[1]], indices_shape)
+    if not np.issubdtype(indices.dtype, np.integer):
+        indices = indices.astype(np.int64)
 
     np_values = {operand_names[0]: operand, operand_names[1]: indices}
     result = execute_gather(op, np_values)
@@ -1738,16 +1782,30 @@ def execute_func_call(op: dict, values: dict) -> np.ndarray:
     # Build local value map: function args ← call operands
     local_values = dict(values)  # inherit outer scope for init values etc.
     call_operands = [values[name] for name in op['operands']]
-    for i, (arg_name, _type_str) in enumerate(func_args):
+    for i, (arg_name, type_str) in enumerate(func_args):
         local_values[arg_name] = call_operands[i]
+        # Mirror the caller's logical shape into the private function's
+        # arg name so ops inside the function can resolve it.
+        caller_operand = op['operands'][i]
+        if caller_operand in _logical_shapes:
+            _logical_shapes[arg_name] = _logical_shapes[caller_operand]
+        else:
+            shape, _ = parse_tensor_type(type_str)
+            _logical_shapes[arg_name] = shape
 
-    # Execute function body
+    # Execute function body, populating logical shapes for each op
     for func_op in func_ops:
         result = execute_op(func_op, local_values)
         if isinstance(result, dict):
             local_values.update(result)
         else:
             local_values[func_op['name']] = result
+            rt = func_op.get('result_type', '')
+            if rt:
+                try:
+                    _logical_shapes[func_op['name']], _ = parse_tensor_type(rt)
+                except (ValueError, TypeError):
+                    pass  # Multi-output or malformed; handled by result_types
 
     # Return the function's return value(s)
     if len(func_returns) == 1:
