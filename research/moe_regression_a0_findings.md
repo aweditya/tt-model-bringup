@@ -22,8 +22,12 @@ Date: 2026-05-11 / 2026-05-12 (qb1 was flapping; data is from two short windows)
 | softmax | `[1,60]` | 45.3 | 50.4 |
 | **topk (k=4)** | `[1,60]` | **101-153** ⚠️ | 110-168 |
 | synchronize_device (noop after sync) | — | 20.8 | 22.5 |
+| to_torch(top4_vals).float() | scalar readback | 62-64 | 65-67 |
+| to_torch(top4_idxs).int() | scalar readback | 62-63 | 64-65 |
+| **one expert pass** (3 matmul + silu+mul+scale) | — | **280** | 294 |
+| **4-expert MoE group** (4× one_expert + 3 adds) | — | **1183-1204** | 1200-1221 |
 
-(`to_torch / one_expert / 4-expert / shared_expert` rows haven't completed yet — ssh broke before they ran.)
+(shared_expert composite ran out of ssh time; it's structurally identical to one_expert + sigmoid mul, ~330 µs expected.)
 
 ## Where the 20 ms regression went (best hypothesis)
 
@@ -56,6 +60,26 @@ Two distinct issues:
    - Compose `silu(g) * u` into a fused `swiglu` op if ttnn has one — `ttnn.swiglu` exists per memory of exp 97 BUT crashed on 4D shapes on Blackhole. May work at 2D shapes.
 
 2. **topk(k=4) is 100-150 µs** — high. For 60 logits this should be fast. Worth a separate check of `ttnn.topk` vs hand-rolled `argmax` repeated 4 times.
+
+## Per-layer eager MoE accounting (updated with composites)
+
+Per layer (4 active experts) at decode time:
+- rms_norm:                       ~50 µs
+- router matmul:                   55 µs
+- softmax + topk:                  45 + 150 = 195 µs
+- 2× sync + readback:              130 µs
+- **4-expert MoE group:           1200 µs**  ← the big one
+- shared expert:                  ~330 µs
+- residual add:                    90 µs
+- **Per-layer total:           ~2050 µs ≈ 2 ms**
+
+× 24 layers = **~50 ms / token** of MoE work alone.
+
+Plus traced attention replay (~50-100 µs / layer × 24 = ~1-2 ms) and Python orchestration overhead.
+
+Total expected ≈ **52 ms / tok**. Measured **64 ms / tok**. Gap = ~12 ms is Python loop overhead (between-call costs not visible in our per-op bench).
+
+This is roughly consistent with the 22.7 → 15.7 tok/s (44 → 64 ms) regression: per-layer MoE went from ~1.2 ms to ~2 ms (+ ~0.83 ms/layer × 24 layers = 20 ms gap), traceable to the binary-mul cost increase plus tighter matmul dispatch.
 
 ## Recommendations
 
