@@ -30,31 +30,35 @@ N_POSITIONS = 5
 #   "240_48": hf shape (seq*n_v, head_v) → pick [pos*n_v:(pos+1)*n_v]
 #   "scalar_g": (a + dt_bias is shape (1, seq, n_v_heads)) → pick [0, pos, :]
 LAYOUT = [
-    # Layer entry
-    ("layer.in",                    "__layer__.in",                       "seq2",   "pos{pos}.x_in"),
+    # Layer entry (input to layer)
+    ("layer.in",                       "__layer__.in",                  "seq2",   "pos{pos}.x_in"),
     # First norm
-    ("input_layernorm.out",         "input_layernorm.out",                "seq2",   "pos{pos}.h_after_input_norm"),
+    ("input_layernorm.out",            "input_layernorm.out",           "seq2",   "pos{pos}.h_after_input_norm"),
     # Projections
-    ("in_proj_qkv.out",             "linear_attn.in_proj_qkv.out",        "seq2",   "pos{pos}.in_proj_qkv"),
-    ("in_proj_z.out",               "linear_attn.in_proj_z.out",          "seq2",   "pos{pos}.in_proj_z"),
-    ("in_proj_a.out",               "linear_attn.in_proj_a.out",          "seq2",   "pos{pos}.in_proj_a"),
-    ("in_proj_b.out",               "linear_attn.in_proj_b.out",          "seq2",   "pos{pos}.in_proj_b"),
-    # Conv1d (HF is [1, channels, seq+padding])
-    ("conv1d.out",                  "linear_attn.conv1d.out",             "seq3_c", "pos{pos}.conv_out"),
-    # RMSNormGated
-    ("linear_attn.norm.in",         "linear_attn.norm.in",                "240_48", "pos{pos}.norm_in"),
-    ("linear_attn.norm.out",        "linear_attn.norm.out",               "240_48", "pos{pos}.norm_out_pre_gate"),
-    # Out proj + post-residual DeltaNet output
-    ("out_proj.out",                "linear_attn.out_proj.out",           "seq2",   "pos{pos}.out_proj"),
-    ("linear_attn.full.out",        "linear_attn.out",                    "seq2",   "pos{pos}.post_deltanet"),
-    # Post-attn norm
-    ("post_attn_layernorm.out",     "post_attention_layernorm.out",       "seq2",   "pos{pos}.post_attn_norm"),
-    # MLP
-    ("mlp.gate_proj_silu",          "mlp.act_fn.out",                     "seq2",   "pos{pos}.mlp_gate_silu"),
-    ("mlp.up_proj.out",             "mlp.up_proj.out",                    "seq2",   "pos{pos}.mlp_up"),
-    ("mlp.down_proj.out",           "mlp.down_proj.out",                  "seq2",   "pos{pos}.mlp_down"),
-    # Final layer output
-    ("layer.out",                   "__layer__.out",                      "seq2",   "pos{pos}.post_mlp"),
+    ("in_proj_qkv.out",                "linear_attn.in_proj_qkv.out",   "seq2",   "pos{pos}.in_proj_qkv"),
+    ("in_proj_z.out",                  "linear_attn.in_proj_z.out",     "seq2",   "pos{pos}.in_proj_z"),
+    ("in_proj_a.out",                  "linear_attn.in_proj_a.out",     "seq2",   "pos{pos}.in_proj_a"),
+    ("in_proj_b.out",                  "linear_attn.in_proj_b.out",     "seq2",   "pos{pos}.in_proj_b"),
+    # Conv1d (HF hook captures PRE-silu; our conv_pre_silu = sum-only, not silu'd yet)
+    ("conv1d.out (pre-silu)",          "linear_attn.conv1d.out",        "seq3_c", "pos{pos}.conv_pre_silu"),
+    # Recurrence output (= RMSNormGated input)
+    ("linear_attn.norm.in",            "linear_attn.norm.in",           "240_48", "pos{pos}.norm_in"),
+    # RMSNormGated output (HF = norm + gate; ours = `gated` after silu(z) mul)
+    ("linear_attn.norm.out (=gated)",  "linear_attn.norm.out",          "240_48", "pos{pos}.gated"),
+    # out_proj output (HF: linear_attn module output BEFORE decoder residual)
+    ("out_proj.out (=linear_attn.out)", "linear_attn.out_proj.out",     "seq2",   "pos{pos}.out_proj"),
+    # Same thing under HF's "linear_attn.out" hook name (full linear_attn module output)
+    ("linear_attn.module.out",         "linear_attn.out",               "seq2",   "pos{pos}.out_proj"),
+    # Post first-residual (= input to post_attention_layernorm)
+    ("post_deltanet (=post_attn_ln.in)", "post_attention_layernorm.in", "seq2",   "pos{pos}.post_deltanet"),
+    # Post post-attn-norm
+    ("post_attn_layernorm.out",        "post_attention_layernorm.out",  "seq2",   "pos{pos}.post_attn_norm"),
+    # MLP submodules
+    ("mlp.gate_proj_silu",             "mlp.act_fn.out",                "seq2",   "pos{pos}.mlp_gate_silu"),
+    ("mlp.up_proj.out",                "mlp.up_proj.out",               "seq2",   "pos{pos}.mlp_up"),
+    ("mlp.down_proj.out (=mlp.out)",   "mlp.down_proj.out",             "seq2",   "pos{pos}.mlp_down"),
+    # Final layer output (post both residuals)
+    ("layer.out",                      "__layer__.out",                 "seq2",   "pos{pos}.post_mlp"),
 ]
 
 

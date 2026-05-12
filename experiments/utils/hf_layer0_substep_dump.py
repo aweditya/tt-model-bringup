@@ -55,6 +55,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
+    p.add_argument("--input-from-hidden", action="store_true",
+                   help="Use hidden_N from ~/tt-xla/.cache/hf_per_layer_hidden_states.npz "
+                        "as input (= real layer N input in production), instead of feeding "
+                        "embed(prompt) through this isolated layer. Required for cross-check "
+                        "against ttnn substep dumps that use the same input.")
     args = p.parse_args()
 
     print("=" * 64)
@@ -139,7 +144,20 @@ def main():
     print(f"prompt ids: {input_ids.tolist()}, seq_len={seq_len}")
 
     with torch.no_grad():
-        hidden_states = embed(input_ids).float()
+        if args.input_from_hidden:
+            # Load real layer-N input from full-forward dump
+            per_layer_path = os.path.expanduser("~/tt-xla/.cache/hf_per_layer_hidden_states.npz")
+            if not os.path.exists(per_layer_path):
+                print(f"ERROR: {per_layer_path} missing. Run hf_full_model_oracle.py "
+                      f"--dump-hidden-states first.")
+                sys.exit(1)
+            hf_data = np.load(per_layer_path)
+            hidden_states = torch.from_numpy(hf_data[f"hidden_{args.layer}"]).float()
+            print(f"  using REAL layer {args.layer} input from {per_layer_path}")
+            print(f"  hidden_states shape: {tuple(hidden_states.shape)}, "
+                  f"‖·‖={hidden_states.norm().item():.4f}")
+        else:
+            hidden_states = embed(input_ids).float()
         intermediates['__embed__.out'] = to_np(hidden_states)
 
         # Build forward kwargs
