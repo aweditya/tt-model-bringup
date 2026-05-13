@@ -573,12 +573,48 @@ def _setup_traced_decode(state: ServerState) -> None:
         torch.from_numpy(np.zeros((1, N_KV, 1, HEAD_DIM), dtype=np.int32)),
         dtype=ttnn.int32, device=device, layout=ttnn.TILE_LAYOUT)
 
-    # Capture trace using traced kernels (state-committing variants from 91f).
-    # CRITICAL: synchronize_device flushes any pending host-to-device writes from
-    # the upload() / ttnn.from_torch calls above. Without this, the trace capture
-    # would catch a pending host write mid-capture and fail with
-    # "TT_FATAL: Writes are not supported during trace capture".
+    # Warmup pass: run forward once EAGERLY to JIT-compile + upload all kernel
+    # binaries. Without this, trace capture would try to upload kernel binaries
+    # MID-CAPTURE (via load_binaries -> enqueue_write_shard), which trips
+    # "TT_FATAL: Writes are not supported during trace capture". The traced
+    # kernels mutate state buffers in place via in-trace ttnn.copy, so this
+    # warmup advances state by one decode step — we reset state below.
+    print(f"[traced_decode] warmup pass (priming JIT)…")
+    state.traced_decode = {  # placeholder so _update_input_buffers can find the bufs
+        "embed_buf": embed_buf, "cos_buf": cos_buf, "sin_buf": sin_buf,
+        "cur_pos_buf": cur_pos_buf, "index_buf": index_buf,
+        "ssm": ssm, "cvs": cvs, "kvc": kvc,
+    }
+    _update_input_buffers(state, token_id=0, cur_pos=0)
+    _x = embed_buf
+    _dn = 0
+    _attn = 0
+    for i in range(NUM_LAYERS):
+        layer_type, w_tt = state.layer_weights[i]
+        if layer_type == "linear_attention":
+            _x = state._91f.deltanet_step_ondevice_traced(
+                _x, w_tt, ssm[_dn], cvs[_dn], cfg)
+            _dn += 1
+        else:
+            kv_k, kv_v = kvc[_attn]
+            _x = state._91f.gated_attn_step_ondevice_traced(
+                _x, w_tt, kv_k, kv_v,
+                cur_pos_buf, cos_buf, sin_buf, index_buf, cfg)
+            _attn += 1
+        _x = state._91f.mlp_step_ondevice(_x, w_tt)
+    _x = ttnn.rms_norm(_x, weight=state.final_norm_tt, epsilon=EPS)
+    _logits = ttnn.linear(_x, state.lm_head_tt,
+                            compute_kernel_config=state._91f.hifi4)
     ttnn.synchronize_device(device)
+    print(f"[traced_decode] warmup done; resetting state in place")
+
+    # Reset state buffers to zero (in place — same buffer addresses) before capture
+    # so the captured trace starts from a known state.
+    _reset_traced_state_inplace(state)
+    ttnn.synchronize_device(device)
+
+    # Capture trace. All ops have warm JIT cache → no host writes during capture.
+    print(f"[traced_decode] begin_trace_capture…")
     tid = ttnn.begin_trace_capture(device, cq_id=0)
     x_tt = embed_buf
     dn_idx = 0

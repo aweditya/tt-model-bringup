@@ -118,49 +118,47 @@ void kernel_main() {
 }
 ```
 
-Line by line:
+- `get_arg_val<uint32_t>(k)` reads runtime arg slot `k`; order must match `SetRuntimeArgs`.
+- `TensorAccessorArgs<0>()` is the *compile-time* template indexed into the `compile_args` blob the host packed. `<0>` is "first accessor's metadata"; the second uses `next_compile_time_args_offset()` to skip past it.
+- `TensorAccessor(args, base_addr)` is a stateless functor. Indexed by tile id, it yields the NoC address for that tile accounting for bank interleaving.
+- `noc_async_read_tile(i, in0, l1_buffer_addr)` — NoC read of tile `i` from `in0` into L1 slot. Asynchronous.
+- `noc_async_read_barrier()` blocks until outstanding reads complete. Required before using the data.
+- `noc_async_write_tile` mirrors it L1 → DRAM. Same L1 slot reused each iter because the barriers fence all in-flight traffic.
 
-- `get_arg_val<uint32_t>(k)` pulls runtime arg slot `k`. Order must match `SetRuntimeArgs` on the host.
-- `TensorAccessorArgs<0>()` — *compile-time* template indexed into the `compile_args` blob the host packed. `<0>` means "first TensorAccessor metadata." The second one uses `in0_args.next_compile_time_args_offset()` to skip past the first.
-- `TensorAccessor(args, base_addr)` is a stateless functor. Calling it on tile-id `i` returns the NoC address for tile `i` taking bank interleaving into account.
-- `noc_async_read_tile(i, in0, l1_buffer_addr)` issues a NoC read of tile `i` from `in0`'s buffer into the L1 slot at `l1_buffer_addr`. Asynchronous — returns immediately.
-- `noc_async_read_barrier()` blocks the RISC-V until all outstanding reads on this core's read channel complete. Required before we use the data.
-- `noc_async_write_tile` mirrors the read but goes L1 → DRAM. The same L1 slot is reused next iteration because the barriers guarantee no in-flight traffic.
-
-Notice what is **absent**: no circular buffer (`cb_*`), no `tile_regs_acquire`, no math engine, no `pack_tile`. Pure data movement — exactly the floor we want before adding compute.
+**Absent on purpose**: no `cb_*` (circular buffer), no `tile_regs_acquire`, no math engine, no `pack_tile`. Pure data movement.
 
 ## 4. Where data flows
 
 ```
-host input_vec  --(EnqueueWriteMeshBuffer)-->  input_dram_buffer (DRAM, 50 tiles, interleaved across banks)
-                                                      |
-                                                      v   noc_async_read_tile(i)
-                                                  l1_buffer (L1 on core {0,0}, 1 tile = 2 KB)
-                                                      |
-                                                      v   noc_async_write_tile(i)
-                                              output_dram_buffer  --(EnqueueReadMeshBuffer)--> result_vec
+host input_vec --EnqueueWriteMeshBuffer--> input_dram_buffer (DRAM, 50 tiles, interleaved)
+                                                  | noc_async_read_tile(i)
+                                                  v
+                                          l1_buffer (L1 on {0,0}, 1 tile = 2 KB)
+                                                  | noc_async_write_tile(i)
+                                                  v
+                              output_dram_buffer --EnqueueReadMeshBuffer--> result_vec
 ```
 
-- **DRAM addresses** are derived inside the kernel by `TensorAccessor` from (compile-time bank layout + runtime `address()` of the buffer + tile id).
-- **Runtime args** are a flat `uint32_t` array — pure values, not references. Set once per `SetRuntimeArgs`, baked into the program until overwritten.
-- **CBs are not configured** here — they only show up once compute (math) joins the pipeline.
+- **DRAM addresses** are derived in-kernel by `TensorAccessor` from (compile-time bank layout) + (runtime `address()`) + (tile id).
+- **Runtime args** are a flat `uint32_t` array — values, not references. Baked into the program until overwritten by another `SetRuntimeArgs`.
+- **No CBs configured** — they only appear once compute joins the pipeline.
 
 ## 5. What changes for our scatter kernel
 
 Spec recap: cache `[1, 4, 256, 256]` bf16 (resident in DRAM), src `[1, 4, 1, 256]` bf16, write src into `cache[:, :, cur_pos, :]`. No reduction, no math.
 
-| Pattern in loopback | What we keep | What we change for scatter |
-|---|---|---|
-| One reader on `{0,0}`, BRISC, no compute | Keep — scatter is also pure data movement | Same single-core start; parallelize across heads later. |
-| `num_tiles` linear loop | Loop structure | Loop over `head=0..3`; each iter copies 256 bf16 = 8 tiles of src into one row of the cache tile-grid. |
-| Source/dest are independent buffers | Two `TensorAccessor`s | **Same buffer for read and write?** Cache is read-modify-write at row `cur_pos`. Speculation: simplest path is to *only write* the new row — no read needed if the rest of the cache is untouched. So scatter is one `TensorAccessor` over `cache`, plus one over `src`. |
-| Static tile index `i` | Tile-id arithmetic | Index becomes `tile_id = head * tiles_per_head + (cur_pos / 32) * tiles_per_row + col`. This is the new logic we must derive carefully — `cur_pos` is **mid-tile** (rows are packed 32-per-tile), so we cannot just plop a whole tile. Two options: (a) widen to write a full tile by reading the existing tile, blending the new row in, writing back; (b) use `noc_async_write` with sub-tile byte addressing. (Speculation — needs experiment.) |
-| `cur_pos` constant per launch | Runtime arg | Pass `cur_pos` as `get_arg_val<uint32_t>(N)`. Avoid baking it into compile args so we don't recompile per step. (Echoes the "Trace Capture" lesson from MEMORY: scalars must be device-side, not Python-side.) |
-| Tile layout 32x32 of bf16 | Same | Cache is `[..., 256, 256]` → tile-grid `8 x 8` per (batch,head). `src` is 1 row of 256 elements → straddles 8 tiles of width but only 1 of 32 rows — sub-tile write territory. |
-| Single barrier per op | Keep | Same. Read-modify-write needs read barrier *before* the modify, write barrier *after*. |
-| No CB | Keep | Still no CB needed — pure NoC traffic. |
-| `TensorAccessorArgs` from host | Keep | Host packs accessors for `cache` and `src` at compile time; runtime args carry base addresses + `cur_pos` + (batch, head sizes if not compile-time). |
+| Loopback pattern | Scatter delta |
+|---|---|
+| One reader, BRISC, no compute | Same — scatter is also pure data movement. Parallelize across heads later. |
+| `num_tiles` linear loop | Loop over `head=0..3`; each iter copies 256 bf16 = 8 tiles' worth into one row of the cache tile-grid for that head. |
+| Two independent buffers | One `TensorAccessor` over `cache`, one over `src`. Speculation: pure-write may be possible if cache rest is untouched; otherwise it is read-modify-write of one row. |
+| Static tile index `i` | Compute `tile_id = head * tiles_per_head + (cur_pos / 32) * tiles_per_row + col`. `cur_pos` is mid-tile (32 rows packed per tile), so we cannot plop a whole tile. Speculation: either (a) read tile, blend in row, write tile, or (b) use `noc_async_write` with sub-tile byte addressing — needs experiment. |
+| `cur_pos` would be constant per launch | Pass as `get_arg_val<uint32_t>(N)` at runtime, never compile-time (echoes the "Trace Capture" lesson — scalars must be device-side, not Python-side). |
+| Tile layout 32x32 bf16 | Cache `[..,256,256]` → 8x8 tile-grid per (batch,head). `src` is 1 row of 256 → spans 8 tile columns but only 1/32 rows. Sub-tile territory. |
+| Single barrier per op | Read-modify-write needs read-barrier *before* modify, write-barrier *after*. |
+| No CB | Still no CB. |
+| Host packs `TensorAccessorArgs` | Same; runtime args carry base addrs + `cur_pos` + dims if not compile-time. |
 
-**Key new design question (label: speculation):** does `noc_async_write_tile` allow writing only part of a tile, or must we round-trip a full tile through L1 to preserve the 31 other rows? If the latter, our kernel becomes: per-head, per-column-tile: read tile from cache, overwrite the 1 row corresponding to `cur_pos % 32`, write tile back. That is structurally `loopback` with a one-row blend in the middle — a very small delta to verify against.
+**Open design question (speculation):** does `noc_async_write_tile` allow partial-tile writes, or must we round-trip full tiles through L1 to preserve the other 31 rows? If the latter, scatter is structurally `loopback` with a one-row blend in the middle — a small delta to verify.
 
-**Reference for next step:** when we are ready to write the kernel, copy `loopback/` wholesale and replace the inner loop body. The host plumbing is essentially reusable verbatim.
+**Next step:** copy `loopback/` wholesale and replace the inner loop body. Host plumbing is reusable verbatim.
