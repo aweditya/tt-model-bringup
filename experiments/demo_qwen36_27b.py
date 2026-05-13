@@ -2,14 +2,22 @@
 """
 Qwen3.6-27B Demo — coherent text generation on a single Blackhole P150.
 
-This is the "demo reel" for Branch III. Loads the 27B model once, runs a
-list of prompts, prints generated text with timing, and runs an automated
-sanity check on a canonical Q&A prompt.
+Standalone demo: loads the 27B model once, runs prompts, greedy-decodes.
 
-In the spirit of `experiments/80_8b_diverse_qa_demo.py` (8B Llama instruct
-demo) and `experiments/31_gpt2_text_generation.py`.
+**FAST DEV LOOP TIP**: this script pays the full ~11 min weight load every
+time. For iterative work, use the persistent inference server instead:
 
-Run on qb2:
+    # On qb1 or qb2:
+    cd ~/tt-xla && .venv/bin/python -m experiments.serve.server &
+    # Then from a separate shell on the same host:
+    cd ~/tt-xla && .venv/bin/python -m experiments.serve.client bench_decode
+    cd ~/tt-xla && .venv/bin/python -m experiments.serve.client bench_decode_paged \\
+        --max-pos 8192
+
+The persistent server amortizes weight load across many requests and supports
+hot-reload of kernel changes via `reload_kernels`.
+
+Run this script directly only for end-to-end "show me text generation":
     cd ~/tt-xla && HF_HOME=$HOME/tt-xla/.cache/hf .venv/bin/python \\
         experiments/demo_qwen36_27b.py
 
@@ -18,9 +26,15 @@ Run on qb2:
         --prompts "The largest planet is" "In machine learning," \\
         --tokens 40
 
-Expected: weight load ~10 min, then ~3 tok/s greedy decode.
-The canonical "The capital of France is" prompt should produce ' Paris'
-as the first decoded token (Branch III correctness gate).
+Current single-chip perf (validated 2026-05-13 on qb2):
+  - Eager non-paged decode: ~210 ms/tok (4.74 tok/s) at MAX_POS=256
+  - Eager paged decode:     ~215 ms/tok (4.65 tok/s) at MAX_POS=8192+ (unlimited context)
+  - Traced decode:          ~198 ms/tok (5.04 tok/s) — execute_trace alone
+
+Per-layer cosine vs HF: ≥ 0.99997 (Branch III correctness gate).
+
+This script uses the eager non-paged path. For long context support use
+`bench_decode_paged` via the server (which exercises `gated_attn_step_ondevice_paged`).
 """
 import os, sys, json, time, gc, argparse
 import numpy as np
