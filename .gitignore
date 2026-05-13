@@ -14,3 +14,4 @@ __pycache__/
 
 # Scraped doc corpus — regenerable via pjrt_plugin/scripts/scrape_tt_docs.py
 tt_docs_corpus/
+experiments/.refs/
