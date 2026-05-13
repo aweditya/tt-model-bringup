@@ -229,7 +229,9 @@ def main():
     print(f"  INTERMEDIATE={INTERMEDIATE}  KEY_DIM={KEY_DIM}  VAL_DIM={VAL_DIM}")
     print(f"  CONV_DIM={CONV_DIM}  CONV_KERNEL={CONV_KERNEL}")
 
-    device = ttnn.open_device(device_id=0)
+    device_id = int(os.environ.get('TT_DEVICE_ID', '0'))
+    print(f"  device_id = {device_id}")
+    device = ttnn.open_device(device_id=device_id)
     try:
         results = []
 
