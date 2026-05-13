@@ -370,6 +370,16 @@ def handle_bench_decode(state: ServerState, args: dict) -> dict:
     n_steps = int(args.get("n_steps", 20))
     warmup = int(args.get("warmup", 3))
 
+    # ServerState doesn't carry a tokenizer (Phase 2 todo). For benchmarking
+    # purposes the prompt content doesn't matter, only the token IDs that
+    # drive the embed lookup. Default to the validated Paris prompt.
+    DEFAULT_PROMPT_IDS = [760, 6511, 314, 9338, 369]   # "The capital of France is"
+    explicit_ids = args.get("prompt_ids")
+    if explicit_ids is not None:
+        prompt_ids_override = list(explicit_ids)
+    else:
+        prompt_ids_override = DEFAULT_PROMPT_IDS
+
     cfg = state.cfg
     HIDDEN = cfg["hidden"]
     NUM_LAYERS = state.num_layers
@@ -397,7 +407,7 @@ def handle_bench_decode(state: ServerState, args: dict) -> dict:
                                 device=device, layout=ttnn.TILE_LAYOUT)
         kvc.append([kv_k, kv_v])
 
-    prompt_ids = state.tokenizer.encode(prompt)
+    prompt_ids = prompt_ids_override
     embed_np = state.embed_np
 
     def forward_token(token_id, cur_pos):
