@@ -320,6 +320,83 @@ def mlp_step_ondevice(x_tt, w_tt):
     return ttnn.add(x_tt, out)
 
 
+# ============================================================
+# C'4: trace-friendly variant of gated_attn_step_ondevice.
+# ============================================================
+# Differences from gated_attn_step_ondevice:
+#   - cur_pos Python int REMOVED from signature; everything that needed it now
+#     reads from PRE-ALLOCATED device tensors maintained by the caller.
+#   - cos_tt / sin_tt are pre-allocated row buffers ([1, ROTARY_DIM]) updated
+#     once per step by the caller via copy_host_to_device_tensor (no per-step
+#     ttnn.slice into a precomputed table => no Python int baked into trace).
+#   - index_tt is a PRE-ALLOCATED int32 buffer of shape [1, N_KV, 1, HEAD_DIM]
+#     filled with cur_pos by the caller per step. Trace sees only the
+#     persistent device tensor; no np.full + ttnn.from_torch inside the
+#     hot path (those allocate fresh tensors that the trace cannot replay).
+# All other math identical to gated_attn_step_ondevice — direct line-by-line
+# port. If the original passes the cosine gate eager, this one must too.
+def gated_attn_step_ondevice_traced(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
+                                     cur_pos_tt, cos_tt, sin_tt, index_tt, cfg):
+    N_Q = cfg['n_q_heads']
+    N_KV = cfg['n_kv_heads']
+    HEAD_DIM = cfg['head_dim']
+    ROTARY_DIM = int(HEAD_DIM * cfg['partial_rotary_factor'])
+
+    h_tt = ttnn.rms_norm(x_tt, weight=w_tt['input_layernorm'], epsilon=EPS)
+
+    qg_tt = ttnn.linear(h_tt, w_tt['q_proj'], compute_kernel_config=hifi4)
+    qg_tt = ttnn.reshape(qg_tt, [N_Q, HEAD_DIM * 2])
+    q_tt = ttnn.slice(qg_tt, [0, 0], [N_Q, HEAD_DIM])
+    gate_tt = ttnn.slice(qg_tt, [0, HEAD_DIM], [N_Q, 2 * HEAD_DIM])
+
+    k_tt = ttnn.reshape(
+        ttnn.linear(h_tt, w_tt['k_proj'], compute_kernel_config=hifi4),
+        [N_KV, HEAD_DIM])
+    v_tt = ttnn.reshape(
+        ttnn.linear(h_tt, w_tt['v_proj'], compute_kernel_config=hifi4),
+        [N_KV, HEAD_DIM])
+
+    q_tt = ttnn.rms_norm(q_tt, weight=w_tt['q_norm'], epsilon=EPS)
+    k_tt = ttnn.rms_norm(k_tt, weight=w_tt['k_norm'], epsilon=EPS)
+
+    def apply_partial_rope(t, n_heads):
+        rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
+        passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
+        half = ROTARY_DIM // 2
+        x1 = ttnn.slice(rot, [0, 0], [n_heads, half])
+        x2 = ttnn.slice(rot, [0, half], [n_heads, ROTARY_DIM])
+        neg_x2 = ttnn.neg(x2)
+        rotated_half = ttnn.concat([neg_x2, x1], dim=-1)
+        cos_b = ttnn.reshape(cos_tt, [1, ROTARY_DIM])
+        sin_b = ttnn.reshape(sin_tt, [1, ROTARY_DIM])
+        rotated = ttnn.add(ttnn.mul(rot, cos_b), ttnn.mul(rotated_half, sin_b))
+        return ttnn.concat([rotated, passthru], dim=-1)
+
+    q_tt = apply_partial_rope(q_tt, N_Q)
+    k_tt = apply_partial_rope(k_tt, N_KV)
+
+    k_for_cache = ttnn.typecast(ttnn.reshape(k_tt, [1, N_KV, 1, HEAD_DIM]), ttnn.bfloat16)
+    v_for_cache = ttnn.typecast(ttnn.reshape(v_tt, [1, N_KV, 1, HEAD_DIM]), ttnn.bfloat16)
+    # index_tt is pre-allocated [1, N_KV, 1, HEAD_DIM] int32 (updated host-side
+    # per step). ttnn.scatter is captured by the trace and replays correctly.
+    kv_cache_k_tt = ttnn.scatter(kv_cache_k_tt, dim=2, index=index_tt, src=k_for_cache)
+    kv_cache_v_tt = ttnn.scatter(kv_cache_v_tt, dim=2, index=index_tt, src=v_for_cache)
+
+    q_for_sdpa = ttnn.reshape(q_tt, [1, 1, N_Q, HEAD_DIM])
+    q_for_sdpa = ttnn.typecast(q_for_sdpa, ttnn.bfloat16)
+    attn = ttnn.transformer.scaled_dot_product_attention_decode(
+        q_for_sdpa, kv_cache_k_tt, kv_cache_v_tt,
+        cur_pos_tensor=cur_pos_tt, compute_kernel_config=hifi4)
+    attn = ttnn.reshape(attn, [N_Q, HEAD_DIM])
+    attn = ttnn.typecast(attn, x_tt.dtype)
+
+    attn = ttnn.mul(attn, ttnn.sigmoid(gate_tt))
+
+    attn_flat = ttnn.reshape(attn, [1, N_Q * HEAD_DIM])
+    out = ttnn.linear(attn_flat, w_tt['o_proj'], compute_kernel_config=hifi4)
+    return ttnn.add(x_tt, out), kv_cache_k_tt, kv_cache_v_tt
+
+
 def main():
     print("=" * 64)
     print("Phase B′6 — Qwen3.6-27B layers 0-3 FULLY ON-DEVICE (no numpy on path)")
