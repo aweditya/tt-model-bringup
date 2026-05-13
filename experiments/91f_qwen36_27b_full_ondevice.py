@@ -421,17 +421,32 @@ def gated_attn_step_ondevice_traced(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
 
     h_tt = ttnn.rms_norm(x_tt, weight=w_tt['input_layernorm'], epsilon=EPS)
 
-    qg_tt = ttnn.linear(h_tt, w_tt['q_proj'], compute_kernel_config=hifi4)
-    qg_tt = ttnn.reshape(qg_tt, [N_Q, HEAD_DIM * 2])
-    q_tt = ttnn.slice(qg_tt, [0, 0], [N_Q, HEAD_DIM])
-    gate_tt = ttnn.slice(qg_tt, [0, HEAD_DIM], [N_Q, 2 * HEAD_DIM])
-
-    k_tt = ttnn.reshape(
-        ttnn.linear(h_tt, w_tt['k_proj'], compute_kernel_config=hifi4),
-        [N_KV, HEAD_DIM])
-    v_tt = ttnn.reshape(
-        ttnn.linear(h_tt, w_tt['v_proj'], compute_kernel_config=hifi4),
-        [N_KV, HEAD_DIM])
+    # ATTN-QKV fusion: weight loader concats q_proj | k_proj | v_proj into
+    # attn_qkv and deletes the individual keys. Mirror the eager kernel's
+    # attn_qkv path so the traced variant works against the same weight dict.
+    QG_DIM = 2 * N_Q * HEAD_DIM
+    KV_DIM = N_KV * HEAD_DIM
+    if 'attn_qkv' in w_tt:
+        all_tt = ttnn.linear(h_tt, w_tt['attn_qkv'], compute_kernel_config=hifi4)
+        qg_flat = ttnn.slice(all_tt, [0, 0],                 [1, QG_DIM])
+        k_flat  = ttnn.slice(all_tt, [0, QG_DIM],            [1, QG_DIM + KV_DIM])
+        v_flat  = ttnn.slice(all_tt, [0, QG_DIM + KV_DIM],   [1, QG_DIM + 2 * KV_DIM])
+        qg_tt = ttnn.reshape(qg_flat, [N_Q, HEAD_DIM * 2])
+        q_tt = ttnn.slice(qg_tt, [0, 0], [N_Q, HEAD_DIM])
+        gate_tt = ttnn.slice(qg_tt, [0, HEAD_DIM], [N_Q, 2 * HEAD_DIM])
+        k_tt = ttnn.reshape(k_flat, [N_KV, HEAD_DIM])
+        v_tt = ttnn.reshape(v_flat, [N_KV, HEAD_DIM])
+    else:
+        qg_tt = ttnn.linear(h_tt, w_tt['q_proj'], compute_kernel_config=hifi4)
+        qg_tt = ttnn.reshape(qg_tt, [N_Q, HEAD_DIM * 2])
+        q_tt = ttnn.slice(qg_tt, [0, 0], [N_Q, HEAD_DIM])
+        gate_tt = ttnn.slice(qg_tt, [0, HEAD_DIM], [N_Q, 2 * HEAD_DIM])
+        k_tt = ttnn.reshape(
+            ttnn.linear(h_tt, w_tt['k_proj'], compute_kernel_config=hifi4),
+            [N_KV, HEAD_DIM])
+        v_tt = ttnn.reshape(
+            ttnn.linear(h_tt, w_tt['v_proj'], compute_kernel_config=hifi4),
+            [N_KV, HEAD_DIM])
 
     q_tt = ttnn.rms_norm(q_tt, weight=w_tt['q_norm'], epsilon=EPS)
     k_tt = ttnn.rms_norm(k_tt, weight=w_tt['k_norm'], epsilon=EPS)
