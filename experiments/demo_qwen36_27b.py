@@ -157,12 +157,13 @@ def main():
     half_rot = rotary_dim // 2
     freqs = 1.0 / (10_000_000.0 ** (np.arange(half_rot).astype(np.float32) / half_rot))
 
-    def rope_for_pos(pos):
-        angles = pos * freqs
-        cos_np = np.concatenate([np.cos(angles), np.cos(angles)]).astype(np.float32)
-        sin_np = np.concatenate([np.sin(angles), np.sin(angles)]).astype(np.float32)
-        return (upload(cos_np, device, dtype=ttnn.float32),
-                upload(sin_np, device, dtype=ttnn.float32))
+    # C'0.6: precompute the full RoPE table at startup; slice one row per step.
+    positions = np.arange(MAX_POS).astype(np.float32)
+    all_angles = positions[:, None] * freqs[None, :]
+    cos_all = np.concatenate([np.cos(all_angles), np.cos(all_angles)], axis=-1).astype(np.float32)
+    sin_all = np.concatenate([np.sin(all_angles), np.sin(all_angles)], axis=-1).astype(np.float32)
+    cos_table_tt = upload(cos_all, device, dtype=ttnn.float32)
+    sin_table_tt = upload(sin_all, device, dtype=ttnn.float32)
 
     def fresh_state():
         n_dn = sum(1 for i in range(NUM_LAYERS) if i % 4 != 3)
@@ -184,7 +185,8 @@ def main():
     def forward_token(token_id, cur_pos, ssm, cvs, kvc):
         x_np = embed_np[token_id]
         x_tt = upload(x_np.reshape(1, HIDDEN), device, dtype=ttnn.float32)
-        cos_tt, sin_tt = rope_for_pos(cur_pos)
+        cos_tt = ttnn.slice(cos_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
+        sin_tt = ttnn.slice(sin_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
         cur_pos_tt = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32), device=device)
         dn_idx = 0
         attn_idx = 0
