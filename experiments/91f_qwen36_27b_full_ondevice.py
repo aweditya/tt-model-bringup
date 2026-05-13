@@ -254,6 +254,13 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     k_tt = ttnn.rms_norm(k_tt, weight=w_tt['k_norm'], epsilon=EPS)
 
     # 3) Partial RoPE: rotate first ROTARY_DIM dims; pass-through last (HEAD_DIM - ROTARY_DIM).
+    # C'3 (native ttnn.experimental.rotary_embedding) attempted and abandoned 2026-05-13:
+    # the op's cos_cache shape constraints (padded_shape [0]==1 && [1]==1) conflict with
+    # both TILE_LAYOUT tile-padding behavior AND our partial-rotary slicing pattern.
+    # Multiple workarounds tried (ROW_MAJOR conversion, token_index variants) all hit
+    # different cos shape rejections. Doc is sparse, source-of-truth is C++. Win was
+    # ~3-5 ms/tok; cost to integrate exceeds the budget. Keeping manual rotate-half;
+    # this path is correct, fast enough, and trace-friendly with a small refactor in C'4.
     def apply_partial_rope(t, n_heads):
         rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
         passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])

@@ -172,18 +172,20 @@ def handle_status(state: ServerState, args: dict) -> dict:
 
 
 def handle_reload_kernels(state: ServerState, args: dict) -> dict:
-    """importlib.reload the kernel modules; never cache function refs.
+    """Re-exec the kernel modules from disk; never cache function refs.
 
-    After reload, the state still holds state._91f as the (now-fresh) module,
-    and per-call dereference (state._91f.deltanet_step_ondevice) picks up
-    the new code automatically.
+    importlib.reload doesn't work with spec_from_file_location-loaded
+    modules (no findable spec for the synthetic name). We re-run the
+    loader instead — state._91f gets a fresh module object pointing at
+    the same name in sys.modules, and per-call dereference
+    (state._91f.deltanet_step_ondevice) picks up the new code.
     """
     reloaded = []
     if state._91f is not None:
-        importlib.reload(state._91f)
+        state._91f = _load_kernel_module(_91F_PATH, "_91f")
         reloaded.append("_91f")
     if state._91l is not None:
-        importlib.reload(state._91l)
+        state._91l = _load_kernel_module(_91L_PATH, "_91l")
         reloaded.append("_91l")
     return {"ok": True, "reloaded_modules": reloaded}
 
