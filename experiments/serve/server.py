@@ -58,6 +58,11 @@ class ServerState:
         self.boot_time = time.time()
         self.last_run: Optional[dict] = None
         self.loaded = False
+        # C'4 v4: lazily allocated for bench_decode_traced. Holds the captured
+        # trace + all persistent buffers it depends on. Buffers MUST NOT be
+        # reallocated after capture (trace is bound to specific addresses).
+        # See handle_bench_decode_traced for the populated shape.
+        self.traced_decode: Optional[dict] = None
 
     def status_dict(self) -> dict:
         return {
@@ -512,17 +517,354 @@ def handle_bench_decode(state: ServerState, args: dict) -> dict:
     return summary
 
 
+# ---------- C'4 v4: traced decode helpers ----------
+
+def _setup_traced_decode(state: ServerState) -> None:
+    """Allocate persistent state buffers + input buffers, then capture the
+    decode trace using the current state._91f kernels (traced variants).
+
+    All buffers stored on state.traced_decode are aliased by the captured
+    trace. Reallocating any of them invalidates the trace; subsequent
+    execute_trace calls will fault. The only safe in-place update is
+    ttnn.copy_host_to_device_tensor with same shape/dtype.
+    """
+    import numpy as np
+    import torch
+    import ttnn
+
+    cfg = state.cfg
+    HIDDEN = cfg["hidden"]
+    N_KV = cfg["n_kv_heads"]
+    HEAD_DIM = cfg["head_dim"]
+    rotary_dim = int(HEAD_DIM * cfg["partial_rotary_factor"])
+    KEY_DIM = cfg["n_k_heads"] * cfg["k_dim"]
+    VAL_DIM = cfg["n_v_heads"] * cfg["v_dim"]
+    CONV_DIM = 2 * KEY_DIM + VAL_DIM
+    NUM_LAYERS = state.num_layers
+    upload = state._91f.upload
+    device = state.device
+
+    # Persistent state buffers (in-place mutated by in-trace ttnn.copy)
+    n_dn = sum(1 for i in range(NUM_LAYERS) if i % 4 != 3)
+    n_attn = NUM_LAYERS - n_dn
+    ssm = [upload(np.zeros((cfg["n_v_heads"], cfg["k_dim"], cfg["v_dim"]),
+                            dtype=np.float32), device, dtype=ttnn.float32)
+           for _ in range(n_dn)]
+    cvs = [upload(np.zeros((CONV_DIM, cfg["conv_kernel"] - 1), dtype=np.float32),
+                    device, dtype=ttnn.float32) for _ in range(n_dn)]
+    kv_init = np.zeros((1, N_KV, MAX_POS, HEAD_DIM), dtype=np.float32)
+    kvc = []
+    for _ in range(n_attn):
+        kv_k = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
+                                device=device, layout=ttnn.TILE_LAYOUT)
+        kv_v = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
+                                device=device, layout=ttnn.TILE_LAYOUT)
+        kvc.append([kv_k, kv_v])
+
+    # Per-step input buffers (written by update_input_buffers each step)
+    embed_buf = upload(np.zeros((1, HIDDEN), dtype=np.float32),
+                        device, dtype=ttnn.float32)
+    cos_buf = upload(np.zeros((1, HEAD_DIM), dtype=np.float32),
+                        device, dtype=ttnn.float32)
+    sin_buf = upload(np.zeros((1, HEAD_DIM), dtype=np.float32),
+                        device, dtype=ttnn.float32)
+    cur_pos_buf = ttnn.from_torch(torch.tensor([0], dtype=torch.int32), device=device)
+    index_buf = ttnn.from_torch(
+        torch.from_numpy(np.zeros((1, N_KV, 1, HEAD_DIM), dtype=np.int32)),
+        dtype=ttnn.int32, device=device, layout=ttnn.TILE_LAYOUT)
+
+    # Capture trace using traced kernels (state-committing variants from 91f).
+    tid = ttnn.begin_trace_capture(device, cq_id=0)
+    x_tt = embed_buf
+    dn_idx = 0
+    attn_idx = 0
+    for i in range(NUM_LAYERS):
+        layer_type, w_tt = state.layer_weights[i]
+        if layer_type == "linear_attention":
+            x_tt = state._91f.deltanet_step_ondevice_traced(
+                x_tt, w_tt, ssm[dn_idx], cvs[dn_idx], cfg)
+            dn_idx += 1
+        else:
+            kv_k, kv_v = kvc[attn_idx]
+            x_tt = state._91f.gated_attn_step_ondevice_traced(
+                x_tt, w_tt, kv_k, kv_v,
+                cur_pos_buf, cos_buf, sin_buf, index_buf, cfg)
+            attn_idx += 1
+        x_tt = state._91f.mlp_step_ondevice(x_tt, w_tt)
+    x_tt = ttnn.rms_norm(x_tt, weight=state.final_norm_tt, epsilon=EPS)
+    logits_tt = ttnn.linear(x_tt, state.lm_head_tt,
+                              compute_kernel_config=state._91f.hifi4)
+    ttnn.end_trace_capture(device, tid, cq_id=0)
+    ttnn.synchronize_device(device)
+
+    state.traced_decode = {
+        "trace_id": tid,
+        "logits_tt": logits_tt,
+        "ssm": ssm, "cvs": cvs, "kvc": kvc,
+        "embed_buf": embed_buf, "cos_buf": cos_buf, "sin_buf": sin_buf,
+        "cur_pos_buf": cur_pos_buf, "index_buf": index_buf,
+        "n_dn": n_dn, "n_attn": n_attn,
+    }
+
+
+def _release_traced_decode(state: ServerState) -> None:
+    """Release the captured trace and drop all buffer references so GC can
+    free them before we recapture."""
+    if state.traced_decode is None:
+        return
+    import ttnn
+    try:
+        ttnn.release_trace(state.device, state.traced_decode["trace_id"])
+    except Exception as e:
+        print(f"[traced_decode] release_trace error: {e}")
+    state.traced_decode = None
+    gc.collect()
+
+
+def _reset_traced_state_inplace(state: ServerState) -> None:
+    """Zero out all persistent state buffers WITHOUT reallocating (the trace
+    is bound to these addresses). Uses copy_host_to_device_tensor."""
+    import numpy as np
+    import torch
+    import ttnn
+    cfg = state.cfg
+    td = state.traced_decode
+    KEY_DIM = cfg["n_k_heads"] * cfg["k_dim"]
+    VAL_DIM = cfg["n_v_heads"] * cfg["v_dim"]
+    CONV_DIM = 2 * KEY_DIM + VAL_DIM
+
+    ssm_zero = ttnn.from_torch(
+        torch.from_numpy(np.zeros((cfg["n_v_heads"], cfg["k_dim"], cfg["v_dim"]),
+                                   dtype=np.float32)),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+    cvs_zero = ttnn.from_torch(
+        torch.from_numpy(np.zeros((CONV_DIM, cfg["conv_kernel"] - 1), dtype=np.float32)),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+    kv_zero = ttnn.from_torch(
+        torch.from_numpy(np.zeros((1, cfg["n_kv_heads"], MAX_POS, cfg["head_dim"]),
+                                   dtype=np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+    for s in td["ssm"]:
+        ttnn.copy_host_to_device_tensor(ssm_zero, s)
+    for c in td["cvs"]:
+        ttnn.copy_host_to_device_tensor(cvs_zero, c)
+    for kv_k, kv_v in td["kvc"]:
+        ttnn.copy_host_to_device_tensor(kv_zero, kv_k)
+        ttnn.copy_host_to_device_tensor(kv_zero, kv_v)
+
+
+def _update_input_buffers(state: ServerState, token_id: int, cur_pos: int) -> None:
+    """Write per-step inputs into pre-allocated buffers (NO device alloc)."""
+    import numpy as np
+    import torch
+    import ttnn
+    cfg = state.cfg
+    HIDDEN = cfg["hidden"]
+    N_KV = cfg["n_kv_heads"]
+    HEAD_DIM = cfg["head_dim"]
+    td = state.traced_decode
+
+    # embed row (host slice; copy into device buffer)
+    embed_row = state.embed_np[token_id].reshape(1, HIDDEN).astype(np.float32)
+    src_e = ttnn.from_torch(torch.from_numpy(embed_row),
+                              dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+    ttnn.copy_host_to_device_tensor(src_e, td["embed_buf"])
+    # RoPE row (Level 1 extended, host-sliced from precomputed table)
+    # cos/sin tables on device are upload(cos_ext_all). Recover host array by
+    # reading them out... too slow per step. Recompute from cfg instead.
+    if "_rope_cache_np" not in td:
+        rotary_dim = int(HEAD_DIM * cfg["partial_rotary_factor"])
+        half_rot = rotary_dim // 2
+        freqs = 1.0 / (10_000_000.0 ** (np.arange(half_rot).astype(np.float32) / half_rot))
+        positions = np.arange(MAX_POS).astype(np.float32)
+        ang = positions[:, None] * freqs[None, :]
+        cos_all = np.concatenate([np.cos(ang), np.cos(ang)], axis=-1).astype(np.float32)
+        sin_all = np.concatenate([np.sin(ang), np.sin(ang)], axis=-1).astype(np.float32)
+        pad = HEAD_DIM - rotary_dim
+        cos_ext = np.concatenate([cos_all, np.ones((MAX_POS, pad), dtype=np.float32)], axis=-1)
+        sin_ext = np.concatenate([sin_all, np.zeros((MAX_POS, pad), dtype=np.float32)], axis=-1)
+        td["_rope_cache_np"] = (cos_ext, sin_ext)
+    cos_ext, sin_ext = td["_rope_cache_np"]
+    src_c = ttnn.from_torch(torch.from_numpy(cos_ext[cur_pos:cur_pos + 1]),
+                              dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+    src_s = ttnn.from_torch(torch.from_numpy(sin_ext[cur_pos:cur_pos + 1]),
+                              dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT)
+    ttnn.copy_host_to_device_tensor(src_c, td["cos_buf"])
+    ttnn.copy_host_to_device_tensor(src_s, td["sin_buf"])
+    # cur_pos scalar
+    src_p = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32))
+    ttnn.copy_host_to_device_tensor(src_p, td["cur_pos_buf"])
+    # scatter index [1, N_KV, 1, HEAD_DIM]
+    idx = np.full((1, N_KV, 1, HEAD_DIM), cur_pos, dtype=np.int32)
+    src_i = ttnn.from_torch(torch.from_numpy(idx),
+                              dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT)
+    ttnn.copy_host_to_device_tensor(src_i, td["index_buf"])
+
+
+def _eager_step_logits(state: ServerState, ssm, cvs, kvc,
+                        token_id: int, cur_pos: int):
+    """Run one eager forward, return logits np array. Mutates ssm/cvs/kvc by
+    rebinding entries (eager kernels return new tensors)."""
+    import numpy as np
+    import torch
+    import ttnn
+    cfg = state.cfg
+    HIDDEN = cfg["hidden"]
+    HEAD_DIM = cfg["head_dim"]
+    device = state.device
+    upload = state._91f.upload
+
+    x_tt = upload(state.embed_np[token_id].reshape(1, HIDDEN),
+                  device, dtype=ttnn.float32)
+    cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0], [cur_pos + 1, HEAD_DIM])
+    sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0], [cur_pos + 1, HEAD_DIM])
+    cur_pos_tt = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32), device=device)
+    dn_idx = 0
+    attn_idx = 0
+    for i in range(state.num_layers):
+        layer_type, w_tt = state.layer_weights[i]
+        if layer_type == "linear_attention":
+            x_tt, ssm[dn_idx], cvs[dn_idx] = state._91f.deltanet_step_ondevice(
+                x_tt, w_tt, ssm[dn_idx], cvs[dn_idx], cfg)
+            dn_idx += 1
+        else:
+            kv_k, kv_v = kvc[attn_idx]
+            x_tt, kv_k, kv_v = state._91f.gated_attn_step_ondevice(
+                x_tt, w_tt, kv_k, kv_v, None, cur_pos_tt, cur_pos,
+                cos_tt, sin_tt, cfg, device)
+            kvc[attn_idx] = [kv_k, kv_v]
+            attn_idx += 1
+        x_tt = state._91f.mlp_step_ondevice(x_tt, w_tt)
+    x_tt = ttnn.rms_norm(x_tt, weight=state.final_norm_tt, epsilon=EPS)
+    logits_tt = ttnn.linear(x_tt, state.lm_head_tt,
+                              compute_kernel_config=state._91f.hifi4)
+    ttnn.synchronize_device(device)
+    return ttnn.to_torch(logits_tt).float().cpu().numpy().flatten()
+
+
+def handle_bench_decode_traced(state: ServerState, args: dict) -> dict:
+    """C'4 v4: capture + bench traced decode, validate vs eager per-step.
+
+    args:
+      n_steps:        timed traced steps (default 20)
+      warmup:         untimed traced steps before timing (default 5)
+      validate_steps: per-step cosine compare vs eager (default 5, 0 to skip)
+      start_token_id: arbitrary starting token (default 760 = "The")
+      recapture:      release + recapture trace (use after reload_kernels)
+
+    Returns timing + min/per-step cosine + top1 match per step.
+    """
+    if state.mock:
+        return {"mock": True, "median_ms": 0.0, "min_cosine": 1.0}
+    import numpy as np
+    import ttnn
+    import statistics
+
+    n_steps = int(args.get("n_steps", 20))
+    n_warmup = int(args.get("warmup", 5))
+    n_validate = int(args.get("validate_steps", 5))
+    start_token = int(args.get("start_token_id", 760))
+    recapture = bool(args.get("recapture", False))
+
+    if state.traced_decode is None or recapture:
+        if state.traced_decode is not None:
+            _release_traced_decode(state)
+        t0 = time.time()
+        _setup_traced_decode(state)
+        capture_sec = time.time() - t0
+    else:
+        capture_sec = 0.0
+
+    td = state.traced_decode
+    device = state.device
+
+    # 1) Validation. Both paths start from zero state, run N steps, compare logits.
+    cosines = []
+    top1_match = []
+    if n_validate > 0:
+        ssm_e, cvs_e, kvc_e = _fresh_state(state)
+        eager_logits_step = []
+        next_id = start_token
+        for i in range(n_validate):
+            logits = _eager_step_logits(state, ssm_e, cvs_e, kvc_e, next_id, i)
+            eager_logits_step.append(logits)
+            next_id = int(np.argmax(logits))
+        del ssm_e, cvs_e, kvc_e
+        gc.collect()
+
+        _reset_traced_state_inplace(state)
+        next_id = start_token
+        for i in range(n_validate):
+            _update_input_buffers(state, next_id, i)
+            ttnn.execute_trace(device, td["trace_id"], cq_id=0, blocking=True)
+            logits = ttnn.to_torch(td["logits_tt"]).float().cpu().numpy().flatten()
+            e = eager_logits_step[i]
+            num = float(np.dot(e.astype(np.float64), logits.astype(np.float64)))
+            den = float(np.linalg.norm(e) * np.linalg.norm(logits) + 1e-12)
+            cosines.append(num / den)
+            top1_match.append(int(np.argmax(e)) == int(np.argmax(logits)))
+            next_id = int(np.argmax(logits))
+
+    # 2) Perf bench. Reset state, time N traced steps. Each step is a full
+    #    update_input_buffers + execute_trace + readback (matches eager bench
+    #    methodology — full-step time, not just execute_trace).
+    _reset_traced_state_inplace(state)
+    times_ms = []
+    times_exec_ms = []
+    next_id = start_token
+    cur_pos = 0
+    for i in range(n_warmup + n_steps):
+        ttnn.synchronize_device(device)
+        t0 = time.perf_counter()
+        _update_input_buffers(state, next_id, cur_pos)
+        t1 = time.perf_counter()
+        ttnn.execute_trace(device, td["trace_id"], cq_id=0, blocking=True)
+        t2 = time.perf_counter()
+        logits = ttnn.to_torch(td["logits_tt"]).float().cpu().numpy().flatten()
+        t3 = time.perf_counter()
+        if i >= n_warmup:
+            times_ms.append((t3 - t0) * 1000)
+            times_exec_ms.append((t2 - t1) * 1000)
+        next_id = int(np.argmax(logits))
+        cur_pos += 1
+
+    median = statistics.median(times_ms)
+    median_exec = statistics.median(times_exec_ms)
+    p95 = sorted(times_ms)[int(len(times_ms) * 0.95) - 1] if len(times_ms) >= 5 else max(times_ms)
+
+    summary = {
+        "n_steps": n_steps,
+        "warmup": n_warmup,
+        "validate_steps": n_validate,
+        "capture_sec": capture_sec,
+        "cosines": cosines,
+        "min_cosine": min(cosines) if cosines else None,
+        "top1_match": top1_match,
+        "all_top1_match": all(top1_match) if top1_match else None,
+        "median_ms": median,
+        "median_exec_ms": median_exec,
+        "p95_ms": p95,
+        "tok_per_sec": 1000.0 / median,
+        "all_ms": times_ms,
+    }
+    state.last_run = {"cmd": "bench_decode_traced", "median_ms": median,
+                       "tok_per_sec": 1000.0 / median,
+                       "min_cosine": summary["min_cosine"], "ts": time.time()}
+    return summary
+
+
 def handle_shutdown(state: ServerState, args: dict) -> dict:
     return {"ok": True, "shutting_down": True}
 
 
 HANDLERS = {
-    "status":         handle_status,
-    "reload_kernels": handle_reload_kernels,
-    "reset_state":    handle_reset_state,
-    "run_91r":        handle_run_91r,
-    "bench_decode":   handle_bench_decode,
-    "shutdown":       handle_shutdown,
+    "status":               handle_status,
+    "reload_kernels":       handle_reload_kernels,
+    "reset_state":          handle_reset_state,
+    "run_91r":              handle_run_91r,
+    "bench_decode":         handle_bench_decode,
+    "bench_decode_traced":  handle_bench_decode_traced,
+    "shutdown":             handle_shutdown,
 }
 
 

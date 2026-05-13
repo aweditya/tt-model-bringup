@@ -71,6 +71,32 @@ def cmd_bench_decode(args):
     print("=" * 72)
 
 
+def cmd_bench_decode_traced(args):
+    payload = {
+        "n_steps": args.n_steps,
+        "warmup": args.warmup,
+        "validate_steps": args.validate_steps,
+        "start_token_id": args.start_token_id,
+        "recapture": args.recapture,
+    }
+    data = send("bench_decode_traced", payload)
+    print("=" * 72)
+    print(f"bench_decode_traced  n_steps={data.get('n_steps')}  warmup={data.get('warmup')}  "
+          f"validate_steps={data.get('validate_steps')}")
+    if data.get("capture_sec", 0) > 0:
+        print(f"  trace captured in {data['capture_sec']:.1f}s")
+    cos = data.get("cosines") or []
+    if cos:
+        print(f"  validation cosines: {[f'{c:.6f}' for c in cos]}")
+        print(f"  min cosine:         {data.get('min_cosine'):.6f}  "
+              f"(top1 match all: {data.get('all_top1_match')})")
+    print(f"  median:             {data.get('median_ms', 0):.2f} ms/tok  "
+          f"({data.get('tok_per_sec', 0):.2f} tok/s)")
+    print(f"  median (exec only): {data.get('median_exec_ms', 0):.2f} ms/tok")
+    print(f"  p95:                {data.get('p95_ms', 0):.2f} ms/tok")
+    print("=" * 72)
+
+
 def cmd_run_91r(args):
     layers = [int(x) for x in args.layers.split(",")] if args.layers else None
     payload = {}
@@ -111,6 +137,16 @@ def main():
     b.add_argument("--n-steps", type=int, default=20)
     b.add_argument("--warmup", type=int, default=3)
     b.set_defaults(fn=cmd_bench_decode)
+    bt = sub.add_parser("bench_decode_traced",
+                         help="capture trace + multi-step validate vs eager + perf bench")
+    bt.add_argument("--n-steps", type=int, default=20)
+    bt.add_argument("--warmup", type=int, default=5)
+    bt.add_argument("--validate-steps", type=int, default=5,
+                     help="per-step cosine compare vs eager (0 to skip)")
+    bt.add_argument("--start-token-id", type=int, default=760)
+    bt.add_argument("--recapture", action="store_true",
+                     help="release old trace and capture fresh (after reload_kernels)")
+    bt.set_defaults(fn=cmd_bench_decode_traced)
     args = ap.parse_args()
     args.fn(args)
 
