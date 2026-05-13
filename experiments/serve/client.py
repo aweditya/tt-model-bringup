@@ -71,6 +71,21 @@ def cmd_bench_decode(args):
     print("=" * 72)
 
 
+def cmd_bench_decode_paged(args):
+    payload = {"n_steps": args.n_steps, "warmup": args.warmup,
+               "max_pos": args.max_pos, "block_size": args.block_size}
+    data = send("bench_decode_paged", payload)
+    print("=" * 72)
+    print(f"bench_decode_paged  max_pos={data.get('max_pos')}  "
+          f"block_size={data.get('block_size')}  n_steps={data.get('n_steps')}")
+    print(f"  median: {data.get('median_ms', 0):.2f} ms/tok  "
+          f"({data.get('tok_per_sec', 0):.2f} tok/s)")
+    print(f"  p95:    {data.get('p95_ms', 0):.2f} ms/tok")
+    print(f"  min:    {data.get('min_ms', 0):.2f} ms/tok")
+    print(f"  max:    {data.get('max_ms', 0):.2f} ms/tok")
+    print("=" * 72)
+
+
 def cmd_bench_decode_traced(args):
     payload = {
         "n_steps": args.n_steps,
@@ -137,6 +152,13 @@ def main():
     b.add_argument("--n-steps", type=int, default=20)
     b.add_argument("--warmup", type=int, default=3)
     b.set_defaults(fn=cmd_bench_decode)
+    bp = sub.add_parser("bench_decode_paged",
+                          help="bench eager decode with paged KV cache + paged SDPA (unlocks long context)")
+    bp.add_argument("--n-steps", type=int, default=20)
+    bp.add_argument("--warmup", type=int, default=3)
+    bp.add_argument("--max-pos", type=int, default=256)
+    bp.add_argument("--block-size", type=int, default=64)
+    bp.set_defaults(fn=cmd_bench_decode_paged)
     bt = sub.add_parser("bench_decode_traced",
                          help="capture trace + multi-step validate vs eager + perf bench")
     bt.add_argument("--n-steps", type=int, default=20)

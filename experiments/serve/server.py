@@ -517,6 +517,155 @@ def handle_bench_decode(state: ServerState, args: dict) -> dict:
     return summary
 
 
+def handle_bench_decode_paged(state: ServerState, args: dict) -> dict:
+    """Bench eager decode using PAGED KV cache + paged_scaled_dot_product_-
+    attention_decode. Same per-step methodology as bench_decode, but exercises
+    the long-context path (unlocks MAX_POS > 256).
+
+    args:
+      n_steps:    int, default 20
+      warmup:     int, default 3
+      max_pos:    int, default 256 (cache max_seq_len; paged unlocks higher)
+      block_size: int, default 64
+    """
+    if state.mock:
+        return {"mock": True, "median_ms": 0.0, "paged": True}
+    import numpy as np
+    import torch
+    import ttnn
+    import statistics
+
+    n_steps = int(args.get("n_steps", 20))
+    warmup = int(args.get("warmup", 3))
+    max_pos = int(args.get("max_pos", 256))
+    block_size = int(args.get("block_size", 64))
+    assert max_pos % block_size == 0, f"max_pos {max_pos} must be multiple of block_size {block_size}"
+
+    DEFAULT_PROMPT_IDS = [760, 6511, 314, 9338, 369]
+    prompt_ids = list(args.get("prompt_ids") or DEFAULT_PROMPT_IDS)
+
+    cfg = state.cfg
+    HIDDEN = cfg["hidden"]
+    N_KV = cfg["n_kv_heads"]
+    HEAD_DIM = cfg["head_dim"]
+    NUM_LAYERS = state.num_layers
+    KEY_DIM = cfg["n_k_heads"] * cfg["k_dim"]
+    VAL_DIM = cfg["n_v_heads"] * cfg["v_dim"]
+    CONV_DIM = 2 * KEY_DIM + VAL_DIM
+    upload = state._91f.upload
+    device = state.device
+
+    max_num_blocks = max_pos // block_size  # single user
+    print(f"[bench_decode_paged] max_pos={max_pos} block_size={block_size} "
+          f"max_num_blocks={max_num_blocks}")
+
+    # === Allocate page_table once (identity mapping for single user) ===
+    page_table_np = np.arange(max_num_blocks, dtype=np.int32).reshape(1, max_num_blocks)
+    page_table_tt = ttnn.from_torch(torch.from_numpy(page_table_np),
+                                      dtype=ttnn.int32, device=device,
+                                      layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    # === Allocate DN state (unchanged from non-paged) ===
+    n_dn = sum(1 for i in range(NUM_LAYERS) if i % 4 != 3)
+    n_attn = NUM_LAYERS - n_dn
+    ssm = [upload(np.zeros((cfg["n_v_heads"], cfg["k_dim"], cfg["v_dim"]),
+                            dtype=np.float32), device, dtype=ttnn.float32)
+           for _ in range(n_dn)]
+    cvs = [upload(np.zeros((CONV_DIM, cfg["conv_kernel"] - 1), dtype=np.float32),
+                    device, dtype=ttnn.float32) for _ in range(n_dn)]
+
+    # === Allocate paged KV caches ===
+    paged_kv_zero = np.zeros((max_num_blocks, N_KV, block_size, HEAD_DIM), dtype=np.float32)
+    kvc = []
+    for _ in range(n_attn):
+        kv_k = ttnn.from_torch(torch.from_numpy(paged_kv_zero), dtype=ttnn.bfloat16,
+                                device=device, layout=ttnn.TILE_LAYOUT,
+                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        kv_v = ttnn.from_torch(torch.from_numpy(paged_kv_zero), dtype=ttnn.bfloat16,
+                                device=device, layout=ttnn.TILE_LAYOUT,
+                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        kvc.append([kv_k, kv_v])
+
+    embed_np = state.embed_np
+
+    def forward_token(token_id, cur_pos):
+        x_np = embed_np[token_id]
+        x_tt = upload(x_np.reshape(1, HIDDEN), device, dtype=ttnn.float32)
+        cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0], [cur_pos + 1, HEAD_DIM])
+        sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0], [cur_pos + 1, HEAD_DIM])
+        cur_pos_tt = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32),
+                                       device=device, layout=ttnn.ROW_MAJOR_LAYOUT)
+        dn_idx = 0
+        attn_idx = 0
+        for i in range(NUM_LAYERS):
+            layer_type, w_tt = state.layer_weights[i]
+            if layer_type == "linear_attention":
+                x_tt, ssm[dn_idx], cvs[dn_idx] = state._91f.deltanet_step_ondevice(
+                    x_tt, w_tt, ssm[dn_idx], cvs[dn_idx], cfg)
+                dn_idx += 1
+            else:
+                kv_k, kv_v = kvc[attn_idx]
+                x_tt = state._91f.gated_attn_step_ondevice_paged(
+                    x_tt, w_tt, kv_k, kv_v, page_table_tt, cur_pos_tt,
+                    cos_tt, sin_tt, cfg)
+                attn_idx += 1
+            x_tt = state._91f.mlp_step_ondevice(x_tt, w_tt)
+        x_tt = ttnn.rms_norm(x_tt, weight=state.final_norm_tt, epsilon=1e-6)
+        logits_tt = ttnn.linear(x_tt, state.lm_head_tt, compute_kernel_config=state._91f.hifi4)
+        return logits_tt
+
+    # === Prefill (untimed) ===
+    for pos, tid in enumerate(prompt_ids):
+        _ = forward_token(tid, pos)
+    ttnn.synchronize_device(device)
+
+    # === Timed step (reset state between reps for apples-to-apples) ===
+    times_ms = []
+    for rep in range(warmup + n_steps):
+        for i in range(n_dn):
+            ssm[i] = upload(np.zeros((cfg["n_v_heads"], cfg["k_dim"], cfg["v_dim"]),
+                                      dtype=np.float32), device, dtype=ttnn.float32)
+            cvs[i] = upload(np.zeros((CONV_DIM, cfg["conv_kernel"] - 1), dtype=np.float32),
+                              device, dtype=ttnn.float32)
+        for i in range(n_attn):
+            kv_k = ttnn.from_torch(torch.from_numpy(paged_kv_zero), dtype=ttnn.bfloat16,
+                                    device=device, layout=ttnn.TILE_LAYOUT,
+                                    memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            kv_v = ttnn.from_torch(torch.from_numpy(paged_kv_zero), dtype=ttnn.bfloat16,
+                                    device=device, layout=ttnn.TILE_LAYOUT,
+                                    memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            kvc[i] = [kv_k, kv_v]
+        for pos, tid in enumerate(prompt_ids):
+            _ = forward_token(tid, pos)
+        ttnn.synchronize_device(device)
+        ttnn.synchronize_device(device)
+        t0 = time.time()
+        _ = forward_token(prompt_ids[-1], len(prompt_ids))
+        ttnn.synchronize_device(device)
+        t1 = time.time()
+        if rep >= warmup:
+            times_ms.append((t1 - t0) * 1000)
+
+    times_ms.sort()
+    median = statistics.median(times_ms)
+    p95 = times_ms[int(len(times_ms) * 0.95) - 1] if len(times_ms) >= 5 else max(times_ms)
+    summary = {
+        "paged": True,
+        "max_pos": max_pos,
+        "block_size": block_size,
+        "n_steps": n_steps,
+        "median_ms": median,
+        "p95_ms": p95,
+        "min_ms": min(times_ms), "max_ms": max(times_ms),
+        "tok_per_sec": 1000.0 / median,
+        "all_ms": times_ms,
+    }
+    state.last_run = {"cmd": "bench_decode_paged", "median_ms": median,
+                        "tok_per_sec": 1000.0 / median, "max_pos": max_pos,
+                        "ts": time.time()}
+    return summary
+
+
 # ---------- C'4 v4: traced decode helpers ----------
 
 def _setup_traced_decode(state: ServerState) -> None:
@@ -904,6 +1053,7 @@ HANDLERS = {
     "reset_state":          handle_reset_state,
     "run_91r":              handle_run_91r,
     "bench_decode":         handle_bench_decode,
+    "bench_decode_paged":   handle_bench_decode_paged,
     "bench_decode_traced":  handle_bench_decode_traced,
     "shutdown":             handle_shutdown,
 }
