@@ -464,9 +464,11 @@ def handle_bench_decode(state: ServerState, args: dict) -> dict:
     def forward_token(token_id, cur_pos):
         x_np = embed_np[token_id]
         x_tt = upload(x_np.reshape(1, HIDDEN), device, dtype=ttnn.float32)
-        # Level 1 RoPE: extended row (head_dim wide)
-        cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0], [cur_pos + 1, cfg["head_dim"]])
-        sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0], [cur_pos + 1, cfg["head_dim"]])
+        # V2 rotate-only RoPE: slice ROTARY_DIM-wide ONCE per token (not HEAD_DIM).
+        # 91f's apply_partial_rope detects ROTARY_DIM input and skips its own slice
+        # → eliminates 32 slice dispatches/token (16 attn layers × 2 for cos+sin).
+        cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
+        sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
         cur_pos_tt = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32), device=device)
         dn_idx = 0
         attn_idx = 0
@@ -576,6 +578,7 @@ def handle_bench_decode_paged(state: ServerState, args: dict) -> dict:
     HIDDEN = cfg["hidden"]
     N_KV = cfg["n_kv_heads"]
     HEAD_DIM = cfg["head_dim"]
+    ROTARY_DIM = int(HEAD_DIM * cfg["partial_rotary_factor"])
     NUM_LAYERS = state.num_layers
     KEY_DIM = cfg["n_k_heads"] * cfg["k_dim"]
     VAL_DIM = cfg["n_v_heads"] * cfg["v_dim"]
@@ -619,8 +622,9 @@ def handle_bench_decode_paged(state: ServerState, args: dict) -> dict:
     def forward_token(token_id, cur_pos):
         x_np = embed_np[token_id]
         x_tt = upload(x_np.reshape(1, HIDDEN), device, dtype=ttnn.float32)
-        cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0], [cur_pos + 1, HEAD_DIM])
-        sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0], [cur_pos + 1, HEAD_DIM])
+        # V2 rotate-only RoPE: slice ROTARY_DIM-wide ONCE per token (paged path).
+        cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0], [cur_pos + 1, ROTARY_DIM])
+        sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0], [cur_pos + 1, ROTARY_DIM])
         cur_pos_tt = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32),
                                        device=device, layout=ttnn.ROW_MAJOR_LAYOUT)
         dn_idx = 0
