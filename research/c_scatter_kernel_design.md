@@ -1,5 +1,26 @@
 # In-place KV cache scatter kernel — design + research plan
 
+## ⚠️ Major update 2026-05-13: custom kernel may be unnecessary
+
+After research agent deep-dive (`research/kernel_research/04_update_cache_reference_op.md`):
+
+1. **`ttnn.kv_cache.update_cache` already exists and does exactly this op.** Lives at `ttnn/cpp/ttnn/operations/kv_cache/` in tt-metal. Structurally an untilize → in-L1-scatter → re-tilize → in-place write-back. Tile arithmetic: `tile_idx = cur_pos / 32`, byte offset `(cur_pos % 32) * Wbytes`.
+
+2. **Blackhole issue #16674 (which we feared would block us) is correlated with the SHARDED writer path.** INTERLEAVED memory config sidesteps the hang. Confirmed via WebFetch on the GitHub issue.
+
+**Implication**: instead of writing a custom kernel (2-4 weeks of work), we may just need to:
+- Switch the KV cache memory config from sharded (if currently sharded) to INTERLEAVED
+- Call `ttnn.kv_cache.update_cache(cache, src, cur_pos)` instead of `ttnn.scatter`
+- This is a ~1-day swap, not a multi-week kernel project
+
+The custom-kernel plan below is preserved for two reasons:
+1. As a backup if `update_cache` doesn't work for our shape/dtype
+2. As future learning — we still WILL want to write tt-metal kernels for other ops (in-place SSM state updates, fused DeltaNet recurrence step, etc.)
+
+**Action**: validate `update_cache` first (1 day). If it works, the custom-kernel project becomes a "nice to have" rather than the primary path.
+
+---
+
 ## Why
 
 `ttnn.scatter` at our production shape costs **0.32 ms × 32 calls/tok = 10.4 ms/tok** for the KV-cache slot write. Measured at 0.3% of P150 DRAM bandwidth — so the cost is **dispatch + the rewrite-whole-cache pattern**, not real work. Replacing this with a kernel that writes ONE tile in place should give a 30-60× speedup on this op, saving ~5-9 ms/tok (~2.5-4% of decode time at the current 210 ms/tok).
