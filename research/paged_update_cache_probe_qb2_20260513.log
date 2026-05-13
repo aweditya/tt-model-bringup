@@ -1,0 +1,79 @@
+2026-05-13 21:37:14.128 | DEBUG    | ttnn:<module>:79 - Initial ttnn.CONFIG:
+Config{cache_path=/home/aditya/.cache/ttnn,model_cache_path=/home/aditya/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=true,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=false,comparison_mode_should_raise_exception=false,comparison_mode_pcc=0.9999,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
+Probe #5: paged_update_cache sharded writer  device_id=0
+  N_KV=4 HEAD_DIM=256 BLOCK_SIZE=64 MAX_SEQ=256
+2026-05-13 21:37:14.222 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-13 21:37:14.225 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-13 21:37:14.225 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-13 21:37:14.242 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:224)
+2026-05-13 21:37:14.242 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-13 21:37:14.245 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-13 21:37:14.245 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-13 21:37:14.260 | info     |             UMD | Harvesting masks for Chip 2: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-13 21:37:14.288 | info     |             UMD | Harvesting masks for Chip 0: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-13 21:37:14.291 | info     |             UMD | Harvesting masks for Chip 1: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-13 21:37:14.295 | info     |             UMD | Harvesting masks for Chip 3: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-13 21:37:14.299 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1, 2, 3}/[1, 2, 3, 0] and remote chip ids {} (cluster.cpp:183)
+2026-05-13 21:37:14.299 | info     |             UMD | IOMMU: disabled (cluster.cpp:157)
+2026-05-13 21:37:14.299 | info     |             UMD | KMD version: 2.8.0 (cluster.cpp:160)
+2026-05-13 21:37:14.302 | info     |             UMD | Starting devices in cluster (cluster.cpp:949)
+2026-05-13 21:37:14.303 | info     |             UMD | Mapped hugepage 0x4c0000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-13 21:37:14.304 | info     |             UMD | Mapped hugepage 0x480000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-13 21:37:14.305 | info     |             UMD | Mapped hugepage 0x500000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-13 21:37:14.306 | info     |             UMD | Mapped hugepage 0x440000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-13 21:37:14.924 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:332)
+2026-05-13 21:37:14.924 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:394)
+2026-05-13 21:37:14.924 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-13 21:37:14.925 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-13 21:37:14.925 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-13 21:37:14.934 | info     |          Fabric | TopologyMapper: Logical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1474)
+2026-05-13 21:37:14.934 | info     |          Fabric | 
+=== Logical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-05-13 21:37:14.934 | info     |          Fabric | 
+=== Logical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-05-13 21:37:14.934 | info     |          Fabric | TopologyMapper: Physical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1485)
+2026-05-13 21:37:14.934 | info     |          Fabric | 
+=== Physical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-05-13 21:37:14.934 | info     |          Fabric | 
+=== Physical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-05-13 21:37:14.934 | info     |          Fabric | Starting multi-mesh mapping: 1 logical mesh(es) to 1 physical mesh(es) (topology_mapper_utils.cpp:1469)
+2026-05-13 21:37:14.934 | info     |          Fabric | Multi-mesh mapping attempt 1/2: Trying inter-mesh mapping (topology_mapper_utils.cpp:1510)
+2026-05-13 21:37:14.934 | info     |          Fabric | Attempt 1: Inter-mesh mapping succeeded, found 1 mesh pair(s) (topology_mapper_utils.cpp:1539)
+2026-05-13 21:37:14.934 | info     |          Fabric | Attempt 1: Mapping 1 mesh pair(s) (topology_mapper_utils.cpp:1547)
+2026-05-13 21:37:14.934 | info     |          Fabric | Attempt 1: Mapping mesh 0 -> 0 (topology_mapper_utils.cpp:1554)
+2026-05-13 21:37:14.934 | info     |          Fabric | Multi-mesh mapping succeeded after 1 attempt(s): 1 mesh pair(s) mapped (topology_mapper_utils.cpp:1686)
+2026-05-13 21:37:15.031 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:261)
+  cache_tt shape: (4, 4, 64, 256)
+  page_table_tt shape: (1, 4)
+  input_padded shape: (1, 1, 32, 256)
+
+[CALL] paged_update_cache(cache, sharded_input, update_idxs=17, page_table)
+  ✓ call succeeded, no hang
+
+[VERIFY] cache[0, :, 17, :] vs input:
+  cosine = 0.999998  max|Δ| = 9.5046e-04
+  cache[0, :, 100, :] (untouched): cos = 0.999999  max|Δ| = 7.2822e-05
+
+=== VERDICT ===
+  ✓ paged_update_cache WORKS on Blackhole with sharded input.
+  ✓ Target write correct, neighbours preserved.
+  ✓ The paged SDPA migration is FULLY UNBLOCKED (reader + writer).
+2026-05-13 21:37:16.018 | info     |    BuildKernels | JIT cache stats: 13/18 hits (72.2%) [13 cached, 3 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-05-13 21:37:16.018 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-05-13 21:37:16.018 | info     |    BuildKernels | JIT telemetry [dependencies_up_to_date]: count=25, total=29.231ms, min=0.038ms, max=2.787ms, mean=1.169ms (build_cache_telemetry.cpp:246)
+2026-05-13 21:37:16.018 | info     |    BuildKernels | JIT telemetry [JitBuildState::build]: count=17, total=2836.402ms, min=1.253ms, max=654.709ms, mean=166.847ms (build_cache_telemetry.cpp:246)
+2026-05-13 21:37:16.018 | info     |    BuildKernels | JIT telemetry [jit_build]: count=5, total=977.939ms, min=1.272ms, max=494.107ms, mean=195.588ms (build_cache_telemetry.cpp:246)
+2026-05-13 21:37:16.043 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:490)
+2026-05-13 21:37:16.043 | info     |             UMD | Closing devices in cluster (cluster.cpp:961)
