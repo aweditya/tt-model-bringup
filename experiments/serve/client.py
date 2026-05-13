@@ -55,6 +55,22 @@ def cmd_shutdown(_):
     print(json.dumps(send("shutdown", {}), indent=2))
 
 
+def cmd_bench_decode(args):
+    payload = {"n_steps": args.n_steps, "warmup": args.warmup}
+    if args.prompt:
+        payload["prompt"] = args.prompt
+    data = send("bench_decode", payload)
+    print("=" * 72)
+    print(f"bench_decode prompt='{data.get('prompt')}' n_steps={data.get('n_steps')} "
+          f"warmup={data.get('warmup')}")
+    print(f"  median: {data.get('median_ms', 0):.2f} ms/tok  ({data.get('tok_per_sec', 0):.2f} tok/s)")
+    print(f"  mean:   {data.get('mean_ms', 0):.2f} ms/tok")
+    print(f"  p95:    {data.get('p95_ms', 0):.2f} ms/tok")
+    print(f"  min:    {data.get('min_ms', 0):.2f} ms/tok")
+    print(f"  max:    {data.get('max_ms', 0):.2f} ms/tok")
+    print("=" * 72)
+
+
 def cmd_run_91r(args):
     layers = [int(x) for x in args.layers.split(",")] if args.layers else None
     payload = {}
@@ -90,6 +106,11 @@ def main():
     r.add_argument("--weight-dtype", type=str, default=None,
                    choices=["bf8", "bf16", "fp32"])
     r.set_defaults(fn=cmd_run_91r)
+    b = sub.add_parser("bench_decode")
+    b.add_argument("--prompt", type=str, default=None)
+    b.add_argument("--n-steps", type=int, default=20)
+    b.add_argument("--warmup", type=int, default=3)
+    b.set_defaults(fn=cmd_bench_decode)
     args = ap.parse_args()
     args.fn(args)
 

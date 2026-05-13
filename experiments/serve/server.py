@@ -344,6 +344,145 @@ def handle_run_91r(state: ServerState, args: dict) -> dict:
     return summary
 
 
+def handle_bench_decode(state: ServerState, args: dict) -> dict:
+    """Time N decode steps through all 64 layers + lm_head.
+
+    args:
+      prompt: str (default: "The capital of France is")
+      n_steps: int (default: 20)
+      warmup: int (default: 3)
+    Returns per-step timings + median/mean/p95 ms.
+
+    Uses sync-bounded host timing (synchronize_device before and after each
+    step). Matches the perf_baseline.py prefill_plus_one_decode pattern but
+    runs against resident weights — no 11-min reload between configs.
+    """
+    if state.mock:
+        return {"mock": True, "median_ms": 100.0, "mean_ms": 100.0, "p95_ms": 100.0,
+                "n_steps": args.get("n_steps", 20)}
+
+    import numpy as np
+    import torch
+    import ttnn
+    import statistics
+
+    prompt = args.get("prompt", "The capital of France is")
+    n_steps = int(args.get("n_steps", 20))
+    warmup = int(args.get("warmup", 3))
+
+    cfg = state.cfg
+    HIDDEN = cfg["hidden"]
+    NUM_LAYERS = state.num_layers
+    KEY_DIM = cfg["n_k_heads"] * cfg["k_dim"]
+    VAL_DIM = cfg["n_v_heads"] * cfg["v_dim"]
+    CONV_DIM = 2 * KEY_DIM + VAL_DIM
+    rotary_dim = int(cfg["head_dim"] * cfg["partial_rotary_factor"])
+    upload = state._91f.upload
+    device = state.device
+
+    # Fresh state — analogous to 91l's `fresh_state` pattern
+    n_dn = sum(1 for i in range(NUM_LAYERS) if i % 4 != 3)
+    n_attn = NUM_LAYERS - n_dn
+    ssm = [upload(np.zeros((cfg["n_v_heads"], cfg["k_dim"], cfg["v_dim"]),
+                            dtype=np.float32), device, dtype=ttnn.float32)
+           for _ in range(n_dn)]
+    cvs = [upload(np.zeros((CONV_DIM, cfg["conv_kernel"] - 1), dtype=np.float32),
+                    device, dtype=ttnn.float32) for _ in range(n_dn)]
+    kvc = []
+    kv_init = np.zeros((1, cfg["n_kv_heads"], MAX_POS, cfg["head_dim"]), dtype=np.float32)
+    for _ in range(n_attn):
+        kv_k = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
+                                device=device, layout=ttnn.TILE_LAYOUT)
+        kv_v = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
+                                device=device, layout=ttnn.TILE_LAYOUT)
+        kvc.append([kv_k, kv_v])
+
+    prompt_ids = state.tokenizer.encode(prompt)
+    embed_np = state.embed_np
+
+    def forward_token(token_id, cur_pos):
+        x_np = embed_np[token_id]
+        x_tt = upload(x_np.reshape(1, HIDDEN), device, dtype=ttnn.float32)
+        cos_tt = ttnn.slice(state.cos_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
+        sin_tt = ttnn.slice(state.sin_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
+        cur_pos_tt = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32), device=device)
+        dn_idx = 0
+        attn_idx = 0
+        for i in range(NUM_LAYERS):
+            layer_type, w_tt = state.layer_weights[i]
+            if layer_type == "linear_attention":
+                x_tt, ssm[dn_idx], cvs[dn_idx] = state._91f.deltanet_step_ondevice(
+                    x_tt, w_tt, ssm[dn_idx], cvs[dn_idx], cfg)
+                dn_idx += 1
+            else:
+                kv_k, kv_v = kvc[attn_idx]
+                x_tt, kv_k, kv_v = state._91f.gated_attn_step_ondevice(
+                    x_tt, w_tt, kv_k, kv_v, None, cur_pos_tt, cur_pos,
+                    cos_tt, sin_tt, cfg, device)
+                kvc[attn_idx] = [kv_k, kv_v]
+                attn_idx += 1
+            x_tt = state._91f.mlp_step_ondevice(x_tt, w_tt)
+        x_tt = ttnn.rms_norm(x_tt, weight=state.final_norm_tt, epsilon=1e-6)
+        logits_tt = ttnn.linear(x_tt, state.lm_head_tt, compute_kernel_config=state._91f.hifi4)
+        return logits_tt
+
+    # Prefill (untimed)
+    for pos, tid in enumerate(prompt_ids):
+        _ = forward_token(tid, pos)
+    ttnn.synchronize_device(device)
+
+    # The "decode step" we measure is one forward pass at pos=len(prompt_ids),
+    # using the last prompt token as input. Reset state between repeats so
+    # each measurement runs against IDENTICAL state (same as perf_baseline).
+    times_ms = []
+    for rep in range(warmup + n_steps):
+        # rebuild fresh state
+        for i in range(n_dn):
+            ssm[i] = upload(np.zeros((cfg["n_v_heads"], cfg["k_dim"], cfg["v_dim"]),
+                                      dtype=np.float32), device, dtype=ttnn.float32)
+            cvs[i] = upload(np.zeros((CONV_DIM, cfg["conv_kernel"] - 1), dtype=np.float32),
+                              device, dtype=ttnn.float32)
+        for i in range(n_attn):
+            kv_k = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
+                                    device=device, layout=ttnn.TILE_LAYOUT)
+            kv_v = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
+                                    device=device, layout=ttnn.TILE_LAYOUT)
+            kvc[i] = [kv_k, kv_v]
+        # warm prefill (untimed)
+        for pos, tid in enumerate(prompt_ids):
+            _ = forward_token(tid, pos)
+        ttnn.synchronize_device(device)
+        # timed step
+        ttnn.synchronize_device(device)
+        t0 = time.time()
+        _ = forward_token(prompt_ids[-1], len(prompt_ids))
+        ttnn.synchronize_device(device)
+        t1 = time.time()
+        if rep >= warmup:
+            times_ms.append((t1 - t0) * 1000)
+
+    times_ms.sort()
+    median = statistics.median(times_ms)
+    mean = statistics.mean(times_ms)
+    p95 = times_ms[int(len(times_ms) * 0.95) - 1] if len(times_ms) >= 5 else max(times_ms)
+
+    summary = {
+        "prompt": prompt,
+        "n_steps": n_steps,
+        "warmup": warmup,
+        "median_ms": median,
+        "mean_ms": mean,
+        "p95_ms": p95,
+        "min_ms": min(times_ms),
+        "max_ms": max(times_ms),
+        "tok_per_sec": 1000.0 / median,
+        "all_ms": times_ms,
+    }
+    state.last_run = {"cmd": "bench_decode", "median_ms": median,
+                      "tok_per_sec": 1000.0 / median, "ts": time.time()}
+    return summary
+
+
 def handle_shutdown(state: ServerState, args: dict) -> dict:
     return {"ok": True, "shutting_down": True}
 
@@ -353,6 +492,7 @@ HANDLERS = {
     "reload_kernels": handle_reload_kernels,
     "reset_state":    handle_reset_state,
     "run_91r":        handle_run_91r,
+    "bench_decode":   handle_bench_decode,
     "shutdown":       handle_shutdown,
 }
 

@@ -111,6 +111,16 @@ def load_layer_weights_all(layer_idx, layer_type):
                 [weights[k] for k in all_keys], axis=1).copy()
             for k in all_keys:
                 del weights[k]
+    # ATTN-fusion: full-attention layers also fuse q_proj (already q+gate),
+    # k_proj, v_proj into a single attn_qkv. Same dispatch-reduction
+    # principle. Saves 2 dispatches per gated_attn step (16 attn layers).
+    if layer_type == 'full_attention':
+        attn_keys = ('q_proj', 'k_proj', 'v_proj')
+        if all(k in weights for k in attn_keys):
+            weights['attn_qkv'] = np.concatenate(
+                [weights[k] for k in attn_keys], axis=1).copy()
+            for k in attn_keys:
+                del weights[k]
     return weights
 
 
@@ -261,17 +271,34 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     # 1) Pre-norm
     h_tt = ttnn.rms_norm(x_tt, weight=w_tt['input_layernorm'], epsilon=EPS)
 
-    # 2) Q+gate (packed), K, V projections
-    qg_tt = ttnn.linear(h_tt, w_tt['q_proj'], compute_kernel_config=hifi4)
-    qg_tt = ttnn.reshape(qg_tt, [N_Q, HEAD_DIM * 2])
-    q_tt = ttnn.slice(qg_tt, [0, 0], [N_Q, HEAD_DIM])
-    gate_tt = ttnn.slice(qg_tt, [0, HEAD_DIM], [N_Q, 2 * HEAD_DIM])
-
-    k_tt = ttnn.reshape(
-        ttnn.linear(h_tt, w_tt['k_proj'], compute_kernel_config=hifi4),
-        [N_KV, HEAD_DIM])
-    v_tt = ttnn.reshape(
-        ttnn.linear(h_tt, w_tt['v_proj'], compute_kernel_config=hifi4),
+    # 2) Q+gate+K+V fused projection (was 3 separate linears).
+    # Weight loader produces 'attn_qkv' = concat(q_proj | k_proj | v_proj)
+    # along output dim. q_proj already carries Q+gate (HEAD_DIM*2 cols).
+    # Layout: [0 .. 2*N_Q*HEAD_DIM)         = Q+gate
+    #         [2*N_Q*HEAD_DIM .. +N_KV*HEAD_DIM)  = K
+    #         [...                       .. +N_KV*HEAD_DIM)  = V
+    QG_DIM = 2 * N_Q * HEAD_DIM
+    KV_DIM = N_KV * HEAD_DIM
+    if 'attn_qkv' in w_tt:
+        all_tt = ttnn.linear(h_tt, w_tt['attn_qkv'], compute_kernel_config=hifi4)
+        qg_flat = ttnn.slice(all_tt, [0, 0],                 [1, QG_DIM])
+        k_flat  = ttnn.slice(all_tt, [0, QG_DIM],            [1, QG_DIM + KV_DIM])
+        v_flat  = ttnn.slice(all_tt, [0, QG_DIM + KV_DIM],   [1, QG_DIM + 2 * KV_DIM])
+        qg_tt = ttnn.reshape(qg_flat, [N_Q, HEAD_DIM * 2])
+        q_tt = ttnn.slice(qg_tt, [0, 0], [N_Q, HEAD_DIM])
+        gate_tt = ttnn.slice(qg_tt, [0, HEAD_DIM], [N_Q, 2 * HEAD_DIM])
+        k_tt = ttnn.reshape(k_flat, [N_KV, HEAD_DIM])
+        v_tt = ttnn.reshape(v_flat, [N_KV, HEAD_DIM])
+    else:
+        qg_tt = ttnn.linear(h_tt, w_tt['q_proj'], compute_kernel_config=hifi4)
+        qg_tt = ttnn.reshape(qg_tt, [N_Q, HEAD_DIM * 2])
+        q_tt = ttnn.slice(qg_tt, [0, 0], [N_Q, HEAD_DIM])
+        gate_tt = ttnn.slice(qg_tt, [0, HEAD_DIM], [N_Q, 2 * HEAD_DIM])
+        k_tt = ttnn.reshape(
+            ttnn.linear(h_tt, w_tt['k_proj'], compute_kernel_config=hifi4),
+            [N_KV, HEAD_DIM])
+        v_tt = ttnn.reshape(
+            ttnn.linear(h_tt, w_tt['v_proj'], compute_kernel_config=hifi4),
         [N_KV, HEAD_DIM])
 
     # B'9.5 fix: per-head Qwen3_5RMSNorm on Q and K BEFORE RoPE.
