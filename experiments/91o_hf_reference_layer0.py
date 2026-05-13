@@ -45,40 +45,76 @@ def main():
     # ----------------------------------------
     # Phase 1: Probe
     # ----------------------------------------
-    print("\n[1/4] Probing HF Qwen3-Next availability…")
+    print("\n[1/4] Probing HF model class for this config…")
+
+    # First: enumerate all qwen* modules in transformers.models
+    import transformers.models as tm
+    qwen_mods = sorted(n for n in dir(tm) if 'qwen' in n.lower())
+    print(f"  available qwen modules in transformers.models:")
+    for n in qwen_mods:
+        print(f"    {n}")
+
+    # Load the config FIRST to know which family we need
+    print("\n  loading config to identify model class…")
+    full_cfg_probe = AutoConfig.from_pretrained(MODEL_ID)
+    text_cfg_probe = getattr(full_cfg_probe, 'text_config', full_cfg_probe)
+    print(f"  full_cfg class: {type(full_cfg_probe).__name__}")
+    print(f"  text_cfg class: {type(text_cfg_probe).__name__}")
+    print(f"  text_cfg.model_type: {getattr(text_cfg_probe, 'model_type', '(absent)')}")
+    print(f"  text_cfg module: {type(text_cfg_probe).__module__}")
+    print(f"  full_cfg.architectures: {getattr(full_cfg_probe, 'architectures', None)}")
+
+    # The config's __module__ tells us where to look for the matching modeling code
+    config_module_path = type(text_cfg_probe).__module__
+    # e.g., transformers.models.qwen3_5.configuration_qwen3_5 → modeling_qwen3_5
+    modeling_module_path = config_module_path.replace('configuration_', 'modeling_')
+    print(f"  trying modeling module: {modeling_module_path}")
+
     try:
-        from transformers.models.qwen3_next import modeling_qwen3_next as mqn
+        import importlib
+        mqn = importlib.import_module(modeling_module_path)
+        print(f"  imported {mqn.__file__}")
     except ImportError as e:
         print(f"  ImportError: {e}")
-        print("  Available qwen3* in transformers.models:")
-        import transformers.models as tm
-        for n in sorted(dir(tm)):
-            if 'qwen' in n.lower():
-                print(f"    {n}")
-        sys.exit(1)
+        print("  Trying Qwen3-Next as fallback…")
+        from transformers.models.qwen3_next import modeling_qwen3_next as mqn
 
-    print(f"  module: {mqn.__file__}")
     classes_of_interest = sorted(c for c in dir(mqn)
                                   if 'Layer' in c or 'Model' in c or 'Rotary' in c
                                   or 'Attention' in c or 'RMSNorm' in c)
-    print(f"  relevant classes:")
+    print(f"\n  relevant classes in {mqn.__name__}:")
     for c in classes_of_interest:
         print(f"    {c}")
 
-    DecoderLayer = getattr(mqn, 'Qwen3NextDecoderLayer', None)
+    # Look for the DecoderLayer class
+    DecoderLayer = None
+    for name in ('Qwen3_5DecoderLayer', 'Qwen3_5MoeDecoderLayer', 'Qwen3NextDecoderLayer',
+                 'Qwen3DecoderLayer', 'Qwen2DecoderLayer'):
+        if hasattr(mqn, name):
+            DecoderLayer = getattr(mqn, name)
+            DecoderLayer_name = name
+            print(f"\n  using {name}")
+            break
     if DecoderLayer is None:
-        print("  Qwen3NextDecoderLayer not found")
-        sys.exit(1)
-    print(f"\n  Qwen3NextDecoderLayer.__init__: {inspect.signature(DecoderLayer.__init__)}")
-    print(f"  Qwen3NextDecoderLayer.forward:  {inspect.signature(DecoderLayer.forward)}")
+        # fallback: pick the first class with "DecoderLayer" in name
+        candidates = [c for c in classes_of_interest if 'DecoderLayer' in c]
+        if not candidates:
+            print("  no DecoderLayer class found in modeling module")
+            sys.exit(1)
+        DecoderLayer_name = candidates[0]
+        DecoderLayer = getattr(mqn, DecoderLayer_name)
+        print(f"\n  fallback: using {DecoderLayer_name}")
 
-    # Try to find a rotary embedding helper
-    RotaryEmb = getattr(mqn, 'Qwen3NextRotaryEmbedding', None)
-    if RotaryEmb is not None:
-        print(f"  Qwen3NextRotaryEmbedding.__init__: {inspect.signature(RotaryEmb.__init__)}")
-        print(f"  Qwen3NextRotaryEmbedding.forward:  {inspect.signature(RotaryEmb.forward)}")
-    else:
-        print("  Qwen3NextRotaryEmbedding NOT found — will need to construct cos/sin manually")
+    print(f"  {DecoderLayer_name}.__init__: {inspect.signature(DecoderLayer.__init__)}")
+    print(f"  {DecoderLayer_name}.forward:  {inspect.signature(DecoderLayer.forward)}")
+
+    # RotaryEmbedding
+    RotaryEmb = None
+    for name in ('Qwen3_5RotaryEmbedding', 'Qwen3NextRotaryEmbedding', 'Qwen3RotaryEmbedding'):
+        if hasattr(mqn, name):
+            RotaryEmb = getattr(mqn, name)
+            print(f"  using rotary: {name}")
+            break
 
     # ----------------------------------------
     # Phase 2: Load config + weights for layer 0

@@ -43,14 +43,13 @@ Sharding-strategy semantics (`memory_for_kernel_developers.md:268-270`, `ttnn/te
 | WIDTH_SHARDED | columns (last dim) | Wide matmul activations (column-tiled) |
 | BLOCK_SHARDED | 2D grid | Square matmul activations, conv, anywhere with 2D core-grid producers/consumers |
 
-Trade-offs summary:
+Trade-offs:
 
 | | INTERLEAVED DRAM | INTERLEAVED L1 | SHARDED L1 |
 |---|---|---|---|
-| Capacity | up to 32 GB (Blackhole, 8 ctrl × 4 GB) | ~96 MB total (64 Tensix × 1.5 MB) | same as L1 |
-| Bandwidth | DRAM controllers, contention possible | SRAM, contention across NoC | SRAM, locality wins |
-| Reader complexity | trivial (`TensorAccessor`) | trivial | shard-spec must line up with kernel work split |
-| NoC traffic | every tile fetch traverses NoC | fewer hops | minimal — producer/consumer co-located |
+| Capacity | ~32 GB (Blackhole, 8×4 GB) | ~195 MB total (130 Tensix × 1.5 MB) | same as L1 |
+| Bandwidth | DRAM ctrl, NoC contention | SRAM, fewer hops | SRAM, producer/consumer co-located |
+| Setup cost | none (default) | none | shard-spec must align with kernel work split |
 
 ---
 
@@ -95,26 +94,18 @@ Rule 3 is the binding constraint for our 27B model — see §3.
 
 ## 3. DRAM vs L1 buffers
 
-Capacity numbers come straight from the doc (`memory_for_kernel_developers.md:52`):
+L1 = 1.5 MB per Tensix tile on Wormhole/Blackhole (`dram_loopback.md:51`, `memory_for_kernel_developers.md:52`). Blackhole p150: 8 DRAM controllers × 4 GB, 130 Tensix tiles. Lock-step allocation means every L1 alloc is mirrored across all banks (some waste; `memory_for_kernel_developers.md:151-162`).
 
-> Each Tensix tile contains **1.5MB of SRAM**.
-
-And (`dram_loopback.md:51`):
-
-> Each generation of Tenstorrent processors has a different amount of L1 memory per Tensix. Grayskull had 1MB and **Wormhole/Blackhole has 1.5MB**.
-
-Blackhole p150 has 8 DRAM controllers × 4 GB and 130 Tensix tiles (per metalium doc, lines 153). With lock-step allocation you can address all of DRAM under one virtual pointer, but every L1 allocation is replicated across all banks (lines 151-162 — *"if the allocation size is not evenly divisible by the number of controllers, some banks will contain unused space"*).
-
-Practical "where do I put it" matrix:
+Where things go:
 
 | Tensor | Where | Why |
 |---|---|---|
-| Weights, KV cache, activations between layers | DRAM, INTERLEAVED | Too big for L1; only touched once per token |
-| Reused matmul operands (LLM attention K, V slices read every step) | L1, SHARDED | NoC bandwidth dominates dispatch |
-| Compute intermediates inside a kernel | L1 via CB | Producer/consumer co-located on same core |
+| Weights, KV cache, inter-layer activations | DRAM, INTERLEAVED | Too big for L1, touched once per token |
+| Reused matmul operands (sharded SDPA inputs) | L1, SHARDED | NoC bandwidth dominates dispatch |
+| Compute intermediates inside a kernel | L1 via CB | Producer/consumer co-located |
 | Anything > ~1 MB per core | DRAM | L1 won't hold it |
 
-For Qwen3.6-27B at our shape `[B=1, num_kv_heads=4, max_seq=32768, head_dim=128]` in bf16 that's `4 * 32768 * 128 * 2 = 32 MiB` per layer per K-or-V. Even sharded over all 130 Tensix cores that's ~250 KB/core — feasible, but eats half of L1 just to hold the cache, leaving nothing for CBs. **The whole KV cache must live in DRAM.** This matches every reference model: `tt_transformers/tt/attention.py:428` builds it with `memory_config=ttnn.DRAM_MEMORY_CONFIG`.
+For Qwen3.6-27B at `[B=1, n_kv_heads=4, max_seq=32768, head_dim=128]` bf16, each K or V is `4 * 32768 * 128 * 2 = 32 MiB` per layer. Even sharded over all 130 Tensix cores that's ~250 KB/core — feasible but eats most of L1, leaving nothing for CBs. **KV cache must live in DRAM.** Matches `tt_transformers/tt/attention.py:428` which uses `memory_config=ttnn.DRAM_MEMORY_CONFIG`.
 
 ---
 
@@ -168,9 +159,9 @@ Best characterization: a Blackhole-specific NoC/semaphore deadlock in `paged_upd
 
 ## 7. Recommendation for our KV-cache scatter
 
-Cache shape: `[B=1, n_kv_heads=4, max_seq=32768, head_dim=128]`, bf16 or bf8_b, TILE_LAYOUT. ~32 MiB per K/V per layer — must be DRAM. Single token write per decode step.
+Cache shape: `[B=1, n_kv_heads=4, max_seq=32768, head_dim=128]`, bf16/bf8_b, TILE_LAYOUT. ~32 MiB per K/V per layer — DRAM-only. Single token write per decode step.
 
-**Use this exact memory config for the KV cache:**
+**Cache memory_config:**
 
 ```python
 ttnn.DRAM_MEMORY_CONFIG
@@ -179,11 +170,11 @@ ttnn.DRAM_MEMORY_CONFIG
 
 Rationale:
 
-1. **Sidesteps #16674.** The hang is correlated with the sharded-input → interleaved-cache writer path. Holding the cache as DRAM-INTERLEAVED and feeding the writer from an **INTERLEAVED** input keeps us on the same path that `ttnn.kv_cache.update_cache_for_token_` exercises today (see `grok_attention.py:225-226` and `tt_transformers/tt/attention.py:428`). That path is the production-stable one across the codebase.
-2. **Maximizes Blackhole DRAM bandwidth.** Round-robin across all 8 controllers (vs 6 on Wormhole) gives ~8× the per-controller bandwidth we'd see with sharded-DRAM (which the metalium doc explicitly flags as *"rarely used due to limited DRAM vs NoC bandwidth"*, line 299).
-3. **Fits trace capture.** No layout transitions during the autoregressive loop. `override_runtime_arguments` patches the in-tile byte offset on every step without recompile.
-4. **Matches every reference KV cache we read.** `tt_transformers/tt/attention.py:422-437` constructs `self.layer_past` with `memory_config=ttnn.DRAM_MEMORY_CONFIG`. Don't deviate without a measured reason.
+1. **Sidesteps #16674.** Hang is correlated with the sharded-input → interleaved-cache writer path. Keeping cache=INTERLEAVED + feeding the writer from an INTERLEAVED input keeps us on the path `ttnn.kv_cache.update_cache_for_token_` exercises today (`grok_attention.py:225-226`).
+2. **Maximizes Blackhole DRAM bandwidth.** Round-robin across all 8 controllers. Sharded-DRAM is *"rarely used due to limited DRAM vs NoC bandwidth"* (`memory_for_kernel_developers.md:299`).
+3. **Fits trace capture.** No layout transitions in the autoregressive loop. `override_runtime_arguments` patches the in-tile byte offset every step, no recompile.
+4. **Matches every reference KV cache.** `tt_transformers/tt/attention.py:428` uses exactly this. Don't deviate without a measured reason.
 
-**For the new-token input** to our custom scatter, the safe starting point is also INTERLEAVED (DRAM or L1 — L1 if the producer matmul can put its output there cheaply). Only move to a sharded input if we hit a clear dispatch bottleneck and have a fix in mind for #16674's class of failure. Phase 0 is one Wbytes write per step — the writer is not the hot path; the *reader* (untilizing a 32-row stripe of cache) is.
+**New-token input** to our custom scatter: also INTERLEAVED to start (DRAM or L1 — L1 if the producer matmul can place output there cheaply). Move to sharded only if dispatch becomes the bottleneck *and* we have a workaround for #16674's class of failure. The hot path here is the reader untilizing a 32-row cache stripe, not the writer's one-row scatter.
 
-If we later want to mirror `paged_update_cache`'s sharded-input ergonomics, do it **outside** the paged op (i.e., in our own program factory where we control the writer's core-grid + semaphore setup) so #16674's exact failure pattern can't reproduce.
+If we later need sharded-input ergonomics, build it in our own program factory (controlled writer core-grid + semaphore init) — not by reusing `paged_update_cache`'s code path.
