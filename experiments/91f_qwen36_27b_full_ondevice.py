@@ -314,33 +314,27 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     # different cos shape rejections. Doc is sparse, source-of-truth is C++. Win was
     # ~3-5 ms/tok; cost to integrate exceeds the budget. Keeping manual rotate-half;
     # this path is correct, fast enough, and trace-friendly with a small refactor in C'4.
+    # V2 rotate-only RoPE (supersedes V1 Level 1). Math bit-identical
+    # (max|Δ|=0 vs V1 in attn_step_rope_swap_probe.py) but 8.7% faster
+    # at full gated_attn_step level — mul/add ops touch ROTARY_DIM=64
+    # instead of full HEAD_DIM=256. Saves ~2.2 ms/tok at 16 attn layers.
+    if int(cos_tt.shape[-1]) == HEAD_DIM:
+        cos_rot_lifted = ttnn.slice(cos_tt, [0, 0], [1, ROTARY_DIM])
+        sin_rot_lifted = ttnn.slice(sin_tt, [0, 0], [1, ROTARY_DIM])
+    else:
+        cos_rot_lifted = cos_tt
+        sin_rot_lifted = sin_tt
+
     def apply_partial_rope(t, n_heads):
-        # Level 1: if cos_tt/sin_tt are EXTENDED rows ([1, HEAD_DIM] with
-        # passthrough region = 1 for cos, 0 for sin), use the no-slice-of-q
-        # formula: q' = q * cos_ext + rotate_half_partial(q) * sin_ext.
-        # Math-identical (validated bit-exact in partial_rope_level1_probe.py).
-        # Falls back to rotary-only path if cos/sin are [1, ROTARY_DIM].
         half = ROTARY_DIM // 2
-        if int(cos_tt.shape[-1]) == HEAD_DIM:
-            x1 = ttnn.slice(t, [0, 0], [n_heads, half])
-            x2 = ttnn.slice(t, [0, half], [n_heads, ROTARY_DIM])
-            passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
-            neg_x2 = ttnn.neg(x2)
-            rotated_full = ttnn.concat([neg_x2, x1, passthru], dim=-1)
-            # cos_tt / sin_tt are already [1, HEAD_DIM] from the slice; the
-            # earlier reshape tripped a TILE-padded volume check. Broadcast
-            # mul directly works.
-            return ttnn.add(ttnn.mul(t, cos_tt), ttnn.mul(rotated_full, sin_tt))
-        # Rotary-only fallback (C'0.6 path)
         rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
         passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
         x1 = ttnn.slice(rot, [0, 0], [n_heads, half])
         x2 = ttnn.slice(rot, [0, half], [n_heads, ROTARY_DIM])
         neg_x2 = ttnn.neg(x2)
         rotated_half = ttnn.concat([neg_x2, x1], dim=-1)
-        cos_b = ttnn.reshape(cos_tt, [1, ROTARY_DIM])
-        sin_b = ttnn.reshape(sin_tt, [1, ROTARY_DIM])
-        rotated = ttnn.add(ttnn.mul(rot, cos_b), ttnn.mul(rotated_half, sin_b))
+        rotated = ttnn.add(ttnn.mul(rot, cos_rot_lifted),
+                           ttnn.mul(rotated_half, sin_rot_lifted))
         return ttnn.concat([rotated, passthru], dim=-1)
 
     q_tt = apply_partial_rope(q_tt, N_Q)
@@ -431,25 +425,24 @@ def gated_attn_step_ondevice_paged(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     q_tt = ttnn.rms_norm(q_tt, weight=w_tt['q_norm'], epsilon=EPS)
     k_tt = ttnn.rms_norm(k_tt, weight=w_tt['k_norm'], epsilon=EPS)
 
-    # Partial RoPE (Level 1 — same as non-paged path)
-    half = ROTARY_DIM // 2
+    # Partial RoPE V2 rotate-only (supersedes V1 Level 1, math bit-identical)
+    if int(cos_tt.shape[-1]) == HEAD_DIM:
+        cos_rot_lifted = ttnn.slice(cos_tt, [0, 0], [1, ROTARY_DIM])
+        sin_rot_lifted = ttnn.slice(sin_tt, [0, 0], [1, ROTARY_DIM])
+    else:
+        cos_rot_lifted = cos_tt
+        sin_rot_lifted = sin_tt
+
     def apply_partial_rope(t, n_heads):
-        if int(cos_tt.shape[-1]) == HEAD_DIM:
-            x1 = ttnn.slice(t, [0, 0], [n_heads, half])
-            x2 = ttnn.slice(t, [0, half], [n_heads, ROTARY_DIM])
-            passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
-            neg_x2 = ttnn.neg(x2)
-            rotated_full = ttnn.concat([neg_x2, x1, passthru], dim=-1)
-            return ttnn.add(ttnn.mul(t, cos_tt), ttnn.mul(rotated_full, sin_tt))
+        half = ROTARY_DIM // 2
         rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
         passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
         x1 = ttnn.slice(rot, [0, 0], [n_heads, half])
         x2 = ttnn.slice(rot, [0, half], [n_heads, ROTARY_DIM])
         neg_x2 = ttnn.neg(x2)
         rotated_half = ttnn.concat([neg_x2, x1], dim=-1)
-        cos_b = ttnn.reshape(cos_tt, [1, ROTARY_DIM])
-        sin_b = ttnn.reshape(sin_tt, [1, ROTARY_DIM])
-        rotated = ttnn.add(ttnn.mul(rot, cos_b), ttnn.mul(rotated_half, sin_b))
+        rotated = ttnn.add(ttnn.mul(rot, cos_rot_lifted),
+                           ttnn.mul(rotated_half, sin_rot_lifted))
         return ttnn.concat([rotated, passthru], dim=-1)
 
     q_tt = apply_partial_rope(q_tt, N_Q)
@@ -574,33 +567,24 @@ def gated_attn_step_ondevice_traced(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     q_tt = ttnn.rms_norm(q_tt, weight=w_tt['q_norm'], epsilon=EPS)
     k_tt = ttnn.rms_norm(k_tt, weight=w_tt['k_norm'], epsilon=EPS)
 
+    # V2 rotate-only RoPE (traced variant — same as eager). Math bit-identical.
+    if int(cos_tt.shape[-1]) == HEAD_DIM:
+        cos_rot_lifted = ttnn.slice(cos_tt, [0, 0], [1, ROTARY_DIM])
+        sin_rot_lifted = ttnn.slice(sin_tt, [0, 0], [1, ROTARY_DIM])
+    else:
+        cos_rot_lifted = cos_tt
+        sin_rot_lifted = sin_tt
+
     def apply_partial_rope(t, n_heads):
-        # Level 1: if cos_tt/sin_tt are EXTENDED rows ([1, HEAD_DIM] with
-        # passthrough region = 1 for cos, 0 for sin), use the no-slice-of-q
-        # formula: q' = q * cos_ext + rotate_half_partial(q) * sin_ext.
-        # Math-identical (validated bit-exact in partial_rope_level1_probe.py).
-        # Falls back to rotary-only path if cos/sin are [1, ROTARY_DIM].
         half = ROTARY_DIM // 2
-        if int(cos_tt.shape[-1]) == HEAD_DIM:
-            x1 = ttnn.slice(t, [0, 0], [n_heads, half])
-            x2 = ttnn.slice(t, [0, half], [n_heads, ROTARY_DIM])
-            passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
-            neg_x2 = ttnn.neg(x2)
-            rotated_full = ttnn.concat([neg_x2, x1, passthru], dim=-1)
-            # cos_tt / sin_tt are already [1, HEAD_DIM] from the slice; the
-            # earlier reshape tripped a TILE-padded volume check. Broadcast
-            # mul directly works.
-            return ttnn.add(ttnn.mul(t, cos_tt), ttnn.mul(rotated_full, sin_tt))
-        # Rotary-only fallback (C'0.6 path)
         rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
         passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
         x1 = ttnn.slice(rot, [0, 0], [n_heads, half])
         x2 = ttnn.slice(rot, [0, half], [n_heads, ROTARY_DIM])
         neg_x2 = ttnn.neg(x2)
         rotated_half = ttnn.concat([neg_x2, x1], dim=-1)
-        cos_b = ttnn.reshape(cos_tt, [1, ROTARY_DIM])
-        sin_b = ttnn.reshape(sin_tt, [1, ROTARY_DIM])
-        rotated = ttnn.add(ttnn.mul(rot, cos_b), ttnn.mul(rotated_half, sin_b))
+        rotated = ttnn.add(ttnn.mul(rot, cos_rot_lifted),
+                           ttnn.mul(rotated_half, sin_rot_lifted))
         return ttnn.concat([rotated, passthru], dim=-1)
 
     q_tt = apply_partial_rope(q_tt, N_Q)
