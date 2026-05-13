@@ -574,6 +574,11 @@ def _setup_traced_decode(state: ServerState) -> None:
         dtype=ttnn.int32, device=device, layout=ttnn.TILE_LAYOUT)
 
     # Capture trace using traced kernels (state-committing variants from 91f).
+    # CRITICAL: synchronize_device flushes any pending host-to-device writes from
+    # the upload() / ttnn.from_torch calls above. Without this, the trace capture
+    # would catch a pending host write mid-capture and fail with
+    # "TT_FATAL: Writes are not supported during trace capture".
+    ttnn.synchronize_device(device)
     tid = ttnn.begin_trace_capture(device, cq_id=0)
     x_tt = embed_buf
     dn_idx = 0
