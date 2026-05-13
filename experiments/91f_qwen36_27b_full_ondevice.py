@@ -327,9 +327,10 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
             passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
             neg_x2 = ttnn.neg(x2)
             rotated_full = ttnn.concat([neg_x2, x1, passthru], dim=-1)
-            cos_b = ttnn.reshape(cos_tt, [1, HEAD_DIM])
-            sin_b = ttnn.reshape(sin_tt, [1, HEAD_DIM])
-            return ttnn.add(ttnn.mul(t, cos_b), ttnn.mul(rotated_full, sin_b))
+            # cos_tt / sin_tt are already [1, HEAD_DIM] from the slice; the
+            # earlier reshape tripped a TILE-padded volume check. Broadcast
+            # mul directly works.
+            return ttnn.add(ttnn.mul(t, cos_tt), ttnn.mul(rotated_full, sin_tt))
         # Rotary-only fallback (C'0.6 path)
         rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
         passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
@@ -440,9 +441,10 @@ def gated_attn_step_ondevice_traced(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
             passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
             neg_x2 = ttnn.neg(x2)
             rotated_full = ttnn.concat([neg_x2, x1, passthru], dim=-1)
-            cos_b = ttnn.reshape(cos_tt, [1, HEAD_DIM])
-            sin_b = ttnn.reshape(sin_tt, [1, HEAD_DIM])
-            return ttnn.add(ttnn.mul(t, cos_b), ttnn.mul(rotated_full, sin_b))
+            # cos_tt / sin_tt are already [1, HEAD_DIM] from the slice; the
+            # earlier reshape tripped a TILE-padded volume check. Broadcast
+            # mul directly works.
+            return ttnn.add(ttnn.mul(t, cos_tt), ttnn.mul(rotated_full, sin_tt))
         # Rotary-only fallback (C'0.6 path)
         rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
         passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
