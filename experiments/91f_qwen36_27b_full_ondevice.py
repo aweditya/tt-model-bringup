@@ -99,6 +99,18 @@ def load_layer_weights_all(layer_idx, layer_type):
                 if key in RMSNORM_1PLUS_W_KEYS:
                     t = t + 1.0
                 weights[key] = t.copy()
+
+    # DN-fusion: concat in_proj_{qkv,z,a,b} along output dim. The forward path
+    # then does ONE matmul + four view-only slices instead of four dispatches.
+    # Math-identical (validated in dn_fusion_isolation_probe.py); pure
+    # dispatch-overhead optimization for eager mode.
+    if layer_type == 'linear_attention':
+        all_keys = ('in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b')
+        if all(k in weights for k in all_keys):
+            weights['in_proj_all'] = np.concatenate(
+                [weights[k] for k in all_keys], axis=1).copy()
+            for k in all_keys:
+                del weights[k]
     return weights
 
 
@@ -132,10 +144,24 @@ def deltanet_step_ondevice(x_tt, w_tt, ssm_state_tt, conv_state_tt, cfg):
     N_REP = N_V_HEADS // N_K_HEADS
 
     h_tt = ttnn.rms_norm(x_tt, weight=w_tt['input_layernorm'], epsilon=EPS)
-    mixed_qkv = ttnn.linear(h_tt, w_tt['in_proj_qkv'], compute_kernel_config=hifi4)
-    z_tt     = ttnn.linear(h_tt, w_tt['in_proj_z'], compute_kernel_config=hifi4)
-    a_tt     = ttnn.linear(h_tt, w_tt['in_proj_a'], compute_kernel_config=hifi4)
-    b_tt     = ttnn.linear(h_tt, w_tt['in_proj_b'], compute_kernel_config=hifi4)
+    # DN-fusion: 4 input projections fused into one. The weight loader
+    # produces 'in_proj_all' (concat of qkv|z|a|b along output dim). One
+    # ttnn.linear + four view-only slices replaces four separate dispatches.
+    # Backwards-compatible: if 'in_proj_all' isn't present, fall through to
+    # the per-projection path. Validated math-identical in
+    # experiments/utils/dn_fusion_isolation_probe.py.
+    if 'in_proj_all' in w_tt:
+        all_tt = ttnn.linear(h_tt, w_tt['in_proj_all'], compute_kernel_config=hifi4)
+        mixed_qkv = ttnn.slice(all_tt, [0, 0],                       [1, CONV_DIM])
+        z_tt      = ttnn.slice(all_tt, [0, CONV_DIM],                [1, CONV_DIM + VAL_DIM])
+        a_tt      = ttnn.slice(all_tt, [0, CONV_DIM + VAL_DIM],      [1, CONV_DIM + VAL_DIM + N_V_HEADS])
+        b_tt      = ttnn.slice(all_tt, [0, CONV_DIM + VAL_DIM + N_V_HEADS],
+                                       [1, CONV_DIM + VAL_DIM + 2 * N_V_HEADS])
+    else:
+        mixed_qkv = ttnn.linear(h_tt, w_tt['in_proj_qkv'], compute_kernel_config=hifi4)
+        z_tt     = ttnn.linear(h_tt, w_tt['in_proj_z'], compute_kernel_config=hifi4)
+        a_tt     = ttnn.linear(h_tt, w_tt['in_proj_a'], compute_kernel_config=hifi4)
+        b_tt     = ttnn.linear(h_tt, w_tt['in_proj_b'], compute_kernel_config=hifi4)
 
     mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM, 1])
     conv_input = ttnn.concat([conv_state_tt, mixed_col], dim=-1)
