@@ -346,19 +346,15 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     q_tt = apply_partial_rope(q_tt, N_Q)
     k_tt = apply_partial_rope(k_tt, N_KV)
 
-    # C'1: KV cache slot write via on-device ttnn.scatter.
-    # Cache shape [1, N_KV, MAX_POS, HEAD_DIM]; write k_tt, v_tt at cur_pos along dim=2.
-    # Replaces the prior numpy roundtrip (6× to_torch/from_torch per layer per token).
-    # ttnn.scatter refuses fp32+TILE source ("Scatter doesn't work for fp32 tiled tensors
-    # yet"). Cache is bf16, so cast K/V to bf16 before scatter — net precision matches the
-    # prior numpy version (which also downcast on cache write).
+    # C'1 → C'1+: KV cache slot write via ttnn.kv_cache.update_cache_for_token_.
+    # Validated 7.2× faster than ttnn.scatter at production shape (0.019 vs 0.137 ms)
+    # per experiments/utils/update_cache_probe.py on qb2. In-place mutation; no need
+    # to reassign the cache reference. Per-token saving: ~3.78 ms (32 writes/tok).
+    # INTERLEAVED memory config (the default) sidesteps Blackhole hang #16674.
     k_for_cache = ttnn.typecast(ttnn.reshape(k_tt, [1, N_KV, 1, HEAD_DIM]), ttnn.bfloat16)
     v_for_cache = ttnn.typecast(ttnn.reshape(v_tt, [1, N_KV, 1, HEAD_DIM]), ttnn.bfloat16)
-    index_np = np.full((1, N_KV, 1, HEAD_DIM), cur_pos, dtype=np.int32)
-    index_tt = ttnn.from_torch(torch.from_numpy(index_np), dtype=ttnn.int32,
-                                device=device, layout=ttnn.TILE_LAYOUT)
-    kv_cache_k_tt = ttnn.scatter(kv_cache_k_tt, dim=2, index=index_tt, src=k_for_cache)
-    kv_cache_v_tt = ttnn.scatter(kv_cache_v_tt, dim=2, index=index_tt, src=v_for_cache)
+    ttnn.kv_cache.update_cache_for_token_(kv_cache_k_tt, k_for_cache, cur_pos)
+    ttnn.kv_cache.update_cache_for_token_(kv_cache_v_tt, v_for_cache, cur_pos)
 
     # 5) SDPA decode on device. SDPA wants Q in same dtype as KV cache (bf16);
     # downcast Q for the call, then promote the result back to whatever dtype
