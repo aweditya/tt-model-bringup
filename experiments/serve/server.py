@@ -325,20 +325,48 @@ def handle_run_91r(state: ServerState, args: dict) -> dict:
                 ttnn.synchronize_device(device)
                 outputs.append(ttnn.to_torch(x_tt).float().cpu().numpy().flatten()[:HIDDEN])
         else:
-            kv_init = np.zeros((1, cfg["n_kv_heads"], MAX_POS, cfg["head_dim"]), dtype=np.float32)
-            kv_k = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
-                                    device=device, layout=ttnn.TILE_LAYOUT)
-            kv_v = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
-                                    device=device, layout=ttnn.TILE_LAYOUT)
+            # PAGED path: only used when args["paged"] is true. Cache shape is
+            # [max_num_blocks, N_KV, BLOCK_SIZE, HEAD_DIM] and the layer takes a
+            # page_table_tt argument. Validates that the paged eager kernel
+            # produces the same cosine-vs-HF as the non-paged path.
+            use_paged = bool(args.get("paged", False))
+            if use_paged:
+                BLOCK_SIZE = int(args.get("block_size", 64))
+                assert MAX_POS % BLOCK_SIZE == 0, (
+                    f"MAX_POS {MAX_POS} must be multiple of block_size {BLOCK_SIZE}")
+                max_num_blocks = MAX_POS // BLOCK_SIZE
+                paged_zero = np.zeros((max_num_blocks, cfg["n_kv_heads"],
+                                         BLOCK_SIZE, cfg["head_dim"]), dtype=np.float32)
+                kv_k = ttnn.from_torch(torch.from_numpy(paged_zero), dtype=ttnn.bfloat16,
+                                        device=device, layout=ttnn.TILE_LAYOUT,
+                                        memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                kv_v = ttnn.from_torch(torch.from_numpy(paged_zero), dtype=ttnn.bfloat16,
+                                        device=device, layout=ttnn.TILE_LAYOUT,
+                                        memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                page_table_np = np.arange(max_num_blocks, dtype=np.int32).reshape(1, max_num_blocks)
+                page_table_tt = ttnn.from_torch(torch.from_numpy(page_table_np),
+                                                  dtype=ttnn.int32, device=device,
+                                                  layout=ttnn.ROW_MAJOR_LAYOUT)
+            else:
+                kv_init = np.zeros((1, cfg["n_kv_heads"], MAX_POS, cfg["head_dim"]), dtype=np.float32)
+                kv_k = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
+                                        device=device, layout=ttnn.TILE_LAYOUT)
+                kv_v = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
+                                        device=device, layout=ttnn.TILE_LAYOUT)
             for pos in range(seq):
                 x_tt = upload(hf_in[pos].reshape(1, HIDDEN), device, dtype=ttnn.float32)
-                # Level 1 RoPE: pass extended row (head_dim wide); apply_partial_rope
-                # detects extended shape via cos_tt.shape[-1] == HEAD_DIM
                 cos_tt = ttnn.slice(state.cos_ext_table_tt, [pos, 0], [pos + 1, cfg["head_dim"]])
                 sin_tt = ttnn.slice(state.sin_ext_table_tt, [pos, 0], [pos + 1, cfg["head_dim"]])
-                cur_pos_tt = ttnn.from_torch(torch.tensor([pos], dtype=torch.int32), device=device)
-                x_tt, kv_k, kv_v = state._91f.gated_attn_step_ondevice(
-                    x_tt, w_tt, kv_k, kv_v, None, cur_pos_tt, pos, cos_tt, sin_tt, cfg, device)
+                if use_paged:
+                    cur_pos_tt = ttnn.from_torch(torch.tensor([pos], dtype=torch.int32),
+                                                   device=device, layout=ttnn.ROW_MAJOR_LAYOUT)
+                    x_tt = state._91f.gated_attn_step_ondevice_paged(
+                        x_tt, w_tt, kv_k, kv_v, page_table_tt, cur_pos_tt,
+                        cos_tt, sin_tt, cfg)
+                else:
+                    cur_pos_tt = ttnn.from_torch(torch.tensor([pos], dtype=torch.int32), device=device)
+                    x_tt, kv_k, kv_v = state._91f.gated_attn_step_ondevice(
+                        x_tt, w_tt, kv_k, kv_v, None, cur_pos_tt, pos, cos_tt, sin_tt, cfg, device)
                 x_tt = state._91f.mlp_step_ondevice(x_tt, w_tt)
                 ttnn.synchronize_device(device)
                 outputs.append(ttnn.to_torch(x_tt).float().cpu().numpy().flatten()[:HIDDEN])
