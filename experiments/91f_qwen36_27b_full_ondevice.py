@@ -315,9 +315,24 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     # ~3-5 ms/tok; cost to integrate exceeds the budget. Keeping manual rotate-half;
     # this path is correct, fast enough, and trace-friendly with a small refactor in C'4.
     def apply_partial_rope(t, n_heads):
+        # Level 1: if cos_tt/sin_tt are EXTENDED rows ([1, HEAD_DIM] with
+        # passthrough region = 1 for cos, 0 for sin), use the no-slice-of-q
+        # formula: q' = q * cos_ext + rotate_half_partial(q) * sin_ext.
+        # Math-identical (validated bit-exact in partial_rope_level1_probe.py).
+        # Falls back to rotary-only path if cos/sin are [1, ROTARY_DIM].
+        half = ROTARY_DIM // 2
+        if int(cos_tt.shape[-1]) == HEAD_DIM:
+            x1 = ttnn.slice(t, [0, 0], [n_heads, half])
+            x2 = ttnn.slice(t, [0, half], [n_heads, ROTARY_DIM])
+            passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
+            neg_x2 = ttnn.neg(x2)
+            rotated_full = ttnn.concat([neg_x2, x1, passthru], dim=-1)
+            cos_b = ttnn.reshape(cos_tt, [1, HEAD_DIM])
+            sin_b = ttnn.reshape(sin_tt, [1, HEAD_DIM])
+            return ttnn.add(ttnn.mul(t, cos_b), ttnn.mul(rotated_full, sin_b))
+        # Rotary-only fallback (C'0.6 path)
         rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
         passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
-        half = ROTARY_DIM // 2
         x1 = ttnn.slice(rot, [0, 0], [n_heads, half])
         x2 = ttnn.slice(rot, [0, half], [n_heads, ROTARY_DIM])
         neg_x2 = ttnn.neg(x2)
@@ -413,9 +428,24 @@ def gated_attn_step_ondevice_traced(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     k_tt = ttnn.rms_norm(k_tt, weight=w_tt['k_norm'], epsilon=EPS)
 
     def apply_partial_rope(t, n_heads):
+        # Level 1: if cos_tt/sin_tt are EXTENDED rows ([1, HEAD_DIM] with
+        # passthrough region = 1 for cos, 0 for sin), use the no-slice-of-q
+        # formula: q' = q * cos_ext + rotate_half_partial(q) * sin_ext.
+        # Math-identical (validated bit-exact in partial_rope_level1_probe.py).
+        # Falls back to rotary-only path if cos/sin are [1, ROTARY_DIM].
+        half = ROTARY_DIM // 2
+        if int(cos_tt.shape[-1]) == HEAD_DIM:
+            x1 = ttnn.slice(t, [0, 0], [n_heads, half])
+            x2 = ttnn.slice(t, [0, half], [n_heads, ROTARY_DIM])
+            passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
+            neg_x2 = ttnn.neg(x2)
+            rotated_full = ttnn.concat([neg_x2, x1, passthru], dim=-1)
+            cos_b = ttnn.reshape(cos_tt, [1, HEAD_DIM])
+            sin_b = ttnn.reshape(sin_tt, [1, HEAD_DIM])
+            return ttnn.add(ttnn.mul(t, cos_b), ttnn.mul(rotated_full, sin_b))
+        # Rotary-only fallback (C'0.6 path)
         rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
         passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
-        half = ROTARY_DIM // 2
         x1 = ttnn.slice(rot, [0, 0], [n_heads, half])
         x2 = ttnn.slice(rot, [0, half], [n_heads, ROTARY_DIM])
         neg_x2 = ttnn.neg(x2)

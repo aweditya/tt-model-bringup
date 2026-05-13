@@ -47,6 +47,11 @@ class ServerState:
         self.lm_head_tt = None
         self.cos_table_tt = None
         self.sin_table_tt = None
+        # Level 1 RoPE: extended cos/sin tables (passthrough region = 1/0).
+        # Lets apply_partial_rope use a no-slice-of-q formula, saving ~4 ops
+        # per attn step. Math-identical (validated bit-exact).
+        self.cos_ext_table_tt = None
+        self.sin_ext_table_tt = None
         self.tok = None
         self._91f = None                        # kernel module (re-importable)
         self._91l = None
@@ -160,6 +165,17 @@ def bootstrap(state: ServerState, mock: bool, device_id: int) -> None:
     sin_all = np.concatenate([np.sin(all_angles), np.sin(all_angles)], axis=-1).astype(np.float32)
     state.cos_table_tt = upload(cos_all, device, dtype=ttnn.float32)
     state.sin_table_tt = upload(sin_all, device, dtype=ttnn.float32)
+
+    # Level 1: extended cos/sin tables. Pad passthrough region with cos=1, sin=0
+    # so apply_partial_rope can use the no-slice-of-q formula.
+    head_dim = cfg["head_dim"]
+    pad_size = head_dim - rotary_dim
+    cos_ext_pad = np.ones((MAX_POS, pad_size), dtype=np.float32)
+    sin_ext_pad = np.zeros((MAX_POS, pad_size), dtype=np.float32)
+    cos_ext_all = np.concatenate([cos_all, cos_ext_pad], axis=-1).astype(np.float32)
+    sin_ext_all = np.concatenate([sin_all, sin_ext_pad], axis=-1).astype(np.float32)
+    state.cos_ext_table_tt = upload(cos_ext_all, device, dtype=ttnn.float32)
+    state.sin_ext_table_tt = upload(sin_ext_all, device, dtype=ttnn.float32)
 
     state.loaded = True
     print("[bootstrap] ready")
@@ -311,8 +327,10 @@ def handle_run_91r(state: ServerState, args: dict) -> dict:
                                     device=device, layout=ttnn.TILE_LAYOUT)
             for pos in range(seq):
                 x_tt = upload(hf_in[pos].reshape(1, HIDDEN), device, dtype=ttnn.float32)
-                cos_tt = ttnn.slice(state.cos_table_tt, [pos, 0], [pos + 1, rotary_dim])
-                sin_tt = ttnn.slice(state.sin_table_tt, [pos, 0], [pos + 1, rotary_dim])
+                # Level 1 RoPE: pass extended row (head_dim wide); apply_partial_rope
+                # detects extended shape via cos_tt.shape[-1] == HEAD_DIM
+                cos_tt = ttnn.slice(state.cos_ext_table_tt, [pos, 0], [pos + 1, cfg["head_dim"]])
+                sin_tt = ttnn.slice(state.sin_ext_table_tt, [pos, 0], [pos + 1, cfg["head_dim"]])
                 cur_pos_tt = ttnn.from_torch(torch.tensor([pos], dtype=torch.int32), device=device)
                 x_tt, kv_k, kv_v = state._91f.gated_attn_step_ondevice(
                     x_tt, w_tt, kv_k, kv_v, None, cur_pos_tt, pos, cos_tt, sin_tt, cfg, device)
@@ -413,8 +431,9 @@ def handle_bench_decode(state: ServerState, args: dict) -> dict:
     def forward_token(token_id, cur_pos):
         x_np = embed_np[token_id]
         x_tt = upload(x_np.reshape(1, HIDDEN), device, dtype=ttnn.float32)
-        cos_tt = ttnn.slice(state.cos_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
-        sin_tt = ttnn.slice(state.sin_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
+        # Level 1 RoPE: extended row (head_dim wide)
+        cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0], [cur_pos + 1, cfg["head_dim"]])
+        sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0], [cur_pos + 1, cfg["head_dim"]])
         cur_pos_tt = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32), device=device)
         dn_idx = 0
         attn_idx = 0
