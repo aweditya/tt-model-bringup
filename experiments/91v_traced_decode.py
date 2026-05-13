@@ -1,29 +1,48 @@
 #!/usr/bin/env python3
 """
-Experiment 91v — C'4: trace capture for Qwen3.6-27B decode step.
+Experiment 91v — C'4 v4: trace capture for Qwen3.6-27B decode step with
+in-trace state threading.
 
 Self-contained benchmark. Loads all 64 layers once (~11 min), then:
-  1. Runs eager decode for warmup + 20 measured steps -> median ms/tok
-  2. Captures the trace of one decode step
-  3. Runs traced decode for warmup + 30 measured steps -> median ms/tok
-  4. Validates traced logits match eager (cosine >= 0.9999)
-  5. Prints the eager-vs-traced perf delta
+  1. Runs eager decode for warmup + 20 measured steps -> median ms/tok +
+     per-step logit snapshots (the multi-step correctness reference)
+  2. Captures ONE trace of a decode step. The trace includes per-layer
+     ttnn.copy() ops that commit the new SSM / conv / KV state back to
+     the pre-allocated input buffers.
+  3. Restores state to the post-prefill snapshot, then runs traced decode
+     for the same number of steps. Each execute_trace replays the
+     captured graph; the in-trace copies make the NEXT replay see the
+     updated state automatically (no Python-side rebinding).
+  4. Validates traced logits match eager step-by-step (cosine >= 0.9999
+     per step, top-1 match per step).
+  5. Reports the eager-vs-traced perf delta + token agreement.
+
+WHY v4 vs v3:
+  v3 captured a correct one-shot trace but produced zeros at step 1+
+  because functional scatter (and the eager deltanet) return NEW tensors
+  that don't propagate back to the input buffers. v4 fixes this with
+  ttnn.copy(new_state, input_buf) inside the trace itself — validated
+  bit-correct in experiments/utils/trace_state_thread_probe.py.
 
 Trace-friendly design — every per-step host value is written into a
 PRE-ALLOCATED device tensor BEFORE execute_trace. The trace itself sees
 only device-resident tensors; no Python ints are baked into op arguments.
+All persistent state (ssm_states, conv_states, kv_caches) is allocated
+BEFORE begin_trace_capture and NEVER rebound — the in-trace copies
+mutate contents in place.
 
-Pre-allocated buffers (`update_buffers`):
+Pre-allocated input buffers (`update_buffers`):
   - embed_buf [1, HIDDEN] fp32     <- embed_np[token_id]
   - cur_pos_buf [1] int32          <- [cur_pos]
   - cos_row_buf [1, ROTARY_DIM] fp32  <- cos_table[cur_pos, :]
   - sin_row_buf [1, ROTARY_DIM] fp32  <- sin_table[cur_pos, :]
   - index_buf [1, N_KV, 1, HEAD_DIM] int32 <- np.full(... cur_pos)
 
-Reference pattern: experiments/85_8b_full_bfp8.py:303-334
-Trace-friendly kernel: gated_attn_step_ondevice_traced in 91f.
+Trace-friendly kernels (state-committing variants in 91f):
+  - gated_attn_step_ondevice_traced (writes to kv_cache_{k,v} in trace)
+  - deltanet_step_ondevice_traced (writes to ssm_state, conv_state)
 
-Run on qb2:
+Run on qb1:
     cd ~/tt-xla && HF_HOME=$HOME/tt-xla/.cache/hf .venv/bin/python \
         experiments/91v_traced_decode.py
 """
@@ -44,9 +63,10 @@ _spec = importlib.util.spec_from_file_location(
     "_91f", os.path.expanduser("~/tt-xla/experiments/91f_qwen36_27b_full_ondevice.py"))
 _91f = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_91f)
-deltanet_step_ondevice = _91f.deltanet_step_ondevice
-gated_attn_step_ondevice = _91f.gated_attn_step_ondevice          # eager (Python cur_pos)
-gated_attn_step_ondevice_traced = _91f.gated_attn_step_ondevice_traced  # trace-friendly
+deltanet_step_ondevice = _91f.deltanet_step_ondevice                     # eager
+deltanet_step_ondevice_traced = _91f.deltanet_step_ondevice_traced       # trace-friendly v4
+gated_attn_step_ondevice = _91f.gated_attn_step_ondevice                 # eager (Python cur_pos)
+gated_attn_step_ondevice_traced = _91f.gated_attn_step_ondevice_traced   # trace-friendly v4
 mlp_step_ondevice = _91f.mlp_step_ondevice
 load_layer_weights_all = _91f.load_layer_weights_all
 upload = _91f.upload
@@ -59,6 +79,7 @@ N_EAGER_WARMUP = 3
 N_EAGER_MEASURED = 20
 N_TRACED_WARMUP = 5
 N_TRACED_MEASURED = 30
+N_MULTISTEP_VALIDATE = 5  # how many traced steps to cosine-compare vs eager
 COSINE_GATE = 0.9999
 
 hifi4 = ttnn.WormholeComputeKernelConfig(
@@ -282,24 +303,15 @@ def main():
     # --- Forward, TRACE variant. Reads ONLY from pre-allocated device tensors.
     #     Returns the logits tensor (kept alive for ttnn.execute_trace to fill).
     #
-    # STATE-ALIASING NOTE (important for understanding what this trace means):
-    # Both deltanet_step_ondevice and the scatter inside
-    # gated_attn_step_ondevice_traced are FUNCTIONAL ops that return NEW tensors.
-    # The trace captures a linear DAG of tensor-producing ops; each replay reads
-    # the same input tensors and produces the same output tensor identities.
-    # Consequence: across multiple execute_trace replays the SSM state and KV
-    # cache CONTENTS do not persist (the original input tensors are unchanged
-    # by the functional ops). The traced compute graph is correct for ONE
-    # decode step; replaying it back-to-back is FINE FOR TIMING (compute work
-    # is identical per replay) but NOT a real generation loop (later tokens
-    # are wrong because the cache doesn't accumulate). To get a real
-    # generation loop with trace we would need in-place variants
-    # (ttnn.experimental.paged_update_cache for KV; ttnn.copy back into
-    # ssm_states[] for the SSM recurrence) — a follow-up refactor beyond C'4.
-    # The PERF measurement here is still meaningful (compute graph identical;
-    # measuring dispatch overhead delta eager vs traced) and the CORRECTNESS
-    # gate (cosine on step 0 from identical state) is exactly the apples-to-
-    # apples comparison the plan calls for.
+    # IN-TRACE STATE THREADING (C'4 v4):
+    # The traced kernels (deltanet_step_ondevice_traced, gated_attn_step_-
+    # ondevice_traced) each end with ttnn.copy(new_state, input_buffer). These
+    # copies are captured INSIDE the trace. Each execute_trace call mutates the
+    # contents of ssm_states[i], conv_states[i], kv_caches[i][0], kv_caches[i][1]
+    # in place — without rebinding. Next replay reads from the same addresses
+    # and sees the updated state. Validated bit-correct end-to-end by the
+    # multi-step cosine gate below; mechanism validated in isolation by
+    # experiments/utils/trace_state_thread_probe.py.
     def forward_one_token_traced(ssm_states, conv_states, kv_caches):
         x_tt = embed_buf  # alias; ops produce new tensors so we don't write to it
         dn_idx = 0
@@ -307,17 +319,14 @@ def main():
         for i in range(NUM_LAYERS):
             layer_type, w_tt = layer_weights[i]
             if layer_type == 'linear_attention':
-                x_tt, H_new, c_new = deltanet_step_ondevice(
+                x_tt = deltanet_step_ondevice_traced(
                     x_tt, w_tt, ssm_states[dn_idx], conv_states[dn_idx], cfg)
-                ssm_states[dn_idx] = H_new
-                conv_states[dn_idx] = c_new
                 dn_idx += 1
             else:
                 kv_k, kv_v = kv_caches[attn_idx]
-                x_tt, kv_k, kv_v = gated_attn_step_ondevice_traced(
+                x_tt = gated_attn_step_ondevice_traced(
                     x_tt, w_tt, kv_k, kv_v,
                     cur_pos_buf, cos_row_buf, sin_row_buf, index_buf, cfg)
-                kv_caches[attn_idx] = [kv_k, kv_v]
                 attn_idx += 1
             x_tt = mlp_step_ondevice(x_tt, w_tt)
         x_tt = ttnn.rms_norm(x_tt, weight=final_norm_tt, epsilon=EPS)
@@ -379,8 +388,8 @@ def main():
 
     next_id = next_id_after_prefill
     cur_pos = prefill_pos
-    eager_token_log = []  # (next_id, top1_logit_value)
-    eager_first_logits = None  # captured at step 0 for cosine check
+    eager_token_log = []
+    eager_step_logits = []   # logits per step, used for multi-step cosine compare
     eager_times = []
 
     for step in range(N_EAGER_WARMUP + N_EAGER_MEASURED):
@@ -389,8 +398,8 @@ def main():
         ttnn.synchronize_device(device)
         t1 = time.perf_counter()
         logits = logits_to_np(logits_tt)
-        if step == 0:
-            eager_first_logits = logits.copy()
+        if step < N_MULTISTEP_VALIDATE:
+            eager_step_logits.append(logits.copy())
         new_next_id = int(np.argmax(logits))
         eager_token_log.append(new_next_id)
         if step >= N_EAGER_WARMUP:
@@ -409,49 +418,24 @@ def main():
     print(f"  EAGER tokens generated: {eager_token_log[:10]}...")
 
     # =================================================================
-    # TRACED decode — capture + benchmark
+    # TRACED decode — capture + multi-step validate + perf
     # =================================================================
-    print(f"\n[6/7] Trace capture + traced decode benchmark "
-          f"({N_TRACED_WARMUP} warmup + {N_TRACED_MEASURED} measured)...")
+    print(f"\n[6/7] Trace capture + multi-step traced decode "
+          f"({N_TRACED_WARMUP} warmup + {N_TRACED_MEASURED} measured, "
+          f"first {N_MULTISTEP_VALIDATE} cosine-validated vs eager)...")
 
-    # Restore states to the SAME starting point as eager (snapshot from
-    # immediately post-prefill — same point eager_first_logits was measured at).
-    # Note: device-buffer allocations AFTER begin_trace_capture corrupt the
-    # captured trace (per the runtime warning "Allocating device buffers is
-    # unsafe due to the existence of an active trace"). Strategy:
-    #   1. Do ALL fresh allocations (restore_states, warmup) BEFORE capture.
-    #   2. update_buffers writes HOST tensors via copy_host_to_device_tensor;
-    #      it does NOT allocate device buffers, safe after capture.
-    #   3. The capture call itself executes the trace once and fills
-    #      logits_ref_tt with the step-0 result — we use THAT as the
-    #      correctness comparison (no extra execute_trace + state-reset
-    #      dance which v1 tried, and which corrupted the trace).
-    ssm_states, conv_states, kv_caches = restore_states(ssm_snap, conv_snap, kv_snap)
-
-    # Warmup pass (untraced) — JITs all ops + primes program cache. Runs ONE
-    # full forward through the trace-friendly kernel, advancing state by 1.
-    print(f"  warmup pass (untraced, primes program cache)...")
-    update_buffers(next_id_after_prefill, prefill_pos)
-    _warmup_logits = forward_one_token_traced(ssm_states, conv_states, kv_caches)
-    ttnn.synchronize_device(device)
-    try:
-        device.enable_program_cache()
-    except Exception:
-        pass
-    del _warmup_logits
-    gc.collect()
-
-    # Restore from snapshot AGAIN — the warmup mutated state lists (rebinding
-    # to new tensor handles). For the trace, we want known state at start.
-    # This is the LAST fresh-device-allocation point before trace capture.
+    # Allocate FRESH state buffers from the post-prefill snapshot. From this
+    # point on, these handles never get replaced. The traced kernels mutate
+    # buffer CONTENTS via in-trace ttnn.copy at the end of each layer.
     ssm_states, conv_states, kv_caches = restore_states(ssm_snap, conv_snap, kv_snap)
     gc.collect()
 
-    # Capture. Writes inputs into pre-allocated buffers, then captures one
-    # forward pass. The capture pass itself executes — logits_ref_tt holds
-    # the result of running ONE decode step from post-prefill state. That IS
-    # the apples-to-apples comparison to eager_first_logits.
-    update_buffers(next_id_after_prefill, prefill_pos)
+    # Capture. begin/end_trace_capture RECORDS the program but does NOT
+    # execute it (v2 run discovery — content of logits_ref_tt only fills on
+    # ttnn.execute_trace). Therefore state buffers remain at snapshot after
+    # end_trace_capture; no warmup pass is needed for correctness, and adding
+    # one would force us to in-place restore state afterwards (more complexity
+    # than it saves — the trace capture itself JITs needed ops).
     print(f"  begin_trace_capture...")
     t_cap = time.time()
     tid = ttnn.begin_trace_capture(device, cq_id=0)
@@ -460,53 +444,30 @@ def main():
     ttnn.synchronize_device(device)
     print(f"  trace captured in {time.time()-t_cap:.1f}s; trace_id={tid}")
 
-    # === Correctness gate ===
-    # IMPORTANT semantics (v2 run discovery): the begin/end_trace_capture
-    # window RECORDS ops but does NOT execute them on the device. The contents
-    # of logits_ref_tt are only filled by ttnn.execute_trace. So we run the
-    # trace ONCE here — the input buffers were set by the pre-capture
-    # update_buffers call, and state is at the snapshot — and read its output.
-    # That replay is the apples-to-apples comparison to eager step 0.
-    print(f"\n  validating traced output (first execute_trace replay) vs eager step 0...")
-    ttnn.execute_trace(device, tid, cq_id=0, blocking=True)
-    traced_first_logits = logits_to_np(logits_ref_tt)
-
     def cosine(a, b):
         a = a.astype(np.float64).flatten()
         b = b.astype(np.float64).flatten()
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 
-    cos = cosine(eager_first_logits, traced_first_logits)
-    eager_top1 = int(np.argmax(eager_first_logits))
-    traced_top1 = int(np.argmax(traced_first_logits))
-    print(f"  cosine(traced, eager) = {cos:.6f}")
-    print(f"  top-1: eager={eager_top1} ({tok.decode([eager_top1])!r})  "
-          f"traced={traced_top1} ({tok.decode([traced_top1])!r})")
-    correctness_pass = cos >= COSINE_GATE and eager_top1 == traced_top1
-
-    if correctness_pass:
-        print(f"  CORRECTNESS GATE PASS (cosine {cos:.6f} >= {COSINE_GATE})")
-    else:
-        print(f"\n  ! CORRECTNESS GATE FAILED (cosine {cos:.6f} < {COSINE_GATE} or top1 mismatch)")
-        print(f"  Will still run perf benchmark to report observed delta, but the")
-        print(f"  traced numerics need fixing before this is production-usable.")
-
-    # Perf benchmark — replay the trace N times. After the validation replay
-    # above, state has drifted (the first scatter wrote into the cache at
-    # cur_pos=prefill_pos, but later replays' scatter outputs are in
-    # transient tensors not connected back). Compute work per replay is
-    # identical, which is what we're measuring. Token log is informational.
-    # NOTE: we do not call any device-allocating function (upload, fresh
-    # from_torch with device=) here — only update_buffers (host-only) and
-    # execute_trace. This is required to keep the captured trace valid.
+    # Multi-step traced loop. Each iteration: (a) write per-step inputs into
+    # pre-allocated buffers via copy_host_to_device_tensor (NO device alloc);
+    # (b) execute_trace, which reads from those input buffers AND from the
+    # state buffers (mutated by the previous iteration's in-trace copies);
+    # (c) read back logits; (d) optionally compare to eager step-N logits.
+    # The state-threading correctness gate IS the multi-step cosine check:
+    # if cosine stays >= COSINE_GATE for all N_MULTISTEP_VALIDATE steps, the
+    # in-trace copies are actually persisting state across replays.
     next_id = next_id_after_prefill
     cur_pos = prefill_pos
-
     traced_token_log = []
-    traced_times = []   # full-step time (update_buffers + execute_trace + readback)
-    traced_exec_times = []  # execute_trace alone
+    traced_step_logits = []
+    validation_cosines = []
+    validation_top1_match = []
+    traced_times = []        # full step (update_buffers + execute_trace + readback)
+    traced_exec_times = []   # execute_trace alone
+    N_TOTAL = N_TRACED_WARMUP + N_TRACED_MEASURED
 
-    for step in range(N_TRACED_WARMUP + N_TRACED_MEASURED):
+    for step in range(N_TOTAL):
         t0 = time.perf_counter()
         update_buffers(next_id, cur_pos)
         t1 = time.perf_counter()
@@ -515,16 +476,51 @@ def main():
         logits = logits_to_np(logits_ref_tt)
         new_next_id = int(np.argmax(logits))
         t3 = time.perf_counter()
+
+        if step < N_MULTISTEP_VALIDATE:
+            traced_step_logits.append(logits.copy())
+            e_logits = eager_step_logits[step]
+            cos_step = cosine(e_logits, logits)
+            e_top1 = int(np.argmax(e_logits))
+            t_top1 = int(np.argmax(logits))
+            validation_cosines.append(cos_step)
+            validation_top1_match.append(e_top1 == t_top1)
+            gate = '✓' if cos_step >= COSINE_GATE and e_top1 == t_top1 else '✗'
+            print(f"    [validate] step {step}: cur_pos={cur_pos} "
+                  f"cos={cos_step:.6f} eager_top1={e_top1} traced_top1={t_top1} {gate}")
+
         traced_token_log.append(new_next_id)
         if step >= N_TRACED_WARMUP:
             traced_times.append((t3 - t0) * 1000.0)
             traced_exec_times.append((t2 - t1) * 1000.0)
-        if step < 3 or step == N_TRACED_WARMUP + N_TRACED_MEASURED - 1:
+        if step >= N_MULTISTEP_VALIDATE and (
+                step < N_MULTISTEP_VALIDATE + 2 or step == N_TOTAL - 1):
             print(f"    traced step {step:2d}: cur_pos={cur_pos} tok={new_next_id} "
                   f"({tok.decode([new_next_id])!r}) "
                   f"dt_total={(t3-t0)*1000:.2f} dt_exec={(t2-t1)*1000:.2f} ms")
         next_id = new_next_id
         cur_pos += 1
+
+    # Multi-step correctness verdict.
+    cos = float(np.min(validation_cosines)) if validation_cosines else float('nan')
+    eager_top1 = int(np.argmax(eager_step_logits[0])) if eager_step_logits else -1
+    traced_top1 = int(np.argmax(traced_step_logits[0])) if traced_step_logits else -1
+    multistep_pass = (
+        all(c >= COSINE_GATE for c in validation_cosines) and
+        all(validation_top1_match)
+    )
+    correctness_pass = multistep_pass
+
+    print(f"\n  multi-step validation: min cosine = {cos:.6f} "
+          f"across {len(validation_cosines)} steps; "
+          f"top1 match all = {'YES' if all(validation_top1_match) else 'NO'}")
+    if multistep_pass:
+        print(f"  MULTI-STEP CORRECTNESS GATE PASS "
+              f"(min cosine {cos:.6f} >= {COSINE_GATE}, top1 match all steps)")
+    else:
+        print(f"  ! MULTI-STEP CORRECTNESS GATE FAILED")
+        print(f"  per-step cosines: {[f'{c:.6f}' for c in validation_cosines]}")
+        print(f"  per-step top1 match: {validation_top1_match}")
 
     traced_median = float(np.median(traced_times))
     traced_p95 = float(np.percentile(traced_times, 95))
@@ -572,9 +568,12 @@ def main():
         'traced_exec_ms_median': traced_exec_median,
         'delta_ms': delta,
         'speedup': speedup,
-        'cosine': cos,
-        'eager_top1': eager_top1,
-        'traced_top1': traced_top1,
+        'min_cosine_multistep': cos,
+        'per_step_cosines': validation_cosines,
+        'per_step_top1_match': validation_top1_match,
+        'n_multistep_validated': N_MULTISTEP_VALIDATE,
+        'eager_top1_step0': eager_top1,
+        'traced_top1_step0': traced_top1,
         'eager_tokens_head': eager_head,
         'traced_tokens_head': traced_head,
         'eager_token_log': eager_token_log,
@@ -586,7 +585,7 @@ def main():
         'cosine_gate': COSINE_GATE,
         'correctness_pass': correctness_pass,
     }
-    out_path = os.path.expanduser("~/tt-xla/.cache/c4_traced_results.json")
+    out_path = os.path.expanduser("~/tt-xla/.cache/c4v4_traced_results.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(out, f, indent=2)

@@ -406,6 +406,14 @@ def mlp_step_ondevice(x_tt, w_tt):
 # port. If the original passes the cosine gate eager, this one must too.
 def gated_attn_step_ondevice_traced(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
                                      cur_pos_tt, cos_tt, sin_tt, index_tt, cfg):
+    # C'4 v4: save input cache references so we can commit new state back at the
+    # end via in-trace ttnn.copy. Validated in trace_state_thread_probe.py —
+    # ttnn.copy(new, original_buf) inside a trace correctly persists state
+    # across execute_trace calls. Caller pre-allocates kv_cache_{k,v}_tt and
+    # NEVER rebinds; this function mutates contents in place via the copy.
+    k_cache_in = kv_cache_k_tt
+    v_cache_in = kv_cache_v_tt
+
     N_Q = cfg['n_q_heads']
     N_KV = cfg['n_kv_heads']
     HEAD_DIM = cfg['head_dim']
@@ -479,7 +487,30 @@ def gated_attn_step_ondevice_traced(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
 
     attn_flat = ttnn.reshape(attn, [1, N_Q * HEAD_DIM])
     out = ttnn.linear(attn_flat, w_tt['o_proj'], compute_kernel_config=hifi4)
-    return ttnn.add(x_tt, out), kv_cache_k_tt, kv_cache_v_tt
+    # C'4 v4 state commit: write the post-scatter cache back to the input buffer.
+    # The scatter on kv_cache_{k,v}_tt above produced new tensors (functional);
+    # these copies are what makes the new state visible to the NEXT execute_trace
+    # call (which reads from k_cache_in / v_cache_in addresses).
+    ttnn.copy(kv_cache_k_tt, k_cache_in)
+    ttnn.copy(kv_cache_v_tt, v_cache_in)
+    return ttnn.add(x_tt, out)
+
+
+def deltanet_step_ondevice_traced(x_tt, w_tt, ssm_state_tt, conv_state_tt, cfg):
+    """C'4 v4 trace-friendly wrapper around deltanet_step_ondevice.
+
+    Same compute as the eager version, but the new SSM + conv state are
+    committed back to the input buffers via in-trace ttnn.copy at the end.
+    Caller pre-allocates ssm_state_tt and conv_state_tt and NEVER rebinds them;
+    each execute_trace updates contents in place via the copies.
+
+    Validated mechanism: trace_state_thread_probe.py.
+    """
+    x_out, H_new_3d, conv_state_new = deltanet_step_ondevice(
+        x_tt, w_tt, ssm_state_tt, conv_state_tt, cfg)
+    ttnn.copy(H_new_3d, ssm_state_tt)
+    ttnn.copy(conv_state_new, conv_state_tt)
+    return x_out
 
 
 def main():
