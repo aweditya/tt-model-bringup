@@ -288,7 +288,10 @@ def main():
     gl.add_argument("--dry-multiplier", type=float, default=0.0,
                      help="DRY sampler multiplier (llama.cpp PR #6839; default 0.0 = off; "
                           "try 0.5-1.5 — exponential penalty for any token extending a recent "
-                          "match beyond --dry-allowed-length; active at temperature=0)")
+                          "match beyond --dry-allowed-length; active at temperature=0. "
+                          "BEST drift-resistant combo measured on the Rust-parser prompt: "
+                          "--dry-multiplier 0.8 --repetition-penalty 1.1 (greedy, "
+                          "+57% coherent chars vs temp+top-p)")
     gl.add_argument("--dry-base", type=float, default=1.75,
                      help="DRY base (default 1.75 per llama.cpp); penalty = mult * base^(L-allowed)")
     gl.add_argument("--dry-allowed-length", type=int, default=2,
