@@ -1311,6 +1311,54 @@ def _sample_next_id(
     return int(rng.choice(len(probs), p=probs))
 
 
+def _encode_prompt(state: "ServerState", prompt: str, chat: bool, system: str = "") -> tuple[list[int], list[int]]:
+    """Encode prompt with optional chat-template wrapping.
+
+    Qwen3.6 is an instruct/thinking model. Without the <|im_start|>user...<|im_end|>
+    <|im_start|>assistant\n wrapper, the model has no anchor for "this is a turn"
+    and instead continues the document autoregressively — exactly the long-context
+    drift we observe. Canonical reference:
+      experiments/.refs/tt-metal/models/tt_transformers/tt/common.py:303
+      def encode_prompt_hf(tokenizer, prompt_text, system_prompt_text=None):
+          chat = []
+          if system_prompt_text:
+              chat.append({"role": "system", "content": system_prompt_text})
+          chat.append({"role": "user", "content": prompt_text})
+          return tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=True)
+
+    Returns (prompt_ids, stop_token_ids). stop_token_ids = [eos_id] for raw prompts,
+    [eos_id, im_end_id, endoftext_id] for chat prompts. Qwen3.6 tokenizer_config.json:
+      eos_token = <|im_end|> = 248046
+      <|endoftext|> = 248044
+    """
+    tok = state.tok
+    if chat:
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        # Some tokenizers (Qwen3.6) return a dict {input_ids, attention_mask};
+        # older / simpler ones return a flat list. Handle both.
+        out = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+        if isinstance(out, dict):
+            prompt_ids = out["input_ids"]
+        else:
+            prompt_ids = out
+    else:
+        prompt_ids = tok.encode(prompt)
+    # Build stop-token set. For instruct models the model may emit <|im_end|>,
+    # <|endoftext|>, or eos_token_id; any of these should terminate the turn.
+    stop_ids = set()
+    eos = getattr(tok, "eos_token_id", None)
+    if eos is not None:
+        stop_ids.add(int(eos))
+    for s in ("<|im_end|>", "<|endoftext|>"):
+        tid = tok.convert_tokens_to_ids(s) if hasattr(tok, "convert_tokens_to_ids") else None
+        if tid is not None and tid != getattr(tok, "unk_token_id", -1):
+            stop_ids.add(int(tid))
+    return list(prompt_ids), sorted(stop_ids)
+
+
 def handle_generate(state: "ServerState", args: dict):
     """Sample N tokens from a prompt — STREAMS by default.
 
@@ -1357,6 +1405,8 @@ def handle_generate(state: "ServerState", args: dict):
     dry_base = float(args.get("dry_base", 1.75))
     dry_allowed_length = int(args.get("dry_allowed_length", 2))
     seed = int(args.get("seed", 0))
+    chat = bool(args.get("chat", False))
+    system = str(args.get("system", "") or "")
     rng = np.random.default_rng(seed)
 
     if not hasattr(state, "tok") or state.tok is None:
@@ -1373,8 +1423,8 @@ def handle_generate(state: "ServerState", args: dict):
     upload = state._91f.upload
     device = state.device
 
-    # Tokenize
-    prompt_ids = state.tok.encode(prompt)
+    # Tokenize (chat=True wraps prompt in Qwen3 <|im_start|>...<|im_end|> template)
+    prompt_ids, stop_ids = _encode_prompt(state, prompt, chat=chat, system=system)
     if len(prompt_ids) + max_tokens > MAX_POS:
         yield {"_final": True,
                "error": f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} > MAX_POS {MAX_POS}; "
@@ -1438,7 +1488,7 @@ def handle_generate(state: "ServerState", args: dict):
     generated_ids = []
     decode_times = []
     cur_pos = len(prompt_ids)
-    eos_id = getattr(state.tok, "eos_token_id", None)
+    stop_id_set = set(stop_ids)
 
     text_so_far = ""
     pending_chunk = []  # accumulates token dicts for batched yield
@@ -1486,7 +1536,7 @@ def handle_generate(state: "ServerState", args: dict):
             if chunk:
                 yield chunk
 
-        if eos_id is not None and next_id == eos_id:
+        if next_id in stop_id_set:
             stopped_on_eos = True
             break
         td0 = time.time()
@@ -1590,6 +1640,8 @@ def handle_generate_paged(state: "ServerState", args: dict):
     dry_base = float(args.get("dry_base", 1.75))
     dry_allowed_length = int(args.get("dry_allowed_length", 2))
     seed = int(args.get("seed", 0))
+    chat = bool(args.get("chat", False))
+    system = str(args.get("system", "") or "")
     rng = np.random.default_rng(seed)
     assert max_pos % block_size == 0, f"max_pos {max_pos} must be multiple of block_size {block_size}"
     ensure_rope_tables(state, max_pos)
@@ -1610,7 +1662,7 @@ def handle_generate_paged(state: "ServerState", args: dict):
     upload = state._91f.upload
     device = state.device
 
-    prompt_ids = state.tok.encode(prompt)
+    prompt_ids, stop_ids = _encode_prompt(state, prompt, chat=chat, system=system)
     if len(prompt_ids) + max_tokens > max_pos:
         yield {"_final": True,
                "error": f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} > max_pos {max_pos}; "
@@ -1682,7 +1734,7 @@ def handle_generate_paged(state: "ServerState", args: dict):
     generated_ids = []
     decode_times = []
     cur_pos = len(prompt_ids)
-    eos_id = getattr(state.tok, "eos_token_id", None)
+    stop_id_set = set(stop_ids)
 
     text_so_far = ""
     pending = []  # accumulates pre-chunk tokens
@@ -1716,7 +1768,7 @@ def handle_generate_paged(state: "ServerState", args: dict):
             }
             pending = []
 
-        if eos_id is not None and next_id == eos_id:
+        if next_id in stop_id_set:
             stopped_on_eos = True
             break
         td0 = time.time()

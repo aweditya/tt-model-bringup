@@ -199,7 +199,9 @@ def cmd_generate(args):
                        "dry_multiplier": args.dry_multiplier,
                        "dry_base": args.dry_base,
                        "dry_allowed_length": args.dry_allowed_length,
-                       "seed": args.seed},
+                       "seed": args.seed,
+                       "chat": args.chat,
+                       "system": args.system},
                       prompt=args.prompt)
 
 
@@ -216,7 +218,9 @@ def cmd_generate_long(args):
                        "dry_multiplier": args.dry_multiplier,
                        "dry_base": args.dry_base,
                        "dry_allowed_length": args.dry_allowed_length,
-                       "seed": args.seed},
+                       "seed": args.seed,
+                       "chat": args.chat,
+                       "system": args.system},
                       prompt=args.prompt)
 
 
@@ -257,6 +261,14 @@ def main():
                     help="DRY allowed repeat length before penalty kicks in (default 2)")
     g.add_argument("--seed", type=int, default=0,
                     help="RNG seed for deterministic sampling")
+    g.add_argument("--chat", action="store_true",
+                    help="wrap prompt in Qwen3 chat template "
+                         "(<|im_start|>user...<|im_end|><|im_start|>assistant\\n). "
+                         "Qwen3.6 is an instruct/thinking model; without this flag we "
+                         "send raw text and the model continues the doc rather than "
+                         "responding to a turn. Default off for back-compat.")
+    g.add_argument("--system", type=str, default="",
+                    help="optional system prompt (only used with --chat)")
     g.set_defaults(fn=cmd_generate)
     gl = sub.add_parser("generate_long",
                           help="generate text (streams; long context via paged KV)")
@@ -298,6 +310,14 @@ def main():
                      help="DRY allowed repeat length before penalty kicks in (default 2)")
     gl.add_argument("--seed", type=int, default=0,
                      help="RNG seed for deterministic sampling")
+    gl.add_argument("--chat", action="store_true",
+                     help="wrap prompt in Qwen3 chat template "
+                          "(<|im_start|>user...<|im_end|><|im_start|>assistant\\n). "
+                          "Qwen3.6 is an instruct/thinking model; without this flag "
+                          "we send raw text and the model continues the doc rather "
+                          "than responding to a turn. Default off for back-compat.")
+    gl.add_argument("--system", type=str, default="",
+                     help="optional system prompt (only used with --chat)")
     gl.set_defaults(fn=cmd_generate_long)
     r = sub.add_parser("run_91r")
     r.add_argument("--layers", type=str, default=None,
