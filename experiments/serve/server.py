@@ -52,6 +52,10 @@ class ServerState:
         # per attn step. Math-identical (validated bit-exact).
         self.cos_ext_table_tt = None
         self.sin_ext_table_tt = None
+        # Number of positions baked into cos/sin (ext) tables. Set by bootstrap
+        # to MAX_POS and grown by ensure_rope_tables when a long-context path
+        # asks for more. Must be checked before any positional slice.
+        self.rope_table_size = 0
         self.tok = None
         self._91f = None                        # kernel module (re-importable)
         self._91l = None
@@ -160,30 +164,63 @@ def bootstrap(state: ServerState, mock: bool, device_id: int) -> None:
             print(f"    layer {i:2d}  ({time.time()-t0:.0f}s elapsed)")
     print(f"[bootstrap] all {NUM_LAYERS} layers loaded in {time.time()-t0:.0f}s")
 
-    # Pre-compute RoPE table once (demo_qwen36_27b.py:160-166)
+    # Pre-compute RoPE tables for the default (short-context) path.
+    # ensure_rope_tables grows them later for long-context (generate_long).
+    _build_rope_tables(state, MAX_POS)
+
+    state.loaded = True
+    print("[bootstrap] ready")
+
+
+def _build_rope_tables(state: ServerState, table_size: int) -> None:
+    """(Re)build cos/sin and extended cos/sin tables at `table_size` rows.
+
+    Idempotent: safe to call multiple times. Replaces existing tables in place
+    on the device. Must be called before any per-token slice that may index
+    positions >= state.rope_table_size.
+
+    cos_ext / sin_ext are HEAD_DIM-wide (rotate part + passthrough pad of 1/0)
+    so apply_partial_rope can use the no-slice-of-q formula (validated bit-
+    exact vs V1 in attn_step_rope_swap_probe.py).
+    """
+    import numpy as np
+    import ttnn
+
+    cfg = state.cfg
+    device = state.device
+    upload = state._91f.upload
     rotary_dim = int(cfg["head_dim"] * cfg["partial_rotary_factor"])
     half_rot = rotary_dim // 2
     freqs = 1.0 / (10_000_000.0 ** (np.arange(half_rot).astype(np.float32) / half_rot))
-    positions = np.arange(MAX_POS).astype(np.float32)
+    positions = np.arange(table_size).astype(np.float32)
     all_angles = positions[:, None] * freqs[None, :]
     cos_all = np.concatenate([np.cos(all_angles), np.cos(all_angles)], axis=-1).astype(np.float32)
     sin_all = np.concatenate([np.sin(all_angles), np.sin(all_angles)], axis=-1).astype(np.float32)
     state.cos_table_tt = upload(cos_all, device, dtype=ttnn.float32)
     state.sin_table_tt = upload(sin_all, device, dtype=ttnn.float32)
 
-    # Level 1: extended cos/sin tables. Pad passthrough region with cos=1, sin=0
-    # so apply_partial_rope can use the no-slice-of-q formula.
     head_dim = cfg["head_dim"]
     pad_size = head_dim - rotary_dim
-    cos_ext_pad = np.ones((MAX_POS, pad_size), dtype=np.float32)
-    sin_ext_pad = np.zeros((MAX_POS, pad_size), dtype=np.float32)
+    cos_ext_pad = np.ones((table_size, pad_size), dtype=np.float32)
+    sin_ext_pad = np.zeros((table_size, pad_size), dtype=np.float32)
     cos_ext_all = np.concatenate([cos_all, cos_ext_pad], axis=-1).astype(np.float32)
     sin_ext_all = np.concatenate([sin_all, sin_ext_pad], axis=-1).astype(np.float32)
     state.cos_ext_table_tt = upload(cos_ext_all, device, dtype=ttnn.float32)
     state.sin_ext_table_tt = upload(sin_ext_all, device, dtype=ttnn.float32)
+    state.rope_table_size = table_size
+    print(f"[rope] cos/sin tables built at table_size={table_size}")
 
-    state.loaded = True
-    print("[bootstrap] ready")
+
+def ensure_rope_tables(state: ServerState, required_size: int) -> None:
+    """Ensure the RoPE tables cover at least `required_size` positions.
+
+    Long-context handlers (generate_long, bench_decode_paged) must call this
+    before any per-token slice. Rebuilds the tables if they are too small.
+    No-op if tables already large enough.
+    """
+    if state.rope_table_size >= required_size:
+        return
+    _build_rope_tables(state, required_size)
 
 
 # ---------- handlers ----------
@@ -570,6 +607,7 @@ def handle_bench_decode_paged(state: ServerState, args: dict) -> dict:
     max_pos = int(args.get("max_pos", 256))
     block_size = int(args.get("block_size", 64))
     assert max_pos % block_size == 0, f"max_pos {max_pos} must be multiple of block_size {block_size}"
+    ensure_rope_tables(state, max_pos)
 
     DEFAULT_PROMPT_IDS = [760, 6511, 314, 9338, 369]
     prompt_ids = list(args.get("prompt_ids") or DEFAULT_PROMPT_IDS)
@@ -1289,6 +1327,7 @@ def handle_generate_paged(state: "ServerState", args: dict):
     block_size = int(args.get("block_size", 64))
     chunk_size = max(1, int(args.get("chunk_size", 1)))
     assert max_pos % block_size == 0, f"max_pos {max_pos} must be multiple of block_size {block_size}"
+    ensure_rope_tables(state, max_pos)
 
     if not hasattr(state, "tok") or state.tok is None:
         yield {"_final": True, "error": "tokenizer not loaded on server"}
