@@ -113,6 +113,10 @@ def bootstrap(state: MeshServerState):
     }
     state.cfg = cfg
     state.num_layers = text_cfg['num_hidden_layers']
+    _cap = os.environ.get('TP_MAX_LAYERS')
+    if _cap:
+        state.num_layers = min(state.num_layers, int(_cap))
+        print(f"  TP_MAX_LAYERS={_cap} → capping num_layers to {state.num_layers}", flush=True)
     print(f"  ✓ cfg: {cfg}", flush=True)
     print(f"  ✓ num_layers: {state.num_layers}", flush=True)
 
@@ -240,10 +244,10 @@ def bootstrap(state: MeshServerState):
         "_91l", os.path.join(PROJECT_ROOT, "experiments", "91l_fp32_residual_generate.py"))
     _91l = importlib.util.module_from_spec(spec2)
     spec2.loader.exec_module(_91l)
-    embed_np, lm_head_np, final_norm_np = _91l.load_embed_lm_head_weights()
-    state.embed_np = embed_np
-    state.final_norm_tt = upload_replicated(final_norm_np)
-    state.lm_head_tt = upload_replicated(lm_head_np)
+    embed_weights = _91l.load_embed_lm_head_weights()
+    state.embed_np = embed_weights['embed']
+    state.final_norm_tt = upload_replicated(embed_weights['final_norm'])
+    state.lm_head_tt = upload_replicated(embed_weights['lm_head'])
     print(f"  ✓ embed/lm_head/final_norm uploaded", flush=True)
 
     # RoPE cos/sin tables — ROTARY_DIM-wide (V2 rotate-only path)
