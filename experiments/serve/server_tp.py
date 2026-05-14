@@ -47,6 +47,12 @@ from experiments.serve import protocol as P  # noqa: E402
 # Model constants — sourced from config.json at bootstrap, mirrors 91f
 MODEL_ID = "Qwen/Qwen3.6-27B"
 MAX_POS = 256
+# Paged KV cache parameters — required for trace-compatible decode
+# (paged_update_cache supports update_idxs_tensor=, non-paged doesn't).
+# BLOCK_SIZE must be a multiple of TILE_HEIGHT=32. NUM_BLOCKS * BLOCK_SIZE = MAX_POS.
+BLOCK_SIZE = 32
+NUM_BLOCKS = MAX_POS // BLOCK_SIZE  # 8 at MAX_POS=256
+TILE_HEIGHT = 32  # for height-sharded input padding
 
 
 # --- Mesh server state --------------------------------------------------------
@@ -211,12 +217,18 @@ def bootstrap(state: MeshServerState):
             w_o_sh = relayout_o(w_np['o_proj'])
             w_qkv_tt = upload_sharded(w_qkv_sh, dim=1)
             w_o_tt = upload_sharded(w_o_sh, dim=0)
-            # KV cache 4D [B=1, N_KV=4, MAX_POS, HEAD_DIM] sharded along N_KV
-            # → per-chip [1, 1, MAX_POS, HEAD_DIM] (matches P1's validated layout
-            # for update_cache_for_token_).
-            kv_init = np.zeros((1, cfg['n_kv_heads'], MAX_POS, cfg['head_dim']), dtype=np.float32)
-            kv_k_tt = upload_sharded(kv_init, dim=1)
-            kv_v_tt = upload_sharded(kv_init, dim=1)
+            # PAGED KV cache: [NUM_BLOCKS, N_KV=4, BLOCK_SIZE, HEAD_DIM] sharded
+            # along N_KV → per-chip [NUM_BLOCKS, 1, BLOCK_SIZE, HEAD_DIM].
+            # Required for trace-compatible decode: paged_update_cache supports
+            # update_idxs_tensor= (the non-paged update_cache_for_token_ in our
+            # ttnn build takes only Python int — bakes into trace).
+            # Validated on mesh via P12.1 (commit 74441a3).
+            # SDPA is manual (paged SDPA also fails on mesh per P13/feedback_p1).
+            kv_init_paged = np.zeros(
+                (NUM_BLOCKS, cfg['n_kv_heads'], BLOCK_SIZE, cfg['head_dim']),
+                dtype=np.float32)
+            kv_k_tt = upload_sharded(kv_init_paged, dim=1)
+            kv_v_tt = upload_sharded(kv_init_paged, dim=1)
             q_norm_tt = upload_replicated(w_np['q_norm'])
             k_norm_tt = upload_replicated(w_np['k_norm'])
             layer = {
@@ -267,6 +279,25 @@ def bootstrap(state: MeshServerState):
     state.cos_ext_table_tt = upload_replicated(cos_ext)
     state.sin_ext_table_tt = upload_replicated(sin_ext)
     print(f"  ✓ RoPE tables uploaded (MAX_POS={MAX_POS})", flush=True)
+
+    # Paged KV cache page_table: identity mapping for B=1 (logical block i →
+    # physical block i). Replicated across mesh. Fixed (doesn't change per step).
+    page_table_np = np.arange(NUM_BLOCKS, dtype=np.int32).reshape(1, NUM_BLOCKS)
+    state.page_table_tt = ttnn.from_torch(
+        torch.from_numpy(page_table_np),
+        device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    print(f"  ✓ page_table uploaded (NUM_BLOCKS={NUM_BLOCKS}, BLOCK_SIZE={BLOCK_SIZE})",
+          flush=True)
+
+    # Cache the L1-sharded memory_config for paged_update_cache inputs
+    compute_grid = state.mesh.compute_with_storage_grid_size()
+    shard_grid = ttnn.num_cores_to_corerangeset(1, compute_grid, row_wise=True)
+    shard_spec = ttnn.ShardSpec(shard_grid, [TILE_HEIGHT, cfg['head_dim']],
+                                   ttnn.ShardOrientation.ROW_MAJOR)
+    state.paged_write_mem_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
+    print(f"  ✓ paged_write mem_cfg cached", flush=True)
 
     print(f"[bootstrap] STAGE B COMPLETE — all weights + state buffers on mesh.", flush=True)
 
@@ -481,23 +512,40 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
         return ttnn.concat([rotated, passthru], dim=-1)
     q_tt = apply_rope(q_tt, NQ_PER_CHIP)
     k_tt = apply_rope(k_tt, NKV_PER_CHIP)
-    # 5. Update per-chip KV cache (NKV_PER_CHIP=1 head/chip)
-    k_for_cache = ttnn.reshape(k_tt, [1, NKV_PER_CHIP, 1, HEAD_DIM])
-    v_for_cache = ttnn.reshape(v_tt, [1, NKV_PER_CHIP, 1, HEAD_DIM])
-    ttnn.kv_cache.update_cache_for_token_(attn['kc'], k_for_cache, cur_pos)
-    ttnn.kv_cache.update_cache_for_token_(attn['vc'], v_for_cache, cur_pos)
-    # 6. Manual SDPA (Q@K^T softmax V) — P1 probe (2026-05-13) found that
-    # ttnn.transformer.scaled_dot_product_attention_decode FAILS on per-chip
-    # KV cache shape [1, 1, MAX_POS, HEAD_DIM] with tree-reduction error:
-    # "Tree reduction max 6 rounds (64 cores/head), got 110 cores/head" —
-    # the fused op allocates all per-chip cores to the single N_KV=1 head,
-    # exceeding the reduction depth. Manual SDPA was validated cos 0.999937
-    # in C'7.3 probe; it works for ANY shape on a mesh.
-    # Reshape cache for the math: per-chip [1, 1, MAX_POS, HEAD_DIM] →
-    # [MAX_POS, HEAD_DIM] (NKV_PER_CHIP=1 collapsed away).
+    # 5. PAGED KV cache update via paged_update_cache.
+    # Cache: [NUM_BLOCKS, N_KV, BLOCK_SIZE, HEAD_DIM] per-chip sharded along N_KV.
+    # Input must be HEIGHT_SHARDED in L1, padded to TILE_HEIGHT=32 on dim -2.
+    # cur_pos_tt is a [1] int32 replicated tensor — supports trace replay
+    # (the non-paged update_cache_for_token_ takes Python int, bakes into trace).
+    # See feedback_paged_refactor_constraints.md + P12.1 validated recipe.
+    def _shard_for_paged_write(t_per_head):
+        # t_per_head: [NKV_PER_CHIP, HEAD_DIM] → [1, 1, NKV_PER_CHIP, HEAD_DIM]
+        # → pad dim -2 to TILE_HEIGHT → HEIGHT_SHARDED on 1 core L1
+        t4d = ttnn.reshape(t_per_head, [1, 1, NKV_PER_CHIP, HEAD_DIM])
+        t_padded = ttnn.pad(t4d, [[0, 0], [0, 0], [0, TILE_HEIGHT - NKV_PER_CHIP], [0, 0]],
+                              value=0.0)
+        return ttnn.to_memory_config(t_padded, state.paged_write_mem_cfg)
+    k_sharded = _shard_for_paged_write(k_tt)
+    v_sharded = _shard_for_paged_write(v_tt)
+    ttnn.experimental.paged_update_cache(attn['kc'], k_sharded,
+                                           update_idxs_tensor=cur_pos_tt,
+                                           page_table=state.page_table_tt)
+    ttnn.experimental.paged_update_cache(attn['vc'], v_sharded,
+                                           update_idxs_tensor=cur_pos_tt,
+                                           page_table=state.page_table_tt)
+    ttnn.deallocate(k_sharded)
+    ttnn.deallocate(v_sharded)
+    # 6. Manual SDPA — read paged cache, reshape blocks → flat MAX_POS.
+    # Paged SDPA decode hits the same tree-reduction failure on mesh as the
+    # non-paged variant (P13 confirmed). Keep manual SDPA on the read side.
+    # Per-chip cache: [NUM_BLOCKS, 1, BLOCK_SIZE, HEAD_DIM]
+    # → reshape to [NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM] (collapse NKV_PER_CHIP=1)
+    # → reshape to [MAX_POS, HEAD_DIM] (linear order: block0_slot0, block0_slot1, ..., blockK_slotS)
     assert NKV_PER_CHIP == 1, "manual SDPA assumes 1 KV head per chip"
-    kc_flat = ttnn.reshape(attn['kc'], [MAX_POS, HEAD_DIM])
-    vc_flat = ttnn.reshape(attn['vc'], [MAX_POS, HEAD_DIM])
+    kc_3d = ttnn.reshape(attn['kc'], [NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM])
+    vc_3d = ttnn.reshape(attn['vc'], [NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM])
+    kc_flat = ttnn.reshape(kc_3d, [MAX_POS, HEAD_DIM])
+    vc_flat = ttnn.reshape(vc_3d, [MAX_POS, HEAD_DIM])
     scale = 1.0 / np.sqrt(HEAD_DIM)
     kT = ttnn.transpose(kc_flat, 0, 1)            # [HEAD_DIM, MAX_POS]
     scores = ttnn.mul(ttnn.matmul(q_tt, kT), scale)  # [NQ_PER_CHIP, MAX_POS]
