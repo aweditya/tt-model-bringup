@@ -35,10 +35,15 @@ Per-layer cosine vs HF: ≥ 0.99973 (Branch III gate; QK rms_norm slight drift
 from 0.99997 baseline within bf16 precision noise — see feedback_qk_rms_norm_shipped.md)
 
 Multi-chip TP (qb2, 4× P150 with fabric, in development):
-  - Traced TP per block:     1.34 ms (5.23× over eager — C'7.6.1 probe)
-  - Projected end-to-end:    46.8 ms/tok = 21.36 tok/s theoretical ceiling
-  - Realistic after host overhead: ~12-18 tok/s
-  - Persistent multi-chip server: planned (C'7.8)
+  - REAL measured (C'7.6.1 + C'7.7, 2026-05-13):
+      * Traced TP one block (DeltaNet + MLP, real Qwen3.6 shapes): 1.21 ms
+      * Layer-0 TP forward cos vs numpy gold: 0.999997 (math correct)
+  - NOT YET MEASURED (do not cite as fact):
+      * End-to-end multi-chip ms/tok with all 64 blocks chained + trace
+      * Per-tok overhead (embedding, lm_head, sampling, KV writes)
+      * Gated Attention TP latency (only MLP TP + DN TP measured)
+  - Until C'7.8 (persistent multi-chip server) lands, multi-chip is
+    correctness-validated but not perf-measured end-to-end.
 
 Optimization stack landed in 91f:
   - C'1: in-place update_cache_for_token_ for KV slot writes (7.2× scatter)
