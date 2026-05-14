@@ -456,4 +456,188 @@ The project uses a **fan-out research pattern** where multiple sub-agents work c
 
 ---
 
+## 13. Plan-of-action template (7-step workflow)
+
+Follow this for any non-trivial task. Cut corners only when the user explicitly says so.
+
+| # | Step | Output | Time |
+|---|------|--------|------|
+| 1 | **Read MEMORY.md index** | Identify relevant `feedback_*.md` notes | 5 min |
+| 2 | **Read those notes** (3-5 typically) | Know prior findings, gotchas, dead-ends | 10 min |
+| 3 | **Check `experiments/.refs/tt-metal/`** for canonical implementation | Cite doc path before designing | 10 min |
+| 4 | **Write a plan** (design memo or `research/<topic>.md`) | Hypothesis, experiment design, success criteria | 15 min |
+| 5 | **Write a probe helper** in `experiments/utils/<name>.py` (NEVER inline `python -c`) | Permanent, line-buffered, sync-bounded | 30 min |
+| 6 | **Run probe**, capture results in `.cache/<probe_name>/`, **commit** | Data + log | 15-90 min |
+| 7 | **Write memory note** `feedback_<finding>.md` + update `MEMORY.md` index | Future agents inherit the finding | 15 min |
+
+### Success-criteria gate
+
+Before claiming a win:
+- Cosine vs oracle ≥ 0.99 (correctness — `feedback_correctness_first.md`)
+- Bench numbers are MEASURED end-to-end, not projected (`feedback_real_vs_projected.md`)
+- Sync barriers wrap timing region (`feedback_sync_bounded_timing.md`)
+- Probe ran against PRODUCTION-magnitude inputs + multi-position state (`feedback_isolation_must_match_production.md`)
+- An external oracle (HF or numpy fp32 — NOT your own ttnn code) is the comparison baseline
+
+---
+
+## 14. Pitfalls (meta-lessons)
+
+These are the recurring failure modes from session history. Treat them as red flags during code review.
+
+### 14.1 Isolation ≠ production (`feedback_isolation_must_match_production.md`)
+
+During Branch III, 5 distinct bugs hid behind cosine-0.997 isolation tests because:
+- Test inputs were embed-scale (‖·‖ ≈ 1) but mid-stack hidden states are ‖·‖ ≈ 10-150
+- Tests ran 1-2 token chunks; bugs needed 5+ positions of state accumulation
+- Reference was the same numpy code path being tested (false positive — both sides shared the bug)
+
+**Fix:** feed HF's actual layer-N hidden states (saved per-layer dumps) as input. Run ≥5 positions. Compare against an EXTERNAL oracle.
+
+### 14.2 Projection ≠ measurement (`feedback_real_vs_projected.md`)
+
+Per-block ms × layer count is a **ceiling**, NOT tok/s. Real tok/s requires full `bench_decode`. Always label "projected" or "ceiling" explicitly. Demo headers, memory notes, and PR descriptions must distinguish:
+
+| Correct framing | Wrong framing |
+|---|---|
+| "Per-block traced latency: 1.21 ms ✓. End-to-end ms/tok: NOT YET MEASURED — pending C'7.8." | "Multi-chip TP delivers ~16 tok/s (3× faster than single-chip)." |
+
+### 14.3 Isolation probe perf claims <5% don't survive (`feedback_v2_rope_perf_wash.md`)
+
+V2 RoPE isolation projected -8.7% at gated_attn level (-2.18 ms/tok across 16 layers). Production delta: +1.95 ms (within ±2 ms variance — a WASH). Causes:
+- Pipelining at full-decode level hides per-layer savings (see `feedback_pipelining_already_wins.md`)
+- More dispatched ops can outweigh smaller data sizes
+
+**Rule:** don't trust isolation probe perf claims if projected savings < 5% of full decode. Use isolation for correctness, full-decode for perf.
+
+### 14.4 Cliff hides in defaults (`feedback_fp32_sdpa_cliff_probe.md`)
+
+The 500-position cosine cliff at pos 129 was caused by `compute_kernel_config = HiFi4 + fp32_dest_acc_en=True` — counter-intuitively the "higher-fidelity" setting. Tenstorrent's own Galaxy demo (`models/demos/llama3_70b_galaxy/tt/model_config.py:1202-1207`) uses HiFi2 + `fp32_dest_acc_en=False` for SDPA decode. We were 1.8% slower at HiFi2 but went from 27.8% top-1 at pos 500 to 98.4% top-1. **Compute kernel config flags are not neutral defaults; check what production demos use.**
+
+### 14.5 Async kernel launches fool timing (`feedback_sync_bounded_timing.md`)
+
+`ttnn` op dispatch is async. Naive `time.perf_counter()` around an op measures DISPATCH only, not EXECUTE. Always sync BEFORE start and AFTER stop.
+
+### 14.6 SSH stdout is block-buffered (`feedback_python_stdout_buffering.md`)
+
+SSH pipes have no TTY. Without `sys.stdout.reconfigure(line_buffering=True)` at probe top, logs appear only at process exit — making long probes look hung.
+
+### 14.7 `pkill -9` wedges mesh fabric (`feedback_mesh_recovery_after_kill.md`)
+
+SIGKILL'ing a mesh process corrupts fabric state. Next mesh open hangs. Recover with `ssh qb2 'tt-smi -r 0,1,2,3'`. Use SIGTERM via `serve_tp.sh stop` whenever possible.
+
+### 14.8 ttnn opens ALL chips (`feedback_mtp_head_probe.md`)
+
+`device_ids=[N]` does NOT restrict to one chip. ttnn opens all 4. Two concurrent ttnn processes on the same host SIGBUS each other. If the server is up, no probe can run on that host — coordinate.
+
+### 14.9 `AutoModel.from_pretrained` crashes on remote (`reference_hf_oracle_pattern.md`)
+
+Use the canonical pattern: construct `DecoderLayer` directly + `safe_open` weights. Don't go through `AutoModel`.
+
+### 14.10 Inline `python -c` is banned (`feedback_no_inline_scripts.md`)
+
+Always write a permanent helper in `experiments/utils/`. See `reference_inline_script_helpers.md` for templates (`syntax_check.py`, `ttnn_introspect.py`, `npz_inspect.py`, `hf_download.py`).
+
+### 14.11 Compute kernel config must be all-or-nothing (`feedback_compute_kernel_config.md`)
+
+`WormholeComputeKernelConfig` mixing on Blackhole corrupts ops silently. Either all calls use the same config, or split into a dedicated config object per call site. Don't toggle one flag and reuse.
+
+### 14.12 paged_update_cache trace requirement (`feedback_update_cache_tensor_api_gap.md`)
+
+Our ttnn build's `update_cache_for_token_` has no `cur_pos_tensor=` kwarg (only int `update_index`). Means non-paged path is NOT traceable. Any traced multi-step decode MUST use `paged_update_cache` with `update_idxs_tensor=`. Verified 91f single-chip already does this.
+
+---
+
+## 15. Friend repo (REFERENCE ONLY)
+
+There's a friend's daily-driver Qwen3.6-27B implementation at:
+```
+experiments/.refs/tt-qwen-36/   (commit a3d12574, branch qwen36-fresh)
+```
+
+**Friend (samjett) achieves 15.5 tok/s on 4× P150 dense.** We're at 11.43 tok/s — 25% behind.
+
+### WARNING: REFERENCE ONLY
+
+- **Do NOT copy code wholesale.** This is a learning project.
+- **Do NOT vendor their patterns into our tree without understanding them.**
+- **DO** read it as a reference for "what production-quality multi-chip Tenstorrent inference looks like".
+- **DO** cite it as `experiments/.refs/tt-qwen-36/<path>:<line>` when designing.
+
+Comparison table at `research/friend_repo_borrow_list.md`. Key gaps:
+
+| Component | Friend | Ours |
+|-----------|--------|------|
+| GDN recurrence | Custom C++ `ttnn.experimental.qwen36_gdn_decode` | Python recurrence body |
+| GDN Q/K/V prep | Custom C++ `qwen36_gdn_prepare_decode` | Python slice+reshape+repeat_interleave |
+| RMSNorm | Distributed `rms_norm_pre_all_gather` + `_post_all_gather` | Single fused `ttnn.rms_norm` on replicated x |
+| RoPE | `ttnn.experimental.rotary_embedding` + slice/concat | Manual rotate-only |
+| LM head | Vocab-sharded, DRAM-sharded multi-split, no final all_reduce | Replicated, full all_reduce |
+| Embedding | On-device `ttnn.embedding` | Host `embed_np[token_id]` |
+| Position | On-device `ttnn.plus_one` | Host `cur_pos += 1` |
+| Cos/Sin | Precomputed device cache → `ttnn.embedding` | Host `from_torch` per step |
+| Argmax | `all_gather → untilize → ttnn.argmax` | Host `ConcatMeshToTensor → np.argmax` |
+
+The next ship list (§8 Next ship list) directly maps to closing this gap on the items that need no custom C++.
+
+---
+
+## 16. Quick-start checklist (first 30 min as a new agent)
+
+| # | Action | Time |
+|---|--------|------|
+| 1 | Read `CLAUDE.md` (project root) | 3 min |
+| 2 | Read this `HANDOFF.md` end-to-end | 10 min |
+| 3 | Read `MEMORY.md` index (skim — note the structure, don't read every linked note yet) | 8 min |
+| 4 | Read `reference_how_to_run_stuff.md` carefully | 5 min |
+| 5 | Verify hosts are reachable: `ssh qb1 'tt-smi -s'` and `ssh qb2 'tt-smi -s'` | 1 min |
+| 6 | Check server status on both hosts: `serve.sh status` / `serve_tp.sh status` | 1 min |
+| 7 | If server is up on the host you need: use the protocol pattern in §4. If you need raw device: ASK USER before stopping the server. | — |
+| 8 | Read 3-4 memory notes most relevant to the task | varies |
+| 9 | Write a plan (design memo). Cite memory notes + doc paths inline. | 15 min |
+| 10 | Get user sign-off on plan BEFORE writing probe code | — |
+
+### Sanity checks before you write a single line of code
+
+- [ ] You know which host (qb1 / qb2)
+- [ ] You know whether the server is up there
+- [ ] You have a cited memory note that's relevant
+- [ ] You have a cited tt-metal doc path (for non-trivial ttnn work)
+- [ ] You have an oracle to compare against (HF or numpy fp32)
+- [ ] You have a success criterion in cosine + tok/s terms
+
+---
+
+## 17. Glossary
+
+| Term | Meaning |
+|------|---------|
+| **P150** | Tenstorrent Blackhole chip (newer than Wormhole). 4 per host. ~512 GB/s DRAM bandwidth peak. |
+| **(1, 4) mesh** | 1-row, 4-column device mesh on qb2 for tensor parallelism |
+| **TP** | Tensor parallelism — shard weights across chips, replicate activations |
+| **MAX_POS** | KV cache max sequence length (production default 256, probes go up to 32k) |
+| **paged SDPA** | `ttnn.transformer.paged_scaled_dot_product_attention_decode` — page-table KV cache layout |
+| **B3** | HiFi2 + `fp32_dest_acc_en=False` SDPA compute kernel config — fixes long-context cliff |
+| **DeltaNet (DN)** | Linear-attention recurrent block, half of Qwen3.6-27B layers |
+| **Gated Attention** | Full-attention block, the other half of Qwen3.6-27B layers (16 of 64) |
+| **MLP** | Standard SwiGLU feed-forward |
+| **GQA** | Grouped-Query Attention (Qwen3.6: 24 Q heads, 4 KV heads, ratio 6:1) |
+| **MTP** | Multi-Token Prediction head (Qwen3.6 ships one; D' probe for speculative decode) |
+| **RMSNorm** | Root-mean-square layer norm |
+| **rms_norm_pre/post_all_gather** | Distributed RMSNorm — pre computes partial stats, all_gather, post applies norm |
+| **all_reduce / all_gather / reduce_scatter** | CCL collectives across mesh chips |
+| **CCL** | Collective Communication Library (Tenstorrent's term) |
+| **Tracy** | Sampling profiler for device-side op timing — qb1 only |
+| **trace** | Pre-compiled execution graph replayed each token — `ttnn.begin_trace_capture` / `execute_trace` |
+| **paged_update_cache** | In-place KV cache write with `update_idxs_tensor` — traceable |
+| **L1** | On-chip SRAM (vs DRAM, HBM-like external memory) |
+| **bf8 / BFP8** | Tenstorrent block-float-8 weight format |
+| **HiFi2 / HiFi4** | Math fidelity flags — counter-intuitively, HiFi2 is correct for SDPA decode on Blackhole, HiFi4 has a bug |
+| **fabric** | Inter-chip ethernet/PCIe link — qb1 has none, qb2 has working FABRIC_1D |
+| **sub-device** | Galaxy-style core-group partition (prefetcher + worker) — not yet used here |
+| **dram_prefetcher** | Streams weights into Global Circular Buffer to hide DRAM load — Galaxy's biggest lever |
+| **Agent X/Y/W/O/...** | Sub-agent contributions in 4-agent parallel research pattern |
+| **Branch III / C' / C'7 / D'** | Project-internal branch labels for phases of the 27B effort |
+
+
 
