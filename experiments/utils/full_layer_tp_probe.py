@@ -32,19 +32,22 @@ import ttnn
 sys.stdout.reconfigure(line_buffering=True)
 
 
-# Qwen3.6-27B DeltaNet config
+# Qwen3.6-27B DeltaNet config — REAL values from config.json (corrected 2026-05-13)
+# Prior values were WRONG (N_V_HEADS=32, KERNEL=3, INTERMEDIATE=25600). TP plumbing
+# was validated correctly with those fake shapes (math is layout-agnostic) but
+# perf projections used wrong tensor sizes. Real config:
 HIDDEN = 5120
 N_K_HEADS = 16
-N_V_HEADS = 32
+N_V_HEADS = 48                     # was 32 (wrong); real config = 48
 K_DIM = 128
 V_DIM = 128
-KERNEL = 3
+KERNEL = 4                         # was 3 (wrong); real conv kernel = 4
 KEY_DIM = N_K_HEADS * K_DIM        # 2048
-VAL_DIM = N_V_HEADS * V_DIM        # 4096
-CONV_DIM = 2 * KEY_DIM + VAL_DIM    # 8192
-N_REP = N_V_HEADS // N_K_HEADS      # 2
-IN_PROJ_OUT = CONV_DIM + VAL_DIM + 2 * N_V_HEADS  # 12352
-INTERMEDIATE = 25600
+VAL_DIM = N_V_HEADS * V_DIM        # 6144 (was 4096)
+CONV_DIM = 2 * KEY_DIM + VAL_DIM    # 10240 (was 8192)
+N_REP = N_V_HEADS // N_K_HEADS      # 3 (was 2)
+IN_PROJ_OUT = CONV_DIM + VAL_DIM + 2 * N_V_HEADS  # 16480 (was 12352)
+INTERMEDIATE = 17408               # was 25600 (wrong); real intermediate = 17408
 EPS = 1e-6
 
 NCHIPS = 4
