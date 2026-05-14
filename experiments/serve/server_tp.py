@@ -282,6 +282,27 @@ def bootstrap(state: MeshServerState):
 # Reuses validated layout helpers from full_layer_tp_probe + tp_attn_traced_probe.
 
 
+def _rms_norm_manual(x_tt, weight_tt, eps, dim_size):
+    """Mesh-friendly RMS norm: weight * x / sqrt(mean(x*x) + eps).
+
+    Doc evidence: `ttnn.rms_norm_pre_all_gather` + `..._post_all_gather` exist
+    as separate ops (see `experiments/.refs/tt-metal/models/demos/deepseek_v3/
+    reference/ttnn.md` and `llama3_70b_galaxy/tt/llama_ccl.py:1369`), and
+    production multi-chip code never uses plain `ttnn.rms_norm` on a mesh.
+    Working chain probe `full_layer_tp_probe.deltanet_tp:204` avoids plain
+    rms_norm entirely on replicated inputs and uses this manual form — its
+    DN→MLP×K=8 eager chain runs without hang on (1,4) mesh. Empirically the
+    plain ttnn.rms_norm on our (1,4) mesh accumulates state that wedges the
+    next layer's reshape (see feedback_p7_mlp_wedges_next_dn.md).
+    """
+    import ttnn
+    sq = ttnn.mul(x_tt, x_tt)
+    sum_sq = ttnn.sum(sq, dim=-1, keepdim=True)
+    mean_sq = ttnn.mul(sum_sq, 1.0 / dim_size)
+    inv_rms = ttnn.rsqrt(ttnn.add(mean_sq, eps))
+    return ttnn.mul(ttnn.mul(x_tt, inv_rms), weight_tt)
+
+
 def deltanet_step_tp(state, x_tt, dn, cfg):
     """One DeltaNet TP step on the mesh. Returns the residual-added output.
 
@@ -296,8 +317,8 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     )
 
     HIDDEN = cfg['hidden']
-    # 1. Pre-norm
-    h_tt = ttnn.rms_norm(x_tt, weight=dn['input_norm'], epsilon=EPS)
+    # 1. Pre-norm (manual: see _rms_norm_manual doc)
+    h_tt = _rms_norm_manual(x_tt, dn['input_norm'], EPS, HIDDEN)
     # 2. in_proj (replicated x × sharded weight → per-chip slab)
     all_tt = ttnn.linear(h_tt, dn['w_in'])
     # 3. slice per-chip [Q | K | V | Z | A | B]
@@ -326,10 +347,11 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     q = gqa(q_flat, NK_PER_CHIP, K_DIM)
     k = gqa(k_flat, NK_PER_CHIP, K_DIM)
     v = ttnn.reshape(v_flat, [NV_PER_CHIP, V_DIM])
-    # 6. QK rms_norm fused (matches 91f's QK rms_norm shipped 2026-05-13)
+    # 6. QK l2-norm (manual mesh-safe form — q_l2_scale=1/K_DIM, k_l2_scale=1/sqrt(K_DIM)
+    # baked into the weights; eps=EPS/K_DIM matches the rms_norm semantics exactly).
     EPS_RMS = EPS / K_DIM
-    q = ttnn.rms_norm(q, weight=dn['q_l2_scale'], epsilon=EPS_RMS)
-    k = ttnn.rms_norm(k, weight=dn['k_l2_scale'], epsilon=EPS_RMS)
+    q = _rms_norm_manual(q, dn['q_l2_scale'], EPS_RMS, K_DIM)
+    k = _rms_norm_manual(k, dn['k_l2_scale'], EPS_RMS, K_DIM)
     # 7. gate/decay/beta on per-chip head subset
     softplus_a = ttnn.log(ttnn.add(ttnn.exp(ttnn.add(a_tt, dn['dt_bias'])), 1.0))
     g = ttnn.mul(ttnn.neg(ttnn.exp(dn['A_log'])), softplus_a)
@@ -349,7 +371,7 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     out = ttnn.reshape(ttnn.sum(ttnn.mul(H_new, q_col), dim=-2), [1, VAL_DIM_CHIP])
     # 9. Per-head rms_norm + silu(z) gate
     out_per_head = ttnn.reshape(out, [NV_PER_CHIP, V_DIM])
-    out_normed = ttnn.rms_norm(out_per_head, weight=dn['linear_attn_norm'], epsilon=EPS)
+    out_normed = _rms_norm_manual(out_per_head, dn['linear_attn_norm'], EPS, V_DIM)
     z_per_head = ttnn.reshape(z_tt, [NV_PER_CHIP, V_DIM])
     silu_z = ttnn.silu(z_per_head)
     out_gated = ttnn.reshape(ttnn.mul(out_normed, silu_z), [1, VAL_DIM_CHIP])
@@ -360,8 +382,6 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
         reduced = ttnn.all_gather(scattered, dim=1)
-    # P7 finding: force interleaved DRAM layout — see mlp_step_tp note.
-    reduced = ttnn.to_memory_config(reduced, ttnn.DRAM_MEMORY_CONFIG)
     # 11. residual add + update SSM/conv state in place
     x_out = ttnn.add(x_tt, reduced)
     H_new_3d = ttnn.reshape(H_new, [NV_PER_CHIP, K_DIM, V_DIM])
@@ -374,7 +394,8 @@ def mlp_step_tp(state, x_tt, mlp):
     """One SwiGLU MLP TP step on the mesh."""
     import ttnn
     from full_layer_tp_probe import EPS
-    h_tt = ttnn.rms_norm(x_tt, weight=mlp['post_norm'], epsilon=EPS)
+    HIDDEN = state.cfg['hidden']
+    h_tt = _rms_norm_manual(x_tt, mlp['post_norm'], EPS, HIDDEN)
     g = ttnn.linear(h_tt, mlp['w_gate'], activation="silu")
     u = ttnn.linear(h_tt, mlp['w_up'])
     h = ttnn.mul(g, u)
@@ -384,9 +405,6 @@ def mlp_step_tp(state, x_tt, mlp):
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
         reduced = ttnn.all_gather(scattered, dim=1)
-    # P7 finding: all_reduce/all_gather output memory_config breaks next layer
-    # DN's reshape(k). Force interleaved DRAM so downstream ops see standard layout.
-    reduced = ttnn.to_memory_config(reduced, ttnn.DRAM_MEMORY_CONFIG)
     return ttnn.add(x_tt, reduced)
 
 
@@ -409,8 +427,8 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
     QG_DIM_CHIP = 2 * NQ_PER_CHIP * HEAD_DIM
     KV_DIM_CHIP = NKV_PER_CHIP * HEAD_DIM
     EPS = 1e-6
-    # 1. Pre-norm
-    h_tt = ttnn.rms_norm(x_tt, weight=attn['input_norm'], epsilon=EPS)
+    # 1. Pre-norm (manual: see _rms_norm_manual doc)
+    h_tt = _rms_norm_manual(x_tt, attn['input_norm'], EPS, HIDDEN)
     # 2. Sharded attn_qkv matmul → per-chip slab [Q+gate | K | V] for this chip's heads
     all_tt = ttnn.linear(h_tt, attn['w_qkv'])
     qg = ttnn.slice(all_tt, [0, 0], [1, QG_DIM_CHIP])
@@ -423,8 +441,8 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
     k_tt = ttnn.reshape(k_flat, [NKV_PER_CHIP, HEAD_DIM])
     v_tt = ttnn.reshape(v_flat, [NKV_PER_CHIP, HEAD_DIM])
     # 3. q_norm, k_norm per-head (replicated weights — applied per chip)
-    q_tt = ttnn.rms_norm(q_tt, weight=attn['q_norm'], epsilon=EPS)
-    k_tt = ttnn.rms_norm(k_tt, weight=attn['k_norm'], epsilon=EPS)
+    q_tt = _rms_norm_manual(q_tt, attn['q_norm'], EPS, HEAD_DIM)
+    k_tt = _rms_norm_manual(k_tt, attn['k_norm'], EPS, HEAD_DIM)
     # 4. Partial RoPE V2 rotate-only
     half = ROTARY_DIM // 2
     def apply_rope(t, n_heads):
@@ -512,7 +530,7 @@ def forward_token_tp(state, token_id, cur_pos):
                                        cur_pos, cos_tt, sin_tt, cfg)
         x_tt = mlp_step_tp(state, x_tt, layer['mlp'])
 
-    x_tt = ttnn.rms_norm(x_tt, weight=state.final_norm_tt, epsilon=1e-6)
+    x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
     logits_tt = ttnn.linear(x_tt, state.lm_head_tt)
     return logits_tt
 
