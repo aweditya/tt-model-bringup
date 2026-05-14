@@ -211,10 +211,12 @@ def bootstrap(state: MeshServerState):
             w_o_sh = relayout_o(w_np['o_proj'])
             w_qkv_tt = upload_sharded(w_qkv_sh, dim=1)
             w_o_tt = upload_sharded(w_o_sh, dim=0)
-            # KV cache per-chip (1 KV head/chip): [1, MAX_POS, HEAD_DIM]
-            kv_init = np.zeros((NCHIPS, MAX_POS, cfg['head_dim']), dtype=np.float32)
-            kv_k_tt = upload_sharded(kv_init, dim=0)
-            kv_v_tt = upload_sharded(kv_init, dim=0)
+            # KV cache 4D [B=1, N_KV=4, MAX_POS, HEAD_DIM] sharded along N_KV
+            # → per-chip [1, 1, MAX_POS, HEAD_DIM] (matches P1's validated layout
+            # for update_cache_for_token_).
+            kv_init = np.zeros((1, cfg['n_kv_heads'], MAX_POS, cfg['head_dim']), dtype=np.float32)
+            kv_k_tt = upload_sharded(kv_init, dim=1)
+            kv_v_tt = upload_sharded(kv_init, dim=1)
             q_norm_tt = upload_replicated(w_np['q_norm'])
             k_norm_tt = upload_replicated(w_np['k_norm'])
             layer = {
@@ -358,9 +360,12 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
         reduced = ttnn.all_gather(scattered, dim=1)
+    # P7 finding: force interleaved DRAM layout — see mlp_step_tp note.
+    reduced = ttnn.to_memory_config(reduced, ttnn.DRAM_MEMORY_CONFIG)
     # 11. residual add + update SSM/conv state in place
     x_out = ttnn.add(x_tt, reduced)
-    ttnn.copy(H_new, dn['ssm'])
+    H_new_3d = ttnn.reshape(H_new, [NV_PER_CHIP, K_DIM, V_DIM])
+    ttnn.copy(H_new_3d, dn['ssm'])
     ttnn.copy(conv_state_new, dn['conv_st'])
     return x_out
 
@@ -379,6 +384,9 @@ def mlp_step_tp(state, x_tt, mlp):
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
         reduced = ttnn.all_gather(scattered, dim=1)
+    # P7 finding: all_reduce/all_gather output memory_config breaks next layer
+    # DN's reshape(k). Force interleaved DRAM so downstream ops see standard layout.
+    reduced = ttnn.to_memory_config(reduced, ttnn.DRAM_MEMORY_CONFIG)
     return ttnn.add(x_tt, reduced)
 
 
