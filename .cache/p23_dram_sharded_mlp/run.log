@@ -1,0 +1,136 @@
+2026-05-14 13:01:22.413 | DEBUG    | ttnn:<module>:79 - Initial ttnn.CONFIG:
+Config{cache_path=/home/aditya/.cache/ttnn,model_cache_path=/home/aditya/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=true,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=false,comparison_mode_should_raise_exception=false,comparison_mode_pcc=0.9999,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
+==============================================================================
+P23 / C'6 probe: DRAM-sharded MLP matmuls vs INTERLEAVED baseline (qb1)
+==============================================================================
+Shapes: HIDDEN=5120, INTERMEDIATE=17408
+Dtypes: weights=DataType.BFLOAT8_B, activation=DataType.BFLOAT16
+Output dir: /home/aditya/tt-xla/.cache/p23_dram_sharded_mlp
+
+[1] Open device 0 ...
+2026-05-14 13:01:22.506 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-14 13:01:22.510 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-14 13:01:22.510 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-14 13:01:22.527 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:224)
+2026-05-14 13:01:22.527 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-14 13:01:22.530 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-14 13:01:22.530 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-14 13:01:22.545 | info     |             UMD | Harvesting masks for Chip 3: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-14 13:01:22.571 | info     |             UMD | Harvesting masks for Chip 0: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-14 13:01:22.574 | info     |             UMD | Harvesting masks for Chip 1: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-14 13:01:22.578 | info     |             UMD | Harvesting masks for Chip 2: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-14 13:01:22.582 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1, 2, 3}/[1, 2, 3, 0] and remote chip ids {} (cluster.cpp:183)
+2026-05-14 13:01:22.582 | info     |             UMD | IOMMU: disabled (cluster.cpp:157)
+2026-05-14 13:01:22.582 | info     |             UMD | KMD version: 2.8.0 (cluster.cpp:160)
+2026-05-14 13:01:22.585 | info     |             UMD | Starting devices in cluster (cluster.cpp:949)
+2026-05-14 13:01:22.586 | info     |             UMD | Mapped hugepage 0x180000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-14 13:01:22.587 | info     |             UMD | Mapped hugepage 0x1c0000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-14 13:01:22.588 | info     |             UMD | Mapped hugepage 0x200000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-14 13:01:22.589 | info     |             UMD | Mapped hugepage 0x140000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-14 13:01:23.355 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:332)
+2026-05-14 13:01:23.355 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:394)
+2026-05-14 13:01:23.355 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-14 13:01:23.357 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-14 13:01:23.357 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-14 13:01:23.369 | info     |          Fabric | TopologyMapper: Logical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1474)
+2026-05-14 13:01:23.369 | info     |          Fabric | 
+=== Logical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-05-14 13:01:23.369 | info     |          Fabric | 
+=== Logical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-05-14 13:01:23.369 | info     |          Fabric | TopologyMapper: Physical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1485)
+2026-05-14 13:01:23.369 | info     |          Fabric | 
+=== Physical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-05-14 13:01:23.369 | info     |          Fabric | 
+=== Physical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-05-14 13:01:23.369 | info     |          Fabric | Starting multi-mesh mapping: 1 logical mesh(es) to 1 physical mesh(es) (topology_mapper_utils.cpp:1469)
+2026-05-14 13:01:23.369 | info     |          Fabric | Multi-mesh mapping attempt 1/2: Trying inter-mesh mapping (topology_mapper_utils.cpp:1510)
+2026-05-14 13:01:23.369 | info     |          Fabric | Attempt 1: Inter-mesh mapping succeeded, found 1 mesh pair(s) (topology_mapper_utils.cpp:1539)
+2026-05-14 13:01:23.369 | info     |          Fabric | Attempt 1: Mapping 1 mesh pair(s) (topology_mapper_utils.cpp:1547)
+2026-05-14 13:01:23.369 | info     |          Fabric | Attempt 1: Mapping mesh 0 -> 0 (topology_mapper_utils.cpp:1554)
+2026-05-14 13:01:23.369 | info     |          Fabric | Multi-mesh mapping succeeded after 1 attempt(s): 1 mesh pair(s) mapped (topology_mapper_utils.cpp:1686)
+2026-05-14 13:01:23.379 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:259)
+2026-05-14 13:01:23.381 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:259)
+2026-05-14 13:01:23.384 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:259)
+2026-05-14 13:01:23.388 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:259)
+2026-05-14 13:01:23.447 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:261)
+  ✓ device open
+  DRAM grid: 8 cores  (device.dram_grid_size())
+
+[2] Build random weights (seed=42)...
+  Total MLP weight bytes (bf8, 1.0625 B/elem): 270.9 MB
+  Total MLP weight bytes (bf8, 1.0 B/elem):    255.0 MB
+
+[V0] INTERLEAVED weights, INTERLEAVED activation
+  V0: 0.930 ms/step  →  305.4 GB/s = 59.6% of 512 GB/s peak
+
+[V1] SKIPPED: DRAM WIDTH-sharded weights require explicit progcfg
+     (ttnn rejects WIDTH-SHARDED weight tensor without DRAMShardedProgramConfig)
+
+[V1.5] SINGLE DRAM-sharded matmul (gate only)
+2026-05-14 13:01:32.834 | critical |          Always | TT_THROW: Statically allocated circular buffers in program 11 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=9)]. L1 buffer allocated at 1253376 and static circular buffer region ends at 1388800 (assert.hpp:104)
+  V1.5 cap=8 FAILED: RuntimeError: TT_THROW @ /project/tt_metal/impl/program/program.cpp:1145: tt::exception
+info:
+Statically allocated circular buffers in program 11 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=9)]. L1 buff
+  V1.5 cap=4: 0.711 ms (just gate)  133.1 GB/s = 26.0% peak
+  V1.5 cap=2: 0.725 ms (just gate)  130.7 GB/s = 25.5% peak
+
+[V2] DRAM WIDTH-sharded weights + L1 WIDTH-sharded activation + progcfg
+  act_cores=8, HIDDEN/(TILE*ac)=20, INTERMEDIATE/(TILE*ac)=68
+  weight padded_N: gate=17408, up=17408, down=5120
+  V2: 1.975 ms/step  →  143.9 GB/s = 28.1% of peak  cos vs V0=0.999379
+
+[V3] V2 + in0_block_w cap sweep (1, 2, 4, 8) on down_proj
+  V3 cap=1  gate_bw=1  down_bw=1  2.208 ms  128.7 GB/s = 25.1%  cos=0.999005
+  V3 cap=2  gate_bw=2  down_bw=2  2.060 ms  137.9 GB/s = 26.9%  cos=0.999453
+2026-05-14 13:01:47.276 | critical |          Always | TT_THROW: Statically allocated circular buffers in program 17 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=9)]. L1 buffer allocated at 1130496 and static circular buffer region ends at 1162752 (assert.hpp:104)
+  V3 cap=4 FAILED: RuntimeError: TT_THROW @ /project/tt_metal/impl/program/program.cpp:1145: tt::exception
+info:
+Statically allocated circular buffers in program 17 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=9)]. L1 buff
+2026-05-14 13:01:47.279 | critical |          Always | TT_THROW: Statically allocated circular buffers in program 11 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=9)]. L1 buffer allocated at 1310720 and static circular buffer region ends at 1388800 (assert.hpp:104)
+  V3 cap=8 FAILED: RuntimeError: TT_THROW @ /project/tt_metal/impl/program/program.cpp:1145: tt::exception
+info:
+Statically allocated circular buffers in program 11 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=9)]. L1 buff
+  V3 best: cap=2  2.060 ms  26.9%
+
+==============================================================================
+SUMMARY
+==============================================================================
+  variant                            ms/step     GB/s   %peak   cos vs V0
+  V0_interleaved                       0.930    305.4   59.6%    1.000000
+  V1_dram_sharded_weights_only      SKIPPED: DRAM WIDTH-sharded weight tensor requires explicit MatmulMul
+  V2_full_dram_sharded                 1.975    143.9   28.1%    0.999379
+  V3_tuned sweep:
+    cap= 1     2.208    128.7   25.1%    0.999005
+    cap= 2     2.060    137.9   26.9%    0.999453
+    cap= 4  ERROR: TT_THROW @ /project/tt_metal/impl/program/program.cpp:1145: 
+    cap= 8  ERROR: TT_THROW @ /project/tt_metal/impl/program/program.cpp:1145: 
+
+  Best non-V0: V2_full_dram_sharded
+    1.975 ms  vs V0 0.930 ms  (Δ=-1.044 ms, 0.47×)
+    28.1% of peak  (target ≥ 90%)
+    cos vs V0 = 0.999379  (target ≥ 0.999)
+    Verdict: FAIL
+    At 64 MLPs/tok: V0=59.5 ms, best=126.4 ms, Δ=-66.8 ms
+
+  ✓ wrote /home/aditya/tt-xla/.cache/p23_dram_sharded_mlp/results.json
+
+  ✓ device closed
+2026-05-14 13:01:47.552 | info     |    BuildKernels | JIT cache stats: 40/74 hits (54.1%) [40 cached, 10 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-05-14 13:01:47.552 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-05-14 13:01:47.552 | info     |    BuildKernels | JIT telemetry [dependencies_up_to_date]: count=80, total=87.063ms, min=0.024ms, max=5.584ms, mean=1.088ms (build_cache_telemetry.cpp:246)
+2026-05-14 13:01:47.552 | info     |    BuildKernels | JIT telemetry [JitBuildState::build]: count=74, total=21092.323ms, min=0.707ms, max=1078.469ms, mean=285.031ms (build_cache_telemetry.cpp:246)
+2026-05-14 13:01:47.552 | info     |    BuildKernels | JIT telemetry [jit_build]: count=29, total=5153.601ms, min=0.726ms, max=565.123ms, mean=177.710ms (build_cache_telemetry.cpp:246)
+2026-05-14 13:01:47.578 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:490)
+2026-05-14 13:01:47.578 | info     |             UMD | Closing devices in cluster (cluster.cpp:961)

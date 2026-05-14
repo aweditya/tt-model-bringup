@@ -1,0 +1,82 @@
+{
+  "constants": {
+    "HIDDEN": 5120,
+    "INTERMEDIATE": 17408,
+    "weight_dtype": "bfloat8_b",
+    "act_dtype": "bfloat16",
+    "P150_DRAM_PEAK_GBS": 512.0,
+    "dram_cores": 8,
+    "weight_bytes_bf8": 284098560,
+    "weight_bytes_bf8_conservative": 267386880
+  },
+  "variants": {
+    "V0_interleaved": {
+      "ms": 0.9303630795329809,
+      "gbs_bf8": 305.363106350491,
+      "pct_peak": 59.64123170908028,
+      "cos_vs_v0": 1.0
+    },
+    "V1_dram_sharded_weights_only": {
+      "skipped": true,
+      "reason": "DRAM WIDTH-sharded weight tensor requires explicit MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig; auto-pick matmul rejects with 'Input B memory layout must be INTERLEAVED' (matmul_device_operation.cpp:1089)."
+    },
+    "V2_full_dram_sharded": {
+      "ms": 1.9748435588553548,
+      "gbs_bf8": 143.85876730644287,
+      "pct_peak": 28.097415489539625,
+      "cos_vs_v0": 0.9993790155455726,
+      "act_cores": 8,
+      "weight_dram_cores": 8
+    },
+    "V3_tuned": {
+      "sweep": [
+        {
+          "cap": 1,
+          "gate_bw": 1,
+          "down_bw": 1,
+          "ms": 2.2080809576436877,
+          "gbs_bf8": 128.6631085769475,
+          "pct_peak": 25.12951339393506,
+          "cos_vs_v0": 0.9990054421583733
+        },
+        {
+          "cap": 2,
+          "gate_bw": 2,
+          "down_bw": 2,
+          "ms": 2.060276921838522,
+          "gbs_bf8": 137.8933855874481,
+          "pct_peak": 26.932301872548457,
+          "cos_vs_v0": 0.9994526973694741
+        },
+        {
+          "cap": 4,
+          "error": "TT_THROW @ /project/tt_metal/impl/program/program.cpp:1145: tt::exception\ninfo:\nStatically allocated circular buffers in program 17 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=9)]. L1 buffer allocated at 1130496 and static circular buffer region ends at 1162752\nbacktrace:\n --- /home/adit"
+        },
+        {
+          "cap": 8,
+          "error": "TT_THROW @ /project/tt_metal/impl/program/program.cpp:1145: tt::exception\ninfo:\nStatically allocated circular buffers in program 11 clash with L1 buffers on core range [(x=0,y=0) - (x=7,y=9)]. L1 buffer allocated at 1310720 and static circular buffer region ends at 1388800\nbacktrace:\n --- /home/adit"
+        }
+      ],
+      "best": {
+        "cap": 2,
+        "gate_bw": 2,
+        "down_bw": 2,
+        "ms": 2.060276921838522,
+        "gbs_bf8": 137.8933855874481,
+        "pct_peak": 26.932301872548457,
+        "cos_vs_v0": 0.9994526973694741
+      }
+    }
+  },
+  "verdict": {
+    "best_variant": "V2_full_dram_sharded",
+    "delta_ms_per_step": -1.0444804793223739,
+    "delta_ms_per_token_at_64_mlps": -66.84675067663193,
+    "speedup": 0.4711072304239793,
+    "best_pct_peak": 28.097415489539625,
+    "pass_bw_90pct": false,
+    "pass_lat_half_ms": false,
+    "cos_ok": true,
+    "verdict": "FAIL"
+  }
+}
