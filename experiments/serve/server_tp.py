@@ -321,6 +321,7 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     h_tt = _rms_norm_manual(x_tt, dn['input_norm'], EPS, HIDDEN)
     # 2. in_proj (replicated x × sharded weight → per-chip slab)
     all_tt = ttnn.linear(h_tt, dn['w_in'])
+    ttnn.deallocate(h_tt)
     # 3. slice per-chip [Q | K | V | Z | A | B]
     mixed_qkv = ttnn.slice(all_tt, [0, 0], [1, CONV_DIM_CHIP])
     z_tt = ttnn.slice(all_tt, [0, CONV_DIM_CHIP], [1, CONV_DIM_CHIP + VAL_DIM_CHIP])
@@ -328,16 +329,22 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
                       [1, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP])
     b_tt = ttnn.slice(all_tt, [0, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
                       [1, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP])
+    ttnn.deallocate(all_tt)
     # 4. conv1d on per-chip slab
     mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
+    ttnn.deallocate(mixed_qkv)
     conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
+    ttnn.deallocate(mixed_col)
     conv_prod = ttnn.mul(conv_input, dn['w_conv'])
     conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
+    ttnn.deallocate(conv_prod)
     conv_state_new = ttnn.slice(conv_input, [0, 1], [CONV_DIM_CHIP, cfg['conv_kernel']])
+    ttnn.deallocate(conv_input)
     # 5. Q/K/V per-chip head-sliced
     q_flat = ttnn.slice(conv_out, [0], [KEY_DIM_CHIP])
     k_flat = ttnn.slice(conv_out, [KEY_DIM_CHIP], [2 * KEY_DIM_CHIP])
     v_flat = ttnn.slice(conv_out, [2 * KEY_DIM_CHIP], [CONV_DIM_CHIP])
+    ttnn.deallocate(conv_out)
 
     def gqa(t, n_kh, d):
         t2 = ttnn.reshape(t, [n_kh, 1, d])
@@ -377,35 +384,53 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     out_gated = ttnn.reshape(ttnn.mul(out_normed, silu_z), [1, VAL_DIM_CHIP])
     # 10. out_proj row-parallel + all_reduce
     partial = ttnn.linear(out_gated, dn['w_out'])
+    ttnn.deallocate(out_gated)
     try:
         reduced = ttnn.all_reduce(partial)
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
         reduced = ttnn.all_gather(scattered, dim=1)
+    ttnn.deallocate(partial)
     # 11. residual add + update SSM/conv state in place
     x_out = ttnn.add(x_tt, reduced)
+    ttnn.deallocate(reduced)
     H_new_3d = ttnn.reshape(H_new, [NV_PER_CHIP, K_DIM, V_DIM])
     ttnn.copy(H_new_3d, dn['ssm'])
+    ttnn.deallocate(H_new)
     ttnn.copy(conv_state_new, dn['conv_st'])
+    ttnn.deallocate(conv_state_new)
     return x_out
 
 
 def mlp_step_tp(state, x_tt, mlp):
-    """One SwiGLU MLP TP step on the mesh."""
+    """One SwiGLU MLP TP step on the mesh.
+
+    Aggressive ttnn.deallocate after each intermediate's last use — the
+    Llama70B production pattern (llama3_70b_galaxy/tt/llama_mlp.py:141-193).
+    Without these, intermediates accumulate across forward_token_tp calls
+    and the 3rd call wedges (see feedback_p6_step2_hangs.md).
+    """
     import ttnn
     from full_layer_tp_probe import EPS
     HIDDEN = state.cfg['hidden']
     h_tt = _rms_norm_manual(x_tt, mlp['post_norm'], EPS, HIDDEN)
     g = ttnn.linear(h_tt, mlp['w_gate'], activation="silu")
     u = ttnn.linear(h_tt, mlp['w_up'])
+    ttnn.deallocate(h_tt)
     h = ttnn.mul(g, u)
+    ttnn.deallocate(g)
+    ttnn.deallocate(u)
     partial = ttnn.linear(h, mlp['w_down'])
+    ttnn.deallocate(h)
     try:
         reduced = ttnn.all_reduce(partial)
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
         reduced = ttnn.all_gather(scattered, dim=1)
-    return ttnn.add(x_tt, reduced)
+    ttnn.deallocate(partial)
+    out = ttnn.add(x_tt, reduced)
+    ttnn.deallocate(reduced)
+    return out
 
 
 def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, cfg):
