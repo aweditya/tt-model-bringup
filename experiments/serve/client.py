@@ -134,6 +134,30 @@ def cmd_run_91r(args):
     print(json.dumps(data, indent=2))
 
 
+def cmd_generate(args):
+    payload = {"prompt": args.prompt, "max_tokens": args.max_tokens}
+    data = send("generate", payload)
+    print("=" * 72)
+    print(f"prompt: {data.get('prompt', '?')}")
+    print("-" * 72)
+    if "error" in data:
+        print(f"ERROR: {data['error']}")
+        return
+    print(f"generated: {data.get('generated_text', '')}")
+    print("-" * 72)
+    print(f"full text:")
+    print(data.get('full_text', ''))
+    print("=" * 72)
+    n_gen = data.get('n_generated_tokens', 0)
+    ms_per_tok = data.get('ms_per_tok', 0)
+    tok_per_sec = data.get('tok_per_sec', 0)
+    print(f"  prompt: {data.get('n_prompt_tokens', 0)} tokens, prefill {data.get('prefill_ms', 0):.1f} ms")
+    print(f"  generated: {n_gen} tokens, decode {ms_per_tok:.2f} ms/tok = {tok_per_sec:.2f} tok/s")
+    print(f"  total wall: {data.get('total_ms', 0):.1f} ms")
+    if data.get('stopped_on_eos'):
+        print(f"  (stopped on EOS)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -141,6 +165,10 @@ def main():
     sub.add_parser("reset_state").set_defaults(fn=cmd_reset)
     sub.add_parser("reload_kernels").set_defaults(fn=cmd_reload)
     sub.add_parser("shutdown").set_defaults(fn=cmd_shutdown)
+    g = sub.add_parser("generate", help="generate text from a prompt (greedy decode)")
+    g.add_argument("--prompt", type=str, required=True, help="text prompt")
+    g.add_argument("--max-tokens", type=int, default=40, help="number of tokens to generate")
+    g.set_defaults(fn=cmd_generate)
     r = sub.add_parser("run_91r")
     r.add_argument("--layers", type=str, default=None,
                    help="comma-separated layer indices (default: server default)")
