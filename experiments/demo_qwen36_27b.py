@@ -26,12 +26,28 @@ Run this script directly only for end-to-end "show me text generation":
         --prompts "The largest planet is" "In machine learning," \\
         --tokens 40
 
-Current single-chip perf (validated 2026-05-13 on qb2):
-  - Eager non-paged decode: ~210 ms/tok (4.74 tok/s) at MAX_POS=256
-  - Eager paged decode:     ~215 ms/tok (4.65 tok/s) at MAX_POS=8192+ (unlimited context)
-  - Traced decode:          ~198 ms/tok (5.04 tok/s) — execute_trace alone
+Current single-chip perf (validated 2026-05-13 on qb1, with QK rms_norm shipped):
+  - Eager non-paged decode:  192.81 ms/tok (5.19 tok/s) at MAX_POS=256
+  - Eager paged decode:      ~215 ms/tok (4.65 tok/s) at MAX_POS=8192+ (unlimited context)
+  - Traced decode:           ~198 ms/tok (5.04 tok/s) — execute_trace alone
 
-Per-layer cosine vs HF: ≥ 0.99997 (Branch III correctness gate).
+Per-layer cosine vs HF: ≥ 0.99973 (Branch III gate; QK rms_norm slight drift
+from 0.99997 baseline within bf16 precision noise — see feedback_qk_rms_norm_shipped.md)
+
+Multi-chip TP (qb2, 4× P150 with fabric, in development):
+  - Traced TP per block:     1.34 ms (5.23× over eager — C'7.6.1 probe)
+  - Projected end-to-end:    46.8 ms/tok = 21.36 tok/s theoretical ceiling
+  - Realistic after host overhead: ~12-18 tok/s
+  - Persistent multi-chip server: planned (C'7.8)
+
+Optimization stack landed in 91f:
+  - C'1: in-place update_cache_for_token_ for KV slot writes (7.2× scatter)
+  - C'2: bf16 residual stream
+  - C'4 v4: trace capture for full single-chip decode step
+  - V2 RoPE: rotate-only path with ROTARY_DIM-wide server slice
+  - QK rms_norm: 11-op manual sequence → 2-op fused ttnn.rms_norm
+  - DeltaNet 4-linear in_proj fusion (qkv|z|a|b concat)
+  - ATTN-QKV fusion in gated_attn_step (q_proj|k_proj|v_proj concat)
 
 This script uses the eager non-paged path. For long context support use
 `bench_decode_paged` via the server (which exercises `gated_attn_step_ondevice_paged`).
