@@ -1,0 +1,146 @@
+{
+  "shapes": {
+    "HEAD_DIM": 256,
+    "N_Q": 24,
+    "N_KV": 4,
+    "NQ_PER_CHIP": 6,
+    "NKV_PER_CHIP": 1,
+    "BLOCK_SIZE": 32,
+    "NCHIPS": 4
+  },
+  "attempts": [
+    {
+      "label": "A_no_progcfg",
+      "ok": false,
+      "err": "RuntimeError: TT_FATAL @ /project/ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/sdpa_decode_program_factory.cpp:210: num_tree_reduction_rounds <= MAX_TREE_REDUCTION_ROUNDS\ninfo:\nTree reduction max 6 rounds (64 cores/head), got 110 cores/head\nbacktrace:\n --- /home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/build/lib/_ttnncpp.so(+0x11a52fb) [0x7f8b923fc2fb]\n --- ttnn::prim::SdpaDecodeProgramFactory::create(ttnn::prim::SdpaDecodeParams const&, ttnn::prim::SdpaDecodeInputs const&, tt::tt_metal::Tensor&)\n --- /home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/build/lib/_ttnncpp.so(+0x126e238) [0x7f8b924c5238]\n --- /home/aditya/tt-xla/.venv/lib/python3.10/site-packages/ttnn/build/lib/_ttnncpp.so(+0x126d809) [0x7f8b924c4809]\n --- /home/aditya/tt-xla/.venv/lib/python3.10/site-packa"
+    },
+    {
+      "label": "B_grid_4x4_chunks_0",
+      "ok": true,
+      "err": null,
+      "out_shape": [
+        1,
+        1,
+        24,
+        256
+      ],
+      "finite": true,
+      "max_abs": 0.3828125,
+      "cos_per_chip": [
+        0.9999673935584623,
+        0.9999599091250638,
+        0.9999632880957108,
+        0.999964104510895
+      ],
+      "cos_total": 0.9999619262901771
+    },
+    {
+      "label": "C_grid_8x6_chunks_0",
+      "ok": true,
+      "err": null,
+      "out_shape": [
+        1,
+        1,
+        24,
+        256
+      ],
+      "finite": true,
+      "max_abs": 0.3828125,
+      "cos_per_chip": [
+        0.9999673935584623,
+        0.9999599091250638,
+        0.9999632880957108,
+        0.999964104510895
+      ],
+      "cos_total": 0.9999619262901771
+    },
+    {
+      "label": "D_grid_2x2_chunks_0",
+      "ok": true,
+      "err": null,
+      "out_shape": [
+        1,
+        1,
+        24,
+        256
+      ],
+      "finite": true,
+      "max_abs": 0.3828125,
+      "cos_per_chip": [
+        0.9999673935584623,
+        0.9999599091250638,
+        0.9999632880957108,
+        0.999964104510895
+      ],
+      "cos_total": 0.9999619262901771
+    },
+    {
+      "label": "E_grid_8x6_max_cores_8",
+      "ok": true,
+      "err": null,
+      "out_shape": [
+        1,
+        1,
+        24,
+        256
+      ],
+      "finite": true,
+      "max_abs": 0.3828125,
+      "cos_per_chip": [
+        0.9999673935584623,
+        0.9999599091250638,
+        0.9999632880957108,
+        0.999964104510895
+      ],
+      "cos_total": 0.9999619262901771
+    },
+    {
+      "label": "F_grid_4x4_chunks_32",
+      "ok": true,
+      "err": null,
+      "out_shape": [
+        1,
+        1,
+        24,
+        256
+      ],
+      "finite": true,
+      "max_abs": 0.3828125,
+      "cos_per_chip": [
+        0.9999673935584623,
+        0.9999599091250638,
+        0.9999632880957108,
+        0.999964104510895
+      ],
+      "cos_total": 0.9999619262901771
+    }
+  ],
+  "max_pos_scaling": [
+    {
+      "max_pos": 1024,
+      "median_ms": 0.12111850082874298,
+      "min_ms": 0.11629797518253326,
+      "ok": true
+    },
+    {
+      "max_pos": 4096,
+      "median_ms": 0.1269179629161954,
+      "min_ms": 0.06515998393297195,
+      "ok": true
+    },
+    {
+      "max_pos": 8192,
+      "median_ms": 0.1290834043174982,
+      "min_ms": 0.12794788926839828,
+      "ok": true
+    }
+  ],
+  "latency_ms": {
+    "paged_sdpa_median": 0.1170929754152894,
+    "paged_sdpa_min": 0.07346994243562222,
+    "manual_sdpa_median": 0.42006035801023245,
+    "manual_sdpa_min": 0.4148348234593868,
+    "speedup_median": 3.587408693992271
+  },
+  "winner_label": "B_grid_4x4_chunks_0"
+}
