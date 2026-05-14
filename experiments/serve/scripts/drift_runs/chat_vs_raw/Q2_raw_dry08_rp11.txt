@@ -1,0 +1,51 @@
+========================================================================
+prompt: Implement a JSON parser combinator in Rust
+------------------------------------------------------------------------
+.
+
+<think>
+Here's a thinking process:
+
+1.  **Understand the User Request:**
+   - **Goal:** Implement a JSON parser combinator library in Rust.
+   - **Key Concepts:** Parser combinators, JSON parsing, Rust implementation.
+   - **Expected Output:** A complete, working Rust code example that demonstrates how to parse JSON using parser combinators.
+
+2.  **Deconstruct Parser Combinators:**
+   - What are parser combinators? They're functions that take parsers as input and return new parsers as output. They allow building complex parsers from simple ones.
+   - Common examples: `char`, `satisfy` (ors: `s:` `s s: ` `:: `: ` `: `::::.:::
+:::::: ::: (::::1:::: I:: you:: s s:0:::  :
+0:
+: 1 : : 
+   : : the
+  m   
+
+ :   (     the 0   ,     .    1       ( 
+  (  
+ 
+ , 
+  
+,    or    
+  0 
+  ,
+      a    
+
+     ,,    3      of     5      is     
+ (      0  
+ 1  
+ 
+
+  1 
+   (
+  2     6     T     with    -      P    4     n1   2 01  (  (   ( (  9     S    E     [     on     I     M   by11   ( 1 1
+   8     t  t   111   1 (   10     St   can     L  ‑    –    "   The   -   for     D 0 (   
+-s  the (  the the ( 0 the  / off   m
+ (  [  (  a
+
+ the 
+ " (   an  O a0  the'   [  
+========================================================================
+  prompt: 8 tokens, prefill 1534.5 ms
+  generated: 600 tokens, decode 194.56 ms/tok = 5.14 tok/s
+  paged: max_pos=1024, block_size=64
+  total wall: 145579.2 ms

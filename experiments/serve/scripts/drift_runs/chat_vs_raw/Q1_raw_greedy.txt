@@ -1,0 +1,285 @@
+========================================================================
+prompt: Implement a JSON parser combinator in Rust
+------------------------------------------------------------------------
+.
+
+<think>
+
+</think>
+
+```rust
+use std::fmt;
+
+/// Represents a JSON value
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    Str(String),
+    Array(Vec<JsonValue>),
+    Object(Vec<(String, JsonValue)>),
+}
+
+impl fmt::Display for JsonValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JsonValue::Null => write!(f, "null"),
+            JsonValue:: "bool" => "b" => " ",
+
+
+
+
+
+
+
+
+
+ 
+
+
+  
+
+
+
+
+ 
+
+
+ 
+,
+
+
+
+        
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+ 
+
+
+
+
+
+
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+     
+  
+
+     (  (   (     
+
+ (   (     
+ (  (   ( ( ( ( (  (  (
+
+ ( (  (  (  (  (  (   I
+ (  ( ( (  ( (  ( (  (   ( (  I ( 
+
+0 (  (-  (
+
+ ( ( (  (  I
+ 
+
+
+ T ( 
+ ( ( I (  or ( (  I ( ( ( ( ( (  (  ( ( ( ( ( ( (I
+
+0 present T 
+
+
+s  $\  
+
+
+ (   $\�  or
+  further
+
+ T present 
+
+  present
+ 
+
+ T 
+  $\ ( 
+      
+
+许 
+
+   
+
+   
+
+ one ( 祖G a Re呈 I presentI    I     
+
+
+
+  
+
+
+   . 
+
+ m
+========================================================================
+  prompt: 8 tokens, prefill 2016.6 ms
+  generated: 600 tokens, decode 194.75 ms/tok = 5.13 tok/s
+  paged: max_pos=1024, block_size=64
+  total wall: 146374.3 ms
