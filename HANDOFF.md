@@ -3,23 +3,25 @@
 Last updated: 2026-05-14. Authoritative entry point for any agent picking up this project. Read this end-to-end before touching code. Cite memory notes by filename (e.g. `feedback_paged_sdpa_shipped_tp.md`) — they live in `~/.claude/projects/-Users-adityasriram-Labs-stanford-cs440lx-tt-xla/memory/`.
 
 ## Table of contents
-1. What this project is
-2. Non-negotiables
-3. Hosts (qb1 vs qb2)
-4. Persistent servers (lifecycle + endpoints)
-5. Repo layout
-6. Memory bank
-7. Roofline / ceiling math
-8. Roadmap + shipped wins
-9. Reproducing key results
-10. Tracing / profiling
-11. Web scraping / research strategy
-12. Background research strategy (4-agent parallel)
-13. Plan-of-action template
-14. Pitfalls (meta-lessons)
-15. Friend repo (reference only)
-16. Quick-start checklist
-17. Glossary
+1. [What this project is](#1-what-this-project-is)
+2. [Non-negotiables](#2-non-negotiables)
+3. [Hosts (qb1 vs qb2)](#3-hosts)
+4. [Persistent servers (lifecycle + endpoints)](#4-persistent-servers-lifecycle--endpoints)
+5. [Repo layout](#5-repo-layout)
+6. [Memory bank](#6-memory-bank)
+7. [Roofline / ceiling math](#7-roofline--ceiling-math)
+8. [Roadmap + shipped wins](#8-roadmap--shipped-wins)
+9. [Reproducing key results](#9-reproducing-key-results)
+10. [Tracing / profiling](#10-tracing--profiling)
+11. [Web scraping / research strategy](#11-web-scraping--research-strategy)
+12. [Background research strategy (4-agent parallel)](#12-background-research-strategy-4-agent-parallel-pattern)
+13. [Plan-of-action template](#13-plan-of-action-template-7-step-workflow)
+14. [Pitfalls (meta-lessons)](#14-pitfalls-meta-lessons)
+15. [Friend repo (reference only)](#15-friend-repo-reference-only)
+16. [Quick-start checklist](#16-quick-start-checklist-first-30-min-as-a-new-agent)
+17. [Glossary](#17-glossary)
+
+**Newcomer? Start with §16 (Quick-start checklist), then read §3 + §4 + §14 before writing any code.**
 
 ---
 
@@ -204,7 +206,7 @@ From `reference_p150_roofline_priority.md` and `feedback_realistic_tp_ceiling.md
 | Single-chip post QK rms_norm fusion | 192.81 ms/tok = 5.19 tok/s | `feedback_qk_rms_norm_shipped.md` |
 | TP traced baseline (pre-paged-SDPA) | 7.02 tok/s | commit `9369e1b` |
 | **TP shipped (paged SDPA + HiFi2 B3)** | **11.43 tok/s** | `feedback_paged_sdpa_shipped_tp.md`, commit `4741253` |
-| Friend's daily-driver | 15.3 tok/s | competitive target |
+| Friend's daily-driver | ~15.3-15.5 tok/s | competitive target |
 | El Reg Llama-3.1-70B 4×P150 measured | 1.78× TP4 vs TP1 (~41% of theoretical) | `feedback_realistic_tp_ceiling.md` — realistic ceiling, not 4× |
 
 ### Targets (single-chip, bf16/bf8 mix, MAX_POS=256)
@@ -270,7 +272,7 @@ The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_
 | Long-context cliff (qb1, HiFi2 B3) | none up to L=500 | `feedback_fp32_sdpa_cliff_probe.md` |
 | Speculative decode (D'3) | DON'T SHIP at 57.9% acceptance | `feedback_d3_dont_ship_yet.md` |
 | El Reg ceiling (4× P150 Llama70B BFP8) | 1.78× (~9.2 tok/s equivalent) | `feedback_realistic_tp_ceiling.md` — we're above this |
-| Friend's daily-driver (samjett Qwen3.6-27B) | 15.3 tok/s | 25% gap remaining |
+| Friend's daily-driver (samjett Qwen3.6-27B) | ~15.3-15.5 tok/s | 25% gap remaining |
 
 ### Next ship list (post-paged-SDPA, prioritized)
 
@@ -555,7 +557,7 @@ There's a friend's daily-driver Qwen3.6-27B implementation at:
 experiments/.refs/tt-qwen-36/   (commit a3d12574, branch qwen36-fresh)
 ```
 
-**Friend (samjett) achieves 15.5 tok/s on 4× P150 dense.** We're at 11.43 tok/s — 25% behind.
+**Friend (samjett) achieves ~15.3-15.5 tok/s on 4× P150 dense.** We're at 11.43 tok/s — 25% behind. (15.5 per `models/tt_transformers/PERF.md:50`, 15.3 cited as "daily-driver" in memory notes — both rounded to "~15.")
 
 ### WARNING: REFERENCE ONLY
 
