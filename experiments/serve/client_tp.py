@@ -51,6 +51,15 @@ def cmd_shutdown(_):
     print(json.dumps(_send("shutdown", {}), indent=2))
 
 
+def cmd_bench_decode_tp_components(args):
+    data = _send("bench_decode_tp_components", {
+        "prompt": args.prompt,
+        "iters": args.iters,
+        "warmup": args.warmup,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
 def cmd_generate_tp(args):
     """Streaming generate_tp — same chunk/result protocol as client.cmd_generate."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -103,6 +112,12 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("shutdown").set_defaults(fn=cmd_shutdown)
+    b = sub.add_parser("bench_decode_tp_components",
+                       help="server-resident TP component timing")
+    b.add_argument("--prompt", default="The capital of France is")
+    b.add_argument("--iters", type=int, default=20)
+    b.add_argument("--warmup", type=int, default=3)
+    b.set_defaults(fn=cmd_bench_decode_tp_components)
     g = sub.add_parser("generate_tp", help="multi-chip generate (streams)")
     g.add_argument("--prompt", required=True)
     g.add_argument("--max-tokens", type=int, default=60)

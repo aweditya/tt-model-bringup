@@ -912,6 +912,142 @@ def _traced_forward(state, token_id, cur_pos):
     return state.traced_argmax_tt
 
 
+def _summary_ms(samples):
+    import numpy as np
+    if not samples:
+        return {}
+    arr = np.array(samples, dtype=np.float64)
+    return {
+        "median": float(np.median(arr)),
+        "mean": float(np.mean(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
+
+
+def handle_bench_decode_tp_components(state: MeshServerState, args: dict) -> dict:
+    """Server-resident TP decomposition for the current production trace.
+
+    This endpoint intentionally runs inside the persistent server process so it
+    does not open a second mesh device. It measures the current P25 production
+    trace components directly:
+      - update_input_buffers only (sync-bounded)
+      - execute_trace only (sync-bounded)
+      - update + execute_trace combined (production timed region)
+      - on-device argmax readback (tiny tensor)
+
+    It does not claim a speedup; it sizes opportunity before we choose a patch.
+    """
+    import ttnn
+    import time as _time
+
+    prompt = args.get("prompt", "The capital of France is")
+    iters = int(args.get("iters", 20))
+    warmup = int(args.get("warmup", 3))
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+    if state.tok is None or not state.layers:
+        return {"error": "server not fully loaded"}
+
+    _ensure_decode_trace(state)
+    _reset_state_buffers(state)
+    prompt_ids = state.tok.encode(prompt)
+    if not prompt_ids:
+        return {"error": "prompt encoded to zero tokens"}
+
+    def sync():
+        ttnn.synchronize_device(state.mesh)
+
+    def timed(fn):
+        sync()
+        t0 = _time.perf_counter()
+        out = fn()
+        sync()
+        return (_time.perf_counter() - t0) * 1000.0, out
+
+    # Seed trace output for readback timing and put buffers in a valid state.
+    update_input_buffers(state, prompt_ids[0], 0)
+    ttnn.execute_trace(state.mesh, state.trace_id, cq_id=0, blocking=False)
+    sync()
+
+    # Warm up the exact measurement surfaces.
+    for i in range(warmup):
+        tid = prompt_ids[i % len(prompt_ids)]
+        pos = i % MAX_POS
+        update_input_buffers(state, tid, pos)
+        ttnn.execute_trace(state.mesh, state.trace_id, cq_id=0, blocking=False)
+    sync()
+
+    update_ms = []
+    execute_ms = []
+    combined_ms = []
+    readback_ms = []
+    next_ids = []
+
+    for i in range(iters):
+        tid = prompt_ids[i % len(prompt_ids)]
+        pos = i % MAX_POS
+
+        dt, _ = timed(lambda tid=tid, pos=pos: update_input_buffers(state, tid, pos))
+        update_ms.append(dt)
+
+        dt, _ = timed(lambda: ttnn.execute_trace(state.mesh, state.trace_id, cq_id=0, blocking=False))
+        execute_ms.append(dt)
+
+        def read_argmax():
+            return ttnn.to_torch(
+                state.traced_argmax_tt,
+                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+            )
+        t0 = _time.perf_counter()
+        idx_concat = read_argmax()
+        readback_ms.append((_time.perf_counter() - t0) * 1000.0)
+        next_ids.append(int(idx_concat.cpu().numpy().reshape(-1)[0]))
+
+        tid2 = next_ids[-1]
+        pos2 = (pos + 1) % MAX_POS
+        def update_execute():
+            update_input_buffers(state, tid2, pos2)
+            ttnn.execute_trace(state.mesh, state.trace_id, cq_id=0, blocking=False)
+        dt, _ = timed(update_execute)
+        combined_ms.append(dt)
+
+    # Leave the server in a clean state for the next request.
+    _reset_state_buffers(state)
+
+    result = {
+        "prompt": prompt,
+        "prompt_ids": list(prompt_ids),
+        "iters": iters,
+        "warmup": warmup,
+        "summary_ms": {
+            "update_input_buffers": _summary_ms(update_ms),
+            "execute_trace": _summary_ms(execute_ms),
+            "update_plus_execute": _summary_ms(combined_ms),
+            "argmax_readback": _summary_ms(readback_ms),
+        },
+        "samples_ms": {
+            "update_input_buffers": update_ms,
+            "execute_trace": execute_ms,
+            "update_plus_execute": combined_ms,
+            "argmax_readback": readback_ms,
+        },
+        "next_ids_sample": next_ids[: min(8, len(next_ids))],
+        "note": (
+            "Component timings are sync-bounded and may not sum exactly to the "
+            "production generate_tp ms/tok because update and execute are "
+            "also measured in isolated loops."
+        ),
+    }
+    state.last_run = {
+        "cmd": "bench_decode_tp_components",
+        "median_update_ms": result["summary_ms"]["update_input_buffers"].get("median"),
+        "median_execute_ms": result["summary_ms"]["execute_trace"].get("median"),
+        "median_combined_ms": result["summary_ms"]["update_plus_execute"].get("median"),
+    }
+    return result
+
+
 def handle_generate_tp(state: MeshServerState, args: dict):
     """Multi-chip TP generate — streams by default (mirrors server.py UX).
 
@@ -1032,6 +1168,7 @@ def handle_generate_tp(state: MeshServerState, args: dict):
 HANDLERS = {
     "status":         handle_status,
     "generate_tp":    handle_generate_tp,
+    "bench_decode_tp_components": handle_bench_decode_tp_components,
     "shutdown":       handle_shutdown,
 }
 

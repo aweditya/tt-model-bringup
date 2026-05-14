@@ -21,6 +21,7 @@ Result JSON:
 
 ```text
 ~/tt-xla/.cache/qb2_tp_generate_bench/results_20260514_220947.json
+~/tt-xla/.cache/qb2_tp_generate_bench/results_20260514_222053.json  # after component endpoint restart
 ```
 
 Measured, excluding one warmup:
@@ -34,6 +35,44 @@ Measured, excluding one warmup:
 
 Prompt output is coherent ("Paris" continuation). This is the benchmark
 baseline for subsequent qb2 changes.
+
+Post-endpoint restart recheck (`results_20260514_222053.json`) matched the
+baseline: median 82.808 ms/tok, median 12.076 tok/s. The instrumentation did
+not perturb the production generate path.
+
+## Current component decomposition
+
+Server-resident endpoint:
+
+```bash
+ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp \
+  bench_decode_tp_components --iters 20 --warmup 3'
+```
+
+Result JSON:
+
+```text
+~/tt-xla/.cache/qb2_tp_components/results_20260514_222202.json
+```
+
+Measured medians:
+
+| Component | Median ms |
+|---|---:|
+| `update_input_buffers` only | 0.718 |
+| `execute_trace` only | 82.183 |
+| `update_input_buffers + execute_trace` | 82.693 |
+| tiny argmax readback | 1.419 |
+
+Interpretation:
+
+- The production timed region is almost entirely trace replay. The remaining
+  host update path is less than 1 ms/tok in this sync-bounded probe.
+- On-device `plus_one` for position state may still be worth doing for
+  cleanliness, but this measurement bounds the immediate opportunity: the
+  whole measured update region is ~0.7 ms/tok.
+- The next multi-chip optimization should target trace-body work or collective
+  layout inside the trace, not host input-buffer overhead.
 
 ## Rules for this track
 
@@ -49,7 +88,7 @@ baseline for subsequent qb2 changes.
 
 ## Immediate hypotheses
 
-### H0: Refresh the P25 breakdown
+### H0: Refresh the P25 breakdown — done
 
 Hypothesis: post-P25 bottlenecks differ enough from the old 7.02 tok/s
 breakdown that we need a new decomposition before choosing code changes.
@@ -60,18 +99,19 @@ readback and 1.9 ms update_input_buffers from the pre-P22/P25 path.
 
 Validation:
 
-- Run or adapt `experiments/utils/tp_decompose_probe.py` against the current
-  server/code path.
-- Output per-token buckets for decode compute, collectives, update buffers,
-  argmax/readback, and any host-side gaps.
-- Gate: no production code change; benchmark result must still reproduce
-  ~82.8 ms/tok.
+- Implemented server-resident `bench_decode_tp_components` in
+  `experiments/serve/server_tp.py` and client command in
+  `experiments/serve/client_tp.py`.
+- Gate passed: post-endpoint generate benchmark still reproduces ~82.8 ms/tok.
+- Result: trace replay is the dominant measured region; update/input overhead
+  is small.
 
 ### H1: Move remaining position updates on device
 
 Hypothesis: P25 still writes `tok_buf`, `cur_pos_buf`, and `rot_idxs_buf` from
 host each step. Moving `cur_pos` / rotary index increment into the trace may
-reduce the remaining host update cost.
+reduce the remaining host update cost, but the measured opportunity is bounded
+by the full update bucket.
 
 Evidence:
 
@@ -82,9 +122,8 @@ Evidence:
 
 Validation:
 
-- First quantify remaining update cost in H0.
-- Only prototype if H0 shows the host update path is measurable relative to
-  total decode time.
+- H0 measured update at ~0.718 ms/tok. Treat this as a cleanup/latency-tail
+  candidate, not the main path to hardware-ceiling proximity.
 - Correctness gate: generated token sequence matches current top-1 for a short
   deterministic prompt; paged cache positions advance exactly.
 
