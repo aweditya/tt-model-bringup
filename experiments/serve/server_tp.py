@@ -120,19 +120,150 @@ def bootstrap(state: MeshServerState):
     state.tok = AutoTokenizer.from_pretrained(MODEL_ID)
     print(f"  ✓ tokenizer", flush=True)
 
-    # TODO Stage B: load + shard layer weights
-    # for i in range(state.num_layers):
-    #     layer_type = 'linear_attention' if i % 4 != 3 else 'full_attention'
-    #     w_np = load_layer_weights_all(i, layer_type)
-    #     state.layers.append(shard_and_upload(state.mesh, w_np, layer_type, cfg))
+    # === Stage B: load + shard all layer weights ===
+    print(f"[bootstrap] importing 91f kernels + TP relayout helpers…", flush=True)
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, "experiments"))
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, "experiments", "utils"))
+    spec = importlib.util.spec_from_file_location(
+        "_91f", os.path.join(PROJECT_ROOT, "experiments", "91f_qwen36_27b_full_ondevice.py"))
+    _91f = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_91f)
+    state._91f = _91f
+    from full_layer_tp_probe import (
+        relayout_in_proj, relayout_conv,
+        N_K_HEADS, N_V_HEADS, K_DIM, V_DIM, KERNEL, KEY_DIM, VAL_DIM, CONV_DIM,
+        NCHIPS,
+    )
+    from tp_attn_traced_probe import (
+        relayout_attn_qkv, relayout_o,
+        NQ_PER_CHIP, NKV_PER_CHIP,
+    )
 
-    # TODO Stage B: load + upload embed, lm_head, final_norm (replicated)
-    # TODO Stage B: precompute cos/sin tables, upload (replicated)
-    # TODO Stage C: trace capture
-    # TODO Stage D: traced forward graph + persistent buffers
+    def upload_replicated(arr, dtype=ttnn.bfloat16):
+        return ttnn.from_torch(torch.from_numpy(arr), dtype=dtype,
+                                device=state.mesh, layout=ttnn.TILE_LAYOUT,
+                                mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
 
-    print(f"[bootstrap] STAGE A COMPLETE — mesh + cfg + tokenizer ready.", flush=True)
-    print(f"[bootstrap] TODO: weight loading (Stage B), trace (Stage C), generate (Stage D)", flush=True)
+    def upload_sharded(arr, dim, dtype=ttnn.bfloat16):
+        return ttnn.from_torch(torch.from_numpy(arr), dtype=dtype,
+                                device=state.mesh, layout=ttnn.TILE_LAYOUT,
+                                mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=dim))
+
+    print(f"[bootstrap] loading + sharding {state.num_layers} layers (this is the slow part)…", flush=True)
+    t_load_start = time.time()
+    for i in range(state.num_layers):
+        layer_type = 'linear_attention' if i % 4 != 3 else 'full_attention'
+        w_np = _91f.load_layer_weights_all(i, layer_type)
+        # MLP weights (shared between DN and attn layers)
+        w_gate_tt = upload_sharded(w_np['gate_proj'], dim=1)
+        w_up_tt = upload_sharded(w_np['up_proj'], dim=1)
+        w_down_tt = upload_sharded(w_np['down_proj'], dim=0)
+        post_norm_tt = upload_replicated(w_np['post_attention_layernorm'])
+        input_norm_tt = upload_replicated(w_np['input_layernorm'])
+
+        if layer_type == 'linear_attention':
+            w_in_sh = relayout_in_proj(w_np['in_proj_all'])
+            conv_w_np = w_np['conv1d_weight']
+            if conv_w_np.ndim == 3:
+                conv_w_np = conv_w_np.squeeze(1)
+            w_conv_sh = relayout_conv(conv_w_np)
+            conv_state_sh = relayout_conv(
+                np.zeros((CONV_DIM, cfg['conv_kernel'] - 1), dtype=np.float32))
+
+            w_in_tt = upload_sharded(w_in_sh, dim=1)
+            w_conv_tt = upload_sharded(w_conv_sh, dim=0)
+            conv_state_tt = upload_sharded(conv_state_sh, dim=0)
+            dt_bias_tt = upload_sharded(w_np['dt_bias'], dim=0)
+            A_log_tt = upload_sharded(w_np['A_log'], dim=0)
+            w_out_tt = upload_sharded(w_np['out_proj'], dim=0)
+            ssm_tt = upload_sharded(
+                np.zeros((N_V_HEADS, K_DIM, V_DIM), dtype=np.float32), dim=0)
+            linear_attn_norm_tt = upload_replicated(w_np['linear_attn_norm'])
+            # Q/K L2 scale constants for QK rms_norm fusion (mirrors 91f)
+            K_DIM_LOCAL = 128
+            q_l2_scale = np.full(K_DIM_LOCAL, 1.0 / K_DIM_LOCAL, dtype=np.float32)
+            k_l2_scale = np.full(K_DIM_LOCAL, 1.0 / np.sqrt(K_DIM_LOCAL), dtype=np.float32)
+            q_l2_tt = upload_replicated(q_l2_scale)
+            k_l2_tt = upload_replicated(k_l2_scale)
+
+            layer = {
+                'type': 'linear_attention',
+                'dn': {
+                    'w_in': w_in_tt, 'w_conv': w_conv_tt, 'conv_st': conv_state_tt,
+                    'dt_bias': dt_bias_tt, 'A_log': A_log_tt, 'w_out': w_out_tt,
+                    'ssm': ssm_tt,
+                    'input_norm': input_norm_tt,
+                    'linear_attn_norm': linear_attn_norm_tt,
+                    'q_l2_scale': q_l2_tt, 'k_l2_scale': k_l2_tt,
+                },
+                'mlp': {
+                    'w_gate': w_gate_tt, 'w_up': w_up_tt, 'w_down': w_down_tt,
+                    'post_norm': post_norm_tt,
+                },
+            }
+        else:
+            # full_attention layer
+            w_qkv_sh = relayout_attn_qkv(w_np['attn_qkv'], NQ_PER_CHIP, NKV_PER_CHIP)
+            w_o_sh = relayout_o(w_np['o_proj'])
+            w_qkv_tt = upload_sharded(w_qkv_sh, dim=1)
+            w_o_tt = upload_sharded(w_o_sh, dim=0)
+            # KV cache per-chip (1 KV head/chip): [1, MAX_POS, HEAD_DIM]
+            kv_init = np.zeros((NCHIPS, MAX_POS, cfg['head_dim']), dtype=np.float32)
+            kv_k_tt = upload_sharded(kv_init, dim=0)
+            kv_v_tt = upload_sharded(kv_init, dim=0)
+            q_norm_tt = upload_replicated(w_np['q_norm'])
+            k_norm_tt = upload_replicated(w_np['k_norm'])
+            layer = {
+                'type': 'full_attention',
+                'attn': {
+                    'w_qkv': w_qkv_tt, 'w_o': w_o_tt,
+                    'kc': kv_k_tt, 'vc': kv_v_tt,
+                    'q_norm': q_norm_tt, 'k_norm': k_norm_tt,
+                    'input_norm': input_norm_tt,
+                },
+                'mlp': {
+                    'w_gate': w_gate_tt, 'w_up': w_up_tt, 'w_down': w_down_tt,
+                    'post_norm': post_norm_tt,
+                },
+            }
+        state.layers.append(layer)
+        if (i + 1) % 8 == 0 or i == 0:
+            print(f"  layer {i + 1}/{state.num_layers} loaded ({time.time() - t_load_start:.0f}s elapsed)",
+                  flush=True)
+
+    print(f"[bootstrap] all {state.num_layers} layers loaded in {time.time() - t_load_start:.0f}s", flush=True)
+
+    # === Stage B (cont): embed, lm_head, final_norm — replicated ===
+    print(f"[bootstrap] loading embed + lm_head + final_norm + RoPE tables…", flush=True)
+    # Reuse 91l's loader (used by single-chip server too)
+    spec2 = importlib.util.spec_from_file_location(
+        "_91l", os.path.join(PROJECT_ROOT, "experiments", "91l_fp32_residual_generate.py"))
+    _91l = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(_91l)
+    embed_np, lm_head_np, final_norm_np = _91l.load_embed_lm_head_weights()
+    state.embed_np = embed_np
+    state.final_norm_tt = upload_replicated(final_norm_np)
+    state.lm_head_tt = upload_replicated(lm_head_np)
+    print(f"  ✓ embed/lm_head/final_norm uploaded", flush=True)
+
+    # RoPE cos/sin tables — ROTARY_DIM-wide (V2 rotate-only path)
+    HEAD_DIM = cfg['head_dim']
+    rotary_dim = int(HEAD_DIM * cfg['partial_rotary_factor'])
+    half_rot = rotary_dim // 2
+    freqs = 1.0 / (10_000_000.0 ** (np.arange(half_rot).astype(np.float32) / half_rot))
+    positions = np.arange(MAX_POS).astype(np.float32)
+    ang = positions[:, None] * freqs[None, :]
+    cos_all = np.concatenate([np.cos(ang), np.cos(ang)], axis=-1).astype(np.float32)
+    sin_all = np.concatenate([np.sin(ang), np.sin(ang)], axis=-1).astype(np.float32)
+    pad = HEAD_DIM - rotary_dim
+    cos_ext = np.concatenate([cos_all, np.ones((MAX_POS, pad), dtype=np.float32)], axis=-1)
+    sin_ext = np.concatenate([sin_all, np.zeros((MAX_POS, pad), dtype=np.float32)], axis=-1)
+    state.cos_ext_table_tt = upload_replicated(cos_ext)
+    state.sin_ext_table_tt = upload_replicated(sin_ext)
+    print(f"  ✓ RoPE tables uploaded (MAX_POS={MAX_POS})", flush=True)
+
+    print(f"[bootstrap] STAGE B COMPLETE — all weights + state buffers on mesh.", flush=True)
+    print(f"[bootstrap] TODO Stage C: trace capture, Stage D: handle_generate_tp", flush=True)
 
 
 # --- Handlers -----------------------------------------------------------------
