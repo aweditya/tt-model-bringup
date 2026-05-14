@@ -134,6 +134,73 @@ def cmd_run_91r(args):
     print(json.dumps(data, indent=2))
 
 
+def cmd_generate_stream(args):
+    """Streaming generate — prints token deltas as they arrive."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(7200.0)
+    try:
+        sock.connect(P.SOCKET_PATH)
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        print(f"client: cannot connect to {P.SOCKET_PATH}: {e}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        sock.sendall(P.pack_request("generate_stream",
+                                     {"prompt": args.prompt, "max_tokens": args.max_tokens}))
+        # Print prompt header
+        print("=" * 72)
+        print(f"prompt: {args.prompt}")
+        print("-" * 72)
+        # Read chunks one at a time until final
+        final = None
+        n_chunks = 0
+        # Reuse read_line in a loop; each line is one JSON message.
+        while True:
+            raw = P.read_line(sock, max_bytes=64 << 20)
+            if not raw:
+                print("\nclient: server closed connection before final", file=sys.stderr)
+                break
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except Exception as e:
+                print(f"\nclient: bad JSON: {e}", file=sys.stderr)
+                break
+            t = obj.get("type", "")
+            if t == "error":
+                print(f"\nERROR: {obj.get('msg')}", file=sys.stderr)
+                sys.exit(4)
+            elif t == "chunk":
+                data = obj.get("data", {})
+                txt = data.get("token_text", "")
+                print(txt, end="", flush=True)
+                n_chunks += 1
+            elif t == "result":
+                final = obj.get("data", {})
+                break
+            else:
+                print(f"\nclient: unknown response type: {t}", file=sys.stderr)
+                break
+    finally:
+        sock.close()
+    print()  # newline after generation
+    print("=" * 72)
+    if final is None:
+        print(f"  (streamed {n_chunks} chunks, no final summary)")
+        return
+    if "error" in final:
+        print(f"ERROR: {final['error']}")
+        return
+    n_gen = final.get('n_generated_tokens', 0)
+    ms_per_tok = final.get('ms_per_tok', 0)
+    tok_per_sec = final.get('tok_per_sec', 0)
+    print(f"  prompt: {final.get('n_prompt_tokens', 0)} tokens, "
+          f"prefill {final.get('prefill_ms', 0):.1f} ms")
+    print(f"  generated: {n_gen} tokens, decode {ms_per_tok:.2f} ms/tok "
+          f"= {tok_per_sec:.2f} tok/s")
+    print(f"  total wall: {final.get('total_ms', 0):.1f} ms")
+    if final.get('stopped_on_eos'):
+        print(f"  (stopped on EOS)")
+
+
 def cmd_generate_paged(args):
     payload = {
         "prompt": args.prompt, "max_tokens": args.max_tokens,
@@ -197,6 +264,11 @@ def main():
     g.add_argument("--prompt", type=str, required=True, help="text prompt")
     g.add_argument("--max-tokens", type=int, default=40, help="number of tokens to generate")
     g.set_defaults(fn=cmd_generate)
+    gs = sub.add_parser("generate_stream",
+                          help="generate with token-by-token streaming output")
+    gs.add_argument("--prompt", type=str, required=True, help="text prompt")
+    gs.add_argument("--max-tokens", type=int, default=40, help="number of tokens to generate")
+    gs.set_defaults(fn=cmd_generate_stream)
     gp = sub.add_parser("generate_paged",
                           help="generate with paged KV cache for long context (>256 tokens)")
     gp.add_argument("--prompt", type=str, required=True, help="text prompt")

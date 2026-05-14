@@ -32,6 +32,12 @@ def pack_result(data: dict) -> bytes:
     return (json.dumps({"type": "result", "data": data}) + "\n").encode("utf-8")
 
 
+def pack_chunk(data: dict) -> bytes:
+    """Streaming response chunk. One per token in generate_stream. Server sends
+    multiple chunks then a final pack_result with the summary."""
+    return (json.dumps({"type": "chunk", "data": data}) + "\n").encode("utf-8")
+
+
 def pack_error(msg: str) -> bytes:
     return (json.dumps({"type": "error", "msg": msg}) + "\n").encode("utf-8")
 
