@@ -264,21 +264,28 @@ def bootstrap(state: MeshServerState):
     state.lm_head_tt = upload_replicated(embed_weights['lm_head'])
     print(f"  ✓ embed/lm_head/final_norm uploaded", flush=True)
 
-    # RoPE cos/sin tables — ROTARY_DIM-wide (V2 rotate-only path)
+    # RoPE cos/sin tables — ROTARY_DIM-wide (V2 rotate-only path).
+    # Keep host arrays in state for per-step slicing (trace-compatible: we
+    # write the current row into state.cos_buf/sin_buf via copy_host_to_device).
     HEAD_DIM = cfg['head_dim']
     rotary_dim = int(HEAD_DIM * cfg['partial_rotary_factor'])
     half_rot = rotary_dim // 2
     freqs = 1.0 / (10_000_000.0 ** (np.arange(half_rot).astype(np.float32) / half_rot))
     positions = np.arange(MAX_POS).astype(np.float32)
     ang = positions[:, None] * freqs[None, :]
-    cos_all = np.concatenate([np.cos(ang), np.cos(ang)], axis=-1).astype(np.float32)
-    sin_all = np.concatenate([np.sin(ang), np.sin(ang)], axis=-1).astype(np.float32)
+    state.cos_all_np = np.concatenate([np.cos(ang), np.cos(ang)], axis=-1).astype(np.float32)
+    state.sin_all_np = np.concatenate([np.sin(ang), np.sin(ang)], axis=-1).astype(np.float32)
+    state.rotary_dim = rotary_dim
+    # Keep the device-resident extended table for the legacy eager path (slice
+    # at runtime by Python int). The traced path uses state.cos_buf/sin_buf
+    # populated outside the trace via copy_host_to_device.
     pad = HEAD_DIM - rotary_dim
-    cos_ext = np.concatenate([cos_all, np.ones((MAX_POS, pad), dtype=np.float32)], axis=-1)
-    sin_ext = np.concatenate([sin_all, np.zeros((MAX_POS, pad), dtype=np.float32)], axis=-1)
+    cos_ext = np.concatenate([state.cos_all_np, np.ones((MAX_POS, pad), dtype=np.float32)], axis=-1)
+    sin_ext = np.concatenate([state.sin_all_np, np.zeros((MAX_POS, pad), dtype=np.float32)], axis=-1)
     state.cos_ext_table_tt = upload_replicated(cos_ext)
     state.sin_ext_table_tt = upload_replicated(sin_ext)
-    print(f"  ✓ RoPE tables uploaded (MAX_POS={MAX_POS})", flush=True)
+    print(f"  ✓ RoPE tables uploaded (MAX_POS={MAX_POS}; host arrays kept for trace)",
+          flush=True)
 
     # Paged KV cache page_table: identity mapping for B=1 (logical block i →
     # physical block i). Replicated across mesh. Fixed (doesn't change per step).
@@ -298,6 +305,31 @@ def bootstrap(state: MeshServerState):
     state.paged_write_mem_cfg = ttnn.MemoryConfig(
         ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
     print(f"  ✓ paged_write mem_cfg cached", flush=True)
+
+    # Pre-allocated input buffers for trace-compatible decode.
+    # These are READ by forward_token_tp_inner (which is the trace target).
+    # They are UPDATED before each execute_trace via copy_host_to_device_tensor
+    # — outside the captured region, so the writes don't violate trace semantics.
+    HIDDEN_DIM = cfg['hidden']
+    ROTARY_DIM = state.rotary_dim
+    state.x_buf = ttnn.from_torch(
+        torch.zeros(1, HIDDEN_DIM, dtype=torch.float32),
+        dtype=ttnn.bfloat16, device=state.mesh, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    state.cur_pos_buf = ttnn.from_torch(
+        torch.tensor([0], dtype=torch.int32),
+        device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    state.cos_buf = ttnn.from_torch(
+        torch.zeros(1, ROTARY_DIM, dtype=torch.float32),
+        dtype=ttnn.bfloat16, device=state.mesh, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    state.sin_buf = ttnn.from_torch(
+        torch.zeros(1, ROTARY_DIM, dtype=torch.float32),
+        dtype=ttnn.bfloat16, device=state.mesh, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    print(f"  ✓ input buffers pre-allocated (x_buf, cur_pos_buf, cos_buf, sin_buf)",
+          flush=True)
 
     print(f"[bootstrap] STAGE B COMPLETE — all weights + state buffers on mesh.", flush=True)
 
@@ -569,43 +601,75 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
     return ttnn.add(x_tt, reduced)
 
 
-def forward_token_tp(state, token_id, cur_pos):
-    """One full decode step on the mesh. Returns lm_head logits (replicated)."""
-    import numpy as np
+def update_input_buffers(state, token_id, cur_pos):
+    """Write new token embedding + cur_pos + cos/sin rows into pre-allocated
+    state buffers. Called OUTSIDE any captured trace, between execute_trace
+    calls. Uses ttnn.copy_host_to_device_tensor for in-place buffer updates
+    — the Llama70B production pattern (llama_common.py:211-232).
+    """
+    import ttnn
     import torch
+    import numpy as np
+    cfg = state.cfg
+    HIDDEN = cfg['hidden']
+    mesh = state.mesh
+
+    # Build host tensors (these are short-lived; the in-place copy puts data
+    # into the persistent device buffers).
+    x_np = state.embed_np[token_id].reshape(1, HIDDEN).astype(np.float32)
+    x_host = ttnn.from_torch(torch.from_numpy(x_np),
+                              dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                              mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    ttnn.copy_host_to_device_tensor(x_host, state.x_buf)
+    cur_pos_host = ttnn.from_torch(
+        torch.tensor([cur_pos], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    ttnn.copy_host_to_device_tensor(cur_pos_host, state.cur_pos_buf)
+    cos_host = ttnn.from_torch(
+        torch.from_numpy(state.cos_all_np[cur_pos:cur_pos+1]),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    ttnn.copy_host_to_device_tensor(cos_host, state.cos_buf)
+    sin_host = ttnn.from_torch(
+        torch.from_numpy(state.sin_all_np[cur_pos:cur_pos+1]),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    ttnn.copy_host_to_device_tensor(sin_host, state.sin_buf)
+
+
+def forward_token_tp_inner(state):
+    """The trace-captureable forward function. Reads ONLY from pre-allocated
+    state buffers (state.x_buf, state.cur_pos_buf, state.cos_buf, state.sin_buf)
+    — no host writes, no Python-int-baked args. Returns lm_head logits tensor.
+
+    Callers MUST call update_input_buffers(state, token_id, cur_pos) FIRST
+    to populate the buffers (and outside any captured trace).
+    """
     import ttnn
     cfg = state.cfg
     HIDDEN = cfg['hidden']
-    HEAD_DIM = cfg['head_dim']
-    ROTARY_DIM = int(HEAD_DIM * cfg['partial_rotary_factor'])
-    device = state.mesh
-
-    # Embed lookup (host) + upload replicated
-    x_np = state.embed_np[token_id].reshape(1, HIDDEN)
-    x_tt = ttnn.from_torch(torch.from_numpy(x_np.astype(np.float32)),
-                            dtype=ttnn.bfloat16, device=device,
-                            layout=ttnn.TILE_LAYOUT,
-                            mesh_mapper=ttnn.ReplicateTensorToMesh(device))
-    # RoPE row (ROTARY_DIM-wide for V2 path)
-    cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0], [cur_pos + 1, ROTARY_DIM])
-    sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0], [cur_pos + 1, ROTARY_DIM])
-    cur_pos_tt = ttnn.from_torch(
-        torch.tensor([cur_pos], dtype=torch.int32),
-        device=device, layout=ttnn.ROW_MAJOR_LAYOUT,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(device),
-    )
-
+    x_tt = state.x_buf
     for layer in state.layers:
         if layer['type'] == 'linear_attention':
             x_tt = deltanet_step_tp(state, x_tt, layer['dn'], cfg)
         else:
-            x_tt = gated_attn_step_tp(state, x_tt, layer['attn'], cur_pos_tt,
-                                       cur_pos, cos_tt, sin_tt, cfg)
+            x_tt = gated_attn_step_tp(state, x_tt, layer['attn'],
+                                       state.cur_pos_buf,
+                                       0,  # vestigial cur_pos int (paged path ignores it)
+                                       state.cos_buf, state.sin_buf, cfg)
         x_tt = mlp_step_tp(state, x_tt, layer['mlp'])
-
     x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
     logits_tt = ttnn.linear(x_tt, state.lm_head_tt)
     return logits_tt
+
+
+def forward_token_tp(state, token_id, cur_pos):
+    """Eager wrapper: update buffers then run inner forward.
+    For traced decode, use update_input_buffers + execute_trace directly.
+    """
+    update_input_buffers(state, token_id, cur_pos)
+    return forward_token_tp_inner(state)
 
 
 # --- Handlers -----------------------------------------------------------------
