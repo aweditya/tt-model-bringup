@@ -1,0 +1,62 @@
+========================================================================
+Cosine-ladder TT probe (via server)
+  HF ref: /home/aditya/tt-xla/.cache/cosine_ladder_v2/cosine_ladder_hf_ref_500.npz
+========================================================================
+HF ref:  prompt='The quick brown fox'  P=4  M=500  vocab=248320  dtype=bf16
+
+Calling server 'cosine_ladder' handler (P+M = 504 positions, max_pos = 512)…
+server result:
+{
+  "ok": true,
+  "path": "/home/aditya/tt-xla/.cache/cosine_ladder_v2/cosine_ladder_tt_logits_500.npz",
+  "n_prompt": 4,
+  "n_steps": 500,
+  "vocab": 248320,
+  "prefill_ms": 786.4298820495605,
+  "decode_ms": 101387.37368583679,
+  "ms_per_step": 203.1811095908553
+}
+
+--- COSINE LADDER ---
+  pos   hf_top1   tt_top1  mtch    cos_full  cos_top128   hf_margin   tt_margin
+------------------------------------------------------------------------------------------
+   10      8160      8160     Y   0.9780881   0.9985064      2.7972      2.7468
+   50      1575      1575     Y   0.9994501   0.9999151      2.0462      2.2822
+  100      1049     29804     N   0.9991814   0.9999146      0.0439      0.1213
+  150      1781       220     N   0.8001876   0.5008676      0.1824      2.1461
+  200      3050        13     N   0.8018350   0.2389177      9.5526      1.4315
+  250        11       220     N   0.7450893   0.3262028      2.9134      2.1933
+  300       198       220     N   0.8985904   0.9714815     18.2633      2.8411
+  350        13       220     N   0.8724105   0.9556017      9.6218      2.5989
+  400    248046       271     N   0.6337399   0.6294255      4.0638      0.7397
+  450       883       220     N   0.7388931   0.4483508      1.6534      1.0001
+  500       471       220     N   0.8245905   0.8448512     14.5668      0.2873
+
+First position where cos drops below threshold:
+  cos < 0.999: position = 2
+  cos < 0.99: position = 9
+  cos < 0.9: position = 129
+  cos < 0.5: position = 141
+
+Top-1 match rate cumulative:
+  positions 1..10: 9/10 = 90.0% match
+  positions 1..50: 49/50 = 98.0% match
+  positions 1..100: 97/100 = 97.0% match
+  positions 1..150: 131/150 = 87.3% match
+  positions 1..200: 135/200 = 67.5% match
+  positions 1..250: 136/250 = 54.4% match
+  positions 1..300: 137/300 = 45.7% match
+  positions 1..350: 137/350 = 39.1% match
+  positions 1..400: 137/400 = 34.2% match
+  positions 1..450: 138/450 = 30.7% match
+  positions 1..500: 139/500 = 27.8% match
+
+Cosine percentiles across all 500 positions:
+  p5: 0.3377943
+  p25: 0.7096249
+  p50: 0.8205425
+  p75: 0.9635618
+  p95: 0.9996593
+  min: -0.7428856  max: 0.9998792
+
+Saved → /home/aditya/tt-xla/.cache/cosine_ladder_v2/cosine_ladder_tt_results_500.json
