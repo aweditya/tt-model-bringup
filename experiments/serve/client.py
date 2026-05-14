@@ -193,6 +193,12 @@ def cmd_generate(args):
                        "chunk_size": args.chunk_size,
                        "temperature": args.temperature,
                        "top_p": args.top_p,
+                       "min_p": args.min_p,
+                       "repetition_penalty": args.repetition_penalty,
+                       "no_repeat_ngram_size": args.no_repeat_ngram_size,
+                       "dry_multiplier": args.dry_multiplier,
+                       "dry_base": args.dry_base,
+                       "dry_allowed_length": args.dry_allowed_length,
                        "seed": args.seed},
                       prompt=args.prompt)
 
@@ -204,6 +210,12 @@ def cmd_generate_long(args):
                        "chunk_size": args.chunk_size,
                        "temperature": args.temperature,
                        "top_p": args.top_p,
+                       "min_p": args.min_p,
+                       "repetition_penalty": args.repetition_penalty,
+                       "no_repeat_ngram_size": args.no_repeat_ngram_size,
+                       "dry_multiplier": args.dry_multiplier,
+                       "dry_base": args.dry_base,
+                       "dry_allowed_length": args.dry_allowed_length,
                        "seed": args.seed},
                       prompt=args.prompt)
 
@@ -223,6 +235,26 @@ def main():
                     help="0=greedy (default). >0 enables sampling — recommended for long output")
     g.add_argument("--top-p", type=float, default=1.0,
                     help="nucleus cutoff (default 1.0 = no cutoff)")
+    g.add_argument("--min-p", type=float, default=0.0,
+                    help="min-p cutoff: drop tokens with prob < min_p * max_prob "
+                         "(arXiv:2407.01082; default 0.0 = no cutoff; try 0.05-0.1)")
+    g.add_argument("--repetition-penalty", type=float, default=1.0,
+                    help="CTRL repetition penalty on generated ids "
+                         "(arXiv:1909.05858; default 1.0 = no-op; try 1.1-1.3 to break loops; "
+                         "active even at temperature=0)")
+    g.add_argument("--no-repeat-ngram-size", type=int, default=0,
+                    help="ban tokens that would form a repeated n-gram against the "
+                         "full history (HF generate flag; default 0 = off; try 3-4 to kill "
+                         "exact loops like the whitespace drift on generate_long; "
+                         "active at temperature=0)")
+    g.add_argument("--dry-multiplier", type=float, default=0.0,
+                    help="DRY sampler multiplier (llama.cpp PR #6839; default 0.0 = off; "
+                         "try 0.5-1.5 — exponential penalty for any token extending a recent "
+                         "match beyond --dry-allowed-length; active at temperature=0)")
+    g.add_argument("--dry-base", type=float, default=1.75,
+                    help="DRY base (default 1.75 per llama.cpp); penalty = mult * base^(L-allowed)")
+    g.add_argument("--dry-allowed-length", type=int, default=2,
+                    help="DRY allowed repeat length before penalty kicks in (default 2)")
     g.add_argument("--seed", type=int, default=0,
                     help="RNG seed for deterministic sampling")
     g.set_defaults(fn=cmd_generate)
@@ -236,9 +268,31 @@ def main():
     gl.add_argument("--chunk-size", type=int, default=1, help="tokens per stream chunk")
     gl.add_argument("--temperature", type=float, default=0.0,
                      help="0=greedy (default). Paged greedy degenerates past ~130 tok; "
-                          "try --temperature 0.7 --top-p 0.9 for ~150 tok before drift.")
+                          "try --temperature 0.7 --top-p 0.9 for ~150 tok before drift, or "
+                          "--repetition-penalty 1.15 (works at temperature=0).")
     gl.add_argument("--top-p", type=float, default=1.0,
                      help="nucleus cutoff for temperature>0 (default 1.0 = no cutoff)")
+    gl.add_argument("--min-p", type=float, default=0.0,
+                     help="min-p cutoff: drop tokens with prob < min_p * max_prob "
+                          "(arXiv:2407.01082; default 0.0 = no cutoff; try 0.05-0.1)")
+    gl.add_argument("--repetition-penalty", type=float, default=1.0,
+                     help="CTRL repetition penalty on generated ids "
+                          "(arXiv:1909.05858; default 1.0 = no-op; try 1.1-1.3 to break the "
+                          "whitespace/newline loop the paged path falls into past step ~130; "
+                          "active even at temperature=0)")
+    gl.add_argument("--no-repeat-ngram-size", type=int, default=0,
+                     help="ban tokens that would form a repeated n-gram against the "
+                          "full history (HF generate flag; default 0 = off; try 3-4 to kill "
+                          "the exact whitespace/newline loops that show up past step ~130 "
+                          "on the paged path; active at temperature=0)")
+    gl.add_argument("--dry-multiplier", type=float, default=0.0,
+                     help="DRY sampler multiplier (llama.cpp PR #6839; default 0.0 = off; "
+                          "try 0.5-1.5 — exponential penalty for any token extending a recent "
+                          "match beyond --dry-allowed-length; active at temperature=0)")
+    gl.add_argument("--dry-base", type=float, default=1.75,
+                     help="DRY base (default 1.75 per llama.cpp); penalty = mult * base^(L-allowed)")
+    gl.add_argument("--dry-allowed-length", type=int, default=2,
+                     help="DRY allowed repeat length before penalty kicks in (default 2)")
     gl.add_argument("--seed", type=int, default=0,
                      help="RNG seed for deterministic sampling")
     gl.set_defaults(fn=cmd_generate_long)

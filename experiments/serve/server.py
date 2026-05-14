@@ -1117,23 +1117,185 @@ def handle_shutdown(state: ServerState, args: dict) -> dict:
     return {"ok": True, "shutting_down": True}
 
 
-def _sample_next_id(logits_np, temperature: float, top_p: float, rng):
-    """Pick next token. temperature=0 → greedy argmax. >0 → top-p sampling.
+def _sample_next_id(
+    logits_np,
+    temperature: float,
+    top_p: float,
+    rng,
+    repetition_penalty: float = 1.0,
+    min_p: float = 0.0,
+    recent_ids=None,
+    no_repeat_ngram_size: int = 0,
+    dry_multiplier: float = 0.0,
+    dry_base: float = 1.75,
+    dry_allowed_length: int = 2,
+    full_history_ids=None,
+):
+    """Pick next token. Defaults reproduce greedy argmax.
+
+    Pipeline (matches HuggingFace LogitsProcessor ordering, plus DRY between
+    rep-penalty and temperature per llama.cpp convention):
+      1. repetition_penalty — divide positive logits / multiply negative for ids
+         in `recent_ids` (CTRL paper, Keskar et al. 2019, arXiv:1909.05858).
+         Default 1.0 = no-op. Recommended 1.1-1.3 to break loops.
+      1b. no_repeat_ngram_size — ban tokens that would complete a repeated
+          n-gram against `full_history_ids` (HuggingFace generation flag).
+          Default 0 = disabled. 3-4 is the standard setting; kills exact loops
+          like the whitespace/newline drift on the paged path.
+      1c. DRY sampler — Don't Repeat Yourself (llama.cpp PR #6839,
+          l3utterfly 2024). Subtracts `multiplier * base^(match_len -
+          allowed_length)` from logit of any token that would extend a
+          repeat. Default multiplier=0 = disabled.
+      2. temperature — scale logits. 0.0 (default) → skip softmax, argmax over
+         the (possibly rep-penalized) logits → still deterministic.
+      3. min-p — truncate tokens with prob < min_p * max(prob) (Nguyen et al.
+         2024, arXiv:2407.01082). Default 0.0 = no-op. Recommended 0.05-0.1;
+         the paper argues this beats top_p for coherence at higher temps.
+      4. top-p — nucleus cutoff. Default 1.0 = no-op.
+      5. discrete sample from the renormalized distribution.
 
     Implemented in numpy on host; cost is negligible vs the decode step.
-    Used by both handle_generate and handle_generate_paged. Same RNG seed
-    yields deterministic sampling — caller passes a numpy Generator.
+    Same RNG seed yields deterministic sampling — caller passes a numpy Generator.
+    `recent_ids` is the list of generated token ids so far (for rep-penalty).
+    `full_history_ids` is prompt_ids + generated_ids (for n-gram / DRY). If
+    `full_history_ids` is None, falls back to `recent_ids`.
     """
     import numpy as np
+
+    # Step 1: repetition penalty
+    if repetition_penalty != 1.0 and recent_ids:
+        # Operate on a float64 copy so we don't mutate the caller's array.
+        logits = logits_np.astype(np.float64).copy()
+        unique_ids = np.fromiter(set(recent_ids), dtype=np.int64)
+        if unique_ids.size > 0:
+            scores = logits[unique_ids]
+            # CTRL: penalize whether score>0 or <0 so |score| moves toward 0.
+            penalized = np.where(
+                scores < 0, scores * repetition_penalty, scores / repetition_penalty
+            )
+            logits[unique_ids] = penalized
+    else:
+        logits = logits_np.astype(np.float64)
+
+    # Step 1b: no_repeat_ngram_size — bans tokens that would complete a
+    # previously-seen n-gram. Uses the full history (prompt + generated) so
+    # whitespace/newline loops in the paged drift mode actually get blocked.
+    history = full_history_ids if full_history_ids is not None else recent_ids
+    if no_repeat_ngram_size and no_repeat_ngram_size >= 2 and history and \
+            len(history) >= no_repeat_ngram_size - 1:
+        n = no_repeat_ngram_size
+        # Build set of (n-1)-gram -> next-token tokens seen in history.
+        # banned = { t : exists i s.t. history[i:i+n-1] == history[-(n-1):]
+        #            and history[i+n-1] == t }
+        if n == 1:
+            # n=1 means "don't repeat any token ever" — degenerate but defined.
+            banned = set(history)
+        else:
+            suffix = tuple(history[-(n - 1):])
+            banned = set()
+            # Vectorize with numpy: find all windows matching suffix.
+            h = np.asarray(history, dtype=np.int64)
+            if h.size >= n:
+                # For small n, a slide-window comparison is fine: O(len(h)*n).
+                # len(h) <= max_pos (≤4096 typical) so totally negligible.
+                for i in range(h.size - (n - 1)):
+                    match = True
+                    for j in range(n - 1):
+                        if h[i + j] != suffix[j]:
+                            match = False
+                            break
+                    if match and i + (n - 1) < h.size:
+                        banned.add(int(h[i + (n - 1)]))
+        if banned:
+            ban_arr = np.fromiter(banned, dtype=np.int64)
+            logits[ban_arr] = -np.inf
+
+    # Step 1c: DRY sampler — exponential penalty for any token that would
+    # extend the longest suffix-of-history match beyond `allowed_length`.
+    # Implementation follows llama.cpp PR #6839 (l3utterfly 2024):
+    #   For each candidate token t, find the longest L such that
+    #     history[-L:] + [t] appears as a substring of history (excluding the
+    #     final suffix that overlaps the present). If L >= allowed_length,
+    #     subtract multiplier * base^(L - allowed_length) from logits[t].
+    if dry_multiplier > 0.0 and history and len(history) >= dry_allowed_length:
+        L_max = len(history)
+        # We compute the longest suffix-match-length ending at each historical
+        # position i, against the current suffix history[-?:].
+        # Standard trick: Z-function on (suffix + sep + history) — but for our
+        # context lengths (≤ a few thousand) a plain pass suffices.
+        h = list(history)
+        suffix_len = min(L_max, 50)  # cap match window at 50 — past that the
+                                      # base^L term blows past any finite logit
+                                      # and we get -inf anyway. Keeps cost O(n).
+        # For each position i where the suffix matches ending exactly at i:
+        # find the maximum k s.t. h[i-k+1 : i+1] == h[L_max-k : L_max].
+        # Then the token h[i+1] (if it exists) would extend the match to k+1.
+        # We bucket: for token t = h[i+1], track max k.
+        token_match_len = {}
+        # Walk i from L_max-2 down to 0 (skip i = L_max-1, which IS the suffix).
+        # We only care if h[i+1] exists (i.e. i < L_max-1).
+        # Build longest matching prefix at each position by character-wise
+        # extension. O(L_max * suffix_len) ≤ 50 * 4096 = 200k ops; trivial.
+        for i in range(L_max - 1):
+            # Extend match: how many chars of history[L_max-k : L_max] match
+            # history[i-k+1 : i+1]?
+            k = 0
+            while k < suffix_len and (i - k) >= 0 and \
+                    h[i - k] == h[L_max - 1 - k]:
+                k += 1
+            if k >= dry_allowed_length:
+                # h[i+1] is the token that would extend the match to k+1.
+                t = h[i + 1]
+                # We score the *extension*: penalty exp uses (k+1 - allowed),
+                # i.e. how far past the allowed length picking t would push.
+                # llama.cpp uses (match_len - allowed_length) where match_len
+                # is the length INCLUDING the would-be next token, so k+1.
+                # If picking t would create a (k+1)-length repeat:
+                ext = (k + 1) - dry_allowed_length  # >= 1 since k >= allowed
+                prev = token_match_len.get(t, 0)
+                if ext > prev:
+                    token_match_len[t] = ext
+        if token_match_len:
+            for t, ext in token_match_len.items():
+                # Subtract from logit (operate in log-space; equiv to
+                # multiplying prob by exp(-penalty)).
+                penalty = dry_multiplier * (dry_base ** ext)
+                logits[t] -= penalty
+
+    # Step 2: temperature
     if temperature <= 0.0:
-        return int(np.argmax(logits_np))
-    # numerically stable softmax with temperature
-    scaled = logits_np.astype(np.float64) / float(temperature)
-    scaled = scaled - scaled.max()
+        # Greedy argmax on (possibly rep-penalized) logits — still deterministic,
+        # and the only path when no sampling sliders are touched.
+        if min_p > 0.0 or (top_p < 1.0):
+            # User asked for truncation but temperature=0 — apply truncation in
+            # log-space by setting truncated logits to -inf, then argmax.
+            # We need probs to compute min_p / top_p, so fall through to softmax
+            # with temperature=1 internally; argmax of any monotone transform
+            # of logits is the same anyway.
+            scaled = logits - logits.max()
+        else:
+            return int(np.argmax(logits))
+    else:
+        scaled = logits / float(temperature)
+        scaled = scaled - scaled.max()
+
     probs = np.exp(scaled)
     probs /= probs.sum()
+
+    # Step 3: min-p
+    if min_p > 0.0:
+        threshold = min_p * probs.max()
+        probs = np.where(probs >= threshold, probs, 0.0)
+        s = probs.sum()
+        if s > 0:
+            probs /= s
+        else:
+            # Pathological: even the top token fell below threshold (can't
+            # happen with min_p<=1, but guard anyway). Fall back to argmax.
+            return int(np.argmax(logits_np))
+
+    # Step 4: top-p (nucleus)
     if top_p < 1.0:
-        # nucleus: keep smallest set whose cumulative prob ≥ top_p, zero rest
         order = np.argsort(-probs)
         sorted_p = probs[order]
         cum = np.cumsum(sorted_p)
@@ -1142,7 +1304,10 @@ def _sample_next_id(logits_np, temperature: float, top_p: float, rng):
         mask = np.zeros_like(probs)
         mask[keep_idx] = probs[keep_idx]
         probs = mask / mask.sum()
-    # Discrete sample
+
+    # Step 5: sample (greedy if temperature was 0; sample otherwise)
+    if temperature <= 0.0:
+        return int(np.argmax(probs))
     return int(rng.choice(len(probs), p=probs))
 
 
@@ -1160,6 +1325,13 @@ def handle_generate(state: "ServerState", args: dict):
                    sampling (e.g. 0.7). Greedy can collapse into repetition
                    on base models at long contexts; sampling avoids this.
       top_p:       float (default: 1.0) — nucleus cutoff when temperature>0.
+      min_p:       float (default: 0.0) — min-p cutoff (arXiv:2407.01082).
+                   Recommended 0.05-0.1. Composes with top_p; defaults to off.
+      repetition_penalty: float (default: 1.0) — CTRL penalty on recently
+                   generated ids (arXiv:1909.05858). 1.0 = no-op; 1.1-1.3
+                   recommended to break repetition loops at long contexts.
+                   Applies BEFORE temperature scaling. Active even at
+                   temperature=0 (still deterministic, just rebiased argmax).
       seed:        int   (default: 0)   — RNG seed for reproducible sampling.
     """
     if state.mock:
@@ -1178,6 +1350,12 @@ def handle_generate(state: "ServerState", args: dict):
     chunk_size = max(1, int(args.get("chunk_size", 1)))
     temperature = float(args.get("temperature", 0.0))
     top_p = float(args.get("top_p", 1.0))
+    min_p = float(args.get("min_p", 0.0))
+    repetition_penalty = float(args.get("repetition_penalty", 1.0))
+    no_repeat_ngram_size = int(args.get("no_repeat_ngram_size", 0))
+    dry_multiplier = float(args.get("dry_multiplier", 0.0))
+    dry_base = float(args.get("dry_base", 1.75))
+    dry_allowed_length = int(args.get("dry_allowed_length", 2))
     seed = int(args.get("seed", 0))
     rng = np.random.default_rng(seed)
 
@@ -1282,7 +1460,17 @@ def handle_generate(state: "ServerState", args: dict):
 
     for step in range(max_tokens):
         logits_np = ttnn.to_torch(last_logits).float().cpu().numpy().flatten()
-        next_id = _sample_next_id(logits_np, temperature, top_p, rng)
+        next_id = _sample_next_id(
+            logits_np, temperature, top_p, rng,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            recent_ids=generated_ids,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            dry_multiplier=dry_multiplier,
+            dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            full_history_ids=list(prompt_ids) + generated_ids,
+        )
         generated_ids.append(next_id)
 
         # Delta decode (handles multi-byte tokens)
@@ -1366,6 +1554,14 @@ def handle_generate_paged(state: "ServerState", args: dict):
                    ~130 tok (greedy) to ~150 tok at temperature=0.7 +
                    top_p=0.9, but doesn't fully eliminate long-context drift.
       top_p:       float (default: 1.0) — nucleus cutoff when temperature>0.
+      min_p:       float (default: 0.0) — min-p cutoff (arXiv:2407.01082).
+                   Recommended 0.05-0.1. Composes with top_p.
+      repetition_penalty: float (default: 1.0) — CTRL penalty on recently
+                   generated ids (arXiv:1909.05858). 1.0 = no-op; try 1.1-1.3
+                   to break the whitespace/newline loop the paged path falls
+                   into past step ~130. Applies before temperature scaling
+                   and works even at temperature=0 (deterministic rebiased
+                   argmax).
       seed:        int   (default: 0)   — RNG seed for reproducible sampling.
     """
     if state.mock:
@@ -1387,6 +1583,12 @@ def handle_generate_paged(state: "ServerState", args: dict):
     # Default greedy; user can opt into sampling for slightly longer coherent output.
     temperature = float(args.get("temperature", 0.0))
     top_p = float(args.get("top_p", 1.0))
+    min_p = float(args.get("min_p", 0.0))
+    repetition_penalty = float(args.get("repetition_penalty", 1.0))
+    no_repeat_ngram_size = int(args.get("no_repeat_ngram_size", 0))
+    dry_multiplier = float(args.get("dry_multiplier", 0.0))
+    dry_base = float(args.get("dry_base", 1.75))
+    dry_allowed_length = int(args.get("dry_allowed_length", 2))
     seed = int(args.get("seed", 0))
     rng = np.random.default_rng(seed)
     assert max_pos % block_size == 0, f"max_pos {max_pos} must be multiple of block_size {block_size}"
@@ -1488,7 +1690,17 @@ def handle_generate_paged(state: "ServerState", args: dict):
 
     for step in range(max_tokens):
         logits_np = ttnn.to_torch(last_logits).float().cpu().numpy().flatten()
-        next_id = _sample_next_id(logits_np, temperature, top_p, rng)
+        next_id = _sample_next_id(
+            logits_np, temperature, top_p, rng,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            recent_ids=generated_ids,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            dry_multiplier=dry_multiplier,
+            dry_base=dry_base,
+            dry_allowed_length=dry_allowed_length,
+            full_history_ids=list(prompt_ids) + generated_ids,
+        )
         generated_ids.append(next_id)
         new_text = state.tok.decode(generated_ids, skip_special_tokens=True)
         delta = new_text[len(text_so_far):]
@@ -1543,6 +1755,12 @@ def handle_generate_paged(state: "ServerState", args: dict):
         "block_size": block_size,
         "temperature": temperature,
         "top_p": top_p,
+        "min_p": min_p,
+        "repetition_penalty": repetition_penalty,
+        "no_repeat_ngram_size": no_repeat_ngram_size,
+        "dry_multiplier": dry_multiplier,
+        "dry_base": dry_base,
+        "dry_allowed_length": dry_allowed_length,
     }
 
 
