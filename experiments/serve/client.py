@@ -134,6 +134,34 @@ def cmd_run_91r(args):
     print(json.dumps(data, indent=2))
 
 
+def cmd_generate_paged(args):
+    payload = {
+        "prompt": args.prompt, "max_tokens": args.max_tokens,
+        "max_pos": args.max_pos, "block_size": args.block_size,
+    }
+    data = send("generate_paged", payload)
+    print("=" * 72)
+    print(f"prompt: {data.get('prompt', '?')}")
+    print("-" * 72)
+    if "error" in data:
+        print(f"ERROR: {data['error']}")
+        return
+    print(f"generated: {data.get('generated_text', '')}")
+    print("-" * 72)
+    print(f"full text:")
+    print(data.get('full_text', ''))
+    print("=" * 72)
+    n_gen = data.get('n_generated_tokens', 0)
+    ms_per_tok = data.get('ms_per_tok', 0)
+    tok_per_sec = data.get('tok_per_sec', 0)
+    print(f"  prompt: {data.get('n_prompt_tokens', 0)} tokens, prefill {data.get('prefill_ms', 0):.1f} ms")
+    print(f"  generated: {n_gen} tokens, decode {ms_per_tok:.2f} ms/tok = {tok_per_sec:.2f} tok/s")
+    print(f"  paged: max_pos={data.get('max_pos')}, block_size={data.get('block_size')}")
+    print(f"  total wall: {data.get('total_ms', 0):.1f} ms")
+    if data.get('stopped_on_eos'):
+        print(f"  (stopped on EOS)")
+
+
 def cmd_generate(args):
     payload = {"prompt": args.prompt, "max_tokens": args.max_tokens}
     data = send("generate", payload)
@@ -169,6 +197,14 @@ def main():
     g.add_argument("--prompt", type=str, required=True, help="text prompt")
     g.add_argument("--max-tokens", type=int, default=40, help="number of tokens to generate")
     g.set_defaults(fn=cmd_generate)
+    gp = sub.add_parser("generate_paged",
+                          help="generate with paged KV cache for long context (>256 tokens)")
+    gp.add_argument("--prompt", type=str, required=True, help="text prompt")
+    gp.add_argument("--max-tokens", type=int, default=40, help="number of tokens to generate")
+    gp.add_argument("--max-pos", type=int, default=1024,
+                     help="KV cache size (default: 1024; use 4096+ for long context)")
+    gp.add_argument("--block-size", type=int, default=64, help="paged block size")
+    gp.set_defaults(fn=cmd_generate_paged)
     r = sub.add_parser("run_91r")
     r.add_argument("--layers", type=str, default=None,
                    help="comma-separated layer indices (default: server default)")
