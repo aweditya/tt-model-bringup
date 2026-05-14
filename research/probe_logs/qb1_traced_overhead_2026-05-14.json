@@ -1,0 +1,44 @@
+{
+  "hypothesis": "traced decode is still paying avoidable host/I/O time outside execute_trace",
+  "invalidation_criteria": [
+    "median_overhead_ms < 5.00 ms/tok across repeated resident-server runs",
+    "validation cosine fails or server reports mock/unloaded state",
+    "results require trace recapture or standalone device ownership instead of the persistent server"
+  ],
+  "median_execute_trace_ms": 195.73733897414058,
+  "median_full_ms": 241.55706295277923,
+  "median_overhead_ms": 45.81972397863865,
+  "overhead_fraction": 0.18968488612397028,
+  "rows": [
+    {
+      "execute_trace_ms": 195.7297745393589,
+      "full_ms": 240.82956789061427,
+      "overhead_ms": 45.09979335125536
+    },
+    {
+      "execute_trace_ms": 195.73733897414058,
+      "full_ms": 241.55706295277923,
+      "overhead_ms": 45.81972397863865
+    },
+    {
+      "execute_trace_ms": 195.74013794772327,
+      "full_ms": 241.64558202028275,
+      "overhead_ms": 45.905444072559476
+    }
+  ],
+  "runs": 3,
+  "started_at": "2026-05-14T15:26:39-0700",
+  "status": {
+    "device_id": 0,
+    "last_run": null,
+    "loaded": true,
+    "mock": false,
+    "num_layers": 64,
+    "uptime_sec": 8678.001979589462
+  },
+  "threshold_ms": 5.0,
+  "tokens": 32,
+  "validate_steps": 5,
+  "verdict": "pursue_token_feedback_or_io_overlap",
+  "warmup": 5
+}

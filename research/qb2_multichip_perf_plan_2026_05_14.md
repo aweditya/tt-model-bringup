@@ -149,6 +149,83 @@ Validation:
   path.
 - Perf gate: same full-decode benchmark improves over 82.809 ms/tok median.
 
+First concrete collective probe:
+
+- Added guarded `probe_explicit_all_reduce_tp`.
+- Variant: replace default `ttnn.all_reduce(partial)` exits with
+  `ttnn.all_reduce(partial, cluster_axis=1, topology=ttnn.Topology.Linear,
+  num_links=1, memory_config=partial.memory_config())`.
+- Rationale: qb2 mesh is `(1,4)`, so axis 1 is the populated TP axis. The docs
+  scout found persistent-buffer `all_reduce_async` requires width-sharded
+  layouts that current `[1, 5120]` partials may not satisfy, so explicit
+  `ttnn.all_reduce` is the conservative first test.
+- Gate: eager baseline vs explicit top-1 must match before temporary trace
+  timing is considered.
+
+Result:
+
+```text
+.cache/qb2_tp_collectives/results_explicit_all_reduce_20260514_2318.json
+```
+
+The explicit all-reduce variant was accepted and matched baseline top-1
+(`2614`). Temporary trace timing was effectively unchanged versus H0:
+execute-only median was about `82.13 ms`, and update+execute median was about
+`82.65 ms`. A post-probe baseline component sanity check still measured
+`execute_trace` at `82.20 ms`. Conclusion: explicit axis/topology kwargs are
+safe, but not a standalone performance win. Do not promote this as an
+optimization unless it becomes a prerequisite for a later CCL change.
+
+### H2a: Fuse K/V paged cache writes
+
+Hypothesis: the two `paged_update_cache` calls in each full-attention layer can
+be replaced by one `paged_fused_update_cache` call. This is trace-body work:
+there are 16 full-attention layers, so the operation-count reason to test this
+is one fewer cache-write dispatch per full-attention layer per token. No
+speedup is assumed until full-decode timing moves.
+
+First validation result:
+
+```text
+.cache/qb2_tp_fused_cache/results_overlap_reject_20260514_2236.json
+```
+
+The fused op rejected the production writer layout:
+
+```text
+input_tensor1 and input_tensor2 must not overlap
+```
+
+The current production path uses the same one-core height-sharded L1 writer
+config for K and V, so this first variant is invalidated. The next variant is
+now server-resident and guarded: keep the default path unchanged, but in probe
+mode place K writer input on cores `(0,0)..(7,3)` and V writer input on
+`(0,4)..(7,7)` before calling `paged_fused_update_cache`.
+
+Validation:
+
+- Run `probe_fused_paged_update_cache_tp` after restarting the qb2 server with
+  the disjoint K/V writer configs.
+- Correctness gate: baseline and fused eager argmax match after resetting
+  mutable state. If accepted, capture a temporary fused trace and compare
+  sync-bounded trace medians against H0.
+- Full-decode gate: only if the probe passes, promote to a guarded production
+  variant and run the 5-run `qb2_tp_generate_bench.py` benchmark.
+
+Second validation result:
+
+```text
+.cache/qb2_tp_fused_cache/results_disjoint_timeout_20260514_155332.json
+```
+
+The disjoint K/V writer variant did not return after more than 10 minutes in
+the resident server handler. The client was killed and `serve_tp.sh stop`
+required SIGTERM after graceful shutdown timed out. Treat this production-path
+variant as invalidated for now. A future investigation would need a much
+smaller isolated compatibility probe before touching production decode again.
+The server endpoint now refuses to run the wedge-prone disjoint path unless
+`allow_wedge_prone_disjoint=true` is passed explicitly.
+
 ### H3: Reduce manual RoPE dispatches
 
 Hypothesis: current manual partial-RoPE sequence still dispatches many small ops

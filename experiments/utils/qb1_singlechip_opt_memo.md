@@ -37,6 +37,17 @@ Gate: if `median_ms - median_exec_ms >= 5 ms/tok`, prototype a separate
 on-device argmax/token-feedback trace before editing 91f/server production.
 This is a measurement of opportunity size, not a speedup claim.
 
+2026-05-14 result: resident-server run on qb1 device 0 measured
+`median_full_ms=241.56`, `median_execute_trace_ms=195.74`, gap
+`45.82 ms/tok` across 3×32-token runs with validation cosine
+`0.9999997887209274`. Artifact:
+`research/probe_logs/qb1_traced_overhead_2026-05-14.json`.
+
+Next validation should split that 45.82 ms/tok into input-buffer update,
+`execute_trace`, and logits readback, still through the persistent server. If
+readback dominates, prototype on-device argmax/token feedback. If input updates
+dominate, prototype command-queue overlap or fewer host buffer updates.
+
 ## Hypothesis 2: if host/I/O is small, remaining single-chip work is kernel-body
 
 Memory notes point at DeltaNet small ops, not MLP bandwidth:

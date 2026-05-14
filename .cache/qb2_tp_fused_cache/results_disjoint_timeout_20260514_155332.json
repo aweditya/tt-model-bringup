@@ -1,0 +1,17 @@
+{
+  "experiment": "probe_fused_paged_update_cache_tp",
+  "variant": "disjoint_kv_writer_l1_core_ranges",
+  "prompt": "The capital of France is",
+  "command": "ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp probe_fused_paged_update_cache_tp --iters 10 --warmup 2'",
+  "result": {
+    "accepted": false,
+    "phase": "disjoint_fused_forward_or_trace",
+    "reason": "timeout_or_wedge",
+    "details": "After the first overlap rejection, server_tp was patched to place K writer input on cores (0,0)..(7,3) and V writer input on (0,4)..(7,7). The resident-server probe did not return after more than 10 minutes with server_tp busy in the handler. Client was killed and serve_tp.sh stop required SIGTERM after graceful shutdown timed out."
+  },
+  "workflow_decision": "Invalidate this production-path fused-cache variant. Do not claim a speedup. Move to a smaller isolated compatibility probe or to the next trace-body hypothesis.",
+  "server_recovery": {
+    "action": "serve_tp.sh stop then serve_tp.sh start",
+    "note": "qb2 persistent server was restarted after the timeout."
+  }
+}

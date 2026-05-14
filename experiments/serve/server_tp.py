@@ -100,12 +100,18 @@ class MeshServerState:
         # Paged KV cache shared state
         self.page_table_tt = None
         self.paged_write_mem_cfg = None
+        self.fused_paged_write_mem_cfg_k = None
+        self.fused_paged_write_mem_cfg_v = None
         # Paged SDPA configs (P18/P19 — see feedback_p19_chained_paged_sdpa.md)
         self.paged_sdpa_progcfg = None
         self.sdpa_compute_kernel_config = None
         self.trace_x_buf = None
         self.trace_logits_buf = None
         self.last_run = None
+        # Experiment guard. Production default stays on the validated two-call
+        # paged_update_cache path; probe endpoints may flip this temporarily.
+        self.use_fused_paged_update = False
+        self.collective_mode = "baseline"
 
 
 # --- Bootstrap ----------------------------------------------------------------
@@ -381,6 +387,28 @@ def bootstrap(state: MeshServerState):
     state.paged_write_mem_cfg = ttnn.MemoryConfig(
         ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
     print(f"  ✓ paged_write mem_cfg cached", flush=True)
+    # paged_fused_update_cache requires K/V input tensors to occupy disjoint
+    # L1 core ranges. Keep this separate from the production single-writer
+    # config, which intentionally uses one core and remains the default path.
+    if compute_grid.x >= 8 and compute_grid.y >= 8:
+        k_cores = ttnn.CoreRangeSet({
+            ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(7, 3))
+        })
+        v_cores = ttnn.CoreRangeSet({
+            ttnn.CoreRange(ttnn.CoreCoord(0, 4), ttnn.CoreCoord(7, 7))
+        })
+        shard_spec_k = ttnn.ShardSpec(k_cores, [TILE_HEIGHT, cfg['head_dim']],
+                                      ttnn.ShardOrientation.ROW_MAJOR)
+        shard_spec_v = ttnn.ShardSpec(v_cores, [TILE_HEIGHT, cfg['head_dim']],
+                                      ttnn.ShardOrientation.ROW_MAJOR)
+        state.fused_paged_write_mem_cfg_k = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec_k)
+        state.fused_paged_write_mem_cfg_v = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec_v)
+        print(f"  ✓ fused paged_write disjoint K/V mem_cfg cached", flush=True)
+    else:
+        print(f"  ! fused paged_write disjoint mem_cfg unavailable for grid "
+              f"{compute_grid.x}x{compute_grid.y}", flush=True)
 
     # Paged SDPA program + compute kernel config (P18 winner, see
     # feedback_mesh_paged_sdpa_works.md + feedback_p19_chained_paged_sdpa.md).
@@ -470,6 +498,23 @@ def _rms_norm_manual(x_tt, weight_tt, eps, dim_size):
     return ttnn.rms_norm(x_tt, weight=weight_tt, epsilon=eps)
 
 
+def _tp_all_reduce(state: MeshServerState, partial):
+    import ttnn
+    if state.collective_mode == "explicit_all_reduce":
+        return ttnn.all_reduce(
+            partial,
+            cluster_axis=1,
+            memory_config=partial.memory_config(),
+            num_links=1,
+            topology=ttnn.Topology.Linear,
+        )
+    try:
+        return ttnn.all_reduce(partial)
+    except Exception:
+        scattered = ttnn.reduce_scatter(partial, dim=1)
+        return ttnn.all_gather(scattered, dim=1)
+
+
 def deltanet_step_tp(state, x_tt, dn, cfg):
     """One DeltaNet TP step on the mesh. Returns the residual-added output.
 
@@ -552,11 +597,7 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     # 10. out_proj row-parallel + all_reduce
     partial = ttnn.linear(out_gated, dn['w_out'])
     ttnn.deallocate(out_gated)
-    try:
-        reduced = ttnn.all_reduce(partial)
-    except Exception:
-        scattered = ttnn.reduce_scatter(partial, dim=1)
-        reduced = ttnn.all_gather(scattered, dim=1)
+    reduced = _tp_all_reduce(state, partial)
     ttnn.deallocate(partial)
     # 11. residual add + update SSM/conv state in place
     x_out = ttnn.add(x_tt, reduced)
@@ -589,11 +630,7 @@ def mlp_step_tp(state, x_tt, mlp):
     ttnn.deallocate(u)
     partial = ttnn.linear(h, mlp['w_down'])
     ttnn.deallocate(h)
-    try:
-        reduced = ttnn.all_reduce(partial)
-    except Exception:
-        scattered = ttnn.reduce_scatter(partial, dim=1)
-        reduced = ttnn.all_gather(scattered, dim=1)
+    reduced = _tp_all_reduce(state, partial)
     ttnn.deallocate(partial)
     out = ttnn.add(x_tt, reduced)
     ttnn.deallocate(reduced)
@@ -654,21 +691,32 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
     # cur_pos_tt is a [1] int32 replicated tensor — supports trace replay
     # (the non-paged update_cache_for_token_ takes Python int, bakes into trace).
     # See feedback_paged_refactor_constraints.md + P12.1 validated recipe.
-    def _shard_for_paged_write(t_per_head):
+    def _shard_for_paged_write(t_per_head, mem_cfg):
         # t_per_head: [NKV_PER_CHIP, HEAD_DIM] → [1, 1, NKV_PER_CHIP, HEAD_DIM]
-        # → pad dim -2 to TILE_HEIGHT → HEIGHT_SHARDED on 1 core L1
+        # → pad dim -2 to TILE_HEIGHT → HEIGHT_SHARDED L1 per supplied mem_cfg.
         t4d = ttnn.reshape(t_per_head, [1, 1, NKV_PER_CHIP, HEAD_DIM])
         t_padded = ttnn.pad(t4d, [[0, 0], [0, 0], [0, TILE_HEIGHT - NKV_PER_CHIP], [0, 0]],
                               value=0.0)
-        return ttnn.to_memory_config(t_padded, state.paged_write_mem_cfg)
-    k_sharded = _shard_for_paged_write(k_tt)
-    v_sharded = _shard_for_paged_write(v_tt)
-    ttnn.experimental.paged_update_cache(attn['kc'], k_sharded,
-                                           update_idxs_tensor=cur_pos_tt,
-                                           page_table=state.page_table_tt)
-    ttnn.experimental.paged_update_cache(attn['vc'], v_sharded,
-                                           update_idxs_tensor=cur_pos_tt,
-                                           page_table=state.page_table_tt)
+        return ttnn.to_memory_config(t_padded, mem_cfg)
+    if state.use_fused_paged_update:
+        if (state.fused_paged_write_mem_cfg_k is None or
+                state.fused_paged_write_mem_cfg_v is None):
+            raise RuntimeError("fused paged write mem_cfg is unavailable on this grid")
+        k_sharded = _shard_for_paged_write(k_tt, state.fused_paged_write_mem_cfg_k)
+        v_sharded = _shard_for_paged_write(v_tt, state.fused_paged_write_mem_cfg_v)
+        ttnn.experimental.paged_fused_update_cache(
+            attn['kc'], k_sharded, attn['vc'], v_sharded,
+            update_idxs_tensor=cur_pos_tt,
+            page_table=state.page_table_tt)
+    else:
+        k_sharded = _shard_for_paged_write(k_tt, state.paged_write_mem_cfg)
+        v_sharded = _shard_for_paged_write(v_tt, state.paged_write_mem_cfg)
+        ttnn.experimental.paged_update_cache(attn['kc'], k_sharded,
+                                               update_idxs_tensor=cur_pos_tt,
+                                               page_table=state.page_table_tt)
+        ttnn.experimental.paged_update_cache(attn['vc'], v_sharded,
+                                               update_idxs_tensor=cur_pos_tt,
+                                               page_table=state.page_table_tt)
     ttnn.deallocate(k_sharded)
     ttnn.deallocate(v_sharded)
     # 6. PAGED SDPA decode (P18/P19 validated).
@@ -695,11 +743,7 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
     # 8. out_proj row-parallel + all_reduce
     attn_flat = ttnn.reshape(attn_gated, [1, NQ_PER_CHIP * HEAD_DIM])
     partial = ttnn.linear(attn_flat, attn['w_o'])
-    try:
-        reduced = ttnn.all_reduce(partial)
-    except Exception:
-        scattered = ttnn.reduce_scatter(partial, dim=1)
-        reduced = ttnn.all_gather(scattered, dim=1)
+    reduced = _tp_all_reduce(state, partial)
     return ttnn.add(x_tt, reduced)
 
 
@@ -1048,6 +1092,374 @@ def handle_bench_decode_tp_components(state: MeshServerState, args: dict) -> dic
     return result
 
 
+def _read_argmax_id(state: MeshServerState, argmax_tt) -> int:
+    import ttnn
+    idx_concat = ttnn.to_torch(
+        argmax_tt,
+        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    )
+    return int(idx_concat.cpu().numpy().reshape(-1)[0])
+
+
+def _forward_argmax_id_with_cache_writer(state: MeshServerState, token_id: int,
+                                         cur_pos: int, use_fused: bool,
+                                         collective_mode: str | None = None) -> int:
+    import ttnn
+    old_fused = state.use_fused_paged_update
+    old_collective = state.collective_mode
+    state.use_fused_paged_update = use_fused
+    if collective_mode is not None:
+        state.collective_mode = collective_mode
+    try:
+        _reset_state_buffers(state)
+        update_input_buffers(state, token_id, cur_pos)
+        out = forward_token_tp_inner(state)
+        ttnn.synchronize_device(state.mesh)
+        return _read_argmax_id(state, out)
+    finally:
+        state.use_fused_paged_update = old_fused
+        state.collective_mode = old_collective
+        _reset_state_buffers(state)
+
+
+def _capture_temp_decode_trace(state: MeshServerState, use_fused: bool,
+                               collective_mode: str | None = None):
+    """Capture an alternate decode trace for a probe, without replacing prod."""
+    import ttnn
+    old_fused = state.use_fused_paged_update
+    old_collective = state.collective_mode
+    state.use_fused_paged_update = use_fused
+    if collective_mode is not None:
+        state.collective_mode = collective_mode
+    trace_id = None
+    argmax_tt = None
+    try:
+        _reset_state_buffers(state)
+        update_input_buffers(state, token_id=0, cur_pos=0)
+        _ = forward_token_tp_inner(state)
+        ttnn.synchronize_device(state.mesh)
+        update_input_buffers(state, token_id=0, cur_pos=1)
+        _ = forward_token_tp_inner(state)
+        ttnn.synchronize_device(state.mesh)
+        update_input_buffers(state, token_id=0, cur_pos=2)
+        trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
+        argmax_tt = forward_token_tp_inner(state)
+        ttnn.end_trace_capture(state.mesh, trace_id, cq_id=0)
+        ttnn.synchronize_device(state.mesh)
+        return trace_id, argmax_tt
+    except Exception:
+        if trace_id is not None:
+            try:
+                ttnn.release_trace(state.mesh, trace_id)
+            except Exception:
+                pass
+        raise
+    finally:
+        state.use_fused_paged_update = old_fused
+        state.collective_mode = old_collective
+        _reset_state_buffers(state)
+
+
+def handle_probe_fused_paged_update_cache_tp(state: MeshServerState, args: dict) -> dict:
+    """Validate the fused K/V paged cache writer in the resident qb2 server.
+
+    Hypothesis: the two K/V paged_update_cache dispatches in each full-attention
+    layer can be replaced by one paged_fused_update_cache dispatch. This endpoint
+    only reports measured compatibility/correctness/timing. Production remains
+    on the validated two-call path unless a later patch changes the default.
+    """
+    import ttnn
+    import time as _time
+
+    prompt = args.get("prompt", "The capital of France is")
+    iters = int(args.get("iters", 10))
+    warmup = int(args.get("warmup", 2))
+    bench_trace = bool(args.get("bench_trace", True))
+    allow_wedge_prone_disjoint = bool(args.get("allow_wedge_prone_disjoint", False))
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+    if state.tok is None or not state.layers:
+        return {"error": "server not fully loaded"}
+
+    prompt_ids = state.tok.encode(prompt)
+    if not prompt_ids:
+        return {"error": "prompt encoded to zero tokens"}
+    token_id = int(prompt_ids[0])
+
+    if not allow_wedge_prone_disjoint:
+        return {
+            "prompt": prompt,
+            "prompt_ids": list(prompt_ids),
+            "token_id": token_id,
+            "compatibility": {
+                "accepted": False,
+                "phase": "disjoint_variant_disabled",
+                "error": (
+                    "The original same-core fused writer was rejected because "
+                    "K/V input tensors overlapped. The disjoint-core variant "
+                    "then wedged qb2 for >10 minutes and required SIGTERM. "
+                    "Pass allow_wedge_prone_disjoint=true only for a "
+                    "coordinated isolation run."
+                ),
+            },
+            "trace_bench": None,
+        }
+
+    # First validate the exact production forward with the writer swapped.
+    try:
+        baseline_id = _forward_argmax_id_with_cache_writer(
+            state, token_id=token_id, cur_pos=0, use_fused=False)
+    except Exception as e:
+        return {
+            "prompt": prompt,
+            "prompt_ids": list(prompt_ids),
+            "token_id": token_id,
+            "compatibility": {
+                "accepted": False,
+                "phase": "baseline_forward",
+                "error": f"{type(e).__name__}: {e}",
+            },
+            "trace_bench": None,
+        }
+    try:
+        fused_id = _forward_argmax_id_with_cache_writer(
+            state, token_id=token_id, cur_pos=0, use_fused=True)
+    except Exception as e:
+        state.use_fused_paged_update = False
+        _reset_state_buffers(state)
+        result = {
+            "prompt": prompt,
+            "prompt_ids": list(prompt_ids),
+            "token_id": token_id,
+            "compatibility": {
+                "accepted": False,
+                "phase": "fused_forward",
+                "baseline_argmax_id": baseline_id,
+                "error": f"{type(e).__name__}: {e}",
+            },
+            "trace_bench": None,
+        }
+        state.last_run = {
+            "cmd": "probe_fused_paged_update_cache_tp",
+            "accepted": False,
+            "phase": "fused_forward",
+        }
+        return result
+    argmax_match = (baseline_id == fused_id)
+
+    result = {
+        "prompt": prompt,
+        "prompt_ids": list(prompt_ids),
+        "token_id": token_id,
+        "compatibility": {
+            "accepted": True,
+            "baseline_argmax_id": baseline_id,
+            "fused_argmax_id": fused_id,
+            "argmax_match": argmax_match,
+            "note": (
+                "Argmax equality is a narrow correctness check for the same "
+                "token/position after resetting mutable state; it is not a "
+                "full quality validation."
+            ),
+        },
+        "trace_bench": None,
+    }
+
+    if not bench_trace:
+        state.last_run = {
+            "cmd": "probe_fused_paged_update_cache_tp",
+            "accepted": True,
+            "argmax_match": argmax_match,
+            "bench_trace": False,
+        }
+        return result
+
+    trace_id = None
+    try:
+        t_capture0 = _time.perf_counter()
+        trace_id, fused_argmax_tt = _capture_temp_decode_trace(state, use_fused=True)
+        capture_ms = (_time.perf_counter() - t_capture0) * 1000.0
+
+        def sync():
+            ttnn.synchronize_device(state.mesh)
+
+        def timed(fn):
+            sync()
+            t0 = _time.perf_counter()
+            fn()
+            sync()
+            return (_time.perf_counter() - t0) * 1000.0
+
+        for i in range(warmup):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            update_input_buffers(state, tid, pos)
+            ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+        sync()
+
+        execute_ms = []
+        update_execute_ms = []
+        for i in range(iters):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            execute_ms.append(timed(
+                lambda: ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)))
+
+            tid2 = prompt_ids[(i + 1) % len(prompt_ids)]
+            pos2 = (pos + 1) % MAX_POS
+            def update_execute(tid2=tid2, pos2=pos2):
+                update_input_buffers(state, tid2, pos2)
+                ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+            update_execute_ms.append(timed(update_execute))
+
+        traced_id = _read_argmax_id(state, fused_argmax_tt)
+        result["trace_bench"] = {
+            "iters": iters,
+            "warmup": warmup,
+            "capture_ms": capture_ms,
+            "summary_ms": {
+                "fused_execute_trace": _summary_ms(execute_ms),
+                "fused_update_plus_execute": _summary_ms(update_execute_ms),
+            },
+            "samples_ms": {
+                "fused_execute_trace": execute_ms,
+                "fused_update_plus_execute": update_execute_ms,
+            },
+            "traced_argmax_id_sample": traced_id,
+        }
+    finally:
+        if trace_id is not None:
+            ttnn.release_trace(state.mesh, trace_id)
+        state.use_fused_paged_update = False
+        _reset_state_buffers(state)
+
+    state.last_run = {
+        "cmd": "probe_fused_paged_update_cache_tp",
+        "accepted": True,
+        "argmax_match": argmax_match,
+        "median_fused_execute_ms": (
+            result["trace_bench"]["summary_ms"]["fused_execute_trace"].get("median")
+            if result["trace_bench"] else None
+        ),
+        "median_fused_combined_ms": (
+            result["trace_bench"]["summary_ms"]["fused_update_plus_execute"].get("median")
+            if result["trace_bench"] else None
+        ),
+    }
+    return result
+
+
+def handle_probe_explicit_all_reduce_tp(state: MeshServerState, args: dict) -> dict:
+    """Validate explicit axis/topology kwargs for row-parallel TP exits."""
+    import ttnn
+    import time as _time
+
+    prompt = args.get("prompt", "The capital of France is")
+    iters = int(args.get("iters", 10))
+    warmup = int(args.get("warmup", 2))
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+    if state.tok is None or not state.layers:
+        return {"error": "server not fully loaded"}
+
+    prompt_ids = state.tok.encode(prompt)
+    if not prompt_ids:
+        return {"error": "prompt encoded to zero tokens"}
+    token_id = int(prompt_ids[0])
+
+    baseline_id = _forward_argmax_id_with_cache_writer(
+        state, token_id=token_id, cur_pos=0, use_fused=False,
+        collective_mode="baseline")
+    explicit_id = _forward_argmax_id_with_cache_writer(
+        state, token_id=token_id, cur_pos=0, use_fused=False,
+        collective_mode="explicit_all_reduce")
+    argmax_match = (baseline_id == explicit_id)
+
+    trace_id = None
+    try:
+        t_capture0 = _time.perf_counter()
+        trace_id, explicit_argmax_tt = _capture_temp_decode_trace(
+            state, use_fused=False, collective_mode="explicit_all_reduce")
+        capture_ms = (_time.perf_counter() - t_capture0) * 1000.0
+
+        def sync():
+            ttnn.synchronize_device(state.mesh)
+
+        def timed(fn):
+            sync()
+            t0 = _time.perf_counter()
+            fn()
+            sync()
+            return (_time.perf_counter() - t0) * 1000.0
+
+        for i in range(warmup):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            update_input_buffers(state, tid, pos)
+            ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+        sync()
+
+        execute_ms = []
+        update_execute_ms = []
+        for i in range(iters):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            execute_ms.append(timed(
+                lambda: ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)))
+
+            tid2 = prompt_ids[(i + 1) % len(prompt_ids)]
+            pos2 = (pos + 1) % MAX_POS
+            def update_execute(tid2=tid2, pos2=pos2):
+                update_input_buffers(state, tid2, pos2)
+                ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+            update_execute_ms.append(timed(update_execute))
+
+        result = {
+            "prompt": prompt,
+            "prompt_ids": list(prompt_ids),
+            "token_id": token_id,
+            "compatibility": {
+                "accepted": True,
+                "baseline_argmax_id": baseline_id,
+                "explicit_argmax_id": explicit_id,
+                "argmax_match": argmax_match,
+                "mode": "ttnn.all_reduce(cluster_axis=1, topology=Linear, num_links=1)",
+            },
+            "trace_bench": {
+                "iters": iters,
+                "warmup": warmup,
+                "capture_ms": capture_ms,
+                "summary_ms": {
+                    "explicit_execute_trace": _summary_ms(execute_ms),
+                    "explicit_update_plus_execute": _summary_ms(update_execute_ms),
+                },
+                "samples_ms": {
+                    "explicit_execute_trace": execute_ms,
+                    "explicit_update_plus_execute": update_execute_ms,
+                },
+                "traced_argmax_id_sample": _read_argmax_id(state, explicit_argmax_tt),
+            },
+        }
+    finally:
+        if trace_id is not None:
+            ttnn.release_trace(state.mesh, trace_id)
+        state.collective_mode = "baseline"
+        state.use_fused_paged_update = False
+        _reset_state_buffers(state)
+
+    state.last_run = {
+        "cmd": "probe_explicit_all_reduce_tp",
+        "argmax_match": argmax_match,
+        "median_explicit_execute_ms": (
+            result["trace_bench"]["summary_ms"]["explicit_execute_trace"].get("median")
+        ),
+        "median_explicit_combined_ms": (
+            result["trace_bench"]["summary_ms"]["explicit_update_plus_execute"].get("median")
+        ),
+    }
+    return result
+
+
 def handle_generate_tp(state: MeshServerState, args: dict):
     """Multi-chip TP generate — streams by default (mirrors server.py UX).
 
@@ -1169,6 +1581,8 @@ HANDLERS = {
     "status":         handle_status,
     "generate_tp":    handle_generate_tp,
     "bench_decode_tp_components": handle_bench_decode_tp_components,
+    "probe_fused_paged_update_cache_tp": handle_probe_fused_paged_update_cache_tp,
+    "probe_explicit_all_reduce_tp": handle_probe_explicit_all_reduce_tp,
     "shutdown":       handle_shutdown,
 }
 

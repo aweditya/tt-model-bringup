@@ -1,0 +1,64 @@
+{
+  "prompt": "The capital of France is",
+  "prompt_ids": [
+    760,
+    6511,
+    314,
+    9338,
+    369
+  ],
+  "token_id": 760,
+  "compatibility": {
+    "accepted": true,
+    "baseline_argmax_id": 2614,
+    "explicit_argmax_id": 2614,
+    "argmax_match": true,
+    "mode": "ttnn.all_reduce(cluster_axis=1, topology=Linear, num_links=1)"
+  },
+  "trace_bench": {
+    "iters": 10,
+    "warmup": 2,
+    "capture_ms": 1121.981762116775,
+    "summary_ms": {
+      "explicit_execute_trace": {
+        "median": 82.13390910532326,
+        "mean": 82.13001328986138,
+        "min": 82.10202003829181,
+        "max": 82.16203888878226
+      },
+      "explicit_update_plus_execute": {
+        "median": 82.5025454396382,
+        "mean": 82.505395822227,
+        "min": 82.45642599649727,
+        "max": 82.56329619325697
+      }
+    },
+    "samples_ms": {
+      "explicit_execute_trace": [
+        82.13988901115954,
+        82.14271906763315,
+        82.14209997095168,
+        82.10713881999254,
+        82.10202003829181,
+        82.13650900870562,
+        82.12820999324322,
+        82.1313092019409,
+        82.1081988979131,
+        82.16203888878226
+      ],
+      "explicit_update_plus_execute": [
+        82.50121586024761,
+        82.48176611959934,
+        82.50387501902878,
+        82.51978596672416,
+        82.56329619325697,
+        82.47630600817502,
+        82.51700503751636,
+        82.4781060218811,
+        82.45642599649727,
+        82.5561759993434
+      ]
+    },
+    "traced_argmax_id_sample": 760
+  }
+}

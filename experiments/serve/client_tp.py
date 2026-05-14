@@ -60,6 +60,26 @@ def cmd_bench_decode_tp_components(args):
     print(json.dumps(data, indent=2, default=str))
 
 
+def cmd_probe_fused_paged_update_cache_tp(args):
+    data = _send("probe_fused_paged_update_cache_tp", {
+        "prompt": args.prompt,
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "bench_trace": not args.skip_trace_bench,
+        "allow_wedge_prone_disjoint": args.allow_wedge_prone_disjoint,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_explicit_all_reduce_tp(args):
+    data = _send("probe_explicit_all_reduce_tp", {
+        "prompt": args.prompt,
+        "iters": args.iters,
+        "warmup": args.warmup,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
 def cmd_generate_tp(args):
     """Streaming generate_tp — same chunk/result protocol as client.cmd_generate."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -118,6 +138,21 @@ def main():
     b.add_argument("--iters", type=int, default=20)
     b.add_argument("--warmup", type=int, default=3)
     b.set_defaults(fn=cmd_bench_decode_tp_components)
+    f = sub.add_parser("probe_fused_paged_update_cache_tp",
+                       help="validate fused K/V paged-cache writer in resident TP server")
+    f.add_argument("--prompt", default="The capital of France is")
+    f.add_argument("--iters", type=int, default=10)
+    f.add_argument("--warmup", type=int, default=2)
+    f.add_argument("--skip-trace-bench", action="store_true")
+    f.add_argument("--allow-wedge-prone-disjoint", action="store_true",
+                   help="actually run the disjoint fused writer path that previously wedged qb2")
+    f.set_defaults(fn=cmd_probe_fused_paged_update_cache_tp)
+    ar = sub.add_parser("probe_explicit_all_reduce_tp",
+                        help="validate explicit axis/topology all-reduce exits")
+    ar.add_argument("--prompt", default="The capital of France is")
+    ar.add_argument("--iters", type=int, default=10)
+    ar.add_argument("--warmup", type=int, default=2)
+    ar.set_defaults(fn=cmd_probe_explicit_all_reduce_tp)
     g = sub.add_parser("generate_tp", help="multi-chip generate (streams)")
     g.add_argument("--prompt", required=True)
     g.add_argument("--max-tokens", type=int, default=60)
