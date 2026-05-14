@@ -231,3 +231,229 @@ The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_
 
 ---
 
+## 8. Roadmap + shipped wins
+
+### Branch structure (chronological)
+
+| Branch | Theme | Key memory notes |
+|--------|-------|------------------|
+| **Branch III** | 27B bringup, correctness ladder, 7 bugs fixed | `project_branchIII_27b_complete.md`, `feedback_isolation_must_match_production.md` |
+| **Branch C'** | Single-chip perf — fusion, traces, paged KV cache | `project_branchC_perf_state.md`, `feedback_c4v4_validated.md`, `feedback_qk_rms_norm_shipped.md` |
+| **Branch C'7** | Multi-chip TP — mesh, sharding, all_reduce, trace on mesh | `feedback_c71_mesh_smoke_pass.md` ... `feedback_c761_tp_trace_wins_big.md` |
+| **Branch D'** | Speculative decoding probes (MTP head, B=2 verify) | `feedback_speculative_decoding.md`, `feedback_mtp_head_probe.md`, `feedback_d3_dont_ship_yet.md` |
+| **Long context** | bf16 prefill drift root-cause + fix | `feedback_bf16_prefill_drift_cliff.md`, `feedback_fp32_sdpa_cliff_probe.md` |
+
+### Shipped wins (latest first — `git log --oneline -25`)
+
+| Commit | Title | Impact |
+|--------|-------|--------|
+| `4741253` | SHIP V2 paged SDPA on (1,4) mesh | **7.02 → 11.43 tok/s (62% gain)** |
+| `57b1a4e` | Friend repo borrow list + web research v2 | research |
+| `8abb089` | P21 cliff probe: HiFi4+fp32_dest_acc is the bug; HiFi2 unblocks long-context | drift fix |
+| `94f7cba` | P19: paged SDPA chained-context (eager +10.2%, traced wash) | exploratory |
+| `98189be` | bf16 prefill drift cliff: pos 129 cos<0.9, pos 141 cos<0.5 | drift root-cause |
+| `09c935b` | Distributed RMSNorm integration outline | design |
+| `99aaa87` | Integration outline: vocab-sharded LM head | design |
+| `0593245` | P18 mesh paged SDPA: WORKS at production shapes — 3.59× | unblock |
+| `844e194` | Needle-in-haystack at L=500+ — qb1 prefill fully broken | failure mode |
+| `9e75310` | TP per-step decomposition: compute IS scaling 4× | analysis |
+| `9369e1b` | TRACED multi-chip TP inference — 7.02 tok/s correct output | first TP ship |
+| `2d30af7` | P14: TRACE CAPTURE WORKS ON (1,4) MESH | unblock |
+| `4cd0ce1` | server_tp.py: paged KV cache refactor — enables trace | enabler |
+
+### Current state (as of 2026-05-14)
+
+| Metric | Value | Note |
+|--------|-------|------|
+| Production perf (qb2 multi-chip TP traced) | **11.43 tok/s** | `feedback_paged_sdpa_shipped_tp.md` |
+| Production perf (qb1 single-chip) | 5.19 tok/s | `feedback_qk_rms_norm_shipped.md` |
+| Long-context cliff (qb1, HiFi2 B3) | none up to L=500 | `feedback_fp32_sdpa_cliff_probe.md` |
+| Speculative decode (D'3) | DON'T SHIP at 57.9% acceptance | `feedback_d3_dont_ship_yet.md` |
+| El Reg ceiling (4× P150 Llama70B BFP8) | 1.78× (~9.2 tok/s equivalent) | `feedback_realistic_tp_ceiling.md` — we're above this |
+| Friend's daily-driver (samjett Qwen3.6-27B) | 15.3 tok/s | 25% gap remaining |
+
+### Next ship list (post-paged-SDPA, prioritized)
+
+1. **Vocab-sharded LM head** with `all_gather → untilize → argmax` (~50 LOC, low risk, +1-3 tok/s). Outline `research/integration_vocab_sharded_lm_head.md`. Gated on `p20_mesh_argmax_per_chip_probe.py` (~30 min).
+2. **On-device embedding + `ttnn.plus_one(cur_pos)`** (~180 LOC, +0.5-1 tok/s). Kills 1.9 ms update_input_buffers overhead.
+3. **Distributed RMSNorm Step 1** (~270 LOC, +8-12 ms/tok). Outline `research/integration_distributed_rms_norm.md`. Step 2 (real residual fusion) BLOCKED on ttnn rebuild.
+4. **all_gather_concat** (2-5 ms/tok). See `research/multi_chip_optimizations_menu_v2_addendum.md` #16.
+5. **DRAM-sharded matmul + dram_prefetcher** (10-30 ms/tok, high effort). Galaxy's biggest lever.
+
+---
+
+## 9. Reproducing key results
+
+### Cold-start the qb2 multi-chip server (~5-10 min bootstrap)
+
+```bash
+$ ssh qb2 'bash ~/tt-xla/experiments/serve/scripts/serve_tp.sh start'
+$ ssh qb2 'tail -f ~/tt-xla/.cache/server_tp.log'   # wait for "Stage A/B/C/D/E ready"
+$ ssh qb2 'bash ~/tt-xla/experiments/serve/scripts/serve_tp.sh status'
+```
+
+### Reproduce 11.43 tok/s (paged SDPA on mesh, commit `4741253`)
+
+Server must be up on qb2. Then:
+
+```bash
+$ ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp \
+    bench_decode_tp --tokens 10 --runs 3'
+# expected: ~87.5 ms/tok median, 11.43 tok/s
+```
+
+Quick smoke (correctness):
+
+```bash
+$ ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp \
+    generate_tp --prompt "The capital of France is" --max-tokens 10'
+# expected: " Paris." continuation
+```
+
+### Reproduce single-chip 5.19 tok/s (qb1)
+
+```bash
+$ ssh qb1 'bash ~/tt-xla/experiments/serve/scripts/serve.sh start'   # ~11 min
+$ ssh qb1 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client \
+    bench_decode_traced --tokens 32 --runs 3'
+```
+
+### Reproduce long-context fix (HiFi2 B3 vs prod HiFi4)
+
+Sentinel-driven, no re-bootstrap needed:
+
+```bash
+$ ssh qb1 'echo B3 > ~/tt-xla/.cache/p21_sdpa_variant.txt'
+$ ssh qb1 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client \
+    reload_kernels'
+$ ssh qb1 'cd ~/tt-xla && .venv/bin/python experiments/utils/needle_haystack_probe.py'
+# expected: variant B3 retrieves D827W4MW at L=500 frac=0.5
+```
+
+### Reproduce cosine ladder (drift root-cause, 500 positions)
+
+```bash
+$ ssh qb1 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client \
+    cosine_ladder --max-pos 500 --prompt-file prompts/drift.txt'
+# expected (HiFi4 prod variant A): cliff at pos 129
+# expected (HiFi2 B3 variant): no cliff up to 500
+```
+
+### Verify a probe before running it
+
+```bash
+$ ssh qb1 'cd ~/tt-xla && .venv/bin/python experiments/utils/syntax_check.py \
+    experiments/utils/<your_probe>.py'
+# also: ssh qb1 'tt-smi -s' to verify chips are healthy first
+```
+
+---
+
+## 10. Tracing / profiling
+
+### Tracy (qb1 only — `reference_tracy_build_qb1.md`)
+
+- Tracy-enabled build: `~/tt-metal-tracy/` on qb1
+- Wrapper script: `run_with_tracy_build.sh`
+- The default ttnn build's Tracy API is a no-op. Setting `TT_METAL_DEVICE_PROFILER=1` on the non-Tracy build aborts (`feedback_ttnn_device_profiler_build.md`).
+- qb2 has NO Tracy build yet — host-side dispatch breakdown only (`tracy_traced_decode_probe.py` + `tracy_analyze_ops.py`).
+
+```bash
+$ ssh qb1 'bash ~/tt-xla/run_with_tracy_build.sh experiments/utils/<probe>.py'
+```
+
+### Sync-bounded timing (`feedback_sync_bounded_timing.md`)
+
+```python
+import time, ttnn
+ttnn.synchronize_device(device)          # critical pre-sync
+t0 = time.perf_counter()
+out = my_op(...)
+ttnn.synchronize_device(device)          # critical post-sync
+elapsed_ms = (time.perf_counter() - t0) * 1e3
+```
+
+Without both syncs, you measure DISPATCH latency, not EXECUTE latency. Async launches make this trap easy to fall into.
+
+### `bench_decode` family
+
+`bench_decode` (eager), `bench_decode_paged` (eager paged), `bench_decode_traced` (trace replay) all wrap the full decode loop including I/O. Never report `execute_trace`-only timing as tok/s (see `feedback_benchmark_methodology.md`, `feedback_real_vs_projected.md`).
+
+### Tracy analysis helpers (in tree)
+
+- `experiments/utils/tracy_traced_decode_probe.py` — capture a Tracy run
+- `experiments/utils/tracy_analyze_ops.py` — parse Tracy output → per-op time
+- `experiments/utils/tracy_top_ops_breakdown.py` — top-N table
+- `experiments/utils/tp_decompose_probe.py` — per-component TP step breakdown (qb2)
+
+---
+
+## 11. Web scraping / research strategy
+
+The local research corpus has already been built. **Don't re-scrape unless the question is genuinely novel.**
+
+### Existing research index
+
+| Topic | Path |
+|-------|------|
+| tt-metal source tree (vendored) | `experiments/.refs/tt-metal/` — read directly, don't re-fetch |
+| tt-metal tech reports | `experiments/.refs/tt-metal/tech_reports/` — START HERE for ttnn ops |
+| Scraped Tenstorrent docs corpus | `tt_docs_corpus/` (versioned) |
+| Multi-chip web research v1 | `research/multi_chip_web_research.md` (Agent P) |
+| Multi-chip web research v2 | `research/multi_chip_web_research_v2.md` (Agent Y) |
+| Friend's daily-driver repo, scraped | `research/friend_repo_borrow_list.md` — REFERENCE ONLY (see §15) |
+| Multi-chip opt menu v1 | `research/multi_chip_optimizations_menu.md` (14 ranked candidates) |
+| Multi-chip opt menu v2 | `research/multi_chip_optimizations_menu_v2_addendum.md` (11 more candidates) |
+| PJRT reflections | `research/pjrt_reflections.md` |
+| Branch reflections | `research/branch_*.md` |
+
+### Key external URLs (already mined — see `reference_research_sources.md`)
+
+- https://tenstorrent.com (corporate, product info)
+- https://www.corsix.org/content/tt-wh-part1 (Corsix 8-part Wormhole series)
+- https://clehaxze.tw/gemlog/2025/04-21-programming-tensotrrent-processors.gmi
+- https://github.com/tenstorrent/tt-metal (canonical kernels)
+- https://github.com/jax-ml/jax + https://github.com/openxla/xla
+- El Reg 4× P150 QuietBox review (Nov 2025): https://www.theregister.com/2025/11/27/tenstorrent_quietbox_review/
+- ASPLOS 2025 "Dissecting Blackhole": https://asplos.dev/wordpress/wp-content/uploads/2025/09/TT_bench-1.pdf
+- tt-metal #26252 (all_gather BW analysis), #33147 (CCL scaling tuning knobs)
+
+### Rule
+
+Before scraping anything new, **grep the existing research/ + tt_docs_corpus/ + .refs/ first**. Most questions are answered locally. `feedback_consult_docs_before_acting.md` is a hard rule: cite a doc path before designing a fix.
+
+---
+
+## 12. Background research strategy (4-agent parallel pattern)
+
+The project uses a **fan-out research pattern** where multiple sub-agents work concurrently on a question, then converge findings into a memory note. Common in the Branch C'7 era.
+
+### Pattern
+
+1. **User asks a big question** (e.g. "what TP optimizations exist?")
+2. **Spawn 2-4 agents** with non-overlapping mandates (e.g. Agent O = local docs survey, Agent O2 = deeper docs dive, Agent P = web research, Agent Y = competitor benchmarks)
+3. **Each agent writes a separate research note** (`research/multi_chip_optimizations_menu.md`, `_v2_addendum.md`, `multi_chip_web_research.md`, `multi_chip_web_research_v2.md`)
+4. **Converge into a single memory note** (e.g. `reference_multi_chip_opt_menu.md`, `reference_multi_chip_web_research.md`)
+
+### Naming convention
+
+- Agent letters track contribution: O, O2, P, Q, V, W, X, Y, K, N — referenced inline in memory notes ("per Agent Y's finding")
+- File suffix `_v2_addendum.md` or `_v2.md` means another agent extended an earlier doc
+
+### Contention rules
+
+- **Never run two ttnn probes on the same host concurrently** (see §3). If one agent is on qb1, another must use qb2 or local-only research.
+- Persistent server claims its host's ttnn — agents needing raw device access must coordinate.
+- Memory writes are safe — multiple agents can append to `research/` simultaneously; the MEMORY.md index gets merged at session end.
+
+### When to fan-out vs sequential
+
+| Fan-out when | Sequential when |
+|--------------|------------------|
+| Question has 2+ independent sub-questions | Each step depends on the prior |
+| Mixed local-only + remote work possible | All work needs the same scarce resource (one host) |
+| 90-min+ research arc | <30 min task |
+
+---
+
+
