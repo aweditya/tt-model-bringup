@@ -1,0 +1,46 @@
+{
+  "shapes": {
+    "HIDDEN": 5120,
+    "HEAD_DIM": 256,
+    "N_Q": 24,
+    "N_KV": 4,
+    "NQ_PER_CHIP": 6,
+    "NKV_PER_CHIP": 1,
+    "ROTARY_DIM": 64,
+    "MAX_POS": 256,
+    "BLOCK_SIZE": 32,
+    "K_CHAIN": 4,
+    "NUM_POPULATED": 8
+  },
+  "inter_chip_cos_V1": 0.8419880577596185,
+  "chain_cosine_chip0": 0.9996863512502743,
+  "chain_cosine_all_chips": 0.9996752428389586,
+  "chain_cosine": 0.9996863512502743,
+  "chain_max_abs_delta": 0.0615234375,
+  "eager_pass_correctness": true,
+  "eager_latency_ms": {
+    "V1_median": 14.400542015209794,
+    "V1_min": 14.153434894979,
+    "V2_median": 12.93757907114923,
+    "V2_min": 12.675039935857058,
+    "delta_median": 1.462962944060564,
+    "per_layer_delta": 0.365740736015141,
+    "K": 4
+  },
+  "eager_pass_latency": true,
+  "trace_v1_ok": true,
+  "trace_v1_err": null,
+  "trace_v2_ok": true,
+  "trace_v2_err": null,
+  "traced_latency_ms": {
+    "V1_median": 3.495682030916214,
+    "V1_min": 3.4517920576035976,
+    "V2_median": 3.465826972387731,
+    "V2_min": 3.436171915382147,
+    "delta_median": 0.029855058528482914,
+    "per_layer_delta": 0.0074637646321207285,
+    "K": 4
+  },
+  "traced_pass_latency": false,
+  "SHIP": true
+}
