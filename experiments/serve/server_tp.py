@@ -68,6 +68,9 @@ class MeshServerState:
         self.num_layers = 0
         self.tok = None
         self.embed_np = None
+        self.embed_tt = None             # P25: on-device embed table for ttnn.embedding lookup
+        self.cos_table_tt = None         # P25: full [MAX_POS, ROTARY_DIM] cos table on-device
+        self.sin_table_tt = None         # P25: full [MAX_POS, ROTARY_DIM] sin table on-device
         self.lm_head_tt = None
         self.final_norm_tt = None
         self.cos_ext_table_tt = None
@@ -85,10 +88,12 @@ class MeshServerState:
         self.vocab_padded = None        # padded vocab in lm_head weight (248320 for Qwen3.6)
         # Pre-allocated input buffers (populated at bootstrap; updated per step
         # via update_input_buffers using ttnn.copy_host_to_device_tensor)
-        self.x_buf = None
+        self.x_buf = None                # legacy: kept allocated but no longer written per step (P25)
         self.cur_pos_buf = None
-        self.cos_buf = None
-        self.sin_buf = None
+        self.cos_buf = None              # legacy
+        self.sin_buf = None              # legacy
+        self.tok_buf = None              # P25: [1,1] uint32 — current token id, sole per-step host write
+        self.rot_idxs_buf = None         # P25: [1,1] uint32 — current rotary index for cos/sin embedding lookup
         self.cos_all_np = None
         self.sin_all_np = None
         self.rotary_dim = None
@@ -281,6 +286,22 @@ def bootstrap(state: MeshServerState):
     embed_weights = _91l.load_embed_lm_head_weights()
     state.embed_np = embed_weights['embed']
     state.final_norm_tt = upload_replicated(embed_weights['final_norm'])
+    # P25 (validated 2026-05-14, .cache/p25_on_device_embed/results.json):
+    # Upload the full embed table on-device so per-step token embedding lookup
+    # is `ttnn.embedding(tok_buf, embed_tt)` instead of host slice + HtoD copy.
+    # Replicated across mesh. ROW_MAJOR layout required by ttnn.embedding (the
+    # output is then tilized via layout=TILE_LAYOUT arg at lookup time).
+    # Shape: [VOCAB_PADDED=248320, HIDDEN=5120] bf16 ≈ 2.54 GB per chip (fits).
+    state.embed_tt = ttnn.from_torch(
+        torch.from_numpy(state.embed_np),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    print(f"  ✓ embed_tt uploaded on-device [{state.embed_np.shape[0]}, {state.embed_np.shape[1]}] "
+          f"bf16 replicated (~{state.embed_np.shape[0]*state.embed_np.shape[1]*2/1e9:.2f} GB/chip)",
+          flush=True)
     # P22 (validated 2026-05-14, .cache/p22_vocab_sharded_lm_head/results.json):
     # shard lm_head along vocab axis. Weight is pre-transposed [HIDDEN, VOCAB_PADDED]
     # (91l_fp32_residual_generate.py:82) so dim=1 is the vocab dim. Per-chip slab
@@ -321,7 +342,25 @@ def bootstrap(state: MeshServerState):
     sin_ext = np.concatenate([state.sin_all_np, np.zeros((MAX_POS, pad), dtype=np.float32)], axis=-1)
     state.cos_ext_table_tt = upload_replicated(cos_ext)
     state.sin_ext_table_tt = upload_replicated(sin_ext)
-    print(f"  ✓ RoPE tables uploaded (MAX_POS={MAX_POS}; host arrays kept for trace)",
+    # P25: ROW_MAJOR cos/sin tables for on-device per-step lookup via
+    # ttnn.embedding(rot_idxs_buf, cos_table_tt, layout=TILE_LAYOUT).
+    # Replaces host-side cos_all_np[cur_pos] slice + HtoD copy each step.
+    state.cos_table_tt = ttnn.from_torch(
+        torch.from_numpy(state.cos_all_np),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    state.sin_table_tt = ttnn.from_torch(
+        torch.from_numpy(state.sin_all_np),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    print(f"  ✓ RoPE tables uploaded (MAX_POS={MAX_POS}; "
+          f"+ on-device ROW_MAJOR cos/sin tables for ttnn.embedding lookup)",
           flush=True)
 
     # Paged KV cache page_table: identity mapping for B=1 (logical block i →
@@ -383,7 +422,20 @@ def bootstrap(state: MeshServerState):
         torch.zeros(1, ROTARY_DIM, dtype=torch.float32),
         dtype=ttnn.bfloat16, device=state.mesh, layout=ttnn.TILE_LAYOUT,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
-    print(f"  ✓ input buffers pre-allocated (x_buf, cur_pos_buf, cos_buf, sin_buf)",
+    # P25: tiny index buffers — the ONLY per-step HtoD writes after the swap.
+    # tok_buf: [1,1] uint32, current token id (for ttnn.embedding token lookup).
+    # rot_idxs_buf: [1,1] uint32, current rotary index (for cos/sin lookup).
+    # Both shape [1,1] (not [1]) because ttnn.embedding wants idx ndim >= 2.
+    state.tok_buf = ttnn.from_torch(
+        torch.tensor([[0]], dtype=torch.int32),
+        dtype=ttnn.uint32, device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    state.rot_idxs_buf = ttnn.from_torch(
+        torch.tensor([[0]], dtype=torch.int32),
+        dtype=ttnn.uint32, device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    print(f"  ✓ input buffers pre-allocated (x_buf, cur_pos_buf, cos_buf, sin_buf, "
+          f"tok_buf, rot_idxs_buf)",
           flush=True)
 
     print(f"[bootstrap] STAGE B COMPLETE — all weights + state buffers on mesh.", flush=True)
@@ -652,58 +704,82 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
 
 
 def update_input_buffers(state, token_id, cur_pos):
-    """Write new token embedding + cur_pos + cos/sin rows into pre-allocated
-    state buffers. Called OUTSIDE any captured trace, between execute_trace
-    calls. Uses ttnn.copy_host_to_device_tensor for in-place buffer updates
-    — the Llama70B production pattern (llama_common.py:211-232).
+    """Write new token id + cur_pos + rotary index into the pre-allocated index
+    buffers. Called OUTSIDE any captured trace, between execute_trace calls.
+    Uses ttnn.copy_host_to_device_tensor for in-place buffer updates.
+
+    P25 (2026-05-14): collapsed from 4 HtoD calls (x_buf, cur_pos, cos, sin)
+    to 3 tiny index writes (tok_buf, cur_pos_buf, rot_idxs_buf). The embed
+    lookup + cos/sin row lookup now happen on-device inside the trace via
+    ttnn.embedding. Payload per step dropped from ~10.3 KB to ~12 bytes; more
+    importantly, eliminated 4 host-side from_torch calls per step.
     """
     import ttnn
     import torch
-    import numpy as np
-    cfg = state.cfg
-    HIDDEN = cfg['hidden']
     mesh = state.mesh
 
-    # Build host tensors (these are short-lived; the in-place copy puts data
-    # into the persistent device buffers).
-    x_np = state.embed_np[token_id].reshape(1, HIDDEN).astype(np.float32)
-    x_host = ttnn.from_torch(torch.from_numpy(x_np),
-                              dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                              mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
-    ttnn.copy_host_to_device_tensor(x_host, state.x_buf)
+    # tok_buf [1, 1] uint32 — for ttnn.embedding(tok_buf, embed_tt) inside the trace.
+    tok_host = ttnn.from_torch(
+        torch.tensor([[token_id]], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    ttnn.copy_host_to_device_tensor(tok_host, state.tok_buf)
+    # cur_pos_buf [1] int32 — used by paged_update_cache + paged SDPA (gated_attn).
     cur_pos_host = ttnn.from_torch(
         torch.tensor([cur_pos], dtype=torch.int32),
         layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
         mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
     ttnn.copy_host_to_device_tensor(cur_pos_host, state.cur_pos_buf)
-    cos_host = ttnn.from_torch(
-        torch.from_numpy(state.cos_all_np[cur_pos:cur_pos+1]),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+    # rot_idxs_buf [1, 1] uint32 — for ttnn.embedding(rot_idxs_buf, cos/sin_table_tt).
+    rot_host = ttnn.from_torch(
+        torch.tensor([[cur_pos]], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
         mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
-    ttnn.copy_host_to_device_tensor(cos_host, state.cos_buf)
-    sin_host = ttnn.from_torch(
-        torch.from_numpy(state.sin_all_np[cur_pos:cur_pos+1]),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
-    ttnn.copy_host_to_device_tensor(sin_host, state.sin_buf)
+    ttnn.copy_host_to_device_tensor(rot_host, state.rot_idxs_buf)
 
 
 def forward_token_tp_inner(state):
     """The trace-captureable forward function. Reads ONLY from pre-allocated
-    state buffers (state.x_buf, state.cur_pos_buf, state.cos_buf, state.sin_buf)
-    — no host writes, no Python-int-baked args. Returns on-device argmax tensor
-    (P22, 2026-05-14): vocab-sharded matmul + all_gather + slice + untilize +
-    argmax. Returns UINT32 row-major tensor of shape (1, 1), replicated across
-    all chips (post-all_gather all chips agree). Saves ~35 ms/tok vs reading
-    back 152064 fp32 logits.
+    state buffers (state.tok_buf, state.cur_pos_buf, state.rot_idxs_buf) and
+    does the embed + cos/sin row lookups on-device via ttnn.embedding (P25,
+    2026-05-14). No host writes inside, no Python-int-baked args. Returns
+    on-device argmax tensor (P22, 2026-05-14): vocab-sharded matmul +
+    all_gather + slice + untilize + argmax. Returns UINT32 row-major tensor
+    of shape (1, 1), replicated across all chips. Saves ~35 ms/tok vs reading
+    back 152064 fp32 logits (P22) and ~0.7 ms/tok eliminating the 4-call
+    host loop in update_input_buffers (P25).
 
     Callers MUST call update_input_buffers(state, token_id, cur_pos) FIRST
-    to populate the buffers (and outside any captured trace).
+    to populate the tok/cur_pos/rot index buffers (outside any captured trace).
     """
     import ttnn
     cfg = state.cfg
     HIDDEN = cfg['hidden']
-    x_tt = state.x_buf
+    # P25: on-device token embedding lookup. tok_buf is [1, 1] uint32; the
+    # output is [1, 1, HIDDEN] bf16 — reshape to [1, HIDDEN] for the layer loop.
+    # Force DRAM memory_config (friend's pattern, model.py:560) so downstream
+    # rms_norm + linear get the same layout they got from the legacy x_buf
+    # (which was created via from_torch into default DRAM).
+    embed_out = ttnn.embedding(
+        state.tok_buf, state.embed_tt,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    x_tt = ttnn.reshape(embed_out, [1, HIDDEN])
+    # P25: on-device cos/sin row lookup. Outputs [1, 1, ROTARY_DIM] bf16 —
+    # reshape to [1, ROTARY_DIM] for gated_attn_step_tp (which expects 2-D).
+    cos_row_raw = ttnn.embedding(
+        state.rot_idxs_buf, state.cos_table_tt,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    sin_row_raw = ttnn.embedding(
+        state.rot_idxs_buf, state.sin_table_tt,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    cos_row_tt = ttnn.reshape(cos_row_raw, [1, state.rotary_dim])
+    sin_row_tt = ttnn.reshape(sin_row_raw, [1, state.rotary_dim])
     for layer in state.layers:
         if layer['type'] == 'linear_attention':
             x_tt = deltanet_step_tp(state, x_tt, layer['dn'], cfg)
@@ -711,7 +787,7 @@ def forward_token_tp_inner(state):
             x_tt = gated_attn_step_tp(state, x_tt, layer['attn'],
                                        state.cur_pos_buf,
                                        0,  # vestigial cur_pos int (paged path ignores it)
-                                       state.cos_buf, state.sin_buf, cfg)
+                                       cos_row_tt, sin_row_tt, cfg)
         x_tt = mlp_step_tp(state, x_tt, layer['mlp'])
     x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
     # P22 vocab-sharded LM head + on-device argmax (see Agent X's resolution at
