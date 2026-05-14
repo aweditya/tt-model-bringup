@@ -111,31 +111,56 @@ def main():
             conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
             return conv_out
 
-        # === V2: ttnn.conv1d depthwise ===
-        # NOTE: ttnn.conv1d may require various layout/sharding params
-        # Will discover signature errors at runtime.
+        # === V2: ttnn.conv1d depthwise (Mamba-style signature) ===
+        # Per experiments/.refs/tt-metal/models/demos/wormhole/mamba/tt/mamba_conv.py,
+        # ttnn.conv1d expects input_length + conv_config + compute_config.
+        # Build them once outside the timed function so we measure forward-only.
+        try:
+            conv1d_config = ttnn.Conv1dConfig(
+                dtype=DTYPE,
+                weights_dtype=DTYPE,
+                shard_layout=None,
+            )
+            conv1d_compute_config = ttnn.init_device_compute_kernel_config(
+                device.arch(),
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=False,
+                packer_l1_acc=False,
+            )
+            v2_setup_ok = True
+        except Exception as e:
+            v2_setup_ok = False
+            v2_setup_err = f"{type(e).__name__}: {str(e)[:200]}"
+
         def v2():
+            # Mamba pattern: [1, 1, batch * input_length, in_channels]?
+            # Actually try [N, L, C_in] standard layout first
             ci_dw_tt = ttnn.from_torch(
-                ci_dw_torch.unsqueeze(0) if ci_dw_torch.dim() == 3 else ci_dw_torch,
+                ci_dw_torch.permute(0, 2, 1).contiguous() if ci_dw_torch.dim() == 3 else ci_dw_torch,
                 dtype=DTYPE, device=device, layout=ttnn.ROW_MAJOR_LAYOUT
             )
-            # Try ttnn.conv1d directly. Will iterate on errors.
-            try:
-                out = ttnn.conv1d(
-                    input_tensor=ci_dw_tt,
-                    weight_tensor=cw_dw,
-                    in_channels=CONV_DIM,
-                    out_channels=CONV_DIM,
-                    kernel_size=KERNEL,
-                    stride=1,
-                    padding=0,
-                    groups=CONV_DIM,
-                    batch_size=1,
-                    device=device,
-                )
-            except Exception as e:
-                raise RuntimeError(f"ttnn.conv1d failed: {type(e).__name__}: {e}") from e
-            return ttnn.silu(out)
+            out_tuple = ttnn.conv1d(
+                input_tensor=ci_dw_tt,
+                weight_tensor=cw_dw,
+                in_channels=CONV_DIM,
+                out_channels=CONV_DIM,
+                device=device,
+                bias_tensor=None,
+                kernel_size=KERNEL,
+                stride=1,
+                padding=0,
+                batch_size=1,
+                input_length=KERNEL,
+                dtype=DTYPE,
+                conv_config=conv1d_config,
+                compute_config=conv1d_compute_config,
+                groups=CONV_DIM,
+                return_output_dim=True,
+                return_weights_and_bias=False,
+            )
+            out_tensor = out_tuple[0] if isinstance(out_tuple, tuple) else out_tuple
+            return ttnn.silu(out_tensor)
 
         print("\n[3] Math sanity for V1...")
         out_v1 = ttnn.to_torch(v1()).float().cpu().numpy().flatten()[:CONV_DIM]
@@ -147,6 +172,13 @@ def main():
 
         # === Try V2 ===
         print("\n[4] Math sanity for V2 (ttnn.conv1d depthwise)...")
+        if not v2_setup_ok:
+            print(f"  ✗ V2 setup failed: {v2_setup_err}")
+            v2_works = False
+            try:
+                pass  # skip math + latency
+            except Exception:
+                pass
         try:
             out_v2_raw = v2()
             out_v2 = ttnn.to_torch(out_v2_raw).float().cpu().numpy().flatten()[:CONV_DIM]
