@@ -91,6 +91,9 @@ class MeshServerState:
         # Paged KV cache shared state
         self.page_table_tt = None
         self.paged_write_mem_cfg = None
+        # Paged SDPA configs (P18/P19 — see feedback_p19_chained_paged_sdpa.md)
+        self.paged_sdpa_progcfg = None
+        self.sdpa_compute_kernel_config = None
         self.trace_x_buf = None
         self.trace_logits_buf = None
         self.last_run = None
@@ -319,6 +322,24 @@ def bootstrap(state: MeshServerState):
         ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
     print(f"  ✓ paged_write mem_cfg cached", flush=True)
 
+    # Paged SDPA program + compute kernel config (P18 winner, see
+    # feedback_mesh_paged_sdpa_works.md + feedback_p19_chained_paged_sdpa.md).
+    # Required because the default kernel grabs ~110 cores/head, triggering a
+    # tree-reduction error on (1,4) mesh. CoreCoord(4,4) fits the per-chip slab.
+    state.paged_sdpa_progcfg = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
+        q_chunk_size=0,
+        k_chunk_size=0,
+        exp_approx_mode=False,
+    )
+    state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=False,
+        packer_l1_acc=False,
+    )
+    print(f"  ✓ paged SDPA program_config + compute_kernel_config cached", flush=True)
+
     # Pre-allocated input buffers for trace-compatible decode.
     # These are READ by forward_token_tp_inner (which is the trace target).
     # They are UPDATED before each execute_trace via copy_host_to_device_tensor
@@ -359,24 +380,21 @@ def bootstrap(state: MeshServerState):
 
 
 def _rms_norm_manual(x_tt, weight_tt, eps, dim_size):
-    """Mesh-friendly RMS norm: weight * x / sqrt(mean(x*x) + eps).
+    """Mesh RMS norm.
 
-    Doc evidence: `ttnn.rms_norm_pre_all_gather` + `..._post_all_gather` exist
-    as separate ops (see `experiments/.refs/tt-metal/models/demos/deepseek_v3/
-    reference/ttnn.md` and `llama3_70b_galaxy/tt/llama_ccl.py:1369`), and
-    production multi-chip code never uses plain `ttnn.rms_norm` on a mesh.
-    Working chain probe `full_layer_tp_probe.deltanet_tp:204` avoids plain
-    rms_norm entirely on replicated inputs and uses this manual form — its
-    DN→MLP×K=8 eager chain runs without hang on (1,4) mesh. Empirically the
-    plain ttnn.rms_norm on our (1,4) mesh accumulates state that wedges the
-    next layer's reshape (see feedback_p7_mlp_wedges_next_dn.md).
+    P15 (2026-05-14): re-testing plain ttnn.rms_norm after the deallocate
+    discipline (faff42a) + paged refactor (4cd0ce1) + buffer pre-allocation
+    (1fabf07) all landed. The original wedge in feedback_p7_mlp_wedges_next_dn.md
+    may have been caused by intermediate buffer accumulation (the H2 we ruled
+    out at that time but the deallocate fix later confirmed was the real issue).
+    If plain rms_norm now works, drop in: 7 manual ops → 1 fused op × 305 calls/
+    token = ~18.3 ms/tok savings per Agent N's gap analysis (5a9808d).
+
+    Falls back to manual form if plain rms_norm wedges multi-step P6 — see
+    feedback_ttnn_fused_ops_gap_analysis.md.
     """
     import ttnn
-    sq = ttnn.mul(x_tt, x_tt)
-    sum_sq = ttnn.sum(sq, dim=-1, keepdim=True)
-    mean_sq = ttnn.mul(sum_sq, 1.0 / dim_size)
-    inv_rms = ttnn.rsqrt(ttnn.add(mean_sq, eps))
-    return ttnn.mul(ttnn.mul(x_tt, inv_rms), weight_tt)
+    return ttnn.rms_norm(x_tt, weight=weight_tt, epsilon=eps)
 
 
 def deltanet_step_tp(state, x_tt, dn, cfg):
@@ -580,27 +598,25 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
                                            page_table=state.page_table_tt)
     ttnn.deallocate(k_sharded)
     ttnn.deallocate(v_sharded)
-    # 6. Manual SDPA — read paged cache, reshape blocks → flat MAX_POS.
-    # Paged SDPA decode hits the same tree-reduction failure on mesh as the
-    # non-paged variant (P13 confirmed). Keep manual SDPA on the read side.
-    # Per-chip cache: [NUM_BLOCKS, 1, BLOCK_SIZE, HEAD_DIM]
-    # → reshape to [NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM] (collapse NKV_PER_CHIP=1)
-    # → reshape to [MAX_POS, HEAD_DIM] (linear order: block0_slot0, block0_slot1, ..., blockK_slotS)
-    assert NKV_PER_CHIP == 1, "manual SDPA assumes 1 KV head per chip"
-    kc_3d = ttnn.reshape(attn['kc'], [NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM])
-    vc_3d = ttnn.reshape(attn['vc'], [NUM_BLOCKS, BLOCK_SIZE, HEAD_DIM])
-    kc_flat = ttnn.reshape(kc_3d, [MAX_POS, HEAD_DIM])
-    vc_flat = ttnn.reshape(vc_3d, [MAX_POS, HEAD_DIM])
-    scale = 1.0 / np.sqrt(HEAD_DIM)
-    kT = ttnn.transpose(kc_flat, 0, 1)            # [HEAD_DIM, MAX_POS]
-    scores = ttnn.mul(ttnn.matmul(q_tt, kT), scale)  # [NQ_PER_CHIP, MAX_POS]
-    # Note: only positions 0..cur_pos have valid K/V. For correctness we'd
-    # need to mask scores at positions > cur_pos. Untrained positions in our
-    # zero-initialized cache produce near-zero contributions after softmax
-    # — acceptable for correctness gate at small cur_pos but should be masked
-    # for production use beyond MAX_POS/2.
-    attn_w = ttnn.softmax(scores, dim=-1)
-    attn_per_head = ttnn.matmul(attn_w, vc_flat)   # [NQ_PER_CHIP, HEAD_DIM]
+    # 6. PAGED SDPA decode (P18/P19 validated).
+    # Replaces the manual Q@K^T softmax V path. Key wins:
+    #   - Correctness: paged SDPA uses cur_pos_tensor to mask positions > cur_pos.
+    #     The manual path did NOT mask, silently degrading at cur_pos > MAX_POS/2.
+    #   - Long-context: paged SDPA is O(1) in MAX_POS; manual was O(MAX_POS).
+    # NOTE (P19): at MAX_POS=256 under trace, the eager win (0.37 ms/layer)
+    # collapses to wash (0.0075 ms/layer). Production uses trace, so this swap
+    # is for CORRECTNESS + LONG-CONTEXT scaling, not a tok/s claim.
+    # See feedback_p19_chained_paged_sdpa.md.
+    assert NKV_PER_CHIP == 1, "paged SDPA per-chip assumes 1 KV head"
+    q_for_sdpa = ttnn.reshape(q_tt, [1, 1, NQ_PER_CHIP, HEAD_DIM])
+    attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+        q_for_sdpa, attn['kc'], attn['vc'],
+        cur_pos_tensor=cur_pos_tt,
+        page_table_tensor=state.page_table_tt,
+        program_config=state.paged_sdpa_progcfg,
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+    )
+    attn_per_head = ttnn.reshape(attn_out, [NQ_PER_CHIP, HEAD_DIM])
     # 7. Sigmoid gate + multiply
     attn_gated = ttnn.mul(attn_per_head, ttnn.sigmoid(gate_tt))
     # 8. out_proj row-parallel + all_reduce
