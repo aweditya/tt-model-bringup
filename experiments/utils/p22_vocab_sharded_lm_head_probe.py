@@ -40,8 +40,10 @@ import ttnn
 sys.stdout.reconfigure(line_buffering=True)
 
 
-VOCAB = 152064            # real vocab (what 91l slices to via [:VOCAB])
-VOCAB_PADDED = 248320     # actual stored width of lm_head (HF padding)
+VOCAB = 248320            # HF config vocab_size — matches state.embed_np.shape[0]
+                          # (the old "152064" was the wrong value from stale notes;
+                          # actual tokenizer vocab is 248044, model padded to 248320)
+VOCAB_PADDED = 248320     # actual stored width of lm_head (= vocab_size)
 HIDDEN = 5120
 NCHIPS = 4
 VOCAB_PER_CHIP_PADDED = VOCAB_PADDED // NCHIPS  # 62080 — what shards naturally

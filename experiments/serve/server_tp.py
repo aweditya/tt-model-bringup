@@ -78,7 +78,11 @@ class MeshServerState:
         self.layers = []
         # Persistent traced graph (Stage D — P14 commit 2d30af7)
         self.trace_id = None
-        self.traced_logits_tt = None
+        self.traced_logits_tt = None    # legacy field, retained for safety; unused after vocab-sharded LM head ship
+        self.traced_argmax_tt = None    # P22: on-device argmax output of forward_token_tp_inner
+        # P22: vocab-sharded LM head dimensions
+        self.vocab_size = None          # real vocab from state.embed_np.shape[0] (152064 for Qwen3.6)
+        self.vocab_padded = None        # padded vocab in lm_head weight (248320 for Qwen3.6)
         # Pre-allocated input buffers (populated at bootstrap; updated per step
         # via update_input_buffers using ttnn.copy_host_to_device_tensor)
         self.x_buf = None
@@ -277,8 +281,25 @@ def bootstrap(state: MeshServerState):
     embed_weights = _91l.load_embed_lm_head_weights()
     state.embed_np = embed_weights['embed']
     state.final_norm_tt = upload_replicated(embed_weights['final_norm'])
-    state.lm_head_tt = upload_replicated(embed_weights['lm_head'])
-    print(f"  ✓ embed/lm_head/final_norm uploaded", flush=True)
+    # P22 (validated 2026-05-14, .cache/p22_vocab_sharded_lm_head/results.json):
+    # shard lm_head along vocab axis. Weight is pre-transposed [HIDDEN, VOCAB_PADDED]
+    # (91l_fp32_residual_generate.py:82) so dim=1 is the vocab dim. Per-chip slab
+    # is [HIDDEN=5120, VOCAB_PADDED/NCHIPS=62080], which is tile-aligned.
+    # Forward emits the argmax on device (saves ~35 ms/tok readback).
+    NCHIPS = state.mesh.get_num_devices()
+    state.vocab_padded = int(embed_weights['lm_head'].shape[1])  # 248320 for Qwen3.6
+    # NOTE: prior to P22, prod argmaxed over `[: state.embed_np.shape[0]]` which equals
+    # vocab_padded = 248320 (i.e. a no-op slice). The HF config vocab_size IS 248320 (the
+    # tile-aligned padded layout); tokenizer.vocab_size is 248044. Keep behavior parity by
+    # using the full padded vocab for argmax — model padding rows in lm_head are zero-or-tiny
+    # by HF design, so argmax over them never wins in practice.
+    state.vocab_size = state.vocab_padded
+    assert state.vocab_padded % NCHIPS == 0, \
+        f"vocab_padded {state.vocab_padded} not divisible by nchips {NCHIPS}"
+    state.lm_head_tt = upload_sharded(embed_weights['lm_head'], dim=1)
+    print(f"  ✓ embed uploaded; final_norm replicated; "
+          f"lm_head sharded dim=1 (per-chip {state.vocab_padded // NCHIPS}; "
+          f"vocab {state.vocab_size}/{state.vocab_padded})", flush=True)
 
     # RoPE cos/sin tables — ROTARY_DIM-wide (V2 rotate-only path).
     # Keep host arrays in state for per-step slicing (trace-compatible: we
@@ -670,7 +691,11 @@ def update_input_buffers(state, token_id, cur_pos):
 def forward_token_tp_inner(state):
     """The trace-captureable forward function. Reads ONLY from pre-allocated
     state buffers (state.x_buf, state.cur_pos_buf, state.cos_buf, state.sin_buf)
-    — no host writes, no Python-int-baked args. Returns lm_head logits tensor.
+    — no host writes, no Python-int-baked args. Returns on-device argmax tensor
+    (P22, 2026-05-14): vocab-sharded matmul + all_gather + slice + untilize +
+    argmax. Returns UINT32 row-major tensor of shape (1, 1), replicated across
+    all chips (post-all_gather all chips agree). Saves ~35 ms/tok vs reading
+    back 152064 fp32 logits.
 
     Callers MUST call update_input_buffers(state, token_id, cur_pos) FIRST
     to populate the buffers (and outside any captured trace).
@@ -689,8 +714,19 @@ def forward_token_tp_inner(state):
                                        state.cos_buf, state.sin_buf, cfg)
         x_tt = mlp_step_tp(state, x_tt, layer['mlp'])
     x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
-    logits_tt = ttnn.linear(x_tt, state.lm_head_tt)
-    return logits_tt
+    # P22 vocab-sharded LM head + on-device argmax (see Agent X's resolution at
+    # feedback_lm_head_argmax_unknown.md). Per-chip linear produces
+    # [1, VOCAB_PADDED/NCHIPS] then all_gather replicates to [1, VOCAB_PADDED]
+    # on every chip. Slice to real vocab, untilize for argmax compatibility,
+    # then argmax. Result is small UINT32 tensor — tiny readback.
+    # Use keepdim=True + use_multicore=True (the only combo that returns
+    # correct indices on [1, 152064] in our ttnn build — see p22_argmax_sanity6).
+    sharded_logits_tt = ttnn.linear(x_tt, state.lm_head_tt)
+    gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+    sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [1, state.vocab_size])
+    rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+    argmax_tt = ttnn.argmax(rm_logits_tt, dim=-1, keepdim=True, use_multicore=True)
+    return argmax_tt
 
 
 def forward_token_tp(state, token_id, cur_pos):
@@ -781,18 +817,23 @@ def _ensure_decode_trace(state):
     # Capture
     update_input_buffers(state, token_id=0, cur_pos=2)
     state.trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
-    state.traced_logits_tt = forward_token_tp_inner(state)
+    # P22: forward returns on-device argmax tensor (UINT32 [1,1]) not full logits.
+    state.traced_argmax_tt = forward_token_tp_inner(state)
     ttnn.end_trace_capture(state.mesh, state.trace_id, cq_id=0)
     print(f"  ✓ decode trace captured in {(_time.time()-t0)*1000:.0f} ms "
           f"(id={state.trace_id})", flush=True)
 
 
 def _traced_forward(state, token_id, cur_pos):
-    """Equivalent to forward_token_tp but uses the captured trace."""
+    """Equivalent to forward_token_tp but uses the captured trace.
+
+    P22 (2026-05-14): returns on-device argmax tensor (UINT32 [1,1]) — read
+    via to_torch(..., ConcatMeshToTensor(dim=0))[0] for the next-token id.
+    """
     import ttnn
     update_input_buffers(state, token_id, cur_pos)
     ttnn.execute_trace(state.mesh, state.trace_id, cq_id=0, blocking=False)
-    return state.traced_logits_tt
+    return state.traced_argmax_tt
 
 
 def handle_generate_tp(state: MeshServerState, args: dict):
@@ -834,11 +875,12 @@ def handle_generate_tp(state: MeshServerState, args: dict):
     # prefill because warmup or prior queries left state non-zero.
     _reset_state_buffers(state)
 
-    # Prefill (use traced forward; the trace doesn't care about position values)
+    # Prefill (use traced forward; the trace doesn't care about position values).
+    # Variable name reflects P22 change: trace now emits on-device argmax tensor.
     t0 = _time.time()
-    last_logits = None
+    last_argmax = None
     for pos, tid in enumerate(prompt_ids):
-        last_logits = _traced_forward(state, tid, pos)
+        last_argmax = _traced_forward(state, tid, pos)
     ttnn.synchronize_device(state.mesh)
     prefill_ms = (_time.time() - t0) * 1000.0
 
@@ -852,10 +894,13 @@ def handle_generate_tp(state: MeshServerState, args: dict):
     stopped_on_eos = False
 
     for step in range(max_tokens):
-        # Read logits from chip 0 (mesh-composed → first row is chip 0's view)
-        logits_t = ttnn.to_torch(last_logits, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
-        logits_np = logits_t.float().cpu().numpy().reshape(-1)[: state.embed_np.shape[0]]
-        next_id = int(np.argmax(logits_np))
+        # P22: on-device argmax. last_argmax is UINT32 [1,1] replicated on
+        # mesh post-AG, so ConcatMeshToTensor(dim=0) yields [NCHIPS, 1, 1]
+        # with all chips agreeing. Read chip 0's value. Tiny readback (~8 bytes
+        # of payload) vs prior 152064 fp32 readback (~600 KB, ~35 ms).
+        idx_concat = ttnn.to_torch(
+            last_argmax, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+        next_id = int(idx_concat.cpu().numpy().reshape(-1)[0])
         generated_ids.append(next_id)
         new_text = state.tok.decode(generated_ids, skip_special_tokens=True)
         delta = new_text[len(text_so_far):]
@@ -873,7 +918,7 @@ def handle_generate_tp(state: MeshServerState, args: dict):
             stopped_on_eos = True
             break
         td0 = _time.time()
-        last_logits = _traced_forward(state, next_id, cur_pos)
+        last_argmax = _traced_forward(state, next_id, cur_pos)
         ttnn.synchronize_device(state.mesh)
         decode_times.append((_time.time() - td0) * 1000.0)
         cur_pos += 1
