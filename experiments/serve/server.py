@@ -1113,6 +1113,167 @@ def handle_bench_decode_traced(state: ServerState, args: dict) -> dict:
     return summary
 
 
+def handle_cosine_ladder(state: "ServerState", args: dict) -> dict:
+    """Teacher-forced per-position logits dump. Drives a FIXED token sequence
+    through the paged forward and saves the per-step logits to disk.
+
+    Designed for the cosine-ladder bf16-drift experiment: pair with an HF
+    reference run (experiments/utils/cosine_ladder_hf_ref.py) and compare
+    per-position cosines.
+
+    args:
+      prompt_ids:    list[int]   (required) — initial prompt token ids
+      generated_ids: list[int]   (required) — teacher-forced continuation
+                                  (typically from HF greedy).
+      out_path:      str         (default: ~/tt-xla/.cache/cosine_ladder_tt_logits.npz)
+      max_pos:       int         (default: 512)
+      block_size:    int         (default: 64)
+
+    Output file contains:
+      logits:        [M, vocab]  float32  — logits at each generated position.
+                                  logits[0] = predictions AFTER consuming
+                                  prompt_ids[-1] (i.e. distribution that HF used
+                                  to pick generated_ids[0]). logits[i] for i>0 =
+                                  predictions AFTER consuming generated_ids[i-1].
+      prompt_ids:    [P]         int32
+      generated_ids: [M]         int32
+
+    Returns: {"path": out_path, "n_steps": M, "prefill_ms": ..., "decode_ms": ...}
+    """
+    if state.mock:
+        return {"mock": True}
+
+    import numpy as np
+    import torch
+    import ttnn
+
+    prompt_ids = list(args.get("prompt_ids") or [])
+    generated_ids = list(args.get("generated_ids") or [])
+    if not prompt_ids:
+        return {"error": "missing prompt_ids"}
+    if not generated_ids:
+        return {"error": "missing generated_ids"}
+    out_path = str(args.get("out_path") or
+                   os.path.expanduser("~/tt-xla/.cache/cosine_ladder_tt_logits.npz"))
+    max_pos = int(args.get("max_pos", 512))
+    block_size = int(args.get("block_size", 64))
+    assert max_pos % block_size == 0
+    ensure_rope_tables(state, max_pos)
+
+    cfg = state.cfg
+    HIDDEN = cfg["hidden"]
+    N_KV = cfg["n_kv_heads"]
+    HEAD_DIM = cfg["head_dim"]
+    ROTARY_DIM = int(HEAD_DIM * cfg["partial_rotary_factor"])
+    NUM_LAYERS = state.num_layers
+    KEY_DIM = cfg["n_k_heads"] * cfg["k_dim"]
+    VAL_DIM = cfg["n_v_heads"] * cfg["v_dim"]
+    CONV_DIM = 2 * KEY_DIM + VAL_DIM
+    upload = state._91f.upload
+    device = state.device
+
+    P = len(prompt_ids)
+    M = len(generated_ids)
+    if P + M > max_pos:
+        return {"error": f"P {P} + M {M} > max_pos {max_pos}"}
+
+    max_num_blocks = max_pos // block_size
+    page_table_np = np.arange(max_num_blocks, dtype=np.int32).reshape(1, max_num_blocks)
+    page_table_tt = ttnn.from_torch(torch.from_numpy(page_table_np),
+                                     dtype=ttnn.int32, device=device,
+                                     layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    n_dn = sum(1 for i in range(NUM_LAYERS) if i % 4 != 3)
+    n_attn = NUM_LAYERS - n_dn
+    ssm = [upload(np.zeros((cfg["n_v_heads"], cfg["k_dim"], cfg["v_dim"]),
+                            dtype=np.float32), device, dtype=ttnn.float32)
+           for _ in range(n_dn)]
+    cvs = [upload(np.zeros((CONV_DIM, cfg["conv_kernel"] - 1), dtype=np.float32),
+                    device, dtype=ttnn.float32) for _ in range(n_dn)]
+    paged_kv_zero = np.zeros((max_num_blocks, N_KV, block_size, HEAD_DIM),
+                              dtype=np.float32)
+    kvc = []
+    for _ in range(n_attn):
+        kv_k = ttnn.from_torch(torch.from_numpy(paged_kv_zero), dtype=ttnn.bfloat16,
+                                device=device, layout=ttnn.TILE_LAYOUT,
+                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        kv_v = ttnn.from_torch(torch.from_numpy(paged_kv_zero), dtype=ttnn.bfloat16,
+                                device=device, layout=ttnn.TILE_LAYOUT,
+                                memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        kvc.append([kv_k, kv_v])
+
+    embed_np = state.embed_np
+
+    def forward_token(token_id, cur_pos):
+        x_np = embed_np[token_id]
+        x_tt = upload(x_np.reshape(1, HIDDEN), device, dtype=ttnn.float32)
+        cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0],
+                             [cur_pos + 1, ROTARY_DIM])
+        sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0],
+                             [cur_pos + 1, ROTARY_DIM])
+        cur_pos_tt = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32),
+                                       device=device,
+                                       layout=ttnn.ROW_MAJOR_LAYOUT)
+        dn_idx = 0
+        attn_idx = 0
+        for i in range(NUM_LAYERS):
+            layer_type, w_tt = state.layer_weights[i]
+            if layer_type == "linear_attention":
+                x_tt, ssm[dn_idx], cvs[dn_idx] = state._91f.deltanet_step_ondevice(
+                    x_tt, w_tt, ssm[dn_idx], cvs[dn_idx], cfg)
+                dn_idx += 1
+            else:
+                kv_k, kv_v = kvc[attn_idx]
+                x_tt = state._91f.gated_attn_step_ondevice_paged(
+                    x_tt, w_tt, kv_k, kv_v, page_table_tt, cur_pos_tt,
+                    cos_tt, sin_tt, cfg)
+                attn_idx += 1
+            x_tt = state._91f.mlp_step_ondevice(x_tt, w_tt)
+        x_tt = ttnn.rms_norm(x_tt, weight=state.final_norm_tt, epsilon=1e-6)
+        logits_tt = ttnn.linear(x_tt, state.lm_head_tt,
+                                  compute_kernel_config=state._91f.hifi4)
+        return logits_tt
+
+    # Prefill
+    t0 = time.time()
+    last_logits = None
+    for pos, tid in enumerate(prompt_ids):
+        last_logits = forward_token(tid, pos)
+    ttnn.synchronize_device(device)
+    prefill_ms = (time.time() - t0) * 1000.0
+
+    VOCAB = int(state.lm_head_tt.shape[-1])
+    logits_arr = np.empty((M, VOCAB), dtype=np.float32)
+    # Step 0: last_logits from prefill = prediction for generated_ids[0]
+    logits_arr[0] = ttnn.to_torch(last_logits).float().cpu().numpy().flatten()
+
+    # Steps 1..M-1: feed generated_ids[i-1] at position P + i - 1
+    t_decode = time.time()
+    cur_pos = P
+    for i in range(1, M):
+        last_logits = forward_token(generated_ids[i - 1], cur_pos)
+        ttnn.synchronize_device(device)
+        logits_arr[i] = ttnn.to_torch(last_logits).float().cpu().numpy().flatten()
+        cur_pos += 1
+    decode_ms = (time.time() - t_decode) * 1000.0
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    np.savez(out_path,
+             logits=logits_arr,
+             prompt_ids=np.asarray(prompt_ids, dtype=np.int32),
+             generated_ids=np.asarray(generated_ids, dtype=np.int32))
+    return {
+        "ok": True,
+        "path": out_path,
+        "n_prompt": P,
+        "n_steps": M,
+        "vocab": VOCAB,
+        "prefill_ms": prefill_ms,
+        "decode_ms": decode_ms,
+        "ms_per_step": decode_ms / max(M - 1, 1),
+    }
+
+
 def handle_shutdown(state: ServerState, args: dict) -> dict:
     return {"ok": True, "shutting_down": True}
 
@@ -1847,6 +2008,7 @@ HANDLERS = {
     "bench_decode_traced":  handle_bench_decode_traced,
     "generate":             handle_generate,         # short context (≤256), streams
     "generate_long":        handle_generate_paged,    # long context (paged), streams
+    "cosine_ladder":        handle_cosine_ladder,     # teacher-forced logits dump
     "shutdown":             handle_shutdown,
 }
 
