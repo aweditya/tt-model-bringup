@@ -92,16 +92,48 @@ def main():
         print(f"  ✓ cache uploaded (sharded along N_KV dim=1; per-chip "
               f"[{NUM_BLOCKS}, {NKV_PER_CHIP}, {BLOCK_SIZE}, {HEAD_DIM}])", flush=True)
 
-        # Build input — fresh K/V for the current token. Shape [1, B, N_KV, HEAD_DIM]
-        # sharded along N_KV → per-chip [1, B, NKV_PER_CHIP, HEAD_DIM]
+        # Build input — fresh K/V for the current token.
+        # Per 91f:467-482 (shard_for_paged_write):
+        #   - Reshape K to [1, num_users=1, N_KV, HEAD_DIM]
+        #   - Pad dim -2 from N_KV to TILE_HEIGHT=32 with zeros
+        #   - bf16
+        #   - HEIGHT_SHARDED across NUM_USERS=1 cores in L1
+        # On (1,4) mesh: shard the N_KV axis across chips → per-chip
+        # [1, 1, NKV_PER_CHIP=1, HEAD_DIM]; then pad → [1, 1, 32, HEAD_DIM];
+        # then HEIGHT_SHARDED on 1 core per chip.
+        TILE_HEIGHT = 32
+        NUM_USERS = 1
         rng = np.random.default_rng(42)
-        input_np = (rng.standard_normal((1, B, N_KV, HEAD_DIM)).astype(np.float32) * 0.5)
-        input_tt = ttnn.from_torch(
+        # Build global, shard across chips along the N_KV axis
+        input_np = (rng.standard_normal((1, 1, N_KV, HEAD_DIM)).astype(np.float32) * 0.5)
+        # First step: upload + mesh-shard so each chip has [1, 1, 1, HEAD_DIM]
+        input_unsharded = ttnn.from_torch(
             torch.from_numpy(input_np), dtype=ttnn.bfloat16,
             device=mesh, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=2),  # N_KV dim is index 2 here
+            mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=2),  # N_KV axis
         )
-        print(f"  ✓ input uploaded", flush=True)
+        print(f"  ✓ input mesh-sharded (interleaved) [1, 1, {NKV_PER_CHIP}, {HEAD_DIM}] per chip", flush=True)
+
+        # Pad dim -2 from NKV_PER_CHIP=1 → TILE_HEIGHT=32
+        input_padded = ttnn.pad(input_unsharded,
+                                  [[0, 0], [0, 0], [0, TILE_HEIGHT - NKV_PER_CHIP], [0, 0]],
+                                  value=0.0)
+        print(f"  ✓ input padded to [1, 1, {TILE_HEIGHT}, {HEAD_DIM}] per chip", flush=True)
+
+        # Build height-sharded memory_config per chip and apply
+        first_device = mesh.get_devices()[0] if hasattr(mesh, "get_devices") else None
+        if first_device is None:
+            # Some ttnn versions: mesh.get_devices() may not exist; mesh itself accepts the call
+            compute_grid = mesh.compute_with_storage_grid_size()
+        else:
+            compute_grid = first_device.compute_with_storage_grid_size()
+        shard_grid = ttnn.num_cores_to_corerangeset(NUM_USERS, compute_grid, row_wise=True)
+        shard_spec = ttnn.ShardSpec(shard_grid, [TILE_HEIGHT, HEAD_DIM],
+                                       ttnn.ShardOrientation.ROW_MAJOR)
+        sharded_mem_cfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
+        input_tt = ttnn.to_memory_config(input_padded, sharded_mem_cfg)
+        print(f"  ✓ input HEIGHT_SHARDED to L1 on {NUM_USERS} core(s)", flush=True)
 
         # Build page_table — identity for B=1 (logical block i → physical block i)
         page_table_np = np.arange(NUM_BLOCKS, dtype=np.int32).reshape(B, NUM_BLOCKS)
