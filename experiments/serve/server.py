@@ -1117,16 +1117,50 @@ def handle_shutdown(state: ServerState, args: dict) -> dict:
     return {"ok": True, "shutting_down": True}
 
 
+def _sample_next_id(logits_np, temperature: float, top_p: float, rng):
+    """Pick next token. temperature=0 → greedy argmax. >0 → top-p sampling.
+
+    Implemented in numpy on host; cost is negligible vs the decode step.
+    Used by both handle_generate and handle_generate_paged. Same RNG seed
+    yields deterministic sampling — caller passes a numpy Generator.
+    """
+    import numpy as np
+    if temperature <= 0.0:
+        return int(np.argmax(logits_np))
+    # numerically stable softmax with temperature
+    scaled = logits_np.astype(np.float64) / float(temperature)
+    scaled = scaled - scaled.max()
+    probs = np.exp(scaled)
+    probs /= probs.sum()
+    if top_p < 1.0:
+        # nucleus: keep smallest set whose cumulative prob ≥ top_p, zero rest
+        order = np.argsort(-probs)
+        sorted_p = probs[order]
+        cum = np.cumsum(sorted_p)
+        cutoff = int(np.searchsorted(cum, top_p)) + 1
+        keep_idx = order[:cutoff]
+        mask = np.zeros_like(probs)
+        mask[keep_idx] = probs[keep_idx]
+        probs = mask / mask.sum()
+    # Discrete sample
+    return int(rng.choice(len(probs), p=probs))
+
+
 def handle_generate(state: "ServerState", args: dict):
-    """Greedy-decode N tokens from a prompt — STREAMS by default.
+    """Sample N tokens from a prompt — STREAMS by default.
 
     Yields chunks of {token_text, token_id, tok_idx} every chunk_size tokens,
     then a final {_final: True, ...} summary.
 
     args:
-      prompt:     str (required)
-      max_tokens: int (default: 40)
-      chunk_size: int (default: 1) — tokens per streaming chunk
+      prompt:      str (required)
+      max_tokens:  int (default: 40)
+      chunk_size:  int (default: 1) — tokens per streaming chunk
+      temperature: float (default: 0.0) — 0 means greedy argmax. >0 enables
+                   sampling (e.g. 0.7). Greedy can collapse into repetition
+                   on base models at long contexts; sampling avoids this.
+      top_p:       float (default: 1.0) — nucleus cutoff when temperature>0.
+      seed:        int   (default: 0)   — RNG seed for reproducible sampling.
     """
     if state.mock:
         yield {"_final": True, "mock": True, "generated_text": "(mock)"}
@@ -1142,6 +1176,10 @@ def handle_generate(state: "ServerState", args: dict):
         return
     max_tokens = int(args.get("max_tokens", 40))
     chunk_size = max(1, int(args.get("chunk_size", 1)))
+    temperature = float(args.get("temperature", 0.0))
+    top_p = float(args.get("top_p", 1.0))
+    seed = int(args.get("seed", 0))
+    rng = np.random.default_rng(seed)
 
     if not hasattr(state, "tok") or state.tok is None:
         yield {"_final": True, "error": "tokenizer not loaded on server"}
@@ -1244,7 +1282,7 @@ def handle_generate(state: "ServerState", args: dict):
 
     for step in range(max_tokens):
         logits_np = ttnn.to_torch(last_logits).float().cpu().numpy().flatten()
-        next_id = int(np.argmax(logits_np))
+        next_id = _sample_next_id(logits_np, temperature, top_p, rng)
         generated_ids.append(next_id)
 
         # Delta decode (handles multi-byte tokens)
@@ -1297,18 +1335,38 @@ def handle_generate(state: "ServerState", args: dict):
 
 
 def handle_generate_paged(state: "ServerState", args: dict):
-    """Greedy-decode from a prompt using paged KV cache — STREAMS by default.
+    """Sample from a prompt using paged KV cache — STREAMS by default.
 
     Same UX as handle_generate but uses gated_attn_step_ondevice_paged
     + paged_scaled_dot_product_attention_decode → unlocks prompts +
     completions up to max_pos tokens. Wire / RPC name: `generate_long`.
 
+    KNOWN ISSUE — long-context quality on the paged forward (2026-05-13):
+      Greedy decoding (temperature=0) diverges from the non-paged forward
+      at step ~132 for the "JSON parser combinator in Rust" prompt; after
+      that the model drifts into whitespace/newline repetition. Reproducer
+      and analysis: experiments/serve/scripts/compare_paged_vs_nonpaged.py.
+      The underlying kernels (paged_update_cache + paged SDPA decode) were
+      verified bit-correct in isolation (cos≥0.99993 vs numpy oracle at
+      all block boundaries) — the issue is accumulated bf16 noise pushing
+      greedy argmax over a cliff. Cache-size doesn't help — divergence is
+      identical at max_pos ∈ {256, 512, 1024}.
+      Temperature sampling extends coherent output to ~150 tokens but
+      doesn't fully fix it. Real fix needs fp32 KV cache or paged-kernel
+      tuning — both deferred to a future session.
+
     args:
-      prompt:     str (required)
-      max_tokens: int (default: 40)
-      max_pos:    int (default: 1024) — KV cache size
-      block_size: int (default: 64)   — paged block size
-      chunk_size: int (default: 1)    — tokens per streaming chunk
+      prompt:      str (required)
+      max_tokens:  int (default: 40)
+      max_pos:     int (default: 1024) — KV cache size
+      block_size:  int (default: 64)   — paged block size
+      chunk_size:  int (default: 1)    — tokens per streaming chunk
+      temperature: float (default: 0.0) — 0 means greedy. >0 enables
+                   sampling. Sampling extends coherent output from
+                   ~130 tok (greedy) to ~150 tok at temperature=0.7 +
+                   top_p=0.9, but doesn't fully eliminate long-context drift.
+      top_p:       float (default: 1.0) — nucleus cutoff when temperature>0.
+      seed:        int   (default: 0)   — RNG seed for reproducible sampling.
     """
     if state.mock:
         yield {"_final": True, "mock": True, "generated_text": "(mock)"}
@@ -1326,6 +1384,11 @@ def handle_generate_paged(state: "ServerState", args: dict):
     max_pos = int(args.get("max_pos", 1024))
     block_size = int(args.get("block_size", 64))
     chunk_size = max(1, int(args.get("chunk_size", 1)))
+    # Default greedy; user can opt into sampling for slightly longer coherent output.
+    temperature = float(args.get("temperature", 0.0))
+    top_p = float(args.get("top_p", 1.0))
+    seed = int(args.get("seed", 0))
+    rng = np.random.default_rng(seed)
     assert max_pos % block_size == 0, f"max_pos {max_pos} must be multiple of block_size {block_size}"
     ensure_rope_tables(state, max_pos)
 
@@ -1425,7 +1488,7 @@ def handle_generate_paged(state: "ServerState", args: dict):
 
     for step in range(max_tokens):
         logits_np = ttnn.to_torch(last_logits).float().cpu().numpy().flatten()
-        next_id = int(np.argmax(logits_np))
+        next_id = _sample_next_id(logits_np, temperature, top_p, rng)
         generated_ids.append(next_id)
         new_text = state.tok.decode(generated_ids, skip_special_tokens=True)
         delta = new_text[len(text_so_far):]
@@ -1478,6 +1541,8 @@ def handle_generate_paged(state: "ServerState", args: dict):
         "stopped_on_eos": stopped_on_eos,
         "max_pos": max_pos,
         "block_size": block_size,
+        "temperature": temperature,
+        "top_p": top_p,
     }
 
 

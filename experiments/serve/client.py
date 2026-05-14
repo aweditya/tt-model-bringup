@@ -190,7 +190,10 @@ def _stream_generate(server_cmd: str, payload: dict, *, prompt: str) -> None:
 def cmd_generate(args):
     _stream_generate("generate",
                       {"prompt": args.prompt, "max_tokens": args.max_tokens,
-                       "chunk_size": args.chunk_size},
+                       "chunk_size": args.chunk_size,
+                       "temperature": args.temperature,
+                       "top_p": args.top_p,
+                       "seed": args.seed},
                       prompt=args.prompt)
 
 
@@ -198,7 +201,10 @@ def cmd_generate_long(args):
     _stream_generate("generate_long",
                       {"prompt": args.prompt, "max_tokens": args.max_tokens,
                        "max_pos": args.max_pos, "block_size": args.block_size,
-                       "chunk_size": args.chunk_size},
+                       "chunk_size": args.chunk_size,
+                       "temperature": args.temperature,
+                       "top_p": args.top_p,
+                       "seed": args.seed},
                       prompt=args.prompt)
 
 
@@ -213,6 +219,12 @@ def main():
     g.add_argument("--prompt", type=str, required=True)
     g.add_argument("--max-tokens", type=int, default=40)
     g.add_argument("--chunk-size", type=int, default=1, help="tokens per stream chunk")
+    g.add_argument("--temperature", type=float, default=0.0,
+                    help="0=greedy (default). >0 enables sampling — recommended for long output")
+    g.add_argument("--top-p", type=float, default=1.0,
+                    help="nucleus cutoff (default 1.0 = no cutoff)")
+    g.add_argument("--seed", type=int, default=0,
+                    help="RNG seed for deterministic sampling")
     g.set_defaults(fn=cmd_generate)
     gl = sub.add_parser("generate_long",
                           help="generate text (streams; long context via paged KV)")
@@ -222,6 +234,13 @@ def main():
                      help="KV cache size (1024 default; use 4096+ for long context)")
     gl.add_argument("--block-size", type=int, default=64)
     gl.add_argument("--chunk-size", type=int, default=1, help="tokens per stream chunk")
+    gl.add_argument("--temperature", type=float, default=0.0,
+                     help="0=greedy (default). Paged greedy degenerates past ~130 tok; "
+                          "try --temperature 0.7 --top-p 0.9 for ~150 tok before drift.")
+    gl.add_argument("--top-p", type=float, default=1.0,
+                     help="nucleus cutoff for temperature>0 (default 1.0 = no cutoff)")
+    gl.add_argument("--seed", type=int, default=0,
+                     help="RNG seed for deterministic sampling")
     gl.set_defaults(fn=cmd_generate_long)
     r = sub.add_parser("run_91r")
     r.add_argument("--layers", type=str, default=None,
