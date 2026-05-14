@@ -134,8 +134,8 @@ def cmd_run_91r(args):
     print(json.dumps(data, indent=2))
 
 
-def cmd_generate_stream(args):
-    """Streaming generate — prints token deltas as they arrive."""
+def _stream_generate(server_cmd: str, payload: dict, *, prompt: str) -> None:
+    """Streaming RPC client for generate / generate_long. Prints tokens live."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(7200.0)
     try:
@@ -143,36 +143,24 @@ def cmd_generate_stream(args):
     except (FileNotFoundError, ConnectionRefusedError) as e:
         print(f"client: cannot connect to {P.SOCKET_PATH}: {e}", file=sys.stderr)
         sys.exit(2)
+    final = None
     try:
-        sock.sendall(P.pack_request("generate_stream",
-                                     {"prompt": args.prompt, "max_tokens": args.max_tokens}))
-        # Print prompt header
+        sock.sendall(P.pack_request(server_cmd, payload))
         print("=" * 72)
-        print(f"prompt: {args.prompt}")
+        print(f"prompt: {prompt}")
         print("-" * 72)
-        # Read chunks one at a time until final
-        final = None
-        n_chunks = 0
-        # Reuse read_line in a loop; each line is one JSON message.
         while True:
             raw = P.read_line(sock, max_bytes=64 << 20)
             if not raw:
                 print("\nclient: server closed connection before final", file=sys.stderr)
                 break
-            try:
-                obj = json.loads(raw.decode("utf-8"))
-            except Exception as e:
-                print(f"\nclient: bad JSON: {e}", file=sys.stderr)
-                break
+            obj = json.loads(raw.decode("utf-8"))
             t = obj.get("type", "")
             if t == "error":
                 print(f"\nERROR: {obj.get('msg')}", file=sys.stderr)
                 sys.exit(4)
-            elif t == "chunk":
-                data = obj.get("data", {})
-                txt = data.get("token_text", "")
-                print(txt, end="", flush=True)
-                n_chunks += 1
+            if t == "chunk":
+                print(obj.get("data", {}).get("token_text", ""), end="", flush=True)
             elif t == "result":
                 final = obj.get("data", {})
                 break
@@ -181,76 +169,37 @@ def cmd_generate_stream(args):
                 break
     finally:
         sock.close()
-    print()  # newline after generation
-    print("=" * 72)
+    print("\n" + "=" * 72)
     if final is None:
-        print(f"  (streamed {n_chunks} chunks, no final summary)")
         return
     if "error" in final:
         print(f"ERROR: {final['error']}")
         return
-    n_gen = final.get('n_generated_tokens', 0)
-    ms_per_tok = final.get('ms_per_tok', 0)
-    tok_per_sec = final.get('tok_per_sec', 0)
     print(f"  prompt: {final.get('n_prompt_tokens', 0)} tokens, "
           f"prefill {final.get('prefill_ms', 0):.1f} ms")
-    print(f"  generated: {n_gen} tokens, decode {ms_per_tok:.2f} ms/tok "
-          f"= {tok_per_sec:.2f} tok/s")
+    print(f"  generated: {final.get('n_generated_tokens', 0)} tokens, "
+          f"decode {final.get('ms_per_tok', 0):.2f} ms/tok = "
+          f"{final.get('tok_per_sec', 0):.2f} tok/s")
+    if "max_pos" in final:
+        print(f"  paged: max_pos={final['max_pos']}, block_size={final.get('block_size')}")
     print(f"  total wall: {final.get('total_ms', 0):.1f} ms")
     if final.get('stopped_on_eos'):
         print(f"  (stopped on EOS)")
 
 
-def cmd_generate_paged(args):
-    payload = {
-        "prompt": args.prompt, "max_tokens": args.max_tokens,
-        "max_pos": args.max_pos, "block_size": args.block_size,
-    }
-    data = send("generate_paged", payload)
-    print("=" * 72)
-    print(f"prompt: {data.get('prompt', '?')}")
-    print("-" * 72)
-    if "error" in data:
-        print(f"ERROR: {data['error']}")
-        return
-    print(f"generated: {data.get('generated_text', '')}")
-    print("-" * 72)
-    print(f"full text:")
-    print(data.get('full_text', ''))
-    print("=" * 72)
-    n_gen = data.get('n_generated_tokens', 0)
-    ms_per_tok = data.get('ms_per_tok', 0)
-    tok_per_sec = data.get('tok_per_sec', 0)
-    print(f"  prompt: {data.get('n_prompt_tokens', 0)} tokens, prefill {data.get('prefill_ms', 0):.1f} ms")
-    print(f"  generated: {n_gen} tokens, decode {ms_per_tok:.2f} ms/tok = {tok_per_sec:.2f} tok/s")
-    print(f"  paged: max_pos={data.get('max_pos')}, block_size={data.get('block_size')}")
-    print(f"  total wall: {data.get('total_ms', 0):.1f} ms")
-    if data.get('stopped_on_eos'):
-        print(f"  (stopped on EOS)")
-
-
 def cmd_generate(args):
-    payload = {"prompt": args.prompt, "max_tokens": args.max_tokens}
-    data = send("generate", payload)
-    print("=" * 72)
-    print(f"prompt: {data.get('prompt', '?')}")
-    print("-" * 72)
-    if "error" in data:
-        print(f"ERROR: {data['error']}")
-        return
-    print(f"generated: {data.get('generated_text', '')}")
-    print("-" * 72)
-    print(f"full text:")
-    print(data.get('full_text', ''))
-    print("=" * 72)
-    n_gen = data.get('n_generated_tokens', 0)
-    ms_per_tok = data.get('ms_per_tok', 0)
-    tok_per_sec = data.get('tok_per_sec', 0)
-    print(f"  prompt: {data.get('n_prompt_tokens', 0)} tokens, prefill {data.get('prefill_ms', 0):.1f} ms")
-    print(f"  generated: {n_gen} tokens, decode {ms_per_tok:.2f} ms/tok = {tok_per_sec:.2f} tok/s")
-    print(f"  total wall: {data.get('total_ms', 0):.1f} ms")
-    if data.get('stopped_on_eos'):
-        print(f"  (stopped on EOS)")
+    _stream_generate("generate",
+                      {"prompt": args.prompt, "max_tokens": args.max_tokens,
+                       "chunk_size": args.chunk_size},
+                      prompt=args.prompt)
+
+
+def cmd_generate_long(args):
+    _stream_generate("generate_long",
+                      {"prompt": args.prompt, "max_tokens": args.max_tokens,
+                       "max_pos": args.max_pos, "block_size": args.block_size,
+                       "chunk_size": args.chunk_size},
+                      prompt=args.prompt)
 
 
 def main():
@@ -260,23 +209,20 @@ def main():
     sub.add_parser("reset_state").set_defaults(fn=cmd_reset)
     sub.add_parser("reload_kernels").set_defaults(fn=cmd_reload)
     sub.add_parser("shutdown").set_defaults(fn=cmd_shutdown)
-    g = sub.add_parser("generate", help="generate text from a prompt (greedy decode)")
-    g.add_argument("--prompt", type=str, required=True, help="text prompt")
-    g.add_argument("--max-tokens", type=int, default=40, help="number of tokens to generate")
+    g = sub.add_parser("generate", help="generate text (streams; ≤256 tokens)")
+    g.add_argument("--prompt", type=str, required=True)
+    g.add_argument("--max-tokens", type=int, default=40)
+    g.add_argument("--chunk-size", type=int, default=1, help="tokens per stream chunk")
     g.set_defaults(fn=cmd_generate)
-    gs = sub.add_parser("generate_stream",
-                          help="generate with token-by-token streaming output")
-    gs.add_argument("--prompt", type=str, required=True, help="text prompt")
-    gs.add_argument("--max-tokens", type=int, default=40, help="number of tokens to generate")
-    gs.set_defaults(fn=cmd_generate_stream)
-    gp = sub.add_parser("generate_paged",
-                          help="generate with paged KV cache for long context (>256 tokens)")
-    gp.add_argument("--prompt", type=str, required=True, help="text prompt")
-    gp.add_argument("--max-tokens", type=int, default=40, help="number of tokens to generate")
-    gp.add_argument("--max-pos", type=int, default=1024,
-                     help="KV cache size (default: 1024; use 4096+ for long context)")
-    gp.add_argument("--block-size", type=int, default=64, help="paged block size")
-    gp.set_defaults(fn=cmd_generate_paged)
+    gl = sub.add_parser("generate_long",
+                          help="generate text (streams; long context via paged KV)")
+    gl.add_argument("--prompt", type=str, required=True)
+    gl.add_argument("--max-tokens", type=int, default=40)
+    gl.add_argument("--max-pos", type=int, default=1024,
+                     help="KV cache size (1024 default; use 4096+ for long context)")
+    gl.add_argument("--block-size", type=int, default=64)
+    gl.add_argument("--chunk-size", type=int, default=1, help="tokens per stream chunk")
+    gl.set_defaults(fn=cmd_generate_long)
     r = sub.add_parser("run_91r")
     r.add_argument("--layers", type=str, default=None,
                    help="comma-separated layer indices (default: server default)")

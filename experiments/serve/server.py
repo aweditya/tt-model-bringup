@@ -1079,18 +1079,20 @@ def handle_shutdown(state: ServerState, args: dict) -> dict:
     return {"ok": True, "shutting_down": True}
 
 
-def handle_generate(state: "ServerState", args: dict) -> dict:
-    """Greedy-decode N tokens from a prompt using the running model.
+def handle_generate(state: "ServerState", args: dict):
+    """Greedy-decode N tokens from a prompt — STREAMS by default.
+
+    Yields chunks of {token_text, token_id, tok_idx} every chunk_size tokens,
+    then a final {_final: True, ...} summary.
 
     args:
-      prompt:     str (required) — text prompt
-      max_tokens: int (default: 40) — number of tokens to generate
-    Returns:
-      prompt, generated_text, full_text, prompt_ids, generated_ids,
-      total_ms, ms_per_tok, tok_per_sec
+      prompt:     str (required)
+      max_tokens: int (default: 40)
+      chunk_size: int (default: 1) — tokens per streaming chunk
     """
     if state.mock:
-        return {"mock": True, "generated_text": "(mock)"}
+        yield {"_final": True, "mock": True, "generated_text": "(mock)"}
+        return
 
     import numpy as np
     import torch
@@ -1098,11 +1100,14 @@ def handle_generate(state: "ServerState", args: dict) -> dict:
 
     prompt = args.get("prompt")
     if not prompt:
-        return {"error": "missing required arg: prompt"}
+        yield {"_final": True, "error": "missing required arg: prompt"}
+        return
     max_tokens = int(args.get("max_tokens", 40))
+    chunk_size = max(1, int(args.get("chunk_size", 1)))
 
     if not hasattr(state, "tok") or state.tok is None:
-        return {"error": "tokenizer not loaded on server"}
+        yield {"_final": True, "error": "tokenizer not loaded on server"}
+        return
 
     cfg = state.cfg
     HIDDEN = cfg["hidden"]
@@ -1117,10 +1122,10 @@ def handle_generate(state: "ServerState", args: dict) -> dict:
     # Tokenize
     prompt_ids = state.tok.encode(prompt)
     if len(prompt_ids) + max_tokens > MAX_POS:
-        return {
-            "error": f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} > MAX_POS {MAX_POS}; "
-                     f"reduce max_tokens or use bench_decode_paged path"
-        }
+        yield {"_final": True,
+               "error": f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} > MAX_POS {MAX_POS}; "
+                        f"use generate_long for prompts/completions over 256 tokens"}
+        return
 
     # Fresh state buffers (mirrors bench_decode)
     n_dn = sum(1 for i in range(NUM_LAYERS) if i % 4 != 3)
@@ -1181,169 +1186,55 @@ def handle_generate(state: "ServerState", args: dict) -> dict:
     cur_pos = len(prompt_ids)
     eos_id = getattr(state.tok, "eos_token_id", None)
 
-    for step in range(max_tokens):
-        # Argmax over last_logits (read back, pick token)
-        logits_np = ttnn.to_torch(last_logits).float().cpu().numpy().flatten()
-        next_id = int(np.argmax(logits_np))
-        generated_ids.append(next_id)
-        if eos_id is not None and next_id == eos_id:
-            break
-        # Forward next token
-        td0 = time.time()
-        last_logits = forward_token(next_id, cur_pos)
-        ttnn.synchronize_device(device)
-        decode_times.append((time.time() - td0) * 1000.0)
-        cur_pos += 1
-
-    total_ms = (time.time() - t0) * 1000.0
-    n_gen = len(generated_ids)
-    ms_per_tok = (sum(decode_times) / len(decode_times)) if decode_times else float("nan")
-
-    text = state.tok.decode(generated_ids, skip_special_tokens=True)
-    full = prompt + text
-
-    return {
-        "prompt": prompt,
-        "generated_text": text,
-        "full_text": full,
-        "prompt_ids": list(prompt_ids),
-        "generated_ids": generated_ids,
-        "n_prompt_tokens": len(prompt_ids),
-        "n_generated_tokens": n_gen,
-        "prefill_ms": prefill_ms,
-        "total_ms": total_ms,
-        "ms_per_tok": ms_per_tok,
-        "tok_per_sec": 1000.0 / ms_per_tok if ms_per_tok > 0 else 0.0,
-        "stopped_on_eos": eos_id is not None and generated_ids and generated_ids[-1] == eos_id,
-    }
-
-
-def handle_generate_stream(state: "ServerState", args: dict):
-    """Streaming variant of handle_generate — yields one chunk per generated token.
-
-    Wire format:
-      [chunk] {"token_id": int, "token_text": str, "tok_idx": int}  (per token)
-      [chunk] {"token_id": int, "token_text": str, "tok_idx": int}
-      ...
-      [result] {"_final": True, prompt, generated_text, full_text, prompt_ids,
-                 generated_ids, n_prompt_tokens, n_generated_tokens, prefill_ms,
-                 total_ms, ms_per_tok, tok_per_sec, stopped_on_eos}
-
-    args: same as handle_generate (prompt, max_tokens).
-    """
-    if state.mock:
-        yield {"_final": True, "mock": True, "generated_text": "(mock)"}
-        return
-
-    import numpy as np
-    import torch
-    import ttnn
-
-    prompt = args.get("prompt")
-    if not prompt:
-        yield {"_final": True, "error": "missing required arg: prompt"}
-        return
-    max_tokens = int(args.get("max_tokens", 40))
-
-    if not hasattr(state, "tok") or state.tok is None:
-        yield {"_final": True, "error": "tokenizer not loaded on server"}
-        return
-
-    cfg = state.cfg
-    HIDDEN = cfg["hidden"]
-    NUM_LAYERS = state.num_layers
-    KEY_DIM = cfg["n_k_heads"] * cfg["k_dim"]
-    VAL_DIM = cfg["n_v_heads"] * cfg["v_dim"]
-    CONV_DIM = 2 * KEY_DIM + VAL_DIM
-    rotary_dim = int(cfg["head_dim"] * cfg["partial_rotary_factor"])
-    upload = state._91f.upload
-    device = state.device
-
-    prompt_ids = state.tok.encode(prompt)
-    if len(prompt_ids) + max_tokens > MAX_POS:
-        yield {"_final": True,
-               "error": f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} > MAX_POS {MAX_POS}; "
-                        f"use generate_paged_stream for long context"}
-        return
-
-    n_dn = sum(1 for i in range(NUM_LAYERS) if i % 4 != 3)
-    n_attn = NUM_LAYERS - n_dn
-    ssm = [upload(np.zeros((cfg["n_v_heads"], cfg["k_dim"], cfg["v_dim"]),
-                            dtype=np.float32), device, dtype=ttnn.float32)
-           for _ in range(n_dn)]
-    cvs = [upload(np.zeros((CONV_DIM, cfg["conv_kernel"] - 1), dtype=np.float32),
-                    device, dtype=ttnn.float32) for _ in range(n_dn)]
-    kvc = []
-    kv_init = np.zeros((1, cfg["n_kv_heads"], MAX_POS, cfg["head_dim"]), dtype=np.float32)
-    for _ in range(n_attn):
-        kv_k = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
-                                device=device, layout=ttnn.TILE_LAYOUT)
-        kv_v = ttnn.from_torch(torch.from_numpy(kv_init), dtype=ttnn.bfloat16,
-                                device=device, layout=ttnn.TILE_LAYOUT)
-        kvc.append([kv_k, kv_v])
-
-    embed_np = state.embed_np
-
-    def forward_token(token_id, cur_pos):
-        x_np = embed_np[token_id]
-        x_tt = upload(x_np.reshape(1, HIDDEN), device, dtype=ttnn.float32)
-        cos_tt = ttnn.slice(state.cos_ext_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
-        sin_tt = ttnn.slice(state.sin_ext_table_tt, [cur_pos, 0], [cur_pos + 1, rotary_dim])
-        cur_pos_tt = ttnn.from_torch(torch.tensor([cur_pos], dtype=torch.int32), device=device)
-        dn_idx = 0
-        attn_idx = 0
-        for i in range(NUM_LAYERS):
-            layer_type, w_tt = state.layer_weights[i]
-            if layer_type == "linear_attention":
-                x_tt, ssm[dn_idx], cvs[dn_idx] = state._91f.deltanet_step_ondevice(
-                    x_tt, w_tt, ssm[dn_idx], cvs[dn_idx], cfg)
-                dn_idx += 1
-            else:
-                kv_k, kv_v = kvc[attn_idx]
-                x_tt, kv_k, kv_v = state._91f.gated_attn_step_ondevice(
-                    x_tt, w_tt, kv_k, kv_v, None, cur_pos_tt, cur_pos,
-                    cos_tt, sin_tt, cfg, device)
-                kvc[attn_idx] = [kv_k, kv_v]
-                attn_idx += 1
-            x_tt = state._91f.mlp_step_ondevice(x_tt, w_tt)
-        x_tt = ttnn.rms_norm(x_tt, weight=state.final_norm_tt, epsilon=1e-6)
-        logits_tt = ttnn.linear(x_tt, state.lm_head_tt, compute_kernel_config=state._91f.hifi4)
-        return logits_tt
-
-    # Prefill (no per-token output yet)
-    t0 = time.time()
-    last_logits = None
-    for pos, tid in enumerate(prompt_ids):
-        last_logits = forward_token(tid, pos)
-    ttnn.synchronize_device(device)
-    prefill_ms = (time.time() - t0) * 1000.0
-
-    # Decode loop — yield per token
-    generated_ids = []
-    decode_times = []
-    cur_pos = len(prompt_ids)
-    eos_id = getattr(state.tok, "eos_token_id", None)
     text_so_far = ""
+    pending_chunk = []  # accumulates token dicts for batched yield
+    stopped_on_eos = False
+
+    def _flush_chunk():
+        nonlocal pending_chunk
+        if pending_chunk:
+            yield_text = "".join(item["token_text"] for item in pending_chunk)
+            yield_payload = {
+                "token_text": yield_text,
+                "token_ids": [item["token_id"] for item in pending_chunk],
+                "tok_idx_start": pending_chunk[0]["tok_idx"],
+                "tok_idx_end": pending_chunk[-1]["tok_idx"],
+            }
+            pending_chunk = []
+            return yield_payload
+        return None
 
     for step in range(max_tokens):
         logits_np = ttnn.to_torch(last_logits).float().cpu().numpy().flatten()
         next_id = int(np.argmax(logits_np))
         generated_ids.append(next_id)
 
-        # Decode whole generated_ids and emit delta (handles multi-byte tokens)
+        # Delta decode (handles multi-byte tokens)
         new_text = state.tok.decode(generated_ids, skip_special_tokens=True)
         delta = new_text[len(text_so_far):]
         text_so_far = new_text
 
-        yield {"token_id": next_id, "token_text": delta, "tok_idx": step}
+        pending_chunk.append({
+            "token_id": next_id, "token_text": delta, "tok_idx": step,
+        })
+        if len(pending_chunk) >= chunk_size:
+            chunk = _flush_chunk()
+            if chunk:
+                yield chunk
 
         if eos_id is not None and next_id == eos_id:
+            stopped_on_eos = True
             break
         td0 = time.time()
         last_logits = forward_token(next_id, cur_pos)
         ttnn.synchronize_device(device)
         decode_times.append((time.time() - td0) * 1000.0)
         cur_pos += 1
+
+    # Flush any remaining pending tokens
+    chunk = _flush_chunk()
+    if chunk:
+        yield chunk
 
     total_ms = (time.time() - t0) * 1000.0
     n_gen = len(generated_ids)
@@ -1362,25 +1253,28 @@ def handle_generate_stream(state: "ServerState", args: dict):
         "total_ms": total_ms,
         "ms_per_tok": ms_per_tok,
         "tok_per_sec": 1000.0 / ms_per_tok if ms_per_tok > 0 else 0.0,
-        "stopped_on_eos": eos_id is not None and generated_ids and generated_ids[-1] == eos_id,
+        "stopped_on_eos": stopped_on_eos,
     }
 
 
-def handle_generate_paged(state: "ServerState", args: dict) -> dict:
-    """Greedy-decode from a prompt using paged KV cache (long context).
+
+def handle_generate_paged(state: "ServerState", args: dict):
+    """Greedy-decode from a prompt using paged KV cache — STREAMS by default.
 
     Same UX as handle_generate but uses gated_attn_step_ondevice_paged
     + paged_scaled_dot_product_attention_decode → unlocks prompts +
-    completions up to MAX_POS=4096+ (limited by max_pos arg).
+    completions up to max_pos tokens. Wire / RPC name: `generate_long`.
 
     args:
       prompt:     str (required)
       max_tokens: int (default: 40)
       max_pos:    int (default: 1024) — KV cache size
       block_size: int (default: 64)   — paged block size
+      chunk_size: int (default: 1)    — tokens per streaming chunk
     """
     if state.mock:
-        return {"mock": True, "generated_text": "(mock)"}
+        yield {"_final": True, "mock": True, "generated_text": "(mock)"}
+        return
 
     import numpy as np
     import torch
@@ -1388,14 +1282,17 @@ def handle_generate_paged(state: "ServerState", args: dict) -> dict:
 
     prompt = args.get("prompt")
     if not prompt:
-        return {"error": "missing required arg: prompt"}
+        yield {"_final": True, "error": "missing required arg: prompt"}
+        return
     max_tokens = int(args.get("max_tokens", 40))
     max_pos = int(args.get("max_pos", 1024))
     block_size = int(args.get("block_size", 64))
+    chunk_size = max(1, int(args.get("chunk_size", 1)))
     assert max_pos % block_size == 0, f"max_pos {max_pos} must be multiple of block_size {block_size}"
 
     if not hasattr(state, "tok") or state.tok is None:
-        return {"error": "tokenizer not loaded on server"}
+        yield {"_final": True, "error": "tokenizer not loaded on server"}
+        return
 
     cfg = state.cfg
     HIDDEN = cfg["hidden"]
@@ -1411,10 +1308,10 @@ def handle_generate_paged(state: "ServerState", args: dict) -> dict:
 
     prompt_ids = state.tok.encode(prompt)
     if len(prompt_ids) + max_tokens > max_pos:
-        return {
-            "error": f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} > max_pos {max_pos}; "
-                     f"increase --max-pos"
-        }
+        yield {"_final": True,
+               "error": f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} > max_pos {max_pos}; "
+                        f"increase --max-pos"}
+        return
 
     max_num_blocks = max_pos // block_size
     page_table_np = np.arange(max_num_blocks, dtype=np.int32).reshape(1, max_num_blocks)
@@ -1483,11 +1380,30 @@ def handle_generate_paged(state: "ServerState", args: dict) -> dict:
     cur_pos = len(prompt_ids)
     eos_id = getattr(state.tok, "eos_token_id", None)
 
+    text_so_far = ""
+    pending = []  # accumulates pre-chunk tokens
+    stopped_on_eos = False
+
     for step in range(max_tokens):
         logits_np = ttnn.to_torch(last_logits).float().cpu().numpy().flatten()
         next_id = int(np.argmax(logits_np))
         generated_ids.append(next_id)
+        new_text = state.tok.decode(generated_ids, skip_special_tokens=True)
+        delta = new_text[len(text_so_far):]
+        text_so_far = new_text
+        pending.append({"token_id": next_id, "token_text": delta, "tok_idx": step})
+
+        if len(pending) >= chunk_size:
+            yield {
+                "token_text": "".join(p["token_text"] for p in pending),
+                "token_ids": [p["token_id"] for p in pending],
+                "tok_idx_start": pending[0]["tok_idx"],
+                "tok_idx_end": pending[-1]["tok_idx"],
+            }
+            pending = []
+
         if eos_id is not None and next_id == eos_id:
+            stopped_on_eos = True
             break
         td0 = time.time()
         last_logits = forward_token(next_id, cur_pos)
@@ -1495,17 +1411,23 @@ def handle_generate_paged(state: "ServerState", args: dict) -> dict:
         decode_times.append((time.time() - td0) * 1000.0)
         cur_pos += 1
 
+    if pending:
+        yield {
+            "token_text": "".join(p["token_text"] for p in pending),
+            "token_ids": [p["token_id"] for p in pending],
+            "tok_idx_start": pending[0]["tok_idx"],
+            "tok_idx_end": pending[-1]["tok_idx"],
+        }
+
     total_ms = (time.time() - t0) * 1000.0
     n_gen = len(generated_ids)
     ms_per_tok = (sum(decode_times) / len(decode_times)) if decode_times else float("nan")
 
-    text = state.tok.decode(generated_ids, skip_special_tokens=True)
-    full = prompt + text
-
-    return {
+    yield {
+        "_final": True,
         "prompt": prompt,
-        "generated_text": text,
-        "full_text": full,
+        "generated_text": text_so_far,
+        "full_text": prompt + text_so_far,
         "prompt_ids": list(prompt_ids),
         "generated_ids": generated_ids,
         "n_prompt_tokens": len(prompt_ids),
@@ -1514,7 +1436,7 @@ def handle_generate_paged(state: "ServerState", args: dict) -> dict:
         "total_ms": total_ms,
         "ms_per_tok": ms_per_tok,
         "tok_per_sec": 1000.0 / ms_per_tok if ms_per_tok > 0 else 0.0,
-        "stopped_on_eos": eos_id is not None and generated_ids and generated_ids[-1] == eos_id,
+        "stopped_on_eos": stopped_on_eos,
         "max_pos": max_pos,
         "block_size": block_size,
     }
@@ -1528,9 +1450,8 @@ HANDLERS = {
     "bench_decode":         handle_bench_decode,
     "bench_decode_paged":   handle_bench_decode_paged,
     "bench_decode_traced":  handle_bench_decode_traced,
-    "generate":             handle_generate,
-    "generate_stream":      handle_generate_stream,
-    "generate_paged":       handle_generate_paged,
+    "generate":             handle_generate,         # short context (≤256), streams
+    "generate_long":        handle_generate_paged,    # long context (paged), streams
     "shutdown":             handle_shutdown,
 }
 
