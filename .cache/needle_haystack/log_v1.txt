@@ -1,0 +1,36 @@
+========================================================================
+needle_haystack_probe — Qwen3.6-27B qb1 server
+  lengths: [500, 1024, 2048, 4096, 8192]
+  fracs:   [0.25, 0.5, 0.75]
+  max_tokens=20  chat=True  dry=0.8 rp=1.1
+========================================================================
+[loading tokenizer Qwen/Qwen3.6-27B …]
+[tokenizer loaded, vocab_size=248044]
+
+--- trial L=500 frac=0.25 needle=MS7MCV3F ---
+  built prompt: 500 tokens (target 500), needle at ~token 141 (28%)
+  calling generate_long max_pos=576 max_tokens=20
+  generated (20 tok): '  orts不知\n同 ,ment\n\n\n\n\n\n\n!!!!!!!'
+  score: N  wall=102.3s  prefill=98134ms  decode=195.2ms/tok
+
+--- trial L=500 frac=0.50 needle=D827W4MW ---
+  built prompt: 501 tokens (target 500), needle at ~token 253 (50%)
+  calling generate_long max_pos=576 max_tokens=20
+  generated (5 tok): '    '
+  score: N  wall=97.0s  prefill=96060ms  decode=193.7ms/tok
+
+--- trial L=500 frac=0.75 needle=STKMSJ2D ---
+  built prompt: 500 tokens (target 500), needle at ~token 362 (72%)
+  calling generate_long max_pos=576 max_tokens=20
+  generated (20 tok): '\n\n ( (\n\n   ( Naw ( ( ( ( (\n\n\n\n  \n  \n null\n\n\n\n'
+  score: N  wall=100.0s  prefill=95869ms  decode=193.7ms/tok
+
+--- trial L=1024 frac=0.25 needle=FH69N8X4 ---
+  built prompt: 1020 tokens (target 1024), needle at ~token 272 (27%)
+  calling generate_long max_pos=1088 max_tokens=20
+  generated (20 tok): '-ByName \n遣NotNull屿chio散发chetti�OOSEPIPcurring ect ot暴剥ilon'
+  score: N  wall=202.1s  prefill=197930ms  decode=194.4ms/tok
+
+--- trial L=1024 frac=0.50 needle=DKZXFWCF ---
+  built prompt: 1029 tokens (target 1024), needle at ~token 515 (50%)
+  calling generate_long max_pos=1088 max_tokens=20
