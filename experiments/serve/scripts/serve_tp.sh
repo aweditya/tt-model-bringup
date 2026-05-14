@@ -58,13 +58,27 @@ cmd_stop() {
     fi
     local pid; pid=$(cat "$PID_FILE")
     echo "stopping server_tp (pid $pid)…"
-    kill "$pid" 2>/dev/null || true
-    for _ in 1 2 3 4 5; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 1
-    done
+    # Prefer the Unix-socket shutdown path so server_tp.py can close the mesh
+    # device and disable fabric cleanly. Hard-killing mesh processes can leave
+    # qb2 fabric wedged until `tt-smi -r 0,1,2,3`.
+    if [ -S "$SOCK_FILE" ] && [ -x "$VENV_PY" ]; then
+        (cd "$PROJECT_ROOT" && timeout 10 "$VENV_PY" -m experiments.serve.client_tp shutdown \
+            > /dev/null 2>&1) || true
+        for _ in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+    fi
     if kill -0 "$pid" 2>/dev/null; then
-        echo "  still alive; SIGKILL"
+        echo "  graceful shutdown timed out; sending SIGTERM"
+        kill "$pid" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "  still alive; SIGKILL (qb2 fabric may need tt-smi -r 0,1,2,3)"
         kill -9 "$pid" 2>/dev/null || true
     fi
     rm -f "$PID_FILE" "$SOCK_FILE" "$PID_FILE.launch"

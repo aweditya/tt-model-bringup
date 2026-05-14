@@ -821,7 +821,7 @@ def handle_status(state: MeshServerState, args: dict) -> dict:
         "num_devices": state.mesh.get_num_devices() if state.mesh else 0,
         "num_layers_planned": state.num_layers,
         "num_layers_loaded": len(state.layers),
-        "stage": "A_skeleton",
+        "stage": "production_p25_traced_tp",
         "last_run": state.last_run,
     }
 

@@ -229,7 +229,7 @@ Of the 142 ms/tok at 7.02 tok/s pre-paged-SDPA:
 - 1.9 ms update_input_buffers
 - ~0 ms sync barrier
 
-The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_optimizations_menu.md` + `_v2_addendum.md`). Top items: distributed RMSNorm (~18 ms/tok), all_gather_concat (2-5 ms/tok), vocab-sharded lm_head (skips final logits AG).
+The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_optimizations_menu.md` + `_v2_addendum.md`) plus the post-P22/P25 memory notes. Vocab-sharded lm_head and on-device embed/cos/sin lookup have shipped. Distributed RMSNorm and DRAM-sharded MLP were probed negative at current shapes. Current likely levers are all_gather_concat / CCL cleanup, on-device cur_pos increment, native RoPE, and deeper DeltaNet/GDN fusion.
 
 ---
 
@@ -249,6 +249,12 @@ The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_
 
 | Commit | Title | Impact |
 |--------|-------|--------|
+| `56de5d2` | P25 on-device embed + cos/sin lookup | **12.02 → 12.07 tok/s (+0.4%)** |
+| `e71f9b2` | P25 probe: on-device embed + plus_one + cos/sin lookup | probe |
+| `24e07a8` | P24 distributed RMSNorm probe | negative: correct but slower |
+| `8a55933` | P22 post-ship bench data | **12.02 tok/s** |
+| `ef3f336` | SHIP P22 vocab-sharded lm_head + on-device argmax | **11.43 → 12.02 tok/s (+5.1%)** |
+| `dada0a5` | P23 DRAM-sharded MLP probe | negative: 2.1× slower |
 | `4741253` | SHIP V2 paged SDPA on (1,4) mesh | **7.02 → 11.43 tok/s (62% gain)** |
 | `57b1a4e` | Friend repo borrow list + web research v2 | research |
 | `8abb089` | P21 cliff probe: HiFi4+fp32_dest_acc is the bug; HiFi2 unblocks long-context | drift fix |
@@ -267,20 +273,21 @@ The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_
 
 | Metric | Value | Note |
 |--------|-------|------|
-| Production perf (qb2 multi-chip TP traced) | **11.43 tok/s** | `feedback_paged_sdpa_shipped_tp.md` |
+| Production perf (qb2 multi-chip TP traced) | **12.07 tok/s** | commit `56de5d2` P25 ship; P22/P25 notes in `MEMORY.md` |
 | Production perf (qb1 single-chip) | 5.19 tok/s | `feedback_qk_rms_norm_shipped.md` |
 | Long-context cliff (qb1, HiFi2 B3) | none up to L=500 | `feedback_fp32_sdpa_cliff_probe.md` |
 | Speculative decode (D'3) | DON'T SHIP at 57.9% acceptance | `feedback_d3_dont_ship_yet.md` |
 | El Reg ceiling (4× P150 Llama70B BFP8) | 1.78× (~9.2 tok/s equivalent) | `feedback_realistic_tp_ceiling.md` — we're above this |
-| Friend's daily-driver (samjett Qwen3.6-27B) | ~15.3-15.5 tok/s | 25% gap remaining |
+| Optimization target | approach hardware ceiling | compare against roofline / measured full-decode tok/s, not friend's implementation |
 
-### Next ship list (post-paged-SDPA, prioritized)
+### Next investigation list (post-P25, prioritized)
 
-1. **Vocab-sharded LM head** with `all_gather → untilize → argmax` (~50 LOC, low risk, +1-3 tok/s). Outline `research/integration_vocab_sharded_lm_head.md`. Gated on `p20_mesh_argmax_per_chip_probe.py` (~30 min).
-2. **On-device embedding + `ttnn.plus_one(cur_pos)`** (~180 LOC, +0.5-1 tok/s). Kills 1.9 ms update_input_buffers overhead.
-3. **Distributed RMSNorm Step 1** (~270 LOC, +8-12 ms/tok). Outline `research/integration_distributed_rms_norm.md`. Step 2 (real residual fusion) BLOCKED on ttnn rebuild.
-4. **all_gather_concat** (2-5 ms/tok). See `research/multi_chip_optimizations_menu_v2_addendum.md` #16.
-5. **DRAM-sharded matmul + dram_prefetcher** (10-30 ms/tok, high effort). Galaxy's biggest lever.
+1. **Fresh full-decode breakdown at 12.07 tok/s**. Re-run `tp_decompose_probe.py` or equivalent against P25 before trusting any old 7.02 tok/s decomposition.
+2. **On-device `ttnn.plus_one(cur_pos)`**. P25 shipped token/cos/sin lookup, but `server_tp.py` still writes `cur_pos_buf` and `rot_idxs_buf` from host each step.
+3. **all_gather_concat / CCL cleanup** (2-5 ms/tok candidate). See `research/multi_chip_optimizations_menu_v2_addendum.md` #16; validate under full trace, not isolation only.
+4. **Native RoPE / fewer RoPE dispatches**. Manual rotate-only remains in production; prior native-RoPE attempts were blocked by shape/padding constraints, so start from current tt-metal docs before retrying.
+5. **DeltaNet/GDN fusion frontier**. Current decode budget is dominated by DeltaNet + attention compute; Python-level reshapes/repeats/small ops are the likely path before custom C++ kernels.
+6. **Do not re-open killed candidates without new evidence:** distributed RMSNorm Step 1 (`feedback_distributed_rms_norm_failed.md`) and single-P150 DRAM-sharded MLP (`feedback_dram_sharded_mlp_probe.md`) were negative at current shapes.
 
 ---
 
@@ -294,14 +301,14 @@ $ ssh qb2 'tail -f ~/tt-xla/.cache/server_tp.log'   # wait for "Stage A/B/C/D/E 
 $ ssh qb2 'bash ~/tt-xla/experiments/serve/scripts/serve_tp.sh status'
 ```
 
-### Reproduce 11.43 tok/s (paged SDPA on mesh, commit `4741253`)
+### Reproduce current qb2 TP smoke/perf (P25, commit `56de5d2`)
 
 Server must be up on qb2. Then:
 
 ```bash
 $ ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp \
-    bench_decode_tp --tokens 10 --runs 3'
-# expected: ~87.5 ms/tok median, 11.43 tok/s
+    generate_tp --prompt "The capital of France is" --max-tokens 30 --chunk-size 30'
+# expected: coherent "Paris" continuation and ~82.8 ms/tok decode (~12.07 tok/s)
 ```
 
 Quick smoke (correctness):
@@ -557,7 +564,7 @@ There's a friend's daily-driver Qwen3.6-27B implementation at:
 experiments/.refs/tt-qwen-36/   (commit a3d12574, branch qwen36-fresh)
 ```
 
-**Friend (samjett) achieves ~15.3-15.5 tok/s on 4× P150 dense.** We're at 11.43 tok/s — 25% behind. (15.5 per `models/tt_transformers/PERF.md:50`, 15.3 cited as "daily-driver" in memory notes — both rounded to "~15.")
+**Friend (samjett) achieves ~15.3-15.5 tok/s on 4× P150 dense.** Treat this as a reference implementation and pattern catalog, not the optimization target. The target is hardware-ceiling proximity with measured full-decode tok/s and correctness gates.
 
 ### WARNING: REFERENCE ONLY
 
@@ -574,11 +581,11 @@ Comparison table at `research/friend_repo_borrow_list.md`. Key gaps:
 | GDN Q/K/V prep | Custom C++ `qwen36_gdn_prepare_decode` | Python slice+reshape+repeat_interleave |
 | RMSNorm | Distributed `rms_norm_pre_all_gather` + `_post_all_gather` | Single fused `ttnn.rms_norm` on replicated x |
 | RoPE | `ttnn.experimental.rotary_embedding` + slice/concat | Manual rotate-only |
-| LM head | Vocab-sharded, DRAM-sharded multi-split, no final all_reduce | Replicated, full all_reduce |
-| Embedding | On-device `ttnn.embedding` | Host `embed_np[token_id]` |
+| LM head | Vocab-sharded, DRAM-sharded multi-split, no final all_reduce | Vocab-sharded + on-device argmax shipped in P22; still has final all_gather |
+| Embedding | On-device `ttnn.embedding` | On-device `ttnn.embedding` shipped in P25 |
 | Position | On-device `ttnn.plus_one` | Host `cur_pos += 1` |
-| Cos/Sin | Precomputed device cache → `ttnn.embedding` | Host `from_torch` per step |
-| Argmax | `all_gather → untilize → ttnn.argmax` | Host `ConcatMeshToTensor → np.argmax` |
+| Cos/Sin | Precomputed device cache → `ttnn.embedding` | On-device `ttnn.embedding` shipped in P25 |
+| Argmax | `all_gather → untilize → ttnn.argmax` | On-device argmax shipped in P22 |
 
 The next ship list (§8 Next ship list) directly maps to closing this gap on the items that need no custom C++.
 
@@ -640,6 +647,4 @@ The next ship list (§8 Next ship list) directly maps to closing this gap on the
 | **dram_prefetcher** | Streams weights into Global Circular Buffer to hide DRAM load — Galaxy's biggest lever |
 | **Agent X/Y/W/O/...** | Sub-agent contributions in 4-agent parallel research pattern |
 | **Branch III / C' / C'7 / D'** | Project-internal branch labels for phases of the 27B effort |
-
-
 
