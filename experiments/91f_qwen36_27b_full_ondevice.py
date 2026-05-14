@@ -39,6 +39,94 @@ hifi4 = ttnn.WormholeComputeKernelConfig(
 
 
 # ============================================================
+# P21 — runtime-selectable SDPA compute_kernel_config.
+# ------------------------------------------------------------
+# Reads a sentinel file ~/tt-xla/.cache/p21_sdpa_variant.txt at module
+# import time. If absent or unrecognized, falls back to `hifi4` (production
+# default). This lets cliff probes flip SDPA precision flags without a
+# server restart — write the sentinel, then call the `reload_kernels` RPC.
+#
+# Variants (case-insensitive name in sentinel file):
+#   A    : hifi4 (production default; HiFi4 + fp32_dest_acc_en=True)
+#   B    : hifi4 + packer_l1_acc=True (matches 70b galaxy's compute_kernel_config_hifi4)
+#   B2   : "compute_kernel_config_sdpa" from 70b galaxy
+#          (HiFi4, fp32_dest_acc_en=True, packer_l1_acc=False, math_approx_mode=False)
+#          — same as A but explicit; included for completeness.
+#   B3   : SDPA_DECODE_COMPUTE_PROGCFG from 70b galaxy
+#          (HiFi2, fp32_dest_acc_en=False, packer_l1_acc=False) — counterpoint;
+#          tests whether SDPA decode really wants LESS precision.
+#   B4   : Maxed-out (HiFi4 + fp32_dest_acc_en + packer_l1_acc + dst_full_sync_en)
+# Any other token → fall back to A (with a stderr warning).
+# ============================================================
+
+_P21_SDPA_VARIANT_PATH = os.path.expanduser("~/tt-xla/.cache/p21_sdpa_variant.txt")
+
+def _p21_make_sdpa_cfg(variant_name: str):
+    v = (variant_name or "A").strip().upper()
+    if v == "A":
+        return hifi4, "A: HiFi4+fp32_dest_acc_en (production default)"
+    if v == "B":
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        ), "B: HiFi4+fp32_dest_acc+packer_l1_acc (70b galaxy general-matmul style)"
+    if v == "B2":
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        ), "B2: 70b galaxy compute_kernel_config_sdpa (HiFi4+fp32_dest_acc, no packer_l1_acc)"
+    if v == "B3":
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=False,
+        ), "B3: 70b galaxy SDPA_DECODE_COMPUTE_PROGCFG (HiFi2, no fp32_dest_acc) — counter-test"
+    if v == "B4":
+        # dst_full_sync_en is supported on Wormhole; safe to pass on Blackhole P150
+        # since it's a Wormhole compute config (P150 follows WH ABI for compute).
+        try:
+            return ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                packer_l1_acc=True,
+                dst_full_sync_en=True,
+            ), "B4: HiFi4+fp32_dest_acc+packer_l1_acc+dst_full_sync_en (maxed)"
+        except TypeError:
+            # dst_full_sync_en kwarg absent in this ttnn build; degrade to B
+            cfg = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                packer_l1_acc=True,
+            )
+            return cfg, "B4-degraded: dst_full_sync_en kwarg absent → identical to B"
+    sys.stderr.write(f"[91f] WARNING: unknown P21 SDPA variant {v!r}, falling back to A\n")
+    return hifi4, f"A (fallback for unknown variant {v!r})"
+
+
+def _p21_resolve_sdpa_cfg():
+    variant = "A"
+    try:
+        if os.path.exists(_P21_SDPA_VARIANT_PATH):
+            with open(_P21_SDPA_VARIANT_PATH) as f:
+                variant = f.read().strip()
+    except Exception:
+        pass
+    cfg, label = _p21_make_sdpa_cfg(variant)
+    sys.stderr.write(f"[91f] SDPA kernel config: {label}\n")
+    return cfg, variant
+
+
+sdpa_kcfg, sdpa_kcfg_variant = _p21_resolve_sdpa_cfg()
+
+
+# ============================================================
 # Weight loader (same as 91e)
 # ============================================================
 
@@ -366,7 +454,7 @@ def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     q_for_sdpa = ttnn.typecast(q_for_sdpa, ttnn.bfloat16)
     attn = ttnn.transformer.scaled_dot_product_attention_decode(
         q_for_sdpa, kv_cache_k_tt, kv_cache_v_tt,
-        cur_pos_tensor=cur_pos_tt, compute_kernel_config=hifi4)
+        cur_pos_tensor=cur_pos_tt, compute_kernel_config=sdpa_kcfg)
     attn = ttnn.reshape(attn, [N_Q, HEAD_DIM])
     # Match attn dtype to x_tt dtype so the residual flow stays in fp32 when caller upgrades.
     attn = ttnn.typecast(attn, x_tt.dtype)
@@ -495,7 +583,7 @@ def gated_attn_step_ondevice_paged(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     q_for_sdpa = ttnn.typecast(q_for_sdpa, ttnn.bfloat16)
     attn = ttnn.transformer.paged_scaled_dot_product_attention_decode(
         q_for_sdpa, kv_cache_k_tt, kv_cache_v_tt, page_table_tt,
-        cur_pos_tensor=cur_pos_tt, compute_kernel_config=hifi4)
+        cur_pos_tensor=cur_pos_tt, compute_kernel_config=sdpa_kcfg)
     attn = ttnn.reshape(attn, [N_Q, HEAD_DIM])
     attn = ttnn.typecast(attn, x_tt.dtype)
 
@@ -610,7 +698,7 @@ def gated_attn_step_ondevice_traced(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
     q_for_sdpa = ttnn.typecast(q_for_sdpa, ttnn.bfloat16)
     attn = ttnn.transformer.scaled_dot_product_attention_decode(
         q_for_sdpa, kv_cache_k_tt, kv_cache_v_tt,
-        cur_pos_tensor=cur_pos_tt, compute_kernel_config=hifi4)
+        cur_pos_tensor=cur_pos_tt, compute_kernel_config=sdpa_kcfg)
     attn = ttnn.reshape(attn, [N_Q, HEAD_DIM])
     attn = ttnn.typecast(attn, x_tt.dtype)
 

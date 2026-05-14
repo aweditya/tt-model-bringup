@@ -1,0 +1,33 @@
+========================================================================
+needle_haystack_probe — Qwen3.6-27B qb1 server
+  lengths: [500]
+  fracs:   [0.5]
+  max_tokens=20  chat=True  dry=0.8 rp=1.1
+========================================================================
+[loading tokenizer Qwen/Qwen3.6-27B …]
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[tokenizer loaded, vocab_size=248044]
+
+--- trial L=500 frac=0.50 needle=D827W4MW ---
+  built prompt: 501 tokens (target 500), needle at ~token 253 (50%)
+  calling generate_long max_pos=576 max_tokens=20
+  generated (8 tok): 'D827W4MW'
+  score: Y  wall=99.4s  prefill=97854ms  decode=193.6ms/tok
+
+========================================================================
+RECALL GRID (Y=full, P=partial 4+ chars in order, N=miss, ERR=error)
+========================================================================
+frac \ L  |   500 |
+-------------------
+  0.50    |    Y  |
+========================================================================
+
+WALL TIME (sec) GRID
+========================================================================
+frac \ L  |   500 |
+-------------------
+  0.50    |  99.4 |
+========================================================================
+
+[results written to /home/aditya/tt-xla/.cache/needle_haystack_results.json]
+[full log: /home/aditya/tt-xla/.cache/needle_haystack_log.txt]

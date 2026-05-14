@@ -1,0 +1,239 @@
+HF ref: P=4  M=500  vocab=248320  prompt='The quick brown fox'
+Sentinel: /home/aditya/tt-xla/.cache/p21_sdpa_variant.txt
+Output dir: /home/aditya/tt-xla/.cache/p21_fp32_sdpa_probe
+
+========================================================================
+VARIANT A
+========================================================================
+  sentinel = A (/home/aditya/tt-xla/.cache/p21_sdpa_variant.txt)
+  reload_kernels → {'ok': True, 'reloaded_modules': ['_91f', '_91l']}  (1.4 ms)
+  cosine_ladder → wall 103.0s
+  server response:
+  {
+  "ok": true,
+  "path": "/home/aditya/tt-xla/.cache/p21_fp32_sdpa_probe/logits_A.npz",
+  "n_prompt": 4,
+  "n_steps": 500,
+  "vocab": 248320,
+  "prefill_ms": 767.4338817596436,
+  "decode_ms": 101330.53827285767,
+  "ms_per_step": 203.06721096765062
+}
+
+  --- ladder vs HF bf16 ---
+    pos         cos   top1?
+  ------------------------------
+      1   0.9996187       Y
+     10   0.9780881       Y
+     50   0.9994501       Y
+    100   0.9991814       N
+    125   0.9997413       Y
+    128   0.9613510       Y
+    129   0.8516655       N
+    130   0.8837793       N
+    140   0.8413204       N
+    150   0.8001876       N
+    200   0.8018350       N
+    250   0.7450893       N
+    300   0.8985904       N
+    400   0.6337399       N
+    500   0.8245905       N
+
+  cliff @ cos < 0.99 : pos 9
+  cliff @ cos < 0.9  : pos 129
+  cliff @ cos < 0.5  : pos 141
+  top-1 match 1..150 : 87.3%
+  top-1 match 1..200 : 67.5%
+  top-1 match 1..500 : 27.8%
+
+========================================================================
+VARIANT B
+========================================================================
+  sentinel = B (/home/aditya/tt-xla/.cache/p21_sdpa_variant.txt)
+  reload_kernels → {'ok': True, 'reloaded_modules': ['_91f', '_91l']}  (1.9 ms)
+  cosine_ladder → wall 103.0s
+  server response:
+  {
+  "ok": true,
+  "path": "/home/aditya/tt-xla/.cache/p21_fp32_sdpa_probe/logits_B.npz",
+  "n_prompt": 4,
+  "n_steps": 500,
+  "vocab": 248320,
+  "prefill_ms": 768.4483528137207,
+  "decode_ms": 101212.56899833679,
+  "ms_per_step": 202.8307995958653
+}
+
+  --- ladder vs HF bf16 ---
+    pos         cos   top1?
+  ------------------------------
+      1   0.9996187       Y
+     10   0.9780881       Y
+     50   0.9994501       Y
+    100   0.9991814       N
+    125   0.9997413       Y
+    128   0.9613510       Y
+    129   0.8516655       N
+    130   0.8837793       N
+    140   0.8413204       N
+    150   0.8001876       N
+    200   0.8018350       N
+    250   0.7450893       N
+    300   0.8985904       N
+    400   0.6337399       N
+    500   0.8245905       N
+
+  cliff @ cos < 0.99 : pos 9
+  cliff @ cos < 0.9  : pos 129
+  cliff @ cos < 0.5  : pos 141
+  top-1 match 1..150 : 87.3%
+  top-1 match 1..200 : 67.5%
+  top-1 match 1..500 : 27.8%
+
+========================================================================
+VARIANT B2
+========================================================================
+  sentinel = B2 (/home/aditya/tt-xla/.cache/p21_sdpa_variant.txt)
+  reload_kernels → {'ok': True, 'reloaded_modules': ['_91f', '_91l']}  (2.1 ms)
+  cosine_ladder → wall 102.9s
+  server response:
+  {
+  "ok": true,
+  "path": "/home/aditya/tt-xla/.cache/p21_fp32_sdpa_probe/logits_B2.npz",
+  "n_prompt": 4,
+  "n_steps": 500,
+  "vocab": 248320,
+  "prefill_ms": 767.401933670044,
+  "decode_ms": 101152.55570411682,
+  "ms_per_step": 202.71053247318
+}
+
+  --- ladder vs HF bf16 ---
+    pos         cos   top1?
+  ------------------------------
+      1   0.9996187       Y
+     10   0.9780881       Y
+     50   0.9994501       Y
+    100   0.9991814       N
+    125   0.9997413       Y
+    128   0.9613510       Y
+    129   0.8516655       N
+    130   0.8837793       N
+    140   0.8413204       N
+    150   0.8001876       N
+    200   0.8018350       N
+    250   0.7450893       N
+    300   0.8985904       N
+    400   0.6337399       N
+    500   0.8245905       N
+
+  cliff @ cos < 0.99 : pos 9
+  cliff @ cos < 0.9  : pos 129
+  cliff @ cos < 0.5  : pos 141
+  top-1 match 1..150 : 87.3%
+  top-1 match 1..200 : 67.5%
+  top-1 match 1..500 : 27.8%
+
+========================================================================
+VARIANT B3
+========================================================================
+  sentinel = B3 (/home/aditya/tt-xla/.cache/p21_sdpa_variant.txt)
+  reload_kernels → {'ok': True, 'reloaded_modules': ['_91f', '_91l']}  (1.9 ms)
+  cosine_ladder → wall 104.8s
+  server response:
+  {
+  "ok": true,
+  "path": "/home/aditya/tt-xla/.cache/p21_fp32_sdpa_probe/logits_B3.npz",
+  "n_prompt": 4,
+  "n_steps": 500,
+  "vocab": 248320,
+  "prefill_ms": 2500.8795261383057,
+  "decode_ms": 101290.29750823975,
+  "ms_per_step": 202.98656815278505
+}
+
+  --- ladder vs HF bf16 ---
+    pos         cos   top1?
+  ------------------------------
+      1   0.9996308       Y
+     10   0.9777028       Y
+     50   0.9994706       Y
+    100   0.9989802       Y
+    125   0.9997442       Y
+    128   0.9996556       Y
+    129   0.9991066       Y
+    130   0.9993342       Y
+    140   0.9992607       Y
+    150   0.9995854       Y
+    200   0.9996136       Y
+    250   0.9973826       Y
+    300   0.9939885       Y
+    400   0.9973902       Y
+    500   0.9996760       Y
+
+  cliff @ cos < 0.99 : pos 9
+  cliff @ cos < 0.9  : pos never
+  cliff @ cos < 0.5  : pos never
+  top-1 match 1..150 : 98.7%
+  top-1 match 1..200 : 98.5%
+  top-1 match 1..500 : 98.4%
+
+========================================================================
+VARIANT B4
+========================================================================
+  sentinel = B4 (/home/aditya/tt-xla/.cache/p21_sdpa_variant.txt)
+  reload_kernels → {'ok': True, 'reloaded_modules': ['_91f', '_91l']}  (1.9 ms)
+  cosine_ladder → wall 103.0s
+  server response:
+  {
+  "ok": true,
+  "path": "/home/aditya/tt-xla/.cache/p21_fp32_sdpa_probe/logits_B4.npz",
+  "n_prompt": 4,
+  "n_steps": 500,
+  "vocab": 248320,
+  "prefill_ms": 768.5337066650391,
+  "decode_ms": 101266.72887802124,
+  "ms_per_step": 202.93933642890028
+}
+
+  --- ladder vs HF bf16 ---
+    pos         cos   top1?
+  ------------------------------
+      1   0.9996187       Y
+     10   0.9780881       Y
+     50   0.9994501       Y
+    100   0.9991814       N
+    125   0.9997413       Y
+    128   0.9613510       Y
+    129   0.8516655       N
+    130   0.8837793       N
+    140   0.8413204       N
+    150   0.8001876       N
+    200   0.8018350       N
+    250   0.7450893       N
+    300   0.8985904       N
+    400   0.6337399       N
+    500   0.8245905       N
+
+  cliff @ cos < 0.99 : pos 9
+  cliff @ cos < 0.9  : pos 129
+  cliff @ cos < 0.5  : pos 141
+  top-1 match 1..150 : 87.3%
+  top-1 match 1..200 : 67.5%
+  top-1 match 1..500 : 27.8%
+
+========================================================================
+SUMMARY (total wall 531.2s)
+========================================================================
+
+ variant    cliff<0.99     cliff<0.9     cliff<0.5    top1@200    wall_s
+--------  ------------  ------------  ------------  ----------  --------
+       A             9           129           141       67.5%     103.0
+       B             9           129           141       67.5%     103.0
+      B2             9           129           141       67.5%     102.9
+      B3             9         never         never       98.5%     104.8
+      B4             9           129           141       67.5%     103.0
+
+Saved → /home/aditya/tt-xla/.cache/p21_fp32_sdpa_probe/results.json
+Sentinel restored to A (production default).
+Final reload_kernels → {'ok': True, 'reloaded_modules': ['_91f', '_91l']}
