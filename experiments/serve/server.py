@@ -1337,15 +1337,36 @@ def _encode_prompt(state: "ServerState", prompt: str, chat: bool, system: str = 
         if system:
             msgs.append({"role": "system", "content": system})
         msgs.append({"role": "user", "content": prompt})
-        # Some tokenizers (Qwen3.6) return a dict {input_ids, attention_mask};
-        # older / simpler ones return a flat list. Handle both.
+        # Some tokenizers (Qwen3.6) return a transformers BatchEncoding —
+        # a UserDict subclass that does NOT pass isinstance(_, dict) in
+        # python 3.10. Older / simpler ones return a flat list. Use
+        # hasattr("keys") + ("input_ids" in obj) as the mapping test.
         out = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
-        if isinstance(out, dict):
-            prompt_ids = out["input_ids"]
+        if hasattr(out, "keys") and "input_ids" in out:
+            ids_raw = out["input_ids"]
         else:
-            prompt_ids = out
+            ids_raw = out
+        # Coerce to flat list of python ints (handles torch.Tensor, np.ndarray,
+        # list, nested-list-of-one-batch shapes).
+        try:
+            import torch as _torch
+            if isinstance(ids_raw, _torch.Tensor):
+                ids_raw = ids_raw.tolist()
+        except ImportError:
+            pass
+        try:
+            import numpy as _np
+            if isinstance(ids_raw, _np.ndarray):
+                ids_raw = ids_raw.tolist()
+        except ImportError:
+            pass
+        # Unwrap one batch dimension if present: [[1,2,3]] -> [1,2,3]
+        if (isinstance(ids_raw, list) and len(ids_raw) > 0
+                and isinstance(ids_raw[0], (list, tuple))):
+            ids_raw = ids_raw[0]
+        prompt_ids = [int(t) for t in ids_raw]
     else:
-        prompt_ids = tok.encode(prompt)
+        prompt_ids = [int(t) for t in tok.encode(prompt)]
     # Build stop-token set. For instruct models the model may emit <|im_end|>,
     # <|endoftext|>, or eos_token_id; any of these should terminate the turn.
     stop_ids = set()
