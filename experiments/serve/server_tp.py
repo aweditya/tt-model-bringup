@@ -76,8 +76,21 @@ class MeshServerState:
         # 'w_dn': sharded DN weights (if dn), 'w_attn': sharded attn weights (if attn),
         # 'w_mlp': sharded MLP weights, 'state': sharded SSM/conv/KV buffers}
         self.layers = []
-        # Persistent traced graph (Stage C)
+        # Persistent traced graph (Stage D — P14 commit 2d30af7)
         self.trace_id = None
+        self.traced_logits_tt = None
+        # Pre-allocated input buffers (populated at bootstrap; updated per step
+        # via update_input_buffers using ttnn.copy_host_to_device_tensor)
+        self.x_buf = None
+        self.cur_pos_buf = None
+        self.cos_buf = None
+        self.sin_buf = None
+        self.cos_all_np = None
+        self.sin_all_np = None
+        self.rotary_dim = None
+        # Paged KV cache shared state
+        self.page_table_tt = None
+        self.paged_write_mem_cfg = None
         self.trace_x_buf = None
         self.trace_logits_buf = None
         self.last_run = None
@@ -689,12 +702,88 @@ def handle_shutdown(state: MeshServerState, args: dict) -> dict:
     return {"ok": True, "shutting_down": True}
 
 
+def _reset_state_buffers(state):
+    """Zero out per-layer SSM, conv_state, and paged KV cache buffers.
+
+    Required between queries because the warmup in _ensure_decode_trace
+    advances state, and prior queries' state must not leak into new ones.
+    Uses ttnn.copy_host_to_device_tensor for in-place updates so the device
+    buffers stay at their allocated addresses (the trace was captured
+    against those addresses).
+    """
+    import ttnn, torch, numpy as np
+    from full_layer_tp_probe import N_V_HEADS, K_DIM, V_DIM, CONV_DIM
+    cfg = state.cfg
+    mesh = state.mesh
+
+    ssm_host = ttnn.from_torch(
+        torch.zeros(N_V_HEADS, K_DIM, V_DIM, dtype=torch.float32),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0))
+    conv_host = ttnn.from_torch(
+        torch.zeros(CONV_DIM, cfg['conv_kernel'] - 1, dtype=torch.float32),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0))
+    kv_host = ttnn.from_torch(
+        torch.zeros(NUM_BLOCKS, cfg['n_kv_heads'], BLOCK_SIZE, cfg['head_dim'],
+                       dtype=torch.float32),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=1))
+    for layer in state.layers:
+        if layer['type'] == 'linear_attention':
+            ttnn.copy_host_to_device_tensor(ssm_host, layer['dn']['ssm'])
+            ttnn.copy_host_to_device_tensor(conv_host, layer['dn']['conv_st'])
+        else:
+            ttnn.copy_host_to_device_tensor(kv_host, layer['attn']['kc'])
+            ttnn.copy_host_to_device_tensor(kv_host, layer['attn']['vc'])
+
+
+def _ensure_decode_trace(state):
+    """Capture the decode forward trace once. Subsequent calls reuse it.
+
+    Per P14 (commit 2d30af7): captures forward_token_tp_inner — reads only
+    from pre-allocated state buffers, no host writes inside captured region.
+    Per-step execute_trace then runs the captured graph after update_input_buffers
+    fills new token/cur_pos values into the buffers.
+
+    Warmup: run 2 eager forwards FIRST so all JIT kernels are compiled.
+    Per feedback_c4v4_validated, JIT during capture hangs on Blackhole.
+    """
+    import ttnn
+    if state.trace_id is not None:
+        return
+    print(f"[trace] warmup + capture decode trace…", flush=True)
+    import time as _time
+    t0 = _time.time()
+    # Warmup eager — JIT all kernels for the inner forward
+    update_input_buffers(state, token_id=0, cur_pos=0)
+    _ = forward_token_tp_inner(state)
+    ttnn.synchronize_device(state.mesh)
+    update_input_buffers(state, token_id=0, cur_pos=1)
+    _ = forward_token_tp_inner(state)
+    ttnn.synchronize_device(state.mesh)
+    # Capture
+    update_input_buffers(state, token_id=0, cur_pos=2)
+    state.trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
+    state.traced_logits_tt = forward_token_tp_inner(state)
+    ttnn.end_trace_capture(state.mesh, state.trace_id, cq_id=0)
+    print(f"  ✓ decode trace captured in {(_time.time()-t0)*1000:.0f} ms "
+          f"(id={state.trace_id})", flush=True)
+
+
+def _traced_forward(state, token_id, cur_pos):
+    """Equivalent to forward_token_tp but uses the captured trace."""
+    import ttnn
+    update_input_buffers(state, token_id, cur_pos)
+    ttnn.execute_trace(state.mesh, state.trace_id, cq_id=0, blocking=False)
+    return state.traced_logits_tt
+
+
 def handle_generate_tp(state: MeshServerState, args: dict):
     """Multi-chip TP generate — streams by default (mirrors server.py UX).
 
-    Stage C: eager TP forward (no trace yet). Reuses forward_token_tp which
-    chains the validated deltanet_step_tp + gated_attn_step_tp + mlp_step_tp
-    across all 64 layers + final_norm + lm_head.
+    Now uses TRACED forward (P14 unblocked). On first call: warmup + capture.
+    Subsequent calls reuse the trace via execute_trace.
     """
     import numpy as np
     import torch
@@ -722,11 +811,18 @@ def handle_generate_tp(state: MeshServerState, args: dict):
                "error": f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} > MAX_POS {cap}"}
         return
 
-    # Prefill (no streaming yet — we don't show prompt tokens)
+    # Ensure trace is captured (one-time, ~85ms + 2 warmup forwards)
+    _ensure_decode_trace(state)
+
+    # Reset per-layer state (SSM, conv_state, paged KV) — must run BEFORE
+    # prefill because warmup or prior queries left state non-zero.
+    _reset_state_buffers(state)
+
+    # Prefill (use traced forward; the trace doesn't care about position values)
     t0 = _time.time()
     last_logits = None
     for pos, tid in enumerate(prompt_ids):
-        last_logits = forward_token_tp(state, tid, pos)
+        last_logits = _traced_forward(state, tid, pos)
     ttnn.synchronize_device(state.mesh)
     prefill_ms = (_time.time() - t0) * 1000.0
 
@@ -761,7 +857,7 @@ def handle_generate_tp(state: MeshServerState, args: dict):
             stopped_on_eos = True
             break
         td0 = _time.time()
-        last_logits = forward_token_tp(state, next_id, cur_pos)
+        last_logits = _traced_forward(state, next_id, cur_pos)
         ttnn.synchronize_device(state.mesh)
         decode_times.append((_time.time() - td0) * 1000.0)
         cur_pos += 1
