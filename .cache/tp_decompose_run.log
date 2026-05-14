@@ -1,0 +1,144 @@
+2026-05-14 16:46:50.456 | DEBUG    | ttnn:<module>:79 - Initial ttnn.CONFIG:
+Config{cache_path=/home/aditya/.cache/ttnn,model_cache_path=/home/aditya/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=true,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=false,comparison_mode_should_raise_exception=false,comparison_mode_pcc=0.9999,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
+==============================================================================
+TP per-step decomposition probe - qb2 (1,4) mesh
+K_PROBE=8 chained DN+MLP blocks; K_FULL=64 for extrapolation
+==============================================================================
+2026-05-14 16:46:50.551 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-14 16:46:50.555 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-14 16:46:50.555 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-14 16:46:50.572 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:224)
+2026-05-14 16:46:50.572 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-14 16:46:50.575 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-14 16:46:50.575 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-14 16:46:50.591 | info     |             UMD | Harvesting masks for Chip 2: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-14 16:46:50.618 | info     |             UMD | Harvesting masks for Chip 0: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-14 16:46:50.622 | info     |             UMD | Harvesting masks for Chip 1: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-14 16:46:50.625 | info     |             UMD | Harvesting masks for Chip 3: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-14 16:46:50.629 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1, 2, 3}/[1, 2, 3, 0] and remote chip ids {} (cluster.cpp:183)
+2026-05-14 16:46:50.629 | info     |             UMD | IOMMU: disabled (cluster.cpp:157)
+2026-05-14 16:46:50.629 | info     |             UMD | KMD version: 2.8.0 (cluster.cpp:160)
+2026-05-14 16:46:50.632 | info     |             UMD | Starting devices in cluster (cluster.cpp:949)
+2026-05-14 16:46:50.633 | info     |             UMD | Mapped hugepage 0x4c0000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-14 16:46:50.634 | info     |             UMD | Mapped hugepage 0x480000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-14 16:46:50.635 | info     |             UMD | Mapped hugepage 0x500000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-14 16:46:50.637 | info     |             UMD | Mapped hugepage 0x440000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+
+[1] Open (1,4) mesh...
+2026-05-14 16:46:51.526 | DEBUG    | ttnn.device:__init__:150 - Using default dispatch core type for this system: DispatchCoreType.WORKER
+2026-05-14 16:46:51.526 | DEBUG    | ttnn.device:__init__:152 - Using default dispatch core axis for this system: DispatchCoreAxis.COL
+2026-05-14 16:46:51.526 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:332)
+2026-05-14 16:46:51.526 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:394)
+2026-05-14 16:46:51.527 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-14 16:46:51.528 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-14 16:46:51.528 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-14 16:46:51.536 | info     |          Fabric | TopologyMapper: Logical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1474)
+2026-05-14 16:46:51.536 | info     |          Fabric | 
+=== Logical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-05-14 16:46:51.536 | info     |          Fabric | 
+=== Logical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-05-14 16:46:51.536 | info     |          Fabric | TopologyMapper: Physical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1485)
+2026-05-14 16:46:51.536 | info     |          Fabric | 
+=== Physical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-05-14 16:46:51.536 | info     |          Fabric | 
+=== Physical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-05-14 16:46:51.536 | info     |          Fabric | Starting multi-mesh mapping: 1 logical mesh(es) to 1 physical mesh(es) (topology_mapper_utils.cpp:1469)
+2026-05-14 16:46:51.536 | info     |          Fabric | Multi-mesh mapping attempt 1/2: Trying inter-mesh mapping (topology_mapper_utils.cpp:1510)
+2026-05-14 16:46:51.536 | info     |          Fabric | Attempt 1: Inter-mesh mapping succeeded, found 1 mesh pair(s) (topology_mapper_utils.cpp:1539)
+2026-05-14 16:46:51.536 | info     |          Fabric | Attempt 1: Mapping 1 mesh pair(s) (topology_mapper_utils.cpp:1547)
+2026-05-14 16:46:51.536 | info     |          Fabric | Attempt 1: Mapping mesh 0 -> 0 (topology_mapper_utils.cpp:1554)
+2026-05-14 16:46:51.537 | info     |          Fabric | Multi-mesh mapping succeeded after 1 attempt(s): 1 mesh pair(s) mapped (topology_mapper_utils.cpp:1686)
+2026-05-14 16:46:51.626 | info     |           Metal | Initializing Fabric (fabric_firmware_initializer.cpp:45)
+2026-05-14 16:46:51.661 | info     |           Metal | Fabric initialized on Device 0 (device.cpp:412)
+2026-05-14 16:46:51.664 | info     |           Metal | Fabric initialized on Device 1 (device.cpp:412)
+2026-05-14 16:46:51.666 | info     |           Metal | Fabric initialized on Device 2 (device.cpp:412)
+2026-05-14 16:46:51.667 | info     |           Metal | Fabric initialized on Device 3 (device.cpp:412)
+2026-05-14 16:46:51.667 | info     |           Metal | Fabric initialized on 4 devices (fabric_firmware_initializer.cpp:173)
+2026-05-14 16:46:51.667 | info     |           Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:48)
+  ok 4 chips
+
+[2] Build + upload K=8 random DN+MLP blocks (real Qwen3.6 shapes)...
+
+[3] Warmup eager forwards (JIT)...
+
+[4] Capture trace of K=8 block forward...
+  ok captured in 98.6 ms
+
+[5] Trace warmup (x5)...
+
+[6] Measure component A: execute_trace + sync (K=8 compute)...
+  median 9.663 ms (mean 9.663, sigma 0.013)
+  per-block: 1.2079 ms -> K=64 extrap: 77.31 ms
+
+[7] Measure component B: synchronize_device alone (idle barrier)...
+  median 0.072 ms (mean 0.081, sigma 0.016)
+  (this is the cost of the trailing sync barrier alone)
+
+[8] Measure component C: update_input_buffers (4x from_torch + copy_host_to_device_tensor)...
+2026-05-14 16:47:42.492 | warning  |           Metal | Allocating device buffers is unsafe due to the existence of an active trace. These buffers may be corrupted once a trace is executed. (allocator.cpp:108)
+  median 1.899 ms (mean 1.896, sigma 0.039)
+  (4 host->device copies per step, replicated 4-way)
+
+[9] Measure component D: to_torch(logits) readback (152064 fp32)...
+  HIDDEN-wide (5120) median: 1.027 ms
+  LOGITS-wide (152064) median: 9.428 ms (mean 10.335, sigma 2.917)
+
+[10] Measure component E: numpy argmax over composed logits (host)...
+  median 0.063 ms (CPU work; usually trivial)
+
+[11] Measure FULL per-step (update + execute_trace + sync)...
+  median 11.574 ms
+
+==============================================================================
+DECOMPOSITION SUMMARY (per decode step)
+==============================================================================
+  K=8 chained DN+MLP TP trace:
+    A  execute_trace + sync          : 9.663 ms
+    B  pure sync barrier             : 0.072 ms
+    A-B  execute_trace dispatch      : 9.591 ms
+    C  update_input_buffers          : 1.899 ms
+    D  logits to_torch (152064)      : 9.428 ms
+    E  numpy argmax (host)           : 0.063 ms
+    F  full step (C + A)             : 11.574 ms
+
+  Per-block traced compute (A-B)/K : 1.1989 ms/block
+
+  Projection to 64-block model:
+    compute (per-block x 64)  : 76.73 ms
+  + update_input_buffers           : 1.90 ms
+  + sync barrier                   : 0.07 ms
+  + logits readback                : 9.43 ms
+  --------
+  predicted ms/tok                 : 88.13 ms
+  predicted tok/s                  : 11.35
+
+  measured baseline (commit 9369e1b): 142.36 ms/tok = 7.02 tok/s
+  predicted - measured gap         : -54.23 ms
+
+  HEADLINE ATTRIBUTION (assuming linear K scaling):
+    compute      76.73 ms ( 87.1%)
+    update        1.90 ms (  2.2%)
+    sync          0.07 ms (  0.1%)
+    logits        9.43 ms ( 10.7%)
+
+  ok mesh closed
+  ok fabric reset
+2026-05-14 16:47:44.740 | info     |    BuildKernels | JIT cache stats: 307/318 hits (96.5%) [307 cached, 200 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-05-14 16:47:44.740 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-05-14 16:47:44.740 | info     |    BuildKernels | JIT telemetry [dependencies_up_to_date]: count=613, total=548.340ms, min=0.022ms, max=5.851ms, mean=0.895ms (build_cache_telemetry.cpp:246)
+2026-05-14 16:47:44.740 | info     |    BuildKernels | JIT telemetry [JitBuildState::build]: count=317, total=6018.225ms, min=0.674ms, max=566.543ms, mean=18.985ms (build_cache_telemetry.cpp:246)
+2026-05-14 16:47:44.740 | info     |    BuildKernels | JIT telemetry [jit_build]: count=137, total=1096.193ms, min=0.695ms, max=445.355ms, mean=8.001ms (build_cache_telemetry.cpp:246)
+2026-05-14 16:47:44.768 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:490)
+2026-05-14 16:47:44.768 | info     |             UMD | Closing devices in cluster (cluster.cpp:961)
