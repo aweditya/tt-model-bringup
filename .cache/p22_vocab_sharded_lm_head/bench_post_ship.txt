@@ -1,0 +1,23 @@
+P22 ship validation — qb2 (1,4) mesh, commit ef3f336
+======================================================
+Server: experiments.serve.server_tp, lm_head sharded dim=1 (per-chip 62080)
+
+Smoke test (max_tokens=6, "The capital of France is"):
+  prefill: 411.6 ms (5 prompt tokens)
+  decode: 83.93 ms/tok = 11.91 tok/s
+  output: " Paris.\n\n<think>: Yes"
+
+Bench (max_tokens=30, 4 iterations):
+  run 1: 83.17 ms/tok = 12.02 tok/s
+  run 2: 83.16 ms/tok = 12.02 tok/s
+  run 3: 83.25 ms/tok = 12.01 tok/s
+  run 4: 83.75 ms/tok = 11.94 tok/s
+
+Median: 12.02 tok/s   (was 11.43; +5.2%, 3.5 ms/tok saved)
+
+Output coherence: "Paris." correct, then bf16-drift "Yes." loop
+(same drift as baseline — NOT a regression).
+
+Bootstrap log signature:
+  ✓ embed uploaded; final_norm replicated;
+    lm_head sharded dim=1 (per-chip 62080; vocab 248320/248320)
