@@ -47,7 +47,9 @@ from experiments.serve import protocol as P  # noqa: E402
 
 # Model constants — sourced from config.json at bootstrap, mirrors 91f
 MODEL_ID = "Qwen/Qwen3.6-27B"
-MAX_POS = 256
+MAX_POS = 512  # 2026-05-18: bumped from 256 to clear the qb1 single-chip
+               # 500-position long-context bar (cf. feedback_fp32_sdpa_cliff_probe.md,
+               # feedback_needle_haystack_qb1.md) for the owned_gdn promotion gate.
 # Paged KV cache parameters — required for trace-compatible decode
 # (paged_update_cache supports update_idxs_tensor=, non-paged doesn't).
 # BLOCK_SIZE must be a multiple of TILE_HEIGHT=32. NUM_BLOCKS * BLOCK_SIZE = MAX_POS.
