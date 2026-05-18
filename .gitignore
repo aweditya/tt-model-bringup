@@ -19,3 +19,6 @@ experiments/.refs/
 # Tracy raw artifacts — large, regenerable via experiments/utils/qb2_tp_tracy_profile_probe.py
 # (parsed summary JSONs in .cache/qb2_tp_tracy/ remain tracked)
 research/probe_logs/qb2_tp_tracy_p25_sync_20260515_0446/
+
+# Claude Code local runtime/config — per-machine, not source
+.claude/
