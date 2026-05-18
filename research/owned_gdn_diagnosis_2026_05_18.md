@@ -247,6 +247,69 @@ after the gate change ships. Track as a follow-up.
   divergence at the BF16 boundary on output. Friend's higher precision storage
   did not save their bit-identity either.
 
+## Tier 1 result — 2026-05-18 22:05
+
+The cosine_ladder_tp endpoint was ported from qb1 to qb2 (commit `088c33b`)
+and run on a real long-form code-generation prompt to test exactly the
+concern that motivated this whole investigation: **does the custom GDN
+kernel preserve long-context coherence to the same degree as the manual
+TTNN broadcast-reduce path?**
+
+Artifact: `.cache/qb2_tp_deltanet/cosine_ladder_tp_compare_20260518_2105.json`
+
+Setup:
+- Prompt: `"Implement a JSON parser combinator in Rust"` (the project's
+  canonical long-form drift-evaluation prompt)
+- Baseline greedy stream: 8 prompt + **200 generated** tokens from
+  `generate_tp` (manual mode, traced)
+- Both modes teacher-forced through eager `forward_token_tp_inner` with
+  full logits readback per position
+- Eager step latency: manual 345 ms/step, owned_gdn 299 ms/step
+  (eager-only; not a perf claim — production decode is traced)
+
+Result:
+| metric | value |
+|---|---|
+| top-1 disagreement | **0 / 200** |
+| first disagreement step | — (never) |
+| median cosine | 0.999376 |
+| mean cosine | 0.998300 |
+| min cosine | 0.924004 (step 44, single outlier) |
+| positions with cos < 0.99 | 4 / 200 |
+| positions with cos < 0.95 | 1 / 200 |
+| positions with cos < 0.90 | 0 / 200 |
+
+Rolling 20-step bucket medians stay flat at 0.999 from step 0 to step
+199 — **no drift trajectory**. The last bucket (steps 180-199, med
+0.9994) is as clean as the first (steps 0-19, med 0.9991). This rules out
+BF16-ULP-per-step error accumulation across autoregressive depth.
+
+The one outlier at step 44 (cos 0.924) is a razor-tie position — the
+logit vectors rotate by ~22° in 248320-D space but the top-1 winner is
+still identical. Exactly the behavior the BF16-ULP diagnosis predicted.
+
+### Decision update
+
+This is the strongest signal we will get for long-context coherence at
+MAX_POS=256 short of free-generation parity. Combined with the prior
+teacher-forced data (16/16 Python, 14/20 hybrid before any flip), the
+ULP-aware tensor gate, and the now-empirical 0/200 long-context
+agreement, the owned GDN kernel meets the promotion bar at the current
+trace ceiling.
+
+Remaining work before defaulting `owned_gdn`:
+1. **Tier 1 multi-prompt extension** (recommended) — repeat on 3-5 more
+   diverse prompts (narrative, explanatory, translation, Q&A) for
+   coverage. Same endpoint, ~3 min each on qb2.
+2. **Tier 2 free-generation parity** (optional given Tier 1 strength) —
+   port `generate_long` to qb2 with mode-toggle; run free generation on
+   both kernels, compare output text equality. Given Tier 1 shows 0/200
+   argmax disagreements, generated text WILL be identical at the same
+   length — so this is now a redundancy check rather than a new signal.
+3. **Tier 3 daily-driver length** (future session) — extend MAX_POS to
+   ≥ 1024, re-bootstrap qb2, re-run Tier 1 + needle-haystack at the
+   longer length.
+
 ## Artifacts referenced
 
 Tensor probes:
