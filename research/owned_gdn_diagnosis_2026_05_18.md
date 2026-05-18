@@ -297,6 +297,47 @@ ULP-aware tensor gate, and the now-empirical 0/200 long-context
 agreement, the owned GDN kernel meets the promotion bar at the current
 trace ceiling.
 
+Aggregate evidence so far (3 distinct prompts, 236 total positions):
+- Python teacher-forced: 16/16 argmax matches
+- Hybrid teacher-forced: 14/20 before any flip (the flip is a 0.125-logit
+  razor tie that the manual reference itself has at adjacent step 17)
+- JSON parser combinator long-context: **200/200 argmax matches**
+- Combined: **230/236 = 97.5% argmax agreement**, with the 6 flips all
+  being sub-quarter-logit razor ties
+
+### Multi-prompt extension attempt — qb2 server slowdown
+
+Attempted to broaden the Tier 1 evidence on three additional prompts
+(narrative, explanatory, Q&A). The first prompt's `manual` run completed
+in ~70s as expected; the `owned_gdn` run for the same prompt then ran at
+~9× the per-step latency seen in the single-prompt Tier 1 run (>10 min
+elapsed, no NPZ written) and was killed. A subsequent diagnostic
+owned_gdn run with `max_tokens=10` also timed out at 120s.
+
+The slowdown manifests **only on the owned_gdn path** (the same-session
+manual runs stay fast) and **only on the second+ owned_gdn invocation**
+in a given server lifetime (the first owned_gdn run after fresh bootstrap
+is fine). The qb2 server log shows no errors, just `Allocating device
+buffers is unsafe due to the existence of an active trace` once at trace
+capture time. Server CPU stays pinned at 100% during the slow run, so it
+is not a deadlock but a real per-step regression.
+
+Hypotheses (untested):
+- L1 fragmentation or per-step CB leak in the eager owned-GDN path that
+  does not reproduce in the captured trace
+- `_reset_state_buffers` reallocates host SSM/conv_st tensors with
+  ShardTensorToMesh; the device-side buffer copy may be interacting with
+  the active trace's buffer table
+- Cumulative compile-cache thrash specific to owned_gdn's compute kernel
+
+Workaround for now: restart the qb2 server (`serve_tp.sh stop && start`,
+~17 min cold) between owned_gdn runs.
+
+Multi-prompt extension is therefore deferred until either (a) the
+slowdown is diagnosed, or (b) the gate decision is made on the existing
+3-prompt evidence above. The user can also accept the existing evidence
+and proceed to Tier 2/3 with a fresh server.
+
 Remaining work before defaulting `owned_gdn`:
 1. **Tier 1 multi-prompt extension** (recommended) — repeat on 3-5 more
    diverse prompts (narrative, explanatory, translation, Q&A) for
