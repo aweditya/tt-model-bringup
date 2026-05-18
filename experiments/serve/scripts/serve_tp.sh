@@ -33,7 +33,13 @@ cmd_start() {
     fi
     echo "starting server_tp (logs: $LOG_FILE)…"
     : > "$LOG_FILE"
+    TT_METAL_HOME="${TT_METAL_HOME:-$HOME/tenstorrent/tt-metal}"
+    TT_BUILD_DIR="${TT_BUILD_DIR:-$TT_METAL_HOME/build_tracy_gcc12_nodist}"
     HF_HOME="${HF_HOME:-$CACHE_DIR/hf}" \
+    TT_METAL_HOME="$TT_METAL_HOME" \
+    ARCH_NAME="${ARCH_NAME:-blackhole}" \
+    PYTHONPATH="$TT_METAL_HOME/ttnn:${PYTHONPATH:-}" \
+    LD_LIBRARY_PATH="$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib:${LD_LIBRARY_PATH:-}" \
     PYTHONUNBUFFERED=1 \
     nohup setsid "$VENV_PY" -m experiments.serve.server_tp \
         >> "$LOG_FILE" 2>&1 < /dev/null &
