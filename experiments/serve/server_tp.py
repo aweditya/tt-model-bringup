@@ -5034,6 +5034,123 @@ def handle_generate_tp(state: MeshServerState, args: dict):
     }
 
 
+def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
+    """Teacher-forced per-position logits dump on qb2 multi-chip TP. Eager path
+    (mirrors qb1 server.handle_cosine_ladder). Toggles
+    state.deltanet_recurrence_mode for the run and restores it on exit, so the
+    captured production trace is unaffected.
+
+    Used to gate the custom GDN kernel's long-context coherence vs the manual
+    TTNN broadcast-reduce recurrence (Tier 1 of the owned_gdn promotion gate;
+    see research/owned_gdn_diagnosis_2026_05_18.md).
+
+    args:
+      prompt_ids:    list[int]   (required) — initial prompt token ids
+      generated_ids: list[int]   (required) — teacher-forced continuation
+                                  (typically from a prior generate_tp run)
+      deltanet_recurrence_mode: str (default "manual") — "manual" /
+                                  "owned_gdn" / "owned_gdn_inplace"
+      out_path:      str         (default .cache/qb2_tp_deltanet/
+                                  cosine_ladder_tp_logits.npz)
+
+    Saves NPZ {logits[M, vocab] fp32, prompt_ids[P], generated_ids[M]}.
+    Returns: {ok, path, deltanet_recurrence_mode, n_prompt, n_steps, vocab,
+              prefill_ms, decode_ms, ms_per_step}.
+    """
+    import os as _os
+    import time as _time
+    import numpy as np
+    import ttnn
+
+    if state.mesh is None or not state.layers:
+        return {"error": "mesh/weights not loaded"}
+
+    prompt_ids = list(args.get("prompt_ids") or [])
+    generated_ids = list(args.get("generated_ids") or [])
+    if not prompt_ids:
+        return {"error": "missing prompt_ids"}
+    if not generated_ids:
+        return {"error": "missing generated_ids"}
+
+    mode = str(args.get("deltanet_recurrence_mode", "manual"))
+    if mode not in ("manual", "owned_gdn", "owned_gdn_inplace"):
+        return {"error": f"deltanet_recurrence_mode must be one of manual/owned_gdn/owned_gdn_inplace, got {mode}"}
+
+    P = len(prompt_ids)
+    M = len(generated_ids)
+    if P + M > MAX_POS:
+        return {"error": f"P {P} + M {M} > MAX_POS {MAX_POS}"}
+
+    out_path = str(args.get("out_path") or
+                   _os.path.join(CACHE_DIR, "qb2_tp_deltanet",
+                                  "cosine_ladder_tp_logits.npz"))
+    _os.makedirs(_os.path.dirname(out_path), exist_ok=True)
+
+    VOCAB = state.vocab_size
+
+    _reset_state_buffers(state)
+    old_mode = state.deltanet_recurrence_mode
+    state.deltanet_recurrence_mode = mode
+
+    logits_arr = np.empty((M, VOCAB), dtype=np.float32)
+
+    def _readback(t):
+        # forward_token_tp_inner(return_logits=True) returns [1, VOCAB] replicated
+        # across chips post-all_gather. Collect with ConcatMeshToTensor(dim=0) →
+        # [NCHIPS, 1, VOCAB]; take chip 0.
+        return ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        )[0].float().cpu().numpy().reshape(VOCAB)
+
+    try:
+        t0 = _time.time()
+        last_logits_tt = None
+        for pos, tid in enumerate(prompt_ids):
+            update_input_buffers(state, tid, pos)
+            last_logits_tt = forward_token_tp_inner(state, return_logits=True)
+        ttnn.synchronize_device(state.mesh)
+        prefill_ms = (_time.time() - t0) * 1000.0
+
+        # Step 0: prefill's last logits = prediction for generated_ids[0].
+        logits_arr[0] = _readback(last_logits_tt)
+
+        t_decode = _time.time()
+        cur_pos = P
+        for i in range(1, M):
+            update_input_buffers(state, generated_ids[i - 1], cur_pos)
+            last_logits_tt = forward_token_tp_inner(state, return_logits=True)
+            ttnn.synchronize_device(state.mesh)
+            logits_arr[i] = _readback(last_logits_tt)
+            cur_pos += 1
+        decode_ms = (_time.time() - t_decode) * 1000.0
+    finally:
+        state.deltanet_recurrence_mode = old_mode
+
+    np.savez(out_path,
+             logits=logits_arr,
+             prompt_ids=np.asarray(prompt_ids, dtype=np.int32),
+             generated_ids=np.asarray(generated_ids, dtype=np.int32))
+
+    state.last_run = {
+        "cmd": "cosine_ladder_tp",
+        "deltanet_recurrence_mode": mode,
+        "n_prompt": P,
+        "n_steps": M,
+    }
+
+    return {
+        "ok": True,
+        "path": out_path,
+        "deltanet_recurrence_mode": mode,
+        "n_prompt": P,
+        "n_steps": M,
+        "vocab": VOCAB,
+        "prefill_ms": prefill_ms,
+        "decode_ms": decode_ms,
+        "ms_per_step": decode_ms / max(M - 1, 1),
+    }
+
+
 HANDLERS = {
     "status":         handle_status,
     "generate_tp":    handle_generate_tp,
@@ -5053,6 +5170,7 @@ HANDLERS = {
     "probe_deltanet_owned_gdn_teacher_forced_tp": handle_probe_deltanet_owned_gdn_teacher_forced_tp,
     "probe_deltanet_owned_gdn_benchmark_tp": handle_probe_deltanet_owned_gdn_benchmark_tp,
     "probe_deltanet_softplus_decay_tp": handle_probe_deltanet_softplus_decay_tp,
+    "cosine_ladder_tp": handle_cosine_ladder_tp,
     "shutdown":       handle_shutdown,
 }
 

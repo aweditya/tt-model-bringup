@@ -246,6 +246,130 @@ def cmd_probe_deltanet_softplus_decay_tp(args):
     print(json.dumps(data, indent=2, default=str))
 
 
+def cmd_cosine_ladder_tp(args):
+    """Run cosine ladder for one or more recurrence modes and, if ≥2 modes,
+    print + save a per-position comparison vs the first mode. Used to gate
+    long-context coherence of the owned GDN kernel vs the manual TTNN
+    recurrence (Tier 1 of the owned_gdn promotion gate).
+
+    Workflow:
+      1. Call generate_tp once to obtain the baseline greedy token stream
+         (uses whatever mode the server's traced forward was captured with —
+         currently 'manual').
+      2. For each mode in --modes: call cosine_ladder_tp on the SAME
+         prompt_ids + generated_ids; server saves NPZ.
+      3. Load NPZs; compute per-position cosine + top-1 disagreement of every
+         non-base mode vs the first mode listed. Save comparison JSON.
+    """
+    import json as _json, os as _os, time as _t
+    import numpy as np
+
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    if not modes:
+        print("client_tp: --modes is empty", file=sys.stderr); sys.exit(2)
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(7200.0)
+    try:
+        sock.connect(SOCKET_PATH)
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        print(f"client_tp: cannot connect to {SOCKET_PATH}: {e}", file=sys.stderr); sys.exit(2)
+    sock.sendall(P.pack_request("generate_tp", {
+        "prompt": args.prompt, "max_tokens": args.max_tokens,
+        "chunk_size": args.max_tokens, "seed": 0,
+    }))
+    baseline = None
+    while True:
+        raw = P.read_line(sock, max_bytes=64 << 20)
+        if not raw: break
+        obj = _json.loads(raw.decode("utf-8"))
+        t = obj.get("type", "")
+        if t == "error":
+            print(f"\nERROR (generate_tp baseline): {obj.get('msg')}", file=sys.stderr); sys.exit(4)
+        if t == "result":
+            baseline = obj.get("data", {}); break
+    sock.close()
+    if baseline is None:
+        print("client_tp: no final response from generate_tp", file=sys.stderr); sys.exit(4)
+    prompt_ids = baseline["prompt_ids"]
+    generated_ids = baseline["generated_ids"]
+    print(f"[baseline] {len(prompt_ids)} prompt + {len(generated_ids)} generated tokens "
+          f"({baseline.get('ms_per_tok', 0):.2f} ms/tok)")
+
+    timestamp = _t.strftime("%Y%m%d_%H%M")
+    artifacts = {}
+    for mode in modes:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(7200.0)
+        sock.connect(SOCKET_PATH)
+        out_path = _os.path.expanduser(
+            f"~/tt-xla/.cache/qb2_tp_deltanet/_cosine_ladder_tp_{mode}_{timestamp}.npz")
+        sock.sendall(P.pack_request("cosine_ladder_tp", {
+            "prompt_ids": prompt_ids,
+            "generated_ids": generated_ids,
+            "deltanet_recurrence_mode": mode,
+            "out_path": out_path,
+        }))
+        raw = P.read_line(sock, max_bytes=64 << 20)
+        sock.close()
+        obj = _json.loads(raw.decode("utf-8"))
+        if obj.get("type") == "error":
+            print(f"\nERROR (cosine_ladder_tp mode={mode}): {obj.get('msg')}", file=sys.stderr); sys.exit(4)
+        data = obj.get("data", {})
+        artifacts[mode] = data
+        print(f"[{mode:<18}] {data.get('n_steps', 0)} steps, "
+              f"prefill {data.get('prefill_ms', 0):.0f} ms, "
+              f"decode {data.get('ms_per_step', 0):.1f} ms/step → {data.get('path')}")
+
+    if len(modes) < 2:
+        return
+    base_mode = modes[0]
+    base_logits = np.load(artifacts[base_mode]["path"])["logits"].astype(np.float32)
+    M_steps, V = base_logits.shape
+    argmax_base = np.argmax(base_logits, axis=1)
+
+    comparison = {
+        "prompt": args.prompt,
+        "base_mode": base_mode,
+        "n_prompt": int(len(prompt_ids)),
+        "n_steps": int(M_steps),
+        "vocab": int(V),
+        "prompt_ids": list(prompt_ids),
+        "generated_ids": list(generated_ids),
+        "comparisons": {},
+    }
+    print(f"\n[compare] base={base_mode} ({M_steps} steps)")
+    print(f"{'mode':<22} {'min_cos':>10} {'med_cos':>10} {'mean_cos':>10} {'top1_disagree':>15} {'first_disag':>12}")
+    for mode in modes[1:]:
+        other_logits = np.load(artifacts[mode]["path"])["logits"].astype(np.float32)
+        dots = np.sum(base_logits * other_logits, axis=1)
+        cosines = dots / (np.linalg.norm(base_logits, axis=1) *
+                           np.linalg.norm(other_logits, axis=1) + 1e-30)
+        argmax_other = np.argmax(other_logits, axis=1)
+        disagree_mask = (argmax_base != argmax_other)
+        disagree = int(disagree_mask.sum())
+        first_disagree = int(np.argmax(disagree_mask)) if disagree else -1
+        comparison["comparisons"][mode] = {
+            "min_cos": float(cosines.min()),
+            "med_cos": float(np.median(cosines)),
+            "mean_cos": float(cosines.mean()),
+            "max_cos": float(cosines.max()),
+            "top1_disagree_count": disagree,
+            "top1_disagree_rate": disagree / M_steps,
+            "first_disagree_step": first_disagree,
+            "cosines": cosines.tolist(),
+        }
+        print(f"{mode:<22} {cosines.min():>10.6f} {np.median(cosines):>10.6f} "
+              f"{cosines.mean():>10.6f} {f'{disagree}/{M_steps}':>15} {first_disagree:>12}")
+
+    out_json = _os.path.expanduser(
+        f"~/tt-xla/.cache/qb2_tp_deltanet/cosine_ladder_tp_compare_{timestamp}.json")
+    _os.makedirs(_os.path.dirname(out_json), exist_ok=True)
+    with open(out_json, "w") as f:
+        _json.dump(comparison, f, indent=2)
+    print(f"\n[save] comparison → {out_json}")
+
+
 def cmd_generate_tp(args):
     """Streaming generate_tp — same chunk/result protocol as client.cmd_generate."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -448,6 +572,14 @@ def main():
     g.add_argument("--chunk-size", type=int, default=1)
     g.add_argument("--seed", type=int, default=0)
     g.set_defaults(fn=cmd_generate_tp)
+    cl = sub.add_parser("cosine_ladder_tp",
+                          help="teacher-forced cosine ladder; compare deltanet recurrence modes")
+    cl.add_argument("--prompt", required=True)
+    cl.add_argument("--max-tokens", type=int, default=200,
+                     help="positions to teacher-force (P + M ≤ MAX_POS=256)")
+    cl.add_argument("--modes", default="manual,owned_gdn",
+                     help="comma-separated recurrence modes (e.g. manual,owned_gdn)")
+    cl.set_defaults(fn=cmd_cosine_ladder_tp)
     args = p.parse_args()
     args.fn(args)
 
