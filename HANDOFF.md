@@ -1,6 +1,6 @@
 # HANDOFF.md — TT-XLA Qwen3.6-27B Agent Onboarding
 
-Last updated: 2026-05-18. Authoritative entry point for any agent picking up this project. Read this end-to-end before touching code. Cite memory notes by filename when using older memory-bank findings, and cite in-repo research files for the current GDN work.
+Last updated: 2026-05-18 evening (post owned_gdn default-flip). Authoritative entry point for any agent picking up this project. Read this end-to-end before touching code. Cite memory notes by filename when using older memory-bank findings, and cite in-repo research files for the current GDN work.
 
 **Context-compacted agent?** Read `research/ACTIVE_CONTEXT.md` first. It is the
 short active-state file for current measurements, invalidated paths, and next
@@ -43,13 +43,17 @@ Tenstorrent Blackhole P150**, with the main focus on **multi-chip TP on qb2**.
 The target is not a friend's number; it is to move measured end-to-end decode
 as close to the hardware ceiling as correctness permits.
 
-The current production-ish path is:
+The current production path is:
 
-- qb2, 4× P150, `(1,4)` mesh, `server_tp.py`
-- traced decode with paged SDPA, vocab-sharded LM head, on-device argmax, and
-  on-device embedding/cos/sin lookup
-- known end-to-end decode ballpark from the P25 line: about **82 ms/token**
-  (~12 tok/s) on `generate_tp`
+- qb2, 4× P150, `(1,4)` mesh, `server_tp.py`, `MAX_POS=512`
+- traced decode with paged SDPA, vocab-sharded LM head, on-device argmax,
+  on-device embedding/cos/sin lookup, AND **the custom owned GDN kernel
+  `ttnn.experimental.qwen36_gdn_decode_owned` as the default DeltaNet
+  recurrence path** (commit `26cad39`, 2026-05-18 evening)
+- measured end-to-end decode after the owned_gdn default flip: about
+  **80 ms/token (~12.45 tok/s)** on `generate_tp` for the canonical prompts
+  ("The capital of France is" → 80.26 ms/tok; "Implement a JSON parser
+  combinator in Rust" → 80.44 ms/tok)
 
 ### Current bottleneck hypothesis
 
@@ -59,62 +63,60 @@ collectives, and a batch-1 decode graph with skinny GEMV-like matmuls. The
 likely perf frontier is reducing small-op count and memory/layout traffic while
 keeping correctness.
 
-### Current custom GDN status
+### Current custom GDN status — DEFAULTED 2026-05-18 evening
 
-The most recent work is a custom GDN/DeltaNet recurrence effort. It is **not
-ready for integration**.
+The custom single-device GDN kernel
+`ttnn.experimental.qwen36_gdn_decode_owned` is now the production-default
+DeltaNet recurrence path on qb2. Cold-bootstrap of `server_tp.py` captures
+the owned kernel into the production trace; `generate_tp` runs at
+**~80 ms/tok (~12.45 tok/s)** measured end-to-end.
+
+Full diagnosis + gate-evidence trail:
+`research/owned_gdn_diagnosis_2026_05_18.md`.
+
+Headline mechanism: the owned kernel is **strictly more numerically accurate**
+than the manual TTNN broadcast-reduce reference at the prediction step. The
+manual path uses `ttnn.mul` (binary_ng) which, for all-bf16 inputs, runs
+with `fp32_dest_acc_en=false` and so bf16-quantizes per-element products in
+L1 before `ttnn.sum` reduces them in fp32 dst. The owned kernel keeps the
+full contraction in fp32 dst across all 4 K-tile `matmul_tiles` calls and
+packs once at the end. The two paths therefore differ by exactly 1 BF16
+ULP at prediction (intrinsic, not a bug).
 
 Files:
+- `experiments/owned_ops/qwen36_gdn_decode_owned/` (the fused op + tests +
+  benchmark + microbench harness)
+- `experiments/owned_ops/qwen36_gdn_{decay_state,prediction,delta,outer_update,output}/`
+  (the five component ops the fused op was built from)
+- `experiments/serve/server_tp.py:115-121` (`deltanet_recurrence_mode`
+  default = `"owned_gdn"`)
 
-- `experiments/owned_ops/qwen36_gdn_decode_owned/`
-- `experiments/owned_ops/qwen36_gdn_prediction/`
-- `experiments/serve/server_tp.py`
-- `research/ACTIVE_CONTEXT.md`
+Gates passed:
+- ULP-aware tensor at layer 0 (prediction max_diff ≤ 1 BF16 ULP, state ≤ 2 ULP).
+- Teacher-forced argmax on 3 prompts / 236 positions: **230/236** (97.5%);
+  all 6 flips are sub-quarter-logit razor ties the manual reference also has
+  at adjacent positions.
+- Tier 1 long-context (200 positions): **0/200** disagreements.
+- Tier 3 long-context (500 positions, matches qb1 P21 bar): **10/500 = 2.0%**
+  disagreements, median cosine 0.9995, NO cliff (rolling 50-step medians flat
+  at 0.999 across all 500 steps).
+- Measured production decode: 80.26-80.44 ms/tok vs 82.92 ms/tok manual
+  baseline = **+3.2% perf**.
 
-Current hard findings:
-
-- Full owned GDN launches on qb2 but fails the strict promotion gate:
-  state PCC `0.9999997911075303`, state max diff `0.015625`; output PCC
-  `0.9999971009389962`, output max diff `0.001953125`.
-- `owned_copy_vs_input` is exact. The issue is not a trivial state-copy bug.
-- The standalone prediction component is close but not default-safe:
-  `component_prediction` max diff `0.0078125` vs current TTNN
-  broadcast-reduce recurrence.
-- Debug mode 10 K materialization is exact.
-- Debug mode 11 product tile vs TTNN intermediate has PCC
-  `0.9999995951668267`, max diff `0.00390625`.
-- Debug mode 12 one-tile reduce vs TTNN intermediate has PCC
-  `0.9999996063019564`, max diff `0.0078125`.
-- Debug mode 2 full strict prediction is wedge-prone/too slow in the resident
-  server path. Do **not** run all component debug modes together.
-- The clean `ttnn.matmul(k4, state_scaled)` formulation is shape-valid:
-  `[1,12,1,128] @ [1,12,128,128] -> [1,12,1,128]`, but it is **not**
-  numerically equivalent to the current TTNN broadcast-reduce contract:
-  prediction max diff `0.0625`, PCC `0.999993423459592`. Switching the
-  reference to matmul changes the model contract; it does not make the custom
-  kernel correct.
-
-Key artifacts:
-
+Key artifacts (correctness):
 ```text
-.cache/qb2_tp_deltanet/results_owned_gdn_matmul_contract_nativeio_seeded_l0_20260518.json
-.cache/qb2_tp_deltanet/results_owned_gdn_component_mode10_kcol_nativeio_seeded_l0_20260518.json
-.cache/qb2_tp_deltanet/results_owned_gdn_component_mode11_product_ttnn_expected_nativeio_seeded_l0_20260518.json
-.cache/qb2_tp_deltanet/results_owned_gdn_component_mode12_reduce_ttnn_expected_nativeio_seeded_l0_20260518.json
-.cache/qb2_tp_deltanet/results_owned_gdn_component_mode11_product_fullorder_ttnn_expected_nativeio_seeded_l0_20260518.json
-.cache/qb2_tp_deltanet/results_owned_gdn_component_mode12_reduce_fullorder_ttnn_expected_nativeio_seeded_l0_20260518.json
+.cache/qb2_tp_deltanet/cosine_ladder_tp_compare_20260518_2105.json   (Tier 1: 200 pos, 0/200)
+.cache/qb2_tp_deltanet/cosine_ladder_tp_compare_500_20260518.json    (Tier 3: 500 pos, 10/500)
+research/owned_gdn_diagnosis_2026_05_18.md                            (full diagnosis + gate trail)
 ```
 
-Immediate next GDN step:
+Known follow-up tracked, not promotion-blocking:
+- Eager `owned_gdn` slowdown on the 2nd+ invocation per server lifetime
+  (commit `2905470`). Production decode is traced and unaffected; eager
+  probes that toggle modes need server restart between owned_gdn runs.
 
-1. Do **not** integrate or default-enable owned GDN.
-2. Either make the owned prediction/reduction mimic the existing TTNN
-   broadcast-reduce rounding/materialization schedule more closely, or produce
-   a documented BF16-equivalence argument plus teacher-forced/generated-token
-   validation proving the drift is harmless.
-3. Keep tests staged: K materialization -> product tile -> one-tile reduce ->
-   full prediction -> full recurrence -> teacher-forced tokens -> generated
-   tokens -> measured decode.
+Rollback: set `state.deltanet_recurrence_mode = "manual"` in
+`MeshServerState.__init__` (`server_tp.py:115`) and re-bootstrap.
 
 ### Current remote state
 
@@ -399,26 +401,41 @@ The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_
 | `2d30af7` | P14: TRACE CAPTURE WORKS ON (1,4) MESH | unblock |
 | `4cd0ce1` | server_tp.py: paged KV cache refactor — enables trace | enabler |
 
-### Current state (as of 2026-05-18)
+Latest shipped wins (today, 2026-05-18 evening):
+
+| Commit | Title | Impact |
+|--------|-------|--------|
+| `26cad39` | **DEFAULT owned_gdn**: production trace now captures the owned GDN kernel | **12.06 → 12.46 tok/s (+3.2%)** measured |
+| `040e2ac` | Tier 3 long-context gate PASSES (500 positions, no cliff) | promotion-gate |
+| `b4c62ab` | qb2 MAX_POS 256 → 512 (matches qb1 single-chip 500-position bar) | enabler |
+| `e9b4b06` | Tier 1 long-context gate PASSES (200 positions, 0/200) | promotion-gate |
+| `088c33b` | qb2 `cosine_ladder_tp` endpoint + client wrapper | enabler |
+| `27a91e4` | Owned GDN diagnosis memo (kernel > reference accuracy) | mechanism understood |
+| `d3423f6` | Owned GDN op trees (5 components + fused decode_owned) | first owned TT-Metal op |
+
+### Current state (as of 2026-05-18 evening, post owned_gdn default)
 
 | Metric | Value | Note |
 |--------|-------|------|
-| Production perf (qb2 multi-chip TP traced) | **~12 tok/s / ~82 ms-token** | P25 line. Treat exact number as run-dependent; re-benchmark before reporting. |
+| Production perf (qb2 multi-chip TP traced + owned_gdn) | **~12.45 tok/s / ~80 ms-tok** | measured 2026-05-18 evening on 2 prompts × 30 tok; commit `26cad39` |
 | Production perf (qb1 single-chip) | 5.19 tok/s | `feedback_qk_rms_norm_shipped.md` |
 | Long-context cliff (qb1, HiFi2 B3) | none up to L=500 | `feedback_fp32_sdpa_cliff_probe.md` |
+| Long-context cliff (qb2, owned_gdn vs manual) | none up to L=500 (10/500 razor-tie flips, no cliff) | `cosine_ladder_tp_compare_500_20260518.json` |
+| `MAX_POS` ceiling (qb2 trace) | **512** (was 256 pre-2026-05-18 evening) | `b4c62ab` |
 | Speculative decode (D'3) | DON'T SHIP at 57.9% acceptance | `feedback_d3_dont_ship_yet.md` |
 | El Reg ceiling (4× P150 Llama70B BFP8) | 1.78× (~9.2 tok/s equivalent) | `feedback_realistic_tp_ceiling.md` — we're above this |
-| Optimization target | approach hardware ceiling | compare against roofline / measured full-decode tok/s, not friend's implementation |
-| Custom GDN status | **not integration-ready** | see §0 and `research/ACTIVE_CONTEXT.md` |
+| Optimization target | approach hardware ceiling | compare against roofline / measured full-decode tok/s |
+| Custom GDN status | **DEFAULT** (commit `26cad39`) | see §0 and `research/owned_gdn_diagnosis_2026_05_18.md` |
 
-### Next investigation list (post-P25, prioritized)
+### Next investigation list (post owned_gdn default, 2026-05-18 evening)
 
-1. **Fresh full-decode/profile breakdown for current P25-ish path.** The old 7.02 tok/s decomposition is stale. Use current resident qb2 server and group ops into DeltaNet recurrence, attention, MLP, collectives, RoPE, layout/view ops, LM head.
-2. **Custom GDN correctness, not integration.** The current owned GDN path is close but fails strict equivalence. Next work is product/reduce rounding/materialization parity or a documented BF16 tolerance argument plus token-level validation.
-3. **Native RoPE / fewer RoPE dispatches.** Manual rotate-only remains in production; prior fused QK RoPE was wedge-prone. Any retry must start from isolated correctness probes.
-4. **CCL cleanup / overlap.** Look for whether collectives can be overlapped with compute or replaced with better topology/axis usage. Do not claim overlap without Tracy/profile evidence.
-5. **On-device position update.** P25 shipped token/cos/sin lookup, but check whether `cur_pos_buf`/`rot_idxs_buf` still require host writes in the current path.
-6. **Do not re-open killed candidates without new evidence:** distributed RMSNorm Step 1 (`feedback_distributed_rms_norm_failed.md`), single-P150 DRAM-sharded MLP (`feedback_dram_sharded_mlp_probe.md`), and GDN full strict debug mode 2 were negative/wedge-prone at current shapes.
+1. **Fresh full-decode/profile breakdown with owned_gdn defaulted.** The pre-owned profiles (`results_decode_op_counts_20260515_0129.json`) attributed DeltaNet recurrence as ~17% of eager-op time. The owned kernel collapsed 480 recurrence-category ops into 1; the new bottleneck distribution must be re-measured before picking the next fusion target.
+2. **Apply the kernel-fusion pattern to the next op-heavy region.** Top remaining candidates from the pre-owned-gdn profile: DeltaNet decay/gate (480 calls/token), DeltaNet QKV repeat (336), RoPE chain (320), attention plumbing (320). Each is a multi-week custom-op project on the same scaffolding as `qwen36_gdn_decode_owned`.
+3. **Tier 4 daily-driver-length extension.** Bump `MAX_POS` to 1024 or 2048 and re-run `cosine_ladder_tp` at the longer length to confirm no cliff emerges past 500. Same pattern as Tier 3 (commit `040e2ac`); ~30 min wall on qb2.
+4. **Root-cause the eager owned_gdn slowdown** (`2905470`). Production-irrelevant but blocks future eager probe development.
+5. **Native RoPE / fewer RoPE dispatches.** Manual rotate-only remains; the slice-first `ttnn.experimental.rotary_embedding` recipe passed an isolated correctness gate (`results_native_partial_pass_20260515_0030.json`) but was never landed in production.
+6. **CCL cleanup / overlap.** No evidence yet that collectives overlap with compute. Tracy on qb2 (build at `~/tenstorrent/tt-metal/build_tracy_gcc12_nodist`) is set up; needs a real per-op pass.
+7. **Do not re-open killed candidates without new evidence:** distributed RMSNorm (`feedback_distributed_rms_norm_failed.md`), single-P150 DRAM-sharded MLP (`feedback_dram_sharded_mlp_probe.md`), strict-reduce owned-GDN path (rejected 2026-05-17, see `cache/qb2_tp_deltanet/qwen36_gdn_decode_owned_strict_*.json`).
 
 ---
 

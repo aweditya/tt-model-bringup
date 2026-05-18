@@ -3,10 +3,52 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
+## Current Status (2026-05-18 evening) — owned_gdn DEFAULTED
+
+The custom single-device GDN/DeltaNet recurrence kernel
+(`ttnn.experimental.qwen36_gdn_decode_owned`) is now the production-default
+decode path on qb2 (commit `26cad39`). `MAX_POS` was bumped from 256 to 512
+(`b4c62ab`) so the trace re-capture matches the qb1 long-context bar.
+
+Measured production decode after the default flip (fresh qb2 cold bootstrap,
+`generate_tp` on two canonical prompts × 30 tokens each):
+- "The capital of France is" → **80.26 ms/tok = 12.46 tok/s**
+- "Implement a JSON parser combinator in Rust" → **80.44 ms/tok = 12.43 tok/s**
+- Manual baseline same prompt earlier: 82.92 ms/tok = 12.06 tok/s
+- Net delta: **−2.66 ms/tok = +0.40 tok/s = +3.2%**
+
+Gate evidence that justified the default flip (full trail in
+`research/owned_gdn_diagnosis_2026_05_18.md`):
+- ULP-aware tensor gate at layer 0: kernel is strictly more accurate than the
+  manual TTNN broadcast-reduce reference at the prediction step (manual
+  internally bf16-quantizes per-element products via `binary_ng` with
+  `fp32_dest_acc_en=false`; owned keeps full fp32 dst across the matmul).
+  Divergence is exactly 1 BF16 ULP at prediction, intrinsic.
+- Teacher-forced argmax coherence on 3 prompts / 236 positions: 230/236
+  matches (the 6 flips are all sub-quarter-logit razor ties the manual
+  reference itself has at adjacent positions).
+- Tier 1 long-context (200 positions, JSON parser prompt): **0/200**
+  argmax disagreements (`cosine_ladder_tp_compare_20260518_2105.json`).
+- Tier 3 long-context (**500 positions** = qb1 P21 bar): **10/500 = 2.0%**
+  argmax disagreements, median cosine 0.9995, **NO cliff** (rolling 50-step
+  medians flat at 0.999 from step 0 to step 499)
+  (`cosine_ladder_tp_compare_500_20260518.json`).
+
+This is the project's first end-to-end owned TT-Metal custom op landed in
+production. The kernel-fusion pattern (Python `binary_ng + reduce` →
+fused MMA in a custom op) is now proven and reusable for the other op-heavy
+regions of the decode graph.
+
+Known follow-up tracked, not promotion-blocking:
+- Eager owned_gdn slowdown on the 2nd+ invocation per server lifetime
+  (commit `2905470`). Production decode is traced and unaffected; eager
+  probes that toggle modes need a server restart between owned_gdn runs
+  until root-caused.
+
 ## Current Priority
 
 - Main thread: qb2 multi-chip TP optimization for Qwen3.6-27B on one P150 host
-  with `(1,4)` mesh.
+  with `(1,4)` mesh. Custom-kernel fusion is now the active strategy.
 - qb1 is reserved by the user right now. Do not run qb1 background agents or
   qb1 device commands until the user says it is free.
 - PJRT work is parked.
@@ -21,16 +63,28 @@ Read this first after context compaction. Do not re-summarize the whole
 - Sync-bounded timing only.
 - Use `.cache/`, `research/`, or `experiments/`; no `/tmp`.
 - If qb2 fabric wedges after SIGTERM/SIGKILL: `ssh qb2 'tt-smi -r 0,1,2,3'`.
+- **rsync server_tp.py to qb2 BEFORE restarting the server** — local-only
+  edits won't take effect after restart; cost of forgetting is one full
+  17-min cold bootstrap (2026-05-18 verify-after-flip incident).
 
-## Measured Anchors
+## Measured Anchors (post owned_gdn default, 2026-05-18 evening)
 
-- qb2 P25 baseline full decode: about `82.8 ms/tok` / `12.08 tok/s`.
-- qb2 component medians:
+- qb2 production full decode: **`80.26-80.44 ms/tok` / `12.43-12.46 tok/s`**
+  on canonical prompts at `MAX_POS=512`.
+- Same-prompt manual baseline (pre default-flip): 82.92 ms/tok.
+- Measured win: 2.6-2.7 ms/tok, ~3.2%.
+
+Historical anchors (pre-2026-05-18, for context — superseded but kept for
+trajectory understanding):
+- qb2 P25 baseline (manual + trace + MAX_POS=256): `82.8 ms/tok` / `12.08 tok/s`.
+- qb2 component medians at P25:
   - `update_input_buffers`: about `0.7 ms`
   - `execute_trace`: about `82.2 ms`
   - `update+execute`: about `82.7 ms`
   - argmax readback: about `1.4 ms`
-- Interpretation: qb2 bottleneck is the replayed device trace, not host update.
+- Interpretation at P25: bottleneck was the replayed device trace, not host
+  update. With owned_gdn defaulted the trace got ~2.6 ms cheaper; the
+  attribution should be re-profiled before picking the next fusion target.
 
 ## Invalidated Or Safe-But-No-Win Paths
 
