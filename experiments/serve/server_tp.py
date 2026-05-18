@@ -117,7 +117,12 @@ class MeshServerState:
         self.collective_mode = "baseline"
         self.rope_mode = "manual"
         self.deltanet_decay_mode = "manual"
-        self.deltanet_recurrence_mode = "manual"
+        # 2026-05-18: defaulted to "owned_gdn" after Tier 3 long-context gate
+        # passed at 500 positions (commit 040e2ac, research/owned_gdn_
+        # diagnosis_2026_05_18.md). Probe endpoints still toggle this
+        # explicitly. Set to "manual" to revert to the legacy TTNN
+        # broadcast-reduce recurrence.
+        self.deltanet_recurrence_mode = "owned_gdn"
         self.profile_records = None
         self.profile_context_stack = []
 
