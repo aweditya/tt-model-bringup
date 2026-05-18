@@ -1,0 +1,115 @@
+{
+  "candidate": "qwen36_gdn_decode_owned_real_tensors",
+  "prompt": "The capital of France is",
+  "token_id": 760,
+  "layer_idx": 0,
+  "reset_state": true,
+  "use_pretransposed_k": false,
+  "compact_vectors": false,
+  "native_io": true,
+  "seed_state": "manual_once",
+  "symbols": {
+    "qwen36_gdn_decode_owned": true
+  },
+  "shape": {
+    "state": [
+      1,
+      12,
+      128,
+      128
+    ],
+    "q_k_rows": [
+      1,
+      12,
+      1,
+      128
+    ],
+    "value_rows": [
+      1,
+      12,
+      1,
+      128
+    ],
+    "alpha_beta": [
+      1,
+      12,
+      1,
+      1
+    ],
+    "out_manual": [
+      1,
+      12,
+      1,
+      128
+    ],
+    "out_owned": [
+      1,
+      1536
+    ]
+  },
+  "compatibility": {
+    "accepted": true,
+    "error": null
+  },
+  "correctness": {
+    "state_vs_manual": {
+      "pcc": 0.9999997911075303,
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 4.1962653085647617e-07,
+      "p99_abs_diff": 3.814697265625e-06,
+      "p999_abs_diff": 6.103515625e-05,
+      "num_gt_0_001": 20,
+      "num_gt_0_002": 9,
+      "num_gt_0_004": 4,
+      "numel": 786432,
+      "max_index": 300610,
+      "max_values": {
+        "a": 3.0,
+        "b": 2.984375
+      }
+    },
+    "output_vs_manual": {
+      "pcc": 0.9999971009389962,
+      "max_abs_diff": 0.001953125,
+      "mean_abs_diff": 1.1494220188978943e-06,
+      "p99_abs_diff": 3.814697265625e-06,
+      "p999_abs_diff": 0.00022668457031249645,
+      "num_gt_0_001": 1,
+      "num_gt_0_002": 0,
+      "num_gt_0_004": 0,
+      "numel": 6144,
+      "max_index": 3137,
+      "max_values": {
+        "a": 0.30859375,
+        "b": 0.310546875
+      }
+    },
+    "pass_gate": false,
+    "host_shapes": {
+      "state_manual": [
+        4,
+        12,
+        128,
+        128
+      ],
+      "state_owned": [
+        4,
+        12,
+        128,
+        128
+      ],
+      "output_manual": [
+        4,
+        12,
+        1,
+        128
+      ],
+      "output_owned": [
+        4,
+        12,
+        1,
+        128
+      ]
+    }
+  }
+}
