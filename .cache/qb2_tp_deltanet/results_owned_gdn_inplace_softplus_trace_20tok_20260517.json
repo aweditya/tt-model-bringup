@@ -1,0 +1,164 @@
+{
+  "candidate": "deltanet_owned_gdn_recurrence",
+  "prompt": "The capital of France is",
+  "prompt_ids": [
+    760,
+    6511,
+    314,
+    9338,
+    369
+  ],
+  "token_id": 760,
+  "compatibility": {
+    "accepted": true,
+    "baseline_argmax_id": 2614,
+    "owned_argmax_id": 2614,
+    "argmax_match": true,
+    "mode": "owned_gdn_inplace",
+    "decay_mode": "native_softplus"
+  },
+  "trace_bench": {
+    "iters": 6,
+    "warmup": 2,
+    "capture_ms": 1227.1522879600525,
+    "summary_ms": {
+      "manual_execute_trace": {
+        "median": 82.16027601156384,
+        "mean": 82.16023262745391,
+        "min": 82.1431060321629,
+        "max": 82.17591582797468
+      },
+      "owned_execute_trace": {
+        "median": 79.103265539743,
+        "mean": 79.1002072316284,
+        "min": 79.07560607418418,
+        "max": 79.11606505513191
+      },
+      "manual_update_plus_execute": {
+        "median": 82.73347502108663,
+        "mean": 82.71768564979236,
+        "min": 82.54635287448764,
+        "max": 82.830989966169
+      },
+      "owned_update_plus_execute": {
+        "median": 79.65693005826324,
+        "mean": 79.65009038647015,
+        "min": 79.60525108501315,
+        "max": 79.68021999113262
+      }
+    },
+    "samples_ms": {
+      "manual_execute_trace": [
+        82.16521586291492,
+        82.16789597645402,
+        82.15533616021276,
+        82.17591582797468,
+        82.1431060321629,
+        82.15392590500414
+      ],
+      "owned_execute_trace": [
+        79.11606505513191,
+        79.10832506604493,
+        79.07560607418418,
+        79.10939515568316,
+        79.09364602528512,
+        79.09820601344109
+      ],
+      "manual_update_plus_execute": [
+        82.830989966169,
+        82.733070012182,
+        82.74446008726954,
+        82.71736092865467,
+        82.54635287448764,
+        82.73388002999127
+      ],
+      "owned_update_plus_execute": [
+        79.68021999113262,
+        79.60525108501315,
+        79.65524005703628,
+        79.67397011816502,
+        79.62724100798368,
+        79.6586200594902
+      ]
+    },
+    "traced_argmax_id_sample": 6511,
+    "note": "Same-session temporary trace timing; still gated by decode correctness below."
+  },
+  "decode_bench": {
+    "max_tokens": 20,
+    "manual": {
+      "generated_ids": [
+        11751,
+        13,
+        271,
+        248068,
+        271,
+        248069,
+        271,
+        4639,
+        369,
+        4252,
+        13,
+        11751,
+        369,
+        279,
+        6511,
+        321,
+        1379,
+        91188,
+        3177,
+        314
+      ],
+      "n_generated_tokens": 20,
+      "prefill_ms": 411.05048707686365,
+      "decode_ms": {
+        "median": 82.64236047398299,
+        "mean": 82.66279161907732,
+        "min": 82.55614200606942,
+        "max": 83.00976804457605
+      },
+      "ms_per_tok": 82.66279161907732,
+      "tok_per_sec": 12.097341263384276,
+      "stopped_on_eos": false
+    },
+    "owned_gdn": {
+      "generated_ids": [
+        11751,
+        13,
+        271,
+        248068,
+        198,
+        8160,
+        579,
+        264,
+        7047,
+        1817,
+        25,
+        271,
+        16,
+        13,
+        220,
+        2972,
+        2014,
+        53983,
+        2570,
+        5396
+      ],
+      "n_generated_tokens": 20,
+      "prefill_ms": 395.8247147966176,
+      "decode_ms": {
+        "median": 79.58647550549358,
+        "mean": 79.59115974372253,
+        "min": 79.55977087840438,
+        "max": 79.66173999011517
+      },
+      "ms_per_tok": 79.59115974372253,
+      "tok_per_sec": 12.564209432554115,
+      "stopped_on_eos": false
+    },
+    "owned_mode": "owned_gdn_inplace",
+    "decay_mode": "native_softplus",
+    "generated_ids_match": false,
+    "note": "Full decode loop timing includes token readback and buffer updates, using same-session manual and temporary owned traces."
+  }
+}

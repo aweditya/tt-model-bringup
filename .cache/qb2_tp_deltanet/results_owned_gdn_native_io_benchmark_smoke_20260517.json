@@ -1,0 +1,214 @@
+{
+  "candidate": "deltanet_owned_gdn_recurrence",
+  "benchmark": "multi_prompt_guarded_trace_decode",
+  "num_prompts": 1,
+  "iters": 2,
+  "warmup": 1,
+  "max_tokens": 4,
+  "all_prompts_passed": true,
+  "per_prompt_summary": [
+    {
+      "prompt": "The capital of France is",
+      "accepted": true,
+      "argmax_match": true,
+      "generated_ids_match": true,
+      "manual_execute_trace_median_ms": 82.23382697906345,
+      "owned_execute_trace_median_ms": 80.2734064636752,
+      "manual_update_plus_execute_median_ms": 83.01720395684242,
+      "owned_update_plus_execute_median_ms": 81.08937297947705,
+      "manual_decode_ms_per_tok": 82.97961205244064,
+      "owned_decode_ms_per_tok": 81.02066878927872,
+      "n_generated_tokens_manual": 4,
+      "n_generated_tokens_owned": 4,
+      "error": null
+    }
+  ],
+  "aggregate": {
+    "manual_execute_trace_median_ms": {
+      "count": 1,
+      "min": 82.23382697906345,
+      "max": 82.23382697906345,
+      "mean": 82.23382697906345,
+      "median": 82.23382697906345
+    },
+    "owned_execute_trace_median_ms": {
+      "count": 1,
+      "min": 80.2734064636752,
+      "max": 80.2734064636752,
+      "mean": 80.2734064636752,
+      "median": 80.2734064636752
+    },
+    "execute_trace_delta_ms_manual_minus_owned": {
+      "count": 1,
+      "min": 1.9604205153882504,
+      "max": 1.9604205153882504,
+      "mean": 1.9604205153882504,
+      "median": 1.9604205153882504
+    },
+    "execute_trace_delta_pct_manual_minus_owned": {
+      "count": 1,
+      "min": 2.383958752019858,
+      "max": 2.383958752019858,
+      "mean": 2.383958752019858,
+      "median": 2.383958752019858
+    },
+    "manual_update_plus_execute_median_ms": {
+      "count": 1,
+      "min": 83.01720395684242,
+      "max": 83.01720395684242,
+      "mean": 83.01720395684242,
+      "median": 83.01720395684242
+    },
+    "owned_update_plus_execute_median_ms": {
+      "count": 1,
+      "min": 81.08937297947705,
+      "max": 81.08937297947705,
+      "mean": 81.08937297947705,
+      "median": 81.08937297947705
+    },
+    "manual_decode_ms_per_tok": {
+      "count": 1,
+      "min": 82.97961205244064,
+      "max": 82.97961205244064,
+      "mean": 82.97961205244064,
+      "median": 82.97961205244064
+    },
+    "owned_decode_ms_per_tok": {
+      "count": 1,
+      "min": 81.02066878927872,
+      "max": 81.02066878927872,
+      "mean": 81.02066878927872,
+      "median": 81.02066878927872
+    },
+    "decode_delta_ms_per_tok_manual_minus_owned": {
+      "count": 1,
+      "min": 1.9589432631619275,
+      "max": 1.9589432631619275,
+      "mean": 1.9589432631619275,
+      "median": 1.9589432631619275
+    },
+    "decode_delta_pct_manual_minus_owned": {
+      "count": 1,
+      "min": 2.3607524965577493,
+      "max": 2.3607524965577493,
+      "mean": 2.3607524965577493,
+      "median": 2.3607524965577493
+    }
+  },
+  "prompt_results": [
+    {
+      "candidate": "deltanet_owned_gdn_recurrence",
+      "prompt": "The capital of France is",
+      "prompt_ids": [
+        760,
+        6511,
+        314,
+        9338,
+        369
+      ],
+      "token_id": 760,
+      "compatibility": {
+        "accepted": true,
+        "baseline_argmax_id": 2614,
+        "owned_argmax_id": 2614,
+        "argmax_match": true,
+        "mode": "owned_gdn"
+      },
+      "trace_bench": {
+        "iters": 2,
+        "warmup": 1,
+        "capture_ms": 1332.2980040684342,
+        "summary_ms": {
+          "manual_execute_trace": {
+            "median": 82.23382697906345,
+            "mean": 82.23382697906345,
+            "min": 82.22335600294173,
+            "max": 82.24429795518517
+          },
+          "owned_execute_trace": {
+            "median": 80.2734064636752,
+            "mean": 80.2734064636752,
+            "min": 80.26303700171411,
+            "max": 80.28377592563629
+          },
+          "manual_update_plus_execute": {
+            "median": 83.01720395684242,
+            "mean": 83.01720395684242,
+            "min": 82.99034903757274,
+            "max": 83.0440588761121
+          },
+          "owned_update_plus_execute": {
+            "median": 81.08937297947705,
+            "mean": 81.08937297947705,
+            "min": 81.07436797581613,
+            "max": 81.10437798313797
+          }
+        },
+        "samples_ms": {
+          "manual_execute_trace": [
+            82.22335600294173,
+            82.24429795518517
+          ],
+          "owned_execute_trace": [
+            80.28377592563629,
+            80.26303700171411
+          ],
+          "manual_update_plus_execute": [
+            83.0440588761121,
+            82.99034903757274
+          ],
+          "owned_update_plus_execute": [
+            81.07436797581613,
+            81.10437798313797
+          ]
+        },
+        "traced_argmax_id_sample": 314,
+        "note": "Same-session temporary trace timing; still gated by decode correctness below."
+      },
+      "decode_bench": {
+        "max_tokens": 4,
+        "manual": {
+          "generated_ids": [
+            11751,
+            13,
+            271,
+            248068
+          ],
+          "n_generated_tokens": 4,
+          "prefill_ms": 411.34236194193363,
+          "decode_ms": {
+            "median": 82.9498590901494,
+            "mean": 82.97961205244064,
+            "min": 82.88010093383491,
+            "max": 83.13862909562886
+          },
+          "ms_per_tok": 82.97961205244064,
+          "tok_per_sec": 12.05115299126766,
+          "stopped_on_eos": false
+        },
+        "owned_gdn": {
+          "generated_ids": [
+            11751,
+            13,
+            271,
+            248068
+          ],
+          "n_generated_tokens": 4,
+          "prefill_ms": 401.73972584307194,
+          "decode_ms": {
+            "median": 81.0428139520809,
+            "mean": 81.02066878927872,
+            "min": 80.92392911203206,
+            "max": 81.073118140921
+          },
+          "ms_per_tok": 81.02066878927872,
+          "tok_per_sec": 12.342529566138657,
+          "stopped_on_eos": false
+        },
+        "generated_ids_match": true,
+        "note": "Full decode loop timing includes token readback and buffer updates, using same-session manual and temporary owned traces."
+      }
+    }
+  ],
+  "note": "Each prompt reuses the guarded single-prompt manual-vs-owned flow. Timing claims are valid only for prompts whose argmax and generated token streams match."
+}

@@ -1,0 +1,42 @@
+{
+  "candidate": "deltanet_recurrence_matmul_form",
+  "shape": {
+    "state": [12, 128, 128],
+    "q": [12, 128],
+    "k": [12, 128],
+    "value": [12, 128]
+  },
+  "compatibility": {
+    "accepted": true,
+    "error": null
+  },
+  "timing": {
+    "iters": 20,
+    "warmup": 3,
+    "manual_ms": {
+      "median": 1.2938075233250856,
+      "mean": 1.2668986106291413,
+      "min": 1.1703679338097572,
+      "max": 1.2989169918000698
+    },
+    "matmul_ms": {
+      "median": 1.2022379087284207,
+      "mean": 1.216444035526365,
+      "min": 1.172799151390791,
+      "max": 1.2833969667553902
+    },
+    "note": "Synthetic recurrence body only; not trace or full-decode timing."
+  },
+  "correctness": {
+    "state_vs_manual": {
+      "pcc": 0.9999994018163837,
+      "max_abs_diff": 0.00015055760741233826
+    },
+    "out_vs_manual": {
+      "pcc": 0.9998950430336081,
+      "max_abs_diff": 0.0008323937654495239
+    },
+    "pass_gate": false
+  },
+  "conclusion": "Do not promote. The shape is accepted and synthetic timing is slightly lower, but the output PCC missed the strict 0.9999 gate."
+}

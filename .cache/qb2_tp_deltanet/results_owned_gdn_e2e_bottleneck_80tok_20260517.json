@@ -1,0 +1,371 @@
+{
+  "candidate": "deltanet_owned_gdn_recurrence",
+  "benchmark": "multi_prompt_guarded_trace_decode",
+  "num_prompts": 1,
+  "iters": 2,
+  "warmup": 1,
+  "max_tokens": 80,
+  "all_prompts_passed": false,
+  "per_prompt_summary": [
+    {
+      "prompt": "The main bottleneck in batch-one language model decode is",
+      "accepted": false,
+      "argmax_match": true,
+      "generated_ids_match": false,
+      "manual_execute_trace_median_ms": 82.25306507665664,
+      "owned_execute_trace_median_ms": 80.2843444980681,
+      "manual_update_plus_execute_median_ms": 82.93996355496347,
+      "owned_update_plus_execute_median_ms": 81.06055250391364,
+      "manual_decode_ms_per_tok": 82.82562413078267,
+      "owned_decode_ms_per_tok": 80.88255902403034,
+      "n_generated_tokens_manual": 80,
+      "n_generated_tokens_owned": 80,
+      "error": null
+    }
+  ],
+  "aggregate": {
+    "manual_execute_trace_median_ms": {
+      "count": 1,
+      "min": 82.25306507665664,
+      "max": 82.25306507665664,
+      "mean": 82.25306507665664,
+      "median": 82.25306507665664
+    },
+    "owned_execute_trace_median_ms": {
+      "count": 1,
+      "min": 80.2843444980681,
+      "max": 80.2843444980681,
+      "mean": 80.2843444980681,
+      "median": 80.2843444980681
+    },
+    "execute_trace_delta_ms_manual_minus_owned": {
+      "count": 1,
+      "min": 1.9687205785885453,
+      "max": 1.9687205785885453,
+      "mean": 1.9687205785885453,
+      "median": 1.9687205785885453
+    },
+    "execute_trace_delta_pct_manual_minus_owned": {
+      "count": 1,
+      "min": 2.393492056197267,
+      "max": 2.393492056197267,
+      "mean": 2.393492056197267,
+      "median": 2.393492056197267
+    },
+    "manual_update_plus_execute_median_ms": {
+      "count": 1,
+      "min": 82.93996355496347,
+      "max": 82.93996355496347,
+      "mean": 82.93996355496347,
+      "median": 82.93996355496347
+    },
+    "owned_update_plus_execute_median_ms": {
+      "count": 1,
+      "min": 81.06055250391364,
+      "max": 81.06055250391364,
+      "mean": 81.06055250391364,
+      "median": 81.06055250391364
+    },
+    "manual_decode_ms_per_tok": {
+      "count": 1,
+      "min": 82.82562413078267,
+      "max": 82.82562413078267,
+      "mean": 82.82562413078267,
+      "median": 82.82562413078267
+    },
+    "owned_decode_ms_per_tok": {
+      "count": 1,
+      "min": 80.88255902403034,
+      "max": 80.88255902403034,
+      "mean": 80.88255902403034,
+      "median": 80.88255902403034
+    },
+    "decode_delta_ms_per_tok_manual_minus_owned": {
+      "count": 1,
+      "min": 1.9430651067523286,
+      "max": 1.9430651067523286,
+      "mean": 1.9430651067523286,
+      "median": 1.9430651067523286
+    },
+    "decode_delta_pct_manual_minus_owned": {
+      "count": 1,
+      "min": 2.3459709807730578,
+      "max": 2.3459709807730578,
+      "mean": 2.3459709807730578,
+      "median": 2.3459709807730578
+    }
+  },
+  "prompt_results": [
+    {
+      "candidate": "deltanet_owned_gdn_recurrence",
+      "prompt": "The main bottleneck in batch-one language model decode is",
+      "prompt_ids": [
+        760,
+        1822,
+        84810,
+        303,
+        6937,
+        18030,
+        3992,
+        1558,
+        16401,
+        369
+      ],
+      "token_id": 760,
+      "compatibility": {
+        "accepted": true,
+        "baseline_argmax_id": 2614,
+        "owned_argmax_id": 2614,
+        "argmax_match": true,
+        "mode": "owned_gdn"
+      },
+      "trace_bench": {
+        "iters": 2,
+        "warmup": 1,
+        "capture_ms": 1272.490049013868,
+        "summary_ms": {
+          "manual_execute_trace": {
+            "median": 82.25306507665664,
+            "mean": 82.25306507665664,
+            "min": 82.23907509818673,
+            "max": 82.26705505512655
+          },
+          "owned_execute_trace": {
+            "median": 80.2843444980681,
+            "mean": 80.2843444980681,
+            "min": 80.2841349504888,
+            "max": 80.28455404564738
+          },
+          "manual_update_plus_execute": {
+            "median": 82.93996355496347,
+            "mean": 82.93996355496347,
+            "min": 82.93226803652942,
+            "max": 82.94765907339752
+          },
+          "owned_update_plus_execute": {
+            "median": 81.06055250391364,
+            "mean": 81.06055250391364,
+            "min": 81.00128802470863,
+            "max": 81.11981698311865
+          }
+        },
+        "samples_ms": {
+          "manual_execute_trace": [
+            82.23907509818673,
+            82.26705505512655
+          ],
+          "owned_execute_trace": [
+            80.2841349504888,
+            80.28455404564738
+          ],
+          "manual_update_plus_execute": [
+            82.94765907339752,
+            82.93226803652942
+          ],
+          "owned_update_plus_execute": [
+            81.00128802470863,
+            81.11981698311865
+          ]
+        },
+        "traced_argmax_id_sample": 84810,
+        "note": "Same-session temporary trace timing; still gated by decode correctness below."
+      },
+      "decode_bench": {
+        "max_tokens": 80,
+        "manual": {
+          "generated_ids": [
+            279,
+            6326,
+            33303,
+            13,
+            733,
+            411,
+            1675,
+            11,
+            567,
+            668,
+            12804,
+            1204,
+            310,
+            28476,
+            279,
+            6326,
+            33303,
+            364,
+            6937,
+            18030,
+            3992,
+            1558,
+            16401,
+            13,
+            271,
+            550,
+            59930,
+            1158,
+            12935,
+            271,
+            760,
+            6326,
+            33303,
+            369,
+            279,
+            1822,
+            84810,
+            303,
+            6937,
+            18030,
+            3992,
+            1558,
+            16401,
+            13,
+            561,
+            6326,
+            33303,
+            369,
+            4364,
+            430,
+            25,
+            271,
+            13682,
+            198,
+            59,
+            1272,
+            90,
+            66983,
+            24734,
+            48,
+            11,
+            710,
+            11,
+            629,
+            8,
+            283,
+            1088,
+            1272,
+            90,
+            74849,
+            10713,
+            2282,
+            11189,
+            35790,
+            90,
+            48,
+            42,
+            61,
+            51,
+            14728
+          ],
+          "n_generated_tokens": 80,
+          "prefill_ms": 821.6740500647575,
+          "decode_ms": {
+            "median": 82.81869953498244,
+            "mean": 82.82562413078267,
+            "min": 82.73383090272546,
+            "max": 82.94736803509295
+          },
+          "ms_per_tok": 82.82562413078267,
+          "tok_per_sec": 12.073558279753954,
+          "stopped_on_eos": false
+        },
+        "owned_gdn": {
+          "generated_ids": [
+            279,
+            6326,
+            33303,
+            13,
+            733,
+            411,
+            1675,
+            11,
+            567,
+            668,
+            12804,
+            1204,
+            310,
+            28476,
+            279,
+            6326,
+            33303,
+            364,
+            6937,
+            18030,
+            3992,
+            1558,
+            16401,
+            13,
+            271,
+            550,
+            59930,
+            1158,
+            12935,
+            271,
+            760,
+            6326,
+            33303,
+            369,
+            279,
+            1822,
+            84810,
+            303,
+            6937,
+            18030,
+            3992,
+            1558,
+            16401,
+            13,
+            561,
+            6326,
+            33303,
+            369,
+            4364,
+            430,
+            25,
+            271,
+            13682,
+            198,
+            59,
+            1272,
+            90,
+            66983,
+            24734,
+            48,
+            11,
+            710,
+            11,
+            629,
+            8,
+            283,
+            1088,
+            1272,
+            90,
+            74849,
+            92,
+            11189,
+            35790,
+            90,
+            48,
+            42,
+            61,
+            51,
+            14728,
+            59
+          ],
+          "n_generated_tokens": 80,
+          "prefill_ms": 802.5184669531882,
+          "decode_ms": {
+            "median": 80.88515291456133,
+            "mean": 80.88255902403034,
+            "min": 80.79322008416057,
+            "max": 81.02172706276178
+          },
+          "ms_per_tok": 80.88255902403034,
+          "tok_per_sec": 12.363604861993775,
+          "stopped_on_eos": false
+        },
+        "generated_ids_match": false,
+        "note": "Full decode loop timing includes token readback and buffer updates, using same-session manual and temporary owned traces."
+      }
+    }
+  ],
+  "note": "Each prompt reuses the guarded single-prompt manual-vs-owned flow. Timing claims are valid only for prompts whose argmax and generated token streams match."
+}

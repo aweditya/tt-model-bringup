@@ -80,6 +80,172 @@ def cmd_probe_explicit_all_reduce_tp(args):
     print(json.dumps(data, indent=2, default=str))
 
 
+def cmd_probe_rope_fused_qk_tp(args):
+    data = _send("probe_rope_fused_qk_tp", {
+        "positions": args.positions,
+        "allow_wedge_prone_fused_qk": args.allow_wedge_prone_fused_qk,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_rope_native_partial_tp(args):
+    data = _send("probe_rope_native_partial_tp", {
+        "positions": args.positions,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_rope_native_partial_trace_tp(args):
+    data = _send("probe_rope_native_partial_trace_tp", {
+        "prompt": args.prompt,
+        "iters": args.iters,
+        "warmup": args.warmup,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_profile_decode_tp_ops(args):
+    data = _send("profile_decode_tp_ops", {
+        "prompt": args.prompt,
+        "timed": args.timed,
+        "include_records": args.include_records,
+        "deltanet_decay_mode": args.deltanet_decay_mode,
+        "deltanet_recurrence_mode": args.deltanet_recurrence_mode,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_deltanet_recurrence_matmul_tp(args):
+    data = _send("probe_deltanet_recurrence_matmul_tp", {
+        "iters": args.iters,
+        "warmup": args.warmup,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_deltanet_native_gdn_real_tensors_tp(args):
+    data = _send("probe_deltanet_native_gdn_real_tensors_tp", {
+        "prompt": args.prompt,
+        "layer_idx": args.layer_idx,
+        "mode": args.mode,
+        "reset_state": not args.no_reset_state,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_deltanet_owned_gdn_real_tensors_tp(args):
+    data = _send("probe_deltanet_owned_gdn_real_tensors_tp", {
+        "prompt": args.prompt,
+        "layer_idx": args.layer_idx,
+        "reset_state": not args.no_reset_state,
+        "use_pretransposed_k": args.use_pretransposed_k,
+        "compact_vectors": args.compact_vectors,
+        "native_io": args.native_io,
+        "stepwise": args.stepwise,
+        "seed_state": args.seed_state,
+        "direct_state_input": args.direct_state_input,
+        "component_debug_modes": args.component_debug_mode,
+    })
+    if args.output_json:
+        from pathlib import Path
+        path = Path(args.output_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, default=str) + "\n")
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_deltanet_owned_gdn_trace_tp(args):
+    data = _send("probe_deltanet_owned_gdn_trace_tp", {
+        "prompt": args.prompt,
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "max_tokens": args.max_tokens,
+        "deltanet_decay_mode": args.deltanet_decay_mode,
+        "deltanet_recurrence_mode": args.deltanet_recurrence_mode,
+    })
+    if args.output_json:
+        from pathlib import Path
+        path = Path(args.output_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, default=str) + "\n")
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_deltanet_owned_gdn_benchmark_tp(args):
+    data = _send("probe_deltanet_owned_gdn_benchmark_tp", {
+        "prompts": args.prompt,
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "max_tokens": args.max_tokens,
+        "deltanet_decay_mode": args.deltanet_decay_mode,
+        "deltanet_recurrence_mode": args.deltanet_recurrence_mode,
+    })
+    if args.output_json:
+        from pathlib import Path
+        path = Path(args.output_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, default=str) + "\n")
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_deltanet_owned_gdn_divergence_tp(args):
+    data = _send("probe_deltanet_owned_gdn_divergence_tp", {
+        "prompt": args.prompt,
+        "max_tokens": args.max_tokens,
+        "top_k": args.top_k,
+    })
+    if args.output_json:
+        from pathlib import Path
+        path = Path(args.output_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, default=str) + "\n")
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_deltanet_owned_gdn_teacher_forced_tp(args):
+    data = _send("probe_deltanet_owned_gdn_teacher_forced_tp", {
+        "prompt": args.prompt,
+        "max_tokens": args.max_tokens,
+        "top_k": args.top_k,
+        "state_layers": args.state_layer,
+    })
+    if args.output_json:
+        from pathlib import Path
+        path = Path(args.output_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, default=str) + "\n")
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_deltanet_native_gdn_synthetic_mesh_tp(args):
+    data = _send("probe_deltanet_native_gdn_synthetic_mesh_tp", {
+        "slots": args.slots,
+        "key_dim": args.key_dim,
+        "value_dim": args.value_dim,
+        "seed": args.seed,
+        "scale": args.scale,
+        "distribution": args.distribution,
+        "iters": args.iters,
+        "warmup": args.warmup,
+    })
+    if args.output_json:
+        from pathlib import Path
+        path = Path(args.output_json)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, default=str) + "\n")
+    print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_deltanet_softplus_decay_tp(args):
+    data = _send("probe_deltanet_softplus_decay_tp", {
+        "prompt": args.prompt,
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "max_tokens": args.max_tokens,
+    })
+    print(json.dumps(data, indent=2, default=str))
+
+
 def cmd_generate_tp(args):
     """Streaming generate_tp — same chunk/result protocol as client.cmd_generate."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -153,6 +319,129 @@ def main():
     ar.add_argument("--iters", type=int, default=10)
     ar.add_argument("--warmup", type=int, default=2)
     ar.set_defaults(fn=cmd_probe_explicit_all_reduce_tp)
+    rope = sub.add_parser("probe_rope_fused_qk_tp",
+                          help="validate fused Q/K RoPE semantics on production shapes")
+    rope.add_argument("--positions", type=int, nargs="+",
+                      default=[0, 1, 7, 31, 32, 127, 255])
+    rope.add_argument("--allow-wedge-prone-fused-qk", action="store_true",
+                      help="actually run fused QK RoPE path that previously wedged qb2")
+    rope.set_defaults(fn=cmd_probe_rope_fused_qk_tp)
+    rope_native = sub.add_parser("probe_rope_native_partial_tp",
+                                 help="validate native slice-first partial RoPE semantics")
+    rope_native.add_argument("--positions", type=int, nargs="+",
+                             default=[0, 1, 7, 31, 32, 127, 255])
+    rope_native.set_defaults(fn=cmd_probe_rope_native_partial_tp)
+    rope_native_trace = sub.add_parser("probe_rope_native_partial_trace_tp",
+                                       help="bench guarded native partial RoPE trace variant")
+    rope_native_trace.add_argument("--prompt", default="The capital of France is")
+    rope_native_trace.add_argument("--iters", type=int, default=10)
+    rope_native_trace.add_argument("--warmup", type=int, default=2)
+    rope_native_trace.set_defaults(fn=cmd_probe_rope_native_partial_trace_tp)
+    prof = sub.add_parser("profile_decode_tp_ops",
+                          help="resident-server op-count/timing profile of decode trace body")
+    prof.add_argument("--prompt", default="The capital of France is")
+    prof.add_argument("--timed", action="store_true",
+                      help="sync-bound every profiled op; slower but includes category timing")
+    prof.add_argument("--include-records", action="store_true")
+    prof.add_argument("--deltanet-decay-mode", choices=["manual", "native_softplus"],
+                      default="manual")
+    prof.add_argument("--deltanet-recurrence-mode", choices=["manual", "owned_gdn", "owned_gdn_inplace"],
+                      default="manual")
+    prof.set_defaults(fn=cmd_profile_decode_tp_ops)
+    dn = sub.add_parser("probe_deltanet_recurrence_matmul_tp",
+                        help="validate matmul-form DeltaNet recurrence body")
+    dn.add_argument("--iters", type=int, default=20)
+    dn.add_argument("--warmup", type=int, default=3)
+    dn.set_defaults(fn=cmd_probe_deltanet_recurrence_matmul_tp)
+    dn_gdn_mesh = sub.add_parser("probe_deltanet_native_gdn_synthetic_mesh_tp",
+                                 help="validate native Qwen36 GDN op on synthetic resident mesh tensors")
+    dn_gdn_mesh.add_argument("--slots", type=int, default=12)
+    dn_gdn_mesh.add_argument("--key-dim", type=int, default=128)
+    dn_gdn_mesh.add_argument("--value-dim", type=int, default=128)
+    dn_gdn_mesh.add_argument("--seed", type=int, default=20260515)
+    dn_gdn_mesh.add_argument("--scale", type=float, default=0.03125)
+    dn_gdn_mesh.add_argument("--distribution", choices=["replicated", "sharded_dim0"],
+                             default="replicated")
+    dn_gdn_mesh.add_argument("--iters", type=int, default=0)
+    dn_gdn_mesh.add_argument("--warmup", type=int, default=0)
+    dn_gdn_mesh.add_argument("--output-json")
+    dn_gdn_mesh.set_defaults(fn=cmd_probe_deltanet_native_gdn_synthetic_mesh_tp)
+    dn_gdn = sub.add_parser("probe_deltanet_native_gdn_real_tensors_tp",
+                            help="validate native Qwen36 GDN op on real resident DeltaNet tensors")
+    dn_gdn.add_argument("--prompt", default="The capital of France is")
+    dn_gdn.add_argument("--layer-idx", type=int, default=0)
+    dn_gdn.add_argument("--mode", choices=["fp32_cast", "current_dtype"], default="fp32_cast")
+    dn_gdn.add_argument("--no-reset-state", action="store_true")
+    dn_gdn.set_defaults(fn=cmd_probe_deltanet_native_gdn_real_tensors_tp)
+    dn_gdn_owned = sub.add_parser("probe_deltanet_owned_gdn_real_tensors_tp",
+                                  help="validate owned Qwen36 GDN op on real resident DeltaNet tensors")
+    dn_gdn_owned.add_argument("--prompt", default="The capital of France is")
+    dn_gdn_owned.add_argument("--layer-idx", type=int, default=0)
+    dn_gdn_owned.add_argument("--use-pretransposed-k", action="store_true")
+    dn_gdn_owned.add_argument("--compact-vectors", action="store_true")
+    dn_gdn_owned.add_argument("--native-io", action="store_true")
+    dn_gdn_owned.add_argument("--stepwise", action="store_true")
+    dn_gdn_owned.add_argument("--seed-state", choices=["resident", "manual_once"],
+                              default="resident")
+    dn_gdn_owned.add_argument("--direct-state-input", action="store_true",
+                              help="pass H_input directly to owned op; only safe with --seed-state manual_once")
+    dn_gdn_owned.add_argument("--component-debug-mode", type=int, action="append",
+                              help="optional qwen36_gdn_prediction debug mode to run inside stepwise probe; may repeat")
+    dn_gdn_owned.add_argument("--no-reset-state", action="store_true")
+    dn_gdn_owned.add_argument("--output-json")
+    dn_gdn_owned.set_defaults(fn=cmd_probe_deltanet_owned_gdn_real_tensors_tp)
+    dn_gdn_owned_trace = sub.add_parser("probe_deltanet_owned_gdn_trace_tp",
+                                        help="validate and bench guarded owned GDN recurrence trace")
+    dn_gdn_owned_trace.add_argument("--prompt", default="The capital of France is")
+    dn_gdn_owned_trace.add_argument("--iters", type=int, default=10)
+    dn_gdn_owned_trace.add_argument("--warmup", type=int, default=2)
+    dn_gdn_owned_trace.add_argument("--max-tokens", type=int, default=20)
+    dn_gdn_owned_trace.add_argument("--deltanet-recurrence-mode",
+                                    choices=["owned_gdn", "owned_gdn_inplace"],
+                                    default="owned_gdn")
+    dn_gdn_owned_trace.add_argument("--deltanet-decay-mode",
+                                    choices=["manual", "native_softplus"],
+                                    default="manual")
+    dn_gdn_owned_trace.add_argument("--output-json")
+    dn_gdn_owned_trace.set_defaults(fn=cmd_probe_deltanet_owned_gdn_trace_tp)
+    dn_gdn_owned_bench = sub.add_parser("probe_deltanet_owned_gdn_benchmark_tp",
+                                        help="run guarded owned GDN recurrence trace benchmark over a prompt set")
+    dn_gdn_owned_bench.add_argument("--prompt", action="append",
+                                    help="prompt to include; may be repeated; server defaults are used if omitted")
+    dn_gdn_owned_bench.add_argument("--iters", type=int, default=6)
+    dn_gdn_owned_bench.add_argument("--warmup", type=int, default=2)
+    dn_gdn_owned_bench.add_argument("--max-tokens", type=int, default=64)
+    dn_gdn_owned_bench.add_argument("--deltanet-recurrence-mode",
+                                    choices=["owned_gdn", "owned_gdn_inplace"],
+                                    default="owned_gdn")
+    dn_gdn_owned_bench.add_argument("--deltanet-decay-mode",
+                                    choices=["manual", "native_softplus"],
+                                    default="manual")
+    dn_gdn_owned_bench.add_argument("--output-json")
+    dn_gdn_owned_bench.set_defaults(fn=cmd_probe_deltanet_owned_gdn_benchmark_tp)
+    dn_gdn_owned_div = sub.add_parser("probe_deltanet_owned_gdn_divergence_tp",
+                                      help="diagnose owned GDN decode divergence with eager top-k logits")
+    dn_gdn_owned_div.add_argument("--prompt", default="In Python, a simple function to add two numbers is")
+    dn_gdn_owned_div.add_argument("--max-tokens", type=int, default=24)
+    dn_gdn_owned_div.add_argument("--top-k", type=int, default=8)
+    dn_gdn_owned_div.add_argument("--output-json")
+    dn_gdn_owned_div.set_defaults(fn=cmd_probe_deltanet_owned_gdn_divergence_tp)
+    dn_gdn_owned_tf = sub.add_parser("probe_deltanet_owned_gdn_teacher_forced_tp",
+                                     help="compare manual vs owned GDN under the same teacher-forced token stream")
+    dn_gdn_owned_tf.add_argument("--prompt", default="In Python, a simple function to add two numbers is")
+    dn_gdn_owned_tf.add_argument("--max-tokens", type=int, default=24)
+    dn_gdn_owned_tf.add_argument("--top-k", type=int, default=8)
+    dn_gdn_owned_tf.add_argument("--state-layer", type=int, action="append",
+                                 help="linear-attention layer index to compare; may be repeated")
+    dn_gdn_owned_tf.add_argument("--output-json")
+    dn_gdn_owned_tf.set_defaults(fn=cmd_probe_deltanet_owned_gdn_teacher_forced_tp)
+    dn_sp = sub.add_parser("probe_deltanet_softplus_decay_tp",
+                           help="validate native softplus in DeltaNet decay/gate")
+    dn_sp.add_argument("--prompt", default="The capital of France is")
+    dn_sp.add_argument("--iters", type=int, default=10)
+    dn_sp.add_argument("--warmup", type=int, default=2)
+    dn_sp.add_argument("--max-tokens", type=int, default=20)
+    dn_sp.set_defaults(fn=cmd_probe_deltanet_softplus_decay_tp)
     g = sub.add_parser("generate_tp", help="multi-chip generate (streams)")
     g.add_argument("--prompt", required=True)
     g.add_argument("--max-tokens", type=int, default=60)

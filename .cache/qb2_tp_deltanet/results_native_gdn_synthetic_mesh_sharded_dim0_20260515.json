@@ -1,0 +1,72 @@
+{
+  "candidate": "qwen36_gdn_decode_synthetic_mesh",
+  "distribution": "sharded_dim0",
+  "seed": 20260515,
+  "scale": 0.03125,
+  "symbols": {
+    "qwen36_gdn_prepare_decode": true,
+    "qwen36_gdn_decode": true
+  },
+  "shape": {
+    "state": [
+      1,
+      12,
+      128,
+      128
+    ],
+    "qkv": [
+      1,
+      12,
+      1,
+      128
+    ],
+    "alpha_beta": [
+      1,
+      12,
+      1,
+      1
+    ]
+  },
+  "correctness": {
+    "state_vs_manual": {
+      "pcc": 0.9927821563373678,
+      "max_abs_diff": 0.053370650857686996
+    },
+    "output_vs_manual": {
+      "pcc": 0.9917728381167387,
+      "max_abs_diff": 0.0067208558320999146
+    },
+    "pass_gate": false,
+    "host_shapes": {
+      "state_manual": [
+        4,
+        12,
+        128,
+        128
+      ],
+      "state_native": [
+        4,
+        12,
+        128,
+        128
+      ],
+      "output_manual": [
+        4,
+        12,
+        1,
+        128
+      ],
+      "output_native": [
+        4,
+        12,
+        1,
+        128
+      ]
+    }
+  },
+  "timing": {
+    "iters": 0,
+    "warmup": 0,
+    "note": "Synthetic resident-mesh correctness control only. Timing is disabled here because qwen36_gdn_decode mutates state and a naive repeated loop can fragment or exhaust resident L1."
+  }
+}

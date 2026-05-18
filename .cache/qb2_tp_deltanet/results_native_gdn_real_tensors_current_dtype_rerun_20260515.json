@@ -1,0 +1,36 @@
+{
+  "candidate": "qwen36_gdn_decode_real_tensors",
+  "mode": "current_dtype",
+  "prompt": "The capital of France is",
+  "token_id": 760,
+  "layer_idx": 0,
+  "reset_state": true,
+  "symbols": {
+    "qwen36_gdn_prepare_decode": true,
+    "qwen36_gdn_decode": true
+  },
+  "shape": {
+    "state": [
+      1,
+      12,
+      128,
+      128
+    ],
+    "qkv": [
+      1,
+      12,
+      1,
+      128
+    ],
+    "alpha_beta": [
+      1,
+      12,
+      1,
+      1
+    ]
+  },
+  "compatibility": {
+    "accepted": false,
+    "error": "RuntimeError: TT_FATAL @ /home/aditya/tenstorrent/tt-metal/ttnn/cpp/ttnn/operations/experimental/transformer/qwen36_gdn_decode/device/qwen36_gdn_decode_device_operation.cpp:35: tensor.dtype() == DataType::FLOAT32\ninfo:\nstate must be FLOAT32\nbacktrace:\n --- ttnn::experimental::prim::Qwen36GdnDecodeDeviceOperation::validate_on_program_cache_miss(ttnn::experimental::prim::Qwen36GdnDecodeParams const&, ttnn::experimental::prim::Qwen36GdnDecodeInputs const&)\n --- /home/aditya/tenstorrent/tt-metal/ttnn/ttnn/_ttnncpp.so(_ZN4ttnn16device_operation6detail29launch_operation_with_adapterINS0_26MeshDeviceOperationAdapterINS_12experimental4prim30Qwen36GdnDecodeDeviceOperationEEEEEvRKNT_22operation_attributes_tERKNS8_13tensor_args_tERNS8_21tensor_return_value_tEPN2tt8tt_metal11distributed10MeshDeviceE+0x130) [0x7f34dbdc17a0]\n --- ttnn::experimental::prim::Qwen36GdnDecodeDeviceOperation::tensor_return_value_t ttnn::device_operation::detail::launch<ttnn::experimental::prim::Qwen36GdnDecodeDeviceOperation>(ttnn::experimental::prim::Qwen36GdnDecodeDeviceOperation::operation_attributes_t const&, ttnn::experimental::prim::Qwen36GdnDecodeDeviceOperation::tensor_args_t const&)\n --- ttnn::prim::qwen36_gdn_decode(tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, std::optional<tt::tt_metal::Tensor> const&, std::optional<tt::tt_metal::Tensor> const&, bool, std::optional<tt::tt_metal::MemoryConfig> const&, std::optional<tt::tt_metal::Tensor> const&, std::optional<ttnn::ComputeKernelConfig>)\n --- ttnn::experimental::qwen36_gdn_decode(tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, tt::tt_metal::Tensor const&, std::optional<tt::tt_metal::Tensor> const&, std::optional<tt::tt_metal::Tensor> const&, bool, std::optional<tt::tt_metal::MemoryConfig> const&, std::optional<tt::tt_metal::Tensor> const&, std::optional<ttnn::ComputeKernelConfig>)\n --- /home/aditya/tenstorrent/tt-metal/ttnn/ttnn/_ttnn.so(+0x3e6dee) [0x7f34dcbaedee]\n --- /home/aditya/tenstorrent/tt-metal/ttnn/ttnn/_ttnn.so(+0x433c5c) [0x7f34dcbfbc5c]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyObject_FastCallDictTstate+0x16d) [0x55964df5fb0d]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyObject_Call_Prepend+0xc1) [0x55964df748b1]\n --- /home/aditya/tt-xla/.venv/bin/python(+0x29cde4) [0x55964e07bde4]\n --- /home/aditya/tt-xla/.venv/bin/python(PyObject_Call+0xbb) [0x55964df7832b]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyEval_EvalFrameDefault+0x286b) [0x55964df56d7b]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyFunction_Vectorcall+0x7c) [0x55964df6a68c]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyObject_FastCallDictTstate+0x16d) [0x55964df5fb0d]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyObject_Call_Prepend+0xc1) [0x55964df748b1]\n --- /home/aditya/tt-xla/.venv/bin/python(+0x29cde4) [0x55964e07bde4]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyObject_MakeTpCall+0x25b) [0x55964df6089b]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyEval_EvalFrameDefault+0x6a5b) [0x55964df5af6b]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyFunction_Vectorcall+0x7c) [0x55964df6a68c]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyEval_EvalFrameDefault+0x6c0) [0x55964df54bd0]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyFunction_Vectorcall+0x7c) [0x55964df6a68c]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyEval_EvalFrameDefault+0x6c0) [0x55964df54bd0]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyFunction_Vectorcall+0x7c) [0x55964df6a68c]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyEval_EvalFrameDefault+0x6c0) [0x55964df54bd0]\n --- /home/aditya/tt-xla/.venv/bin/python(+0x259d36) [0x55964e038d36]\n --- /home/aditya/tt-xla/.venv/bin/python(PyEval_EvalCode+0x86) [0x55964e038c06]\n --- /home/aditya/tt-xla/.venv/bin/python(+0x25f34d) [0x55964e03e34d]\n --- /home/aditya/tt-xla/.venv/bin/python(+0x18b8e9) [0x55964df6a8e9]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyEval_EvalFrameDefault+0x6c0) [0x55964df54bd0]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyFunction_Vectorcall+0x7c) [0x55964df6a68c]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyEval_EvalFrameDefault+0x6c0) [0x55964df54bd0]\n --- /home/aditya/tt-xla/.venv/bin/python(_PyFunction_Vectorcall+0x7c) [0x55964df6a68c]\n --- /home/aditya/tt-xla/.venv/bin/python(+0x274cad) [0x55964e053cad]\n --- /home/aditya/tt-xla/.venv/bin/python(Py_RunMain+0x128) [0x55964e052a68]\n --- /home/aditya/tt-xla/.venv/bin/python(Py_BytesMain+0x2d) [0x55964e02cc4d]\n --- /lib/x86_64-linux-gnu/libc.so.6(+0x29d90) [0x7f35e0631d90]\n --- /lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x80) [0x7f35e0631e40]\n --- /home/aditya/tt-xla/.venv/bin/python(_start+0x25) [0x55964e02cb45]\n"
+  }
+}

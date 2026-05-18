@@ -1,0 +1,16 @@
+{
+  "experiment": "probe_rope_fused_qk_tp",
+  "candidate": "rotary_embedding_llama_fused_qk",
+  "command": "ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp probe_rope_fused_qk_tp --positions 0 1 7 31 32 127 255'",
+  "result": {
+    "accepted": false,
+    "phase": "fused_qk_semantics_probe",
+    "reason": "timeout_or_wedge",
+    "details": "Resident-server probe reached the fused QK RoPE path and did not return after several minutes. Server log showed sharded tilize warnings but no handler exception. Client was killed; serve_tp.sh stop required SIGTERM; qb2 devices were reset with tt-smi -r 0,1,2,3."
+  },
+  "workflow_decision": "Invalidate rotary_embedding_llama_fused_qk as a production-path candidate for this qb2 mesh/layout until a smaller isolated probe proves it cannot wedge. Do not claim a speedup.",
+  "server_recovery": {
+    "action": "kill client; serve_tp.sh stop; tt-smi -r 0,1,2,3",
+    "note": "Server must be restarted after syncing the guard that disables this path by default."
+  }
+}

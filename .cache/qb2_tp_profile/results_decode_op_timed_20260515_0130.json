@@ -1,0 +1,58 @@
+{
+  "prompt": "The capital of France is",
+  "prompt_ids": [760, 6511, 314, 9338, 369],
+  "token_id": 760,
+  "timed": true,
+  "eager_forward_ms": 960.5727090965956,
+  "argmax_id": 2614,
+  "summary": {
+    "total_ops": 4268,
+    "total_profiled_ms": 672.0981195103377,
+    "per_op_ms_summary": {
+      "median": 0.12984906788915396,
+      "mean": 0.15747378620204727,
+      "max": 1.7365729436278343
+    },
+    "categories": [
+      {"category": "DeltaNet_recurrence", "count": 816, "sync_bounded_ms": 117.05302773043513, "pct_of_profiled_ms": 17.41606237727834},
+      {"category": "DeltaNet_decay_gate", "count": 480, "sync_bounded_ms": 73.95801553502679, "pct_of_profiled_ms": 11.004050359329895},
+      {"category": "DeltaNet_other", "count": 384, "sync_bounded_ms": 61.82244955562055, "pct_of_profiled_ms": 9.198426206081603},
+      {"category": "DeltaNet_qkv_repeat", "count": 336, "sync_bounded_ms": 44.593062018975616, "pct_of_profiled_ms": 6.634903554181083},
+      {"category": "matmul", "count": 321, "sync_bounded_ms": 77.58326246403158, "pct_of_profiled_ms": 11.543442871192001},
+      {"category": "attention_other", "count": 320, "sync_bounded_ms": 37.01202059164643, "pct_of_profiled_ms": 5.506937085110702},
+      {"category": "RoPE", "count": 320, "sync_bounded_ms": 44.84510887414217, "pct_of_profiled_ms": 6.672405051038444},
+      {"category": "RMSNorm", "count": 305, "sync_bounded_ms": 36.73656634055078, "pct_of_profiled_ms": 5.465952853329733},
+      {"category": "DeltaNet_conv", "count": 288, "sync_bounded_ms": 63.987228786572814, "pct_of_profiled_ms": 9.52051894345296},
+      {"category": "DeltaNet_output_gate", "count": 240, "sync_bounded_ms": 31.68532019481063, "pct_of_profiled_ms": 4.714389056451343},
+      {"category": "DeltaNet_state_update", "count": 144, "sync_bounded_ms": 13.021058402955532, "pct_of_profiled_ms": 1.9373746220926975},
+      {"category": "collectives", "count": 129, "sync_bounded_ms": 35.1971578784287, "pct_of_profiled_ms": 5.236907656291593},
+      {"category": "MLP_other", "count": 128, "sync_bounded_ms": 27.706254506483674, "pct_of_profiled_ms": 4.122352630099498},
+      {"category": "cache_update", "count": 32, "sync_bounded_ms": 3.6406656727194786, "pct_of_profiled_ms": 0.541686632804733},
+      {"category": "SDPA", "count": 16, "sync_bounded_ms": 2.15177983045578, "pct_of_profiled_ms": 0.32015858518150236},
+      {"category": "lm_head_or_io", "count": 5, "sync_bounded_ms": 0.8614640682935715, "pct_of_profiled_ms": 0.12817534274923992},
+      {"category": "other", "count": 4, "sync_bounded_ms": 0.24367705918848515, "pct_of_profiled_ms": 0.036256173334634226}
+    ],
+    "top_ops": [
+      {"op": "ttnn.reshape", "count": 1043, "sync_bounded_ms": 108.4201994817704, "pct_of_profiled_ms": 16.131602861909624},
+      {"op": "ttnn.slice", "count": 593, "sync_bounded_ms": 87.94571133330464, "pct_of_profiled_ms": 13.085248832027409},
+      {"op": "ttnn.mul", "count": 528, "sync_bounded_ms": 99.3438740260899, "pct_of_profiled_ms": 14.781156373189626},
+      {"op": "ttnn.linear", "count": 321, "sync_bounded_ms": 77.58326246403158, "pct_of_profiled_ms": 11.543442871192001},
+      {"op": "ttnn.rms_norm", "count": 305, "sync_bounded_ms": 36.73656634055078, "pct_of_profiled_ms": 5.465952853329733},
+      {"op": "ttnn.add", "count": 304, "sync_bounded_ms": 58.68161772377789, "pct_of_profiled_ms": 8.731108750390618},
+      {"op": "ttnn.sum", "count": 144, "sync_bounded_ms": 27.79984287917614, "pct_of_profiled_ms": 4.136277438096379},
+      {"op": "ttnn.exp", "count": 144, "sync_bounded_ms": 21.562296664342284, "pct_of_profiled_ms": 3.208206664832162},
+      {"op": "ttnn.all_reduce", "count": 128, "sync_bounded_ms": 34.47089483961463, "pct_of_profiled_ms": 5.128848577158446},
+      {"op": "ttnn.concat", "count": 112, "sync_bounded_ms": 23.808245547115803, "pct_of_profiled_ms": 3.5423764560539888},
+      {"op": "ttnn.silu", "count": 96, "sync_bounded_ms": 14.566638274118304, "pct_of_profiled_ms": 2.1673380494995196},
+      {"op": "ttnn.repeat", "count": 96, "sync_bounded_ms": 18.101628636941314, "pct_of_profiled_ms": 2.693301485522589},
+      {"op": "ttnn.copy", "count": 96, "sync_bounded_ms": 9.895599680021405, "pct_of_profiled_ms": 1.4723444974419688},
+      {"op": "ttnn.neg", "count": 80, "sync_bounded_ms": 11.995231499895453, "pct_of_profiled_ms": 1.7847440949001125},
+      {"op": "ttnn.sigmoid", "count": 64, "sync_bounded_ms": 9.73461545072496, "pct_of_profiled_ms": 1.4483920082706359}
+    ]
+  },
+  "limitations": [
+    "Resident-server eager profile of the production trace body, not true Tracy timing inside execute_trace.",
+    "timed=true sync-bounds each profiled op, so total_profiled_ms is not execute_trace replay time.",
+    "Use categories to choose candidates; require trace/full-decode timing before speedup claims."
+  ]
+}

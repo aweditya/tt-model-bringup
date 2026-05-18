@@ -1,0 +1,86 @@
+{
+  "config": {
+    "slots": 12,
+    "key_dim": 128,
+    "value_dim": 128,
+    "seed": 20260515,
+    "scale": 0.03125
+  },
+  "tile_summary": {
+    "tile": 32,
+    "key_tiles": 4,
+    "value_tiles": 4,
+    "work_blocks": 48,
+    "state_tiles_per_slot": 16,
+    "default_block": {
+      "state_tiles_read": 4,
+      "q_tiles_read": 4,
+      "k_tiles_read": 4,
+      "value_tiles_read": 1,
+      "state_tiles_written": 4,
+      "out_tiles_written": 1
+    }
+  },
+  "component_report_vs_loop_reference": {
+    "state_scaled": {
+      "shape": [
+        12,
+        128,
+        128
+      ],
+      "pcc": 1.0,
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "allclose_rtol_1e-5_atol_1e-6": true
+    },
+    "prediction": {
+      "shape": [
+        12,
+        128
+      ],
+      "pcc": 0.999999999999992,
+      "max_abs_diff": 5.587935447692871e-09,
+      "mean_abs_diff": 8.842168663925065e-10,
+      "allclose_rtol_1e-5_atol_1e-6": true
+    },
+    "delta": {
+      "shape": [
+        12,
+        128
+      ],
+      "pcc": 0.9999999999999988,
+      "max_abs_diff": 7.450580596923828e-09,
+      "mean_abs_diff": 5.305149097800665e-10,
+      "allclose_rtol_1e-5_atol_1e-6": true
+    },
+    "state_next": {
+      "shape": [
+        12,
+        128,
+        128
+      ],
+      "pcc": 1.0,
+      "max_abs_diff": 7.450580596923828e-09,
+      "mean_abs_diff": 1.3176492015543051e-11,
+      "allclose_rtol_1e-5_atol_1e-6": true
+    },
+    "out": {
+      "shape": [
+        12,
+        128
+      ],
+      "pcc": 0.9999999999999922,
+      "max_abs_diff": 6.05359673500061e-09,
+      "mean_abs_diff": 8.358425063192954e-10,
+      "allclose_rtol_1e-5_atol_1e-6": true
+    }
+  },
+  "output_norms": {
+    "state_scaled": 12.47930322038895,
+    "prediction": 0.37281746372223845,
+    "delta": 0.8089177839032884,
+    "state_next": 12.47554715008816,
+    "out": 0.37898916128342136
+  },
+  "fixture_npz": ".cache/qb2_tp_deltanet/gdn_cpu_oracle_fixture_20260515.npz"
+}

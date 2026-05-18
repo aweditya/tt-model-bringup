@@ -1,0 +1,87 @@
+{
+  "candidate": "deltanet_native_softplus_decay_gate",
+  "prompt": "The capital of France is",
+  "prompt_ids": [760, 6511, 314, 9338, 369],
+  "token_id": 760,
+  "tensor_gate": {
+    "softplus_vs_manual": {
+      "pcc": 0.9999966887762556,
+      "max_abs_diff": 0.00390625
+    },
+    "beta_vs_manual": {
+      "pcc": 0.9999999999996524,
+      "max_abs_diff": 0.0
+    },
+    "decay_vs_manual": {
+      "pcc": 0.9999961572547352,
+      "max_abs_diff": 0.00390625
+    },
+    "pass_gate": true,
+    "shape": {
+      "a": [1, 12],
+      "b": [1, 12],
+      "dt_bias": [12],
+      "A_log": [12]
+    }
+  },
+  "compatibility": {
+    "accepted": true,
+    "baseline_argmax_id": 2614,
+    "native_argmax_id": 2614,
+    "argmax_match": true,
+    "mode": "native_softplus"
+  },
+  "trace_bench": {
+    "iters": 20,
+    "warmup": 3,
+    "capture_ms": 1120.162001810968,
+    "summary_ms": {
+      "native_execute_trace": {
+        "median": 81.60932292230427,
+        "mean": 81.61122057354078,
+        "min": 81.5720739774406,
+        "max": 81.64301188662648
+      },
+      "native_update_plus_execute": {
+        "median": 82.35499542206526,
+        "mean": 82.34507034067065,
+        "min": 82.15629705227911,
+        "max": 82.4409150518477
+      }
+    }
+  },
+  "decode_bench": {
+    "max_tokens": 20,
+    "manual": {
+      "generated_ids": [11751, 13, 271, 248068, 271, 248069, 271, 4639, 369, 4252, 13, 11751, 369, 279, 6511, 321, 1379, 91188, 3177, 314],
+      "n_generated_tokens": 20,
+      "prefill_ms": 410.91974498704076,
+      "decode_ms": {
+        "median": 82.79459550976753,
+        "mean": 82.78564305510372,
+        "min": 82.68552320078015,
+        "max": 82.86710013635457
+      },
+      "ms_per_tok": 82.78564305510372,
+      "tok_per_sec": 12.079389168172321,
+      "stopped_on_eos": false
+    },
+    "native_softplus": {
+      "generated_ids": [11751, 13, 271, 248068, 271, 248069, 271, 4639, 369, 4252, 13, 11751, 369, 279, 6511, 321, 1379, 91188, 3177, 314],
+      "n_generated_tokens": 20,
+      "prefill_ms": 408.09705201536417,
+      "decode_ms": {
+        "median": 82.2339269798249,
+        "mean": 82.22602661699057,
+        "min": 82.14084687642753,
+        "max": 82.26968604139984
+      },
+      "ms_per_tok": 82.22602661699057,
+      "tok_per_sec": 12.161599449016396,
+      "stopped_on_eos": false
+    },
+    "generated_ids_match": true,
+    "note": "Full decode loop timing includes token readback and buffer updates, using same-session manual and temporary native traces."
+  },
+  "conclusion": "Candidate passed tensor gate, one-step argmax, generated-id match over 20 tokens, and same-session full-decode timing on this prompt. Production default remains manual until promotion is explicitly made."
+}

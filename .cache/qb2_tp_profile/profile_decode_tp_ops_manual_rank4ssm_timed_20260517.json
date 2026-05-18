@@ -1,0 +1,291 @@
+{
+  "prompt": "The main bottleneck in batch-one language model decode is",
+  "prompt_ids": [
+    760,
+    1822,
+    84810,
+    303,
+    6937,
+    18030,
+    3992,
+    1558,
+    16401,
+    369
+  ],
+  "token_id": 760,
+  "timed": true,
+  "deltanet_decay_mode": "manual",
+  "deltanet_recurrence_mode": "manual",
+  "eager_forward_ms": 1489.9069040548056,
+  "argmax_id": 2614,
+  "summary": {
+    "total_ops": 4172,
+    "total_profiled_ms": 1058.1829361617565,
+    "per_op_ms_summary": {
+      "median": 0.25567738339304924,
+      "mean": 0.25363924644337404,
+      "max": 1.7890320159494877
+    },
+    "categories": [
+      {
+        "category": "DeltaNet_recurrence",
+        "count": 768,
+        "sync_bounded_ms": 184.34359948150814,
+        "pct_of_profiled_ms": 17.420768487361897
+      },
+      {
+        "category": "DeltaNet_decay_gate",
+        "count": 480,
+        "sync_bounded_ms": 125.8275737054646,
+        "pct_of_profiled_ms": 11.890909350879031
+      },
+      {
+        "category": "DeltaNet_other",
+        "count": 384,
+        "sync_bounded_ms": 105.4137374740094,
+        "pct_of_profiled_ms": 9.961768789843308
+      },
+      {
+        "category": "DeltaNet_qkv_repeat",
+        "count": 336,
+        "sync_bounded_ms": 74.75050259381533,
+        "pct_of_profiled_ms": 7.0640434691708895
+      },
+      {
+        "category": "matmul",
+        "count": 321,
+        "sync_bounded_ms": 104.41492032259703,
+        "pct_of_profiled_ms": 9.867378952577997
+      },
+      {
+        "category": "attention_other",
+        "count": 320,
+        "sync_bounded_ms": 58.71439212933183,
+        "pct_of_profiled_ms": 5.548605077898988
+      },
+      {
+        "category": "RoPE",
+        "count": 320,
+        "sync_bounded_ms": 70.94294857233763,
+        "pct_of_profiled_ms": 6.704223452105744
+      },
+      {
+        "category": "RMSNorm",
+        "count": 305,
+        "sync_bounded_ms": 53.367668529972434,
+        "pct_of_profiled_ms": 5.043331044776413
+      },
+      {
+        "category": "DeltaNet_conv",
+        "count": 288,
+        "sync_bounded_ms": 103.24822529219091,
+        "pct_of_profiled_ms": 9.757124384059065
+      },
+      {
+        "category": "DeltaNet_output_gate",
+        "count": 240,
+        "sync_bounded_ms": 54.04403991997242,
+        "pct_of_profiled_ms": 5.1072492357513415
+      },
+      {
+        "category": "collectives",
+        "count": 129,
+        "sync_bounded_ms": 56.16752034984529,
+        "pct_of_profiled_ms": 5.3079215729537506
+      },
+      {
+        "category": "MLP_other",
+        "count": 128,
+        "sync_bounded_ms": 41.5375919546932,
+        "pct_of_profiled_ms": 3.9253696629581314
+      },
+      {
+        "category": "DeltaNet_state_update",
+        "count": 96,
+        "sync_bounded_ms": 14.090215787291527,
+        "pct_of_profiled_ms": 1.3315481950974932
+      },
+      {
+        "category": "cache_update",
+        "count": 32,
+        "sync_bounded_ms": 6.168161518871784,
+        "pct_of_profiled_ms": 0.5829012459079101
+      },
+      {
+        "category": "SDPA",
+        "count": 16,
+        "sync_bounded_ms": 3.273747395724058,
+        "pct_of_profiled_ms": 0.3093744270341952
+      },
+      {
+        "category": "lm_head_or_io",
+        "count": 5,
+        "sync_bounded_ms": 1.4804049860686064,
+        "pct_of_profiled_ms": 0.13990066702817328
+      },
+      {
+        "category": "other",
+        "count": 4,
+        "sync_bounded_ms": 0.39768614806234837,
+        "pct_of_profiled_ms": 0.0375819845956727
+      }
+    ],
+    "top_ops": [
+      {
+        "op": "ttnn.reshape",
+        "count": 947,
+        "sync_bounded_ms": 163.25592226348817,
+        "pct_of_profiled_ms": 15.427948862571004
+      },
+      {
+        "op": "ttnn.slice",
+        "count": 593,
+        "sync_bounded_ms": 147.63715281151235,
+        "pct_of_profiled_ms": 13.951949872393724
+      },
+      {
+        "op": "ttnn.mul",
+        "count": 528,
+        "sync_bounded_ms": 159.652961185202,
+        "pct_of_profiled_ms": 15.08746320974477
+      },
+      {
+        "op": "ttnn.linear",
+        "count": 321,
+        "sync_bounded_ms": 104.41492032259703,
+        "pct_of_profiled_ms": 9.867378952577997
+      },
+      {
+        "op": "ttnn.rms_norm",
+        "count": 305,
+        "sync_bounded_ms": 53.367668529972434,
+        "pct_of_profiled_ms": 5.043331044776413
+      },
+      {
+        "op": "ttnn.add",
+        "count": 304,
+        "sync_bounded_ms": 95.62545851804316,
+        "pct_of_profiled_ms": 9.036760587436426
+      },
+      {
+        "op": "ttnn.sum",
+        "count": 144,
+        "sync_bounded_ms": 39.36745901592076,
+        "pct_of_profiled_ms": 3.7202885881636396
+      },
+      {
+        "op": "ttnn.exp",
+        "count": 144,
+        "sync_bounded_ms": 36.4710446447134,
+        "pct_of_profiled_ms": 3.4465727426111457
+      },
+      {
+        "op": "ttnn.all_reduce",
+        "count": 128,
+        "sync_bounded_ms": 55.40788732469082,
+        "pct_of_profiled_ms": 5.2361350227084955
+      },
+      {
+        "op": "ttnn.concat",
+        "count": 112,
+        "sync_bounded_ms": 41.33298643864691,
+        "pct_of_profiled_ms": 3.906034110564097
+      },
+      {
+        "op": "ttnn.silu",
+        "count": 96,
+        "sync_bounded_ms": 26.846812572330236,
+        "pct_of_profiled_ms": 2.5370672361916036
+      },
+      {
+        "op": "ttnn.repeat",
+        "count": 96,
+        "sync_bounded_ms": 33.27633417211473,
+        "pct_of_profiled_ms": 3.144667432723374
+      },
+      {
+        "op": "ttnn.copy",
+        "count": 96,
+        "sync_bounded_ms": 14.090215787291527,
+        "pct_of_profiled_ms": 1.3315481950974932
+      },
+      {
+        "op": "ttnn.neg",
+        "count": 80,
+        "sync_bounded_ms": 19.869844894856215,
+        "pct_of_profiled_ms": 1.8777324993472453
+      },
+      {
+        "op": "ttnn.sigmoid",
+        "count": 64,
+        "sync_bounded_ms": 17.057223478332162,
+        "pct_of_profiled_ms": 1.6119352236204225
+      },
+      {
+        "op": "ttnn.log",
+        "count": 48,
+        "sync_bounded_ms": 12.680400861427188,
+        "pct_of_profiled_ms": 1.1983184029995386
+      },
+      {
+        "op": "ttnn.sub",
+        "count": 48,
+        "sync_bounded_ms": 14.25209129229188,
+        "pct_of_profiled_ms": 1.3468456922946703
+      },
+      {
+        "op": "ttnn.pad",
+        "count": 32,
+        "sync_bounded_ms": 5.903460318222642,
+        "pct_of_profiled_ms": 0.557886554061785
+      },
+      {
+        "op": "ttnn.to_memory_config",
+        "count": 32,
+        "sync_bounded_ms": 5.9911448042839766,
+        "pct_of_profiled_ms": 0.5661728799006219
+      },
+      {
+        "op": "ttnn.experimental.paged_update_cache",
+        "count": 32,
+        "sync_bounded_ms": 6.168161518871784,
+        "pct_of_profiled_ms": 0.5829012459079101
+      },
+      {
+        "op": "ttnn.transformer.paged_scaled_dot_product_attention_decode",
+        "count": 16,
+        "sync_bounded_ms": 3.273747395724058,
+        "pct_of_profiled_ms": 0.3093744270341952
+      },
+      {
+        "op": "ttnn.embedding",
+        "count": 3,
+        "sync_bounded_ms": 1.085428986698389,
+        "pct_of_profiled_ms": 0.10257479586993337
+      },
+      {
+        "op": "ttnn.all_gather",
+        "count": 1,
+        "sync_bounded_ms": 0.7596330251544714,
+        "pct_of_profiled_ms": 0.07178655024525475
+      },
+      {
+        "op": "ttnn.untilize",
+        "count": 1,
+        "sync_bounded_ms": 0.20371796563267708,
+        "pct_of_profiled_ms": 0.0192516774435622
+      },
+      {
+        "op": "ttnn.argmax",
+        "count": 1,
+        "sync_bounded_ms": 0.19125803373754025,
+        "pct_of_profiled_ms": 0.01807419371467771
+      }
+    ]
+  },
+  "limitations": [
+    "This profiles eager execution of the production trace body inside the resident server.",
+    "When timed=true, every recorded op is sync-bounded; totals are not equal to execute_trace replay time.",
+    "Use categories and counts to choose candidates; require full trace/full decode measurement before speedup claims."
+  ]
+}

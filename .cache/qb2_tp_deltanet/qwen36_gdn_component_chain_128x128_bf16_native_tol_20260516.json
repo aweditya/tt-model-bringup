@@ -1,0 +1,41 @@
+{
+  "op": "owned_gdn_component_chain",
+  "config": {
+    "device_id": 0,
+    "slots": 1,
+    "key_dim": 128,
+    "value_dim": 128,
+    "seed": 20260515,
+    "scale": 0.03125,
+    "dtype": "bfloat16",
+    "oracle_mode": "native"
+  },
+  "state_next": {
+    "shape": [
+      1,
+      128,
+      128
+    ],
+    "pcc": 0.999999113477798,
+    "max_abs_diff": 0.00048828125,
+    "mean_abs_diff": 7.954964530654252e-06,
+    "allclose_rtol_1e-5_atol_1e-6": false,
+    "name": "state_next"
+  },
+  "out": {
+    "shape": [
+      1,
+      32,
+      128
+    ],
+    "pcc": 0.9999977235415836,
+    "max_abs_diff": 0.0001220703125,
+    "mean_abs_diff": 1.1257827281951904e-05,
+    "allclose_rtol_1e-5_atol_1e-6": false,
+    "name": "out"
+  },
+  "thresholds": {
+    "pcc": 0.99999,
+    "max_abs_diff": 0.001
+  }
+}

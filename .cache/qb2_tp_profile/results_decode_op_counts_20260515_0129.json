@@ -1,0 +1,51 @@
+{
+  "prompt": "The capital of France is",
+  "prompt_ids": [760, 6511, 314, 9338, 369],
+  "token_id": 760,
+  "timed": false,
+  "eager_forward_ms": 277.4932400789112,
+  "argmax_id": 2614,
+  "summary": {
+    "total_ops": 4268,
+    "categories": [
+      {"category": "DeltaNet_recurrence", "count": 816},
+      {"category": "DeltaNet_decay_gate", "count": 480},
+      {"category": "DeltaNet_other", "count": 384},
+      {"category": "DeltaNet_qkv_repeat", "count": 336},
+      {"category": "matmul", "count": 321},
+      {"category": "attention_other", "count": 320},
+      {"category": "RoPE", "count": 320},
+      {"category": "RMSNorm", "count": 305},
+      {"category": "DeltaNet_conv", "count": 288},
+      {"category": "DeltaNet_output_gate", "count": 240},
+      {"category": "DeltaNet_state_update", "count": 144},
+      {"category": "collectives", "count": 129},
+      {"category": "MLP_other", "count": 128},
+      {"category": "cache_update", "count": 32},
+      {"category": "SDPA", "count": 16},
+      {"category": "lm_head_or_io", "count": 5},
+      {"category": "other", "count": 4}
+    ],
+    "top_ops": [
+      {"op": "ttnn.reshape", "count": 1043},
+      {"op": "ttnn.slice", "count": 593},
+      {"op": "ttnn.mul", "count": 528},
+      {"op": "ttnn.linear", "count": 321},
+      {"op": "ttnn.rms_norm", "count": 305},
+      {"op": "ttnn.add", "count": 304},
+      {"op": "ttnn.sum", "count": 144},
+      {"op": "ttnn.exp", "count": 144},
+      {"op": "ttnn.all_reduce", "count": 128},
+      {"op": "ttnn.concat", "count": 112},
+      {"op": "ttnn.silu", "count": 96},
+      {"op": "ttnn.repeat", "count": 96},
+      {"op": "ttnn.copy", "count": 96},
+      {"op": "ttnn.neg", "count": 80},
+      {"op": "ttnn.sigmoid", "count": 64}
+    ]
+  },
+  "limitations": [
+    "Resident-server eager profile of the production trace body, not true Tracy timing inside execute_trace.",
+    "Use counts to select candidates; require trace/full-decode timing before speedup claims."
+  ]
+}

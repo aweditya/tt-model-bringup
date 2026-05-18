@@ -1,0 +1,71 @@
+{
+  "candidate": "qwen36_gdn_decode_synthetic_mesh",
+  "seed": 20260515,
+  "scale": 0.03125,
+  "symbols": {
+    "qwen36_gdn_prepare_decode": true,
+    "qwen36_gdn_decode": true
+  },
+  "shape": {
+    "state": [
+      1,
+      12,
+      128,
+      128
+    ],
+    "qkv": [
+      1,
+      12,
+      1,
+      128
+    ],
+    "alpha_beta": [
+      1,
+      12,
+      1,
+      1
+    ]
+  },
+  "correctness": {
+    "state_vs_manual": {
+      "pcc": 0.9999964644317922,
+      "max_abs_diff": 0.0011507496237754822
+    },
+    "output_vs_manual": {
+      "pcc": 0.9999903074626416,
+      "max_abs_diff": 0.0005017369985580444
+    },
+    "pass_gate": true,
+    "host_shapes": {
+      "state_manual": [
+        4,
+        12,
+        128,
+        128
+      ],
+      "state_native": [
+        4,
+        12,
+        128,
+        128
+      ],
+      "output_manual": [
+        4,
+        12,
+        1,
+        128
+      ],
+      "output_native": [
+        4,
+        12,
+        1,
+        128
+      ]
+    }
+  },
+  "timing": {
+    "iters": 0,
+    "warmup": 0,
+    "note": "Synthetic resident-mesh component timing only. Native samples allocate a fresh state copy because qwen36_gdn_decode mutates state."
+  }
+}

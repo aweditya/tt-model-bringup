@@ -30,6 +30,7 @@ import socket
 import json
 import signal
 import importlib.util
+import contextlib
 
 # Stage A: device init only. Bigger imports gated to bootstrap to keep cold startup fast.
 
@@ -112,9 +113,26 @@ class MeshServerState:
         # paged_update_cache path; probe endpoints may flip this temporarily.
         self.use_fused_paged_update = False
         self.collective_mode = "baseline"
+        self.rope_mode = "manual"
+        self.deltanet_decay_mode = "manual"
+        self.deltanet_recurrence_mode = "manual"
+        self.profile_records = None
+        self.profile_context_stack = []
 
 
 # --- Bootstrap ----------------------------------------------------------------
+@contextlib.contextmanager
+def _profile_scope(state, name: str):
+    if getattr(state, "profile_records", None) is None:
+        yield
+        return
+    state.profile_context_stack.append(name)
+    try:
+        yield
+    finally:
+        state.profile_context_stack.pop()
+
+
 def bootstrap(state: MeshServerState):
     """Stage A: open mesh + set fabric + load sharded weights + tokenizer."""
     print(f"[bootstrap] importing ttnn + torch + numpy…", flush=True)
@@ -218,7 +236,7 @@ def bootstrap(state: MeshServerState):
             A_log_tt = upload_sharded(w_np['A_log'], dim=0)
             w_out_tt = upload_sharded(w_np['out_proj'], dim=0)
             ssm_tt = upload_sharded(
-                np.zeros((N_V_HEADS, K_DIM, V_DIM), dtype=np.float32), dim=0)
+                np.zeros((1, N_V_HEADS, K_DIM, V_DIM), dtype=np.float32), dim=1)
             linear_attn_norm_tt = upload_replicated(w_np['linear_attn_norm'])
             # Q/K L2 scale constants for QK rms_norm fusion (mirrors 91f)
             K_DIM_LOCAL = 128
@@ -543,15 +561,16 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
                       [1, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP])
     ttnn.deallocate(all_tt)
     # 4. conv1d on per-chip slab
-    mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
-    ttnn.deallocate(mixed_qkv)
-    conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
-    ttnn.deallocate(mixed_col)
-    conv_prod = ttnn.mul(conv_input, dn['w_conv'])
-    conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
-    ttnn.deallocate(conv_prod)
-    conv_state_new = ttnn.slice(conv_input, [0, 1], [CONV_DIM_CHIP, cfg['conv_kernel']])
-    ttnn.deallocate(conv_input)
+    with _profile_scope(state, "deltanet_conv"):
+        mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
+        ttnn.deallocate(mixed_qkv)
+        conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
+        ttnn.deallocate(mixed_col)
+        conv_prod = ttnn.mul(conv_input, dn['w_conv'])
+        conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
+        ttnn.deallocate(conv_prod)
+        conv_state_new = ttnn.slice(conv_input, [0, 1], [CONV_DIM_CHIP, cfg['conv_kernel']])
+        ttnn.deallocate(conv_input)
     # 5. Q/K/V per-chip head-sliced
     q_flat = ttnn.slice(conv_out, [0], [KEY_DIM_CHIP])
     k_flat = ttnn.slice(conv_out, [KEY_DIM_CHIP], [2 * KEY_DIM_CHIP])
@@ -563,37 +582,76 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
         t3 = ttnn.repeat(t2, ttnn.Shape([1, N_REP, 1]))
         return ttnn.reshape(t3, [n_kh * N_REP, d])
 
-    q = gqa(q_flat, NK_PER_CHIP, K_DIM)
-    k = gqa(k_flat, NK_PER_CHIP, K_DIM)
-    v = ttnn.reshape(v_flat, [NV_PER_CHIP, V_DIM])
+    def gqa4(t, n_kh, d):
+        t2 = ttnn.reshape(t, [1, n_kh, 1, d])
+        t3 = ttnn.repeat(t2, ttnn.Shape([1, 1, N_REP, 1]))
+        return ttnn.reshape(t3, [1, n_kh * N_REP, 1, d])
+
+    with _profile_scope(state, "deltanet_qkv_repeat"):
+        if state.deltanet_recurrence_mode in ("owned_gdn", "owned_gdn_inplace"):
+            q = gqa4(q_flat, NK_PER_CHIP, K_DIM)
+            k = gqa4(k_flat, NK_PER_CHIP, K_DIM)
+            v = ttnn.reshape(v_flat, [1, NV_PER_CHIP, 1, V_DIM])
+        else:
+            q = gqa(q_flat, NK_PER_CHIP, K_DIM)
+            k = gqa(k_flat, NK_PER_CHIP, K_DIM)
+            v = ttnn.reshape(v_flat, [NV_PER_CHIP, V_DIM])
     # 6. QK l2-norm (manual mesh-safe form — q_l2_scale=1/K_DIM, k_l2_scale=1/sqrt(K_DIM)
     # baked into the weights; eps=EPS/K_DIM matches the rms_norm semantics exactly).
     EPS_RMS = EPS / K_DIM
     q = _rms_norm_manual(q, dn['q_l2_scale'], EPS_RMS, K_DIM)
     k = _rms_norm_manual(k, dn['k_l2_scale'], EPS_RMS, K_DIM)
     # 7. gate/decay/beta on per-chip head subset
-    softplus_a = ttnn.log(ttnn.add(ttnn.exp(ttnn.add(a_tt, dn['dt_bias'])), 1.0))
-    g = ttnn.mul(ttnn.neg(ttnn.exp(dn['A_log'])), softplus_a)
-    beta = ttnn.sigmoid(b_tt)
-    decay = ttnn.reshape(ttnn.exp(g), [1, NV_PER_CHIP, 1, 1])
+    with _profile_scope(state, "deltanet_decay_gate"):
+        a_biased = ttnn.add(a_tt, dn['dt_bias'])
+        if state.deltanet_decay_mode == "native_softplus":
+            softplus_a = ttnn.softplus(a_biased)
+        else:
+            softplus_a = ttnn.log(ttnn.add(ttnn.exp(a_biased), 1.0))
+        g = ttnn.mul(ttnn.neg(ttnn.exp(dn['A_log'])), softplus_a)
+        beta = ttnn.sigmoid(b_tt)
+        decay = ttnn.reshape(ttnn.exp(g), [1, NV_PER_CHIP, 1, 1])
     # 8. Recurrence
-    H_4d = ttnn.reshape(dn['ssm'], [1, NV_PER_CHIP, K_DIM, V_DIM])
-    H_decayed = ttnn.mul(H_4d, decay)
-    k_col = ttnn.reshape(k, [1, NV_PER_CHIP, K_DIM, 1])
-    kv_mem = ttnn.reshape(ttnn.sum(ttnn.mul(H_decayed, k_col), dim=-2),
-                          [1, NV_PER_CHIP, V_DIM])
-    v_3d = ttnn.reshape(v, [1, NV_PER_CHIP, V_DIM])
-    delta = ttnn.mul(ttnn.sub(v_3d, kv_mem), ttnn.reshape(beta, [1, NV_PER_CHIP, 1]))
-    H_new = ttnn.add(H_decayed,
-                     ttnn.mul(k_col, ttnn.reshape(delta, [1, NV_PER_CHIP, 1, V_DIM])))
-    q_col = ttnn.reshape(q, [1, NV_PER_CHIP, K_DIM, 1])
-    out = ttnn.reshape(ttnn.sum(ttnn.mul(H_new, q_col), dim=-2), [1, VAL_DIM_CHIP])
+    with _profile_scope(state, "deltanet_recurrence"):
+        H_4d = dn['ssm']
+        if state.deltanet_recurrence_mode in ("owned_gdn", "owned_gdn_inplace"):
+            beta4 = ttnn.reshape(beta, [1, NV_PER_CHIP, 1, 1])
+            # Default owned_gdn keeps the old copy/commit discipline.
+            # owned_gdn_inplace uses the op's state-input writer directly.
+            H_owned_in = (
+                H_4d
+                if state.deltanet_recurrence_mode == "owned_gdn_inplace"
+                else ttnn.add(H_4d, 0.0)
+            )
+            H_new, out = ttnn.experimental.qwen36_gdn_decode_owned(
+                H_owned_in,
+                q,
+                k,
+                v,
+                decay,
+                beta4,
+                native_io=True,
+                output_memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+            ttnn.deallocate(beta4)
+        else:
+            H_decayed = ttnn.mul(H_4d, decay)
+            k_col = ttnn.reshape(k, [1, NV_PER_CHIP, K_DIM, 1])
+            kv_mem = ttnn.reshape(ttnn.sum(ttnn.mul(H_decayed, k_col), dim=-2),
+                                  [1, NV_PER_CHIP, V_DIM])
+            v_3d = ttnn.reshape(v, [1, NV_PER_CHIP, V_DIM])
+            delta = ttnn.mul(ttnn.sub(v_3d, kv_mem), ttnn.reshape(beta, [1, NV_PER_CHIP, 1]))
+            H_new = ttnn.add(H_decayed,
+                             ttnn.mul(k_col, ttnn.reshape(delta, [1, NV_PER_CHIP, 1, V_DIM])))
+            q_col = ttnn.reshape(q, [1, NV_PER_CHIP, K_DIM, 1])
+            out = ttnn.reshape(ttnn.sum(ttnn.mul(H_new, q_col), dim=-2), [1, VAL_DIM_CHIP])
     # 9. Per-head rms_norm + silu(z) gate
-    out_per_head = ttnn.reshape(out, [NV_PER_CHIP, V_DIM])
-    out_normed = _rms_norm_manual(out_per_head, dn['linear_attn_norm'], EPS, V_DIM)
-    z_per_head = ttnn.reshape(z_tt, [NV_PER_CHIP, V_DIM])
-    silu_z = ttnn.silu(z_per_head)
-    out_gated = ttnn.reshape(ttnn.mul(out_normed, silu_z), [1, VAL_DIM_CHIP])
+    with _profile_scope(state, "deltanet_output_gate"):
+        out_per_head = ttnn.reshape(out, [NV_PER_CHIP, V_DIM])
+        out_normed = _rms_norm_manual(out_per_head, dn['linear_attn_norm'], EPS, V_DIM)
+        z_per_head = ttnn.reshape(z_tt, [NV_PER_CHIP, V_DIM])
+        silu_z = ttnn.silu(z_per_head)
+        out_gated = ttnn.reshape(ttnn.mul(out_normed, silu_z), [1, VAL_DIM_CHIP])
     # 10. out_proj row-parallel + all_reduce
     partial = ttnn.linear(out_gated, dn['w_out'])
     ttnn.deallocate(out_gated)
@@ -602,11 +660,16 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     # 11. residual add + update SSM/conv state in place
     x_out = ttnn.add(x_tt, reduced)
     ttnn.deallocate(reduced)
-    H_new_3d = ttnn.reshape(H_new, [NV_PER_CHIP, K_DIM, V_DIM])
-    ttnn.copy(H_new_3d, dn['ssm'])
-    ttnn.deallocate(H_new)
-    ttnn.copy(conv_state_new, dn['conv_st'])
-    ttnn.deallocate(conv_state_new)
+    with _profile_scope(state, "deltanet_state_update"):
+        if state.deltanet_recurrence_mode == "owned_gdn_inplace":
+            # qwen36_gdn_decode_owned writes the next state into its state input
+            # buffer, which aliases dn['ssm'] through H_4d.
+            pass
+        else:
+            ttnn.copy(H_new, dn['ssm'])
+            ttnn.deallocate(H_new)
+        ttnn.copy(conv_state_new, dn['conv_st'])
+        ttnn.deallocate(conv_state_new)
     return x_out
 
 
@@ -674,17 +737,37 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
     k_tt = _rms_norm_manual(k_tt, attn['k_norm'], EPS, HEAD_DIM)
     # 4. Partial RoPE V2 rotate-only
     half = ROTARY_DIM // 2
-    def apply_rope(t, n_heads):
+    def apply_rope_manual(t, n_heads):
+        with _profile_scope(state, "rope"):
+            rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
+            passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
+            x1 = ttnn.slice(rot, [0, 0], [n_heads, half])
+            x2 = ttnn.slice(rot, [0, half], [n_heads, ROTARY_DIM])
+            neg_x2 = ttnn.neg(x2)
+            rotated = ttnn.add(ttnn.mul(rot, cos_tt),
+                                ttnn.mul(ttnn.concat([neg_x2, x1], dim=-1), sin_tt))
+            return ttnn.concat([rotated, passthru], dim=-1)
+    def apply_rope_native_partial(t, n_heads):
         rot = ttnn.slice(t, [0, 0], [n_heads, ROTARY_DIM])
         passthru = ttnn.slice(t, [0, ROTARY_DIM], [n_heads, HEAD_DIM])
-        x1 = ttnn.slice(rot, [0, 0], [n_heads, half])
-        x2 = ttnn.slice(rot, [0, half], [n_heads, ROTARY_DIM])
-        neg_x2 = ttnn.neg(x2)
-        rotated = ttnn.add(ttnn.mul(rot, cos_tt),
-                            ttnn.mul(ttnn.concat([neg_x2, x1], dim=-1), sin_tt))
-        return ttnn.concat([rotated, passthru], dim=-1)
-    q_tt = apply_rope(q_tt, NQ_PER_CHIP)
-    k_tt = apply_rope(k_tt, NKV_PER_CHIP)
+        rot4d = ttnn.reshape(rot, [1, 1, n_heads, ROTARY_DIM])
+        passthru4d = ttnn.reshape(passthru, [1, 1, n_heads, HEAD_DIM - ROTARY_DIM])
+        cos4d = ttnn.reshape(cos_tt, [1, 1, 1, ROTARY_DIM])
+        sin4d = ttnn.reshape(sin_tt, [1, 1, 1, ROTARY_DIM])
+        native_rot = ttnn.experimental.rotary_embedding(
+            rot4d, cos4d, sin4d,
+            compute_kernel_config=state.sdpa_compute_kernel_config)
+        # rotary_embedding pads the head axis to tile height; trim it before
+        # concatenating with the logical pass-through head rows.
+        native_rot = ttnn.slice(native_rot, [0, 0, 0, 0], [1, 1, n_heads, ROTARY_DIM])
+        out4d = ttnn.concat([native_rot, passthru4d], dim=-1)
+        return ttnn.reshape(out4d, [n_heads, HEAD_DIM])
+    if state.rope_mode == "native_partial":
+        q_tt = apply_rope_native_partial(q_tt, NQ_PER_CHIP)
+        k_tt = apply_rope_native_partial(k_tt, NKV_PER_CHIP)
+    else:
+        q_tt = apply_rope_manual(q_tt, NQ_PER_CHIP)
+        k_tt = apply_rope_manual(k_tt, NKV_PER_CHIP)
     # 5. PAGED KV cache update via paged_update_cache.
     # Cache: [NUM_BLOCKS, N_KV, BLOCK_SIZE, HEAD_DIM] per-chip sharded along N_KV.
     # Input must be HEIGHT_SHARDED in L1, padded to TILE_HEIGHT=32 on dim -2.
@@ -782,7 +865,7 @@ def update_input_buffers(state, token_id, cur_pos):
     ttnn.copy_host_to_device_tensor(rot_host, state.rot_idxs_buf)
 
 
-def forward_token_tp_inner(state):
+def forward_token_tp_inner(state, return_logits: bool = False):
     """The trace-captureable forward function. Reads ONLY from pre-allocated
     state buffers (state.tok_buf, state.cur_pos_buf, state.rot_idxs_buf) and
     does the embed + cos/sin row lookups on-device via ttnn.embedding (P25,
@@ -845,6 +928,8 @@ def forward_token_tp_inner(state):
     gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
     sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [1, state.vocab_size])
     rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+    if return_logits:
+        return rm_logits_tt
     argmax_tt = ttnn.argmax(rm_logits_tt, dim=-1, keepdim=True, use_multicore=True)
     return argmax_tt
 
@@ -889,9 +974,9 @@ def _reset_state_buffers(state):
     mesh = state.mesh
 
     ssm_host = ttnn.from_torch(
-        torch.zeros(N_V_HEADS, K_DIM, V_DIM, dtype=torch.float32),
+        torch.zeros(1, N_V_HEADS, K_DIM, V_DIM, dtype=torch.float32),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0))
+        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=1))
     conv_host = ttnn.from_torch(
         torch.zeros(CONV_DIM, cfg['conv_kernel'] - 1, dtype=torch.float32),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
@@ -1103,13 +1188,25 @@ def _read_argmax_id(state: MeshServerState, argmax_tt) -> int:
 
 def _forward_argmax_id_with_cache_writer(state: MeshServerState, token_id: int,
                                          cur_pos: int, use_fused: bool,
-                                         collective_mode: str | None = None) -> int:
+                                         collective_mode: str | None = None,
+                                         rope_mode: str | None = None,
+                                         deltanet_decay_mode: str | None = None,
+                                         deltanet_recurrence_mode: str | None = None) -> int:
     import ttnn
     old_fused = state.use_fused_paged_update
     old_collective = state.collective_mode
+    old_rope = state.rope_mode
+    old_decay = state.deltanet_decay_mode
+    old_recurrence = state.deltanet_recurrence_mode
     state.use_fused_paged_update = use_fused
     if collective_mode is not None:
         state.collective_mode = collective_mode
+    if rope_mode is not None:
+        state.rope_mode = rope_mode
+    if deltanet_decay_mode is not None:
+        state.deltanet_decay_mode = deltanet_decay_mode
+    if deltanet_recurrence_mode is not None:
+        state.deltanet_recurrence_mode = deltanet_recurrence_mode
     try:
         _reset_state_buffers(state)
         update_input_buffers(state, token_id, cur_pos)
@@ -1119,18 +1216,33 @@ def _forward_argmax_id_with_cache_writer(state: MeshServerState, token_id: int,
     finally:
         state.use_fused_paged_update = old_fused
         state.collective_mode = old_collective
+        state.rope_mode = old_rope
+        state.deltanet_decay_mode = old_decay
+        state.deltanet_recurrence_mode = old_recurrence
         _reset_state_buffers(state)
 
 
 def _capture_temp_decode_trace(state: MeshServerState, use_fused: bool,
-                               collective_mode: str | None = None):
+                               collective_mode: str | None = None,
+                               rope_mode: str | None = None,
+                               deltanet_decay_mode: str | None = None,
+                               deltanet_recurrence_mode: str | None = None):
     """Capture an alternate decode trace for a probe, without replacing prod."""
     import ttnn
     old_fused = state.use_fused_paged_update
     old_collective = state.collective_mode
+    old_rope = state.rope_mode
+    old_decay = state.deltanet_decay_mode
+    old_recurrence = state.deltanet_recurrence_mode
     state.use_fused_paged_update = use_fused
     if collective_mode is not None:
         state.collective_mode = collective_mode
+    if rope_mode is not None:
+        state.rope_mode = rope_mode
+    if deltanet_decay_mode is not None:
+        state.deltanet_decay_mode = deltanet_decay_mode
+    if deltanet_recurrence_mode is not None:
+        state.deltanet_recurrence_mode = deltanet_recurrence_mode
     trace_id = None
     argmax_tt = None
     try:
@@ -1157,6 +1269,9 @@ def _capture_temp_decode_trace(state: MeshServerState, use_fused: bool,
     finally:
         state.use_fused_paged_update = old_fused
         state.collective_mode = old_collective
+        state.rope_mode = old_rope
+        state.deltanet_decay_mode = old_decay
+        state.deltanet_recurrence_mode = old_recurrence
         _reset_state_buffers(state)
 
 
@@ -1460,6 +1575,3348 @@ def handle_probe_explicit_all_reduce_tp(state: MeshServerState, args: dict) -> d
     return result
 
 
+def _pcc_and_maxdiff(a, b):
+    import numpy as np
+    av = a.astype(np.float64).reshape(-1)
+    bv = b.astype(np.float64).reshape(-1)
+    diff = np.abs(a.astype(np.float32) - b.astype(np.float32))
+    flat_diff = diff.reshape(-1)
+    max_idx = int(np.argmax(flat_diff)) if flat_diff.size else 0
+    a_flat = a.reshape(-1)
+    b_flat = b.reshape(-1)
+    denom = np.linalg.norm(av) * np.linalg.norm(bv) + 1e-12
+    return {
+        "pcc": float(np.dot(av, bv) / denom),
+        "max_abs_diff": float(flat_diff[max_idx]) if flat_diff.size else 0.0,
+        "mean_abs_diff": float(np.mean(flat_diff)) if flat_diff.size else 0.0,
+        "p99_abs_diff": float(np.quantile(flat_diff, 0.99)) if flat_diff.size else 0.0,
+        "p999_abs_diff": float(np.quantile(flat_diff, 0.999)) if flat_diff.size else 0.0,
+        "num_gt_0_001": int(np.count_nonzero(flat_diff > 0.001)),
+        "num_gt_0_002": int(np.count_nonzero(flat_diff > 0.002)),
+        "num_gt_0_004": int(np.count_nonzero(flat_diff > 0.004)),
+        "numel": int(flat_diff.size),
+        "max_index": max_idx,
+        "max_values": {
+            "a": float(a_flat[max_idx]) if flat_diff.size else 0.0,
+            "b": float(b_flat[max_idx]) if flat_diff.size else 0.0,
+        },
+    }
+
+
+def _ms_summary(samples):
+    import numpy as np
+    arr = np.array(samples, dtype=np.float64)
+    if arr.size == 0:
+        return {}
+    return {
+        "min": float(np.min(arr)),
+        "median": float(np.median(arr)),
+        "mean": float(np.mean(arr)),
+        "max": float(np.max(arr)),
+    }
+
+
+def handle_probe_rope_fused_qk_tp(state: MeshServerState, args: dict) -> dict:
+    """Check fused Q/K RoPE against the current Qwen partial-RoPE semantics.
+
+    This is intentionally a compatibility/equivalence probe only. It uses
+    production per-chip shapes on the resident qb2 mesh, but does not modify
+    model state or capture a trace.
+    """
+    import numpy as np
+    import torch
+    import ttnn
+
+    if state.mesh is None or state.cfg is None:
+        return {"error": "server not fully loaded"}
+
+    if not bool(args.get("allow_wedge_prone_fused_qk", False)):
+        return {
+            "candidate": "rotary_embedding_llama_fused_qk",
+            "summary": {
+                "all_positions_accepted": False,
+                "pass_gate": False,
+                "phase": "fused_qk_variant_disabled",
+                "error": (
+                    "The resident-server fused QK RoPE semantics probe wedged "
+                    "qb2 for several minutes and required SIGTERM plus "
+                    "tt-smi reset. Pass allow_wedge_prone_fused_qk=true only "
+                    "for a coordinated isolation run."
+                ),
+            },
+            "rows": [],
+        }
+
+    positions = [int(p) for p in args.get("positions", [0, 1, 7, 31, 32, 127, 255])]
+    positions = [p for p in positions if 0 <= p < MAX_POS]
+    if not positions:
+        return {"error": "no valid positions"}
+
+    cfg = state.cfg
+    head_dim = cfg['head_dim']
+    rotary_dim = state.rotary_dim
+    half = rotary_dim // 2
+    nq_per_chip = cfg['n_q_heads'] // state.mesh.get_num_devices()
+    nkv_per_chip = cfg['n_kv_heads'] // state.mesh.get_num_devices()
+    rng = np.random.default_rng(440)
+    q_np = (rng.standard_normal((1, 1, nq_per_chip, head_dim)).astype(np.float32) * 0.1)
+    k_np = (rng.standard_normal((1, 1, nkv_per_chip, head_dim)).astype(np.float32) * 0.1)
+
+    def qwen_partial_rope_np(x, pos):
+        rot = x[..., :rotary_dim]
+        tail = x[..., rotary_dim:]
+        cos = state.cos_all_np[pos].reshape((1, 1, 1, rotary_dim))
+        sin = state.sin_all_np[pos].reshape((1, 1, 1, rotary_dim))
+        rotated = np.concatenate([-rot[..., half:], rot[..., :half]], axis=-1)
+        return np.concatenate([rot * cos + rotated * sin, tail], axis=-1).astype(np.float32)
+
+    q_ref_by_pos = {p: qwen_partial_rope_np(q_np, p) for p in positions}
+    k_ref_by_pos = {p: qwen_partial_rope_np(k_np, p) for p in positions}
+
+    q_cores = ttnn.CoreRangeSet({
+        ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))
+    })
+    k_cores = ttnn.CoreRangeSet({
+        ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 0))
+    })
+    qk_cores = ttnn.CoreRangeSet({
+        ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 0))
+    })
+    q_mem_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(q_cores, [TILE_HEIGHT, head_dim], ttnn.ShardOrientation.ROW_MAJOR))
+    k_mem_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(k_cores, [TILE_HEIGHT, head_dim], ttnn.ShardOrientation.ROW_MAJOR))
+    cos_mem_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(qk_cores, [TILE_HEIGHT, head_dim], ttnn.ShardOrientation.ROW_MAJOR))
+    trans_mem_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(qk_cores, [TILE_HEIGHT, TILE_HEIGHT], ttnn.ShardOrientation.ROW_MAJOR))
+
+    def upload(arr, mem_cfg):
+        return ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32)),
+            dtype=ttnn.bfloat16,
+            device=state.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=mem_cfg,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+
+    trans = np.zeros((1, 2, TILE_HEIGHT, TILE_HEIGHT), dtype=np.float32)
+    trans[..., np.arange(0, TILE_HEIGHT, 2), np.arange(1, TILE_HEIGHT, 2)] = 1.0
+    trans[..., np.arange(1, TILE_HEIGHT, 2), np.arange(0, TILE_HEIGHT, 2)] = -1.0
+
+    q_tt = None
+    k_tt = None
+    trans_tt = None
+    try:
+        q_tt = upload(q_np, q_mem_cfg)
+        k_tt = upload(k_np, k_mem_cfg)
+        trans_tt = upload(trans, trans_mem_cfg)
+        rows = []
+        for pos in positions:
+            cos_ext = np.concatenate([
+                state.cos_all_np[pos],
+                np.ones(head_dim - rotary_dim, dtype=np.float32),
+            ]).astype(np.float32)
+            sin_ext = np.concatenate([
+                state.sin_all_np[pos],
+                np.zeros(head_dim - rotary_dim, dtype=np.float32),
+            ]).astype(np.float32)
+            cos_np = np.tile(cos_ext.reshape(1, 1, 1, head_dim), (1, 2, TILE_HEIGHT, 1))
+            sin_np = np.tile(sin_ext.reshape(1, 1, 1, head_dim), (1, 2, TILE_HEIGHT, 1))
+            cos_tt = upload(cos_np, cos_mem_cfg)
+            sin_tt = upload(sin_np, cos_mem_cfg)
+            try:
+                q_out, k_out = ttnn.experimental.rotary_embedding_llama_fused_qk(
+                    q_tt, k_tt, cos_tt, sin_tt, trans_tt,
+                    compute_kernel_config=state.sdpa_compute_kernel_config)
+                ttnn.synchronize_device(state.mesh)
+                q_host = ttnn.to_torch(
+                    q_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+                ).float().cpu().numpy()[:1].reshape(q_np.shape)
+                k_host = ttnn.to_torch(
+                    k_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+                ).float().cpu().numpy()[:1].reshape(k_np.shape)
+                q_tail = _pcc_and_maxdiff(q_host[..., rotary_dim:], q_np[..., rotary_dim:])
+                k_tail = _pcc_and_maxdiff(k_host[..., rotary_dim:], k_np[..., rotary_dim:])
+                rows.append({
+                    "position": pos,
+                    "accepted": True,
+                    "q_vs_manual": _pcc_and_maxdiff(q_host, q_ref_by_pos[pos]),
+                    "k_vs_manual": _pcc_and_maxdiff(k_host, k_ref_by_pos[pos]),
+                    "q_tail_vs_input": q_tail,
+                    "k_tail_vs_input": k_tail,
+                })
+                ttnn.deallocate(q_out)
+                ttnn.deallocate(k_out)
+            except Exception as e:
+                rows.append({
+                    "position": pos,
+                    "accepted": False,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+            finally:
+                ttnn.deallocate(cos_tt)
+                ttnn.deallocate(sin_tt)
+
+        accepted = [r for r in rows if r.get("accepted")]
+        all_positions_accepted = len(accepted) == len(rows)
+        min_q_pcc = min((r["q_vs_manual"]["pcc"] for r in accepted), default=None)
+        min_k_pcc = min((r["k_vs_manual"]["pcc"] for r in accepted), default=None)
+        max_tail_diff = max(
+            ([r["q_tail_vs_input"]["max_abs_diff"] for r in accepted] +
+             [r["k_tail_vs_input"]["max_abs_diff"] for r in accepted]),
+            default=None,
+        )
+        pass_gate = (
+            all_positions_accepted and
+            min_q_pcc is not None and min_q_pcc >= 0.9999 and
+            min_k_pcc is not None and min_k_pcc >= 0.9999 and
+            max_tail_diff is not None and max_tail_diff <= 1e-2
+        )
+        result = {
+            "candidate": "rotary_embedding_llama_fused_qk",
+            "production_shape": {
+                "q": list(q_np.shape),
+                "k": list(k_np.shape),
+                "head_dim": head_dim,
+                "rotary_dim": rotary_dim,
+                "nq_per_chip": nq_per_chip,
+                "nkv_per_chip": nkv_per_chip,
+            },
+            "positions": positions,
+            "op_count_removed_estimate": {
+                "manual_rope_ops_per_full_attention_layer": 20,
+                "full_attention_layers": sum(
+                    1 for layer in state.layers if layer.get("type") == "full_attention"),
+                "manual_rope_ops_per_token": 20 * sum(
+                    1 for layer in state.layers if layer.get("type") == "full_attention"),
+                "note": "Operation count only; not a speedup claim.",
+            },
+            "summary": {
+                "all_positions_accepted": all_positions_accepted,
+                "min_q_pcc": min_q_pcc,
+                "min_k_pcc": min_k_pcc,
+                "max_tail_diff": max_tail_diff,
+                "pass_gate": pass_gate,
+            },
+            "rows": rows,
+        }
+        state.last_run = {
+            "cmd": "probe_rope_fused_qk_tp",
+            "pass_gate": pass_gate,
+            "min_q_pcc": min_q_pcc,
+            "min_k_pcc": min_k_pcc,
+        }
+        return result
+    finally:
+        for tensor in (q_tt, k_tt, trans_tt):
+            if tensor is not None:
+                ttnn.deallocate(tensor)
+
+
+def handle_probe_rope_native_partial_tp(state: MeshServerState, args: dict) -> dict:
+    """Check slice-first native rotary_embedding against manual partial RoPE."""
+    import numpy as np
+    import torch
+    import ttnn
+
+    if state.mesh is None or state.cfg is None:
+        return {"error": "server not fully loaded"}
+
+    positions = [int(p) for p in args.get("positions", [0, 1, 7, 31, 32, 127, 255])]
+    positions = [p for p in positions if 0 <= p < MAX_POS]
+    if not positions:
+        return {"error": "no valid positions"}
+
+    cfg = state.cfg
+    head_dim = cfg['head_dim']
+    rotary_dim = state.rotary_dim
+    half = rotary_dim // 2
+    nq_per_chip = cfg['n_q_heads'] // state.mesh.get_num_devices()
+    nkv_per_chip = cfg['n_kv_heads'] // state.mesh.get_num_devices()
+    rng = np.random.default_rng(441)
+    q_np = (rng.standard_normal((1, 1, nq_per_chip, head_dim)).astype(np.float32) * 0.1)
+    k_np = (rng.standard_normal((1, 1, nkv_per_chip, head_dim)).astype(np.float32) * 0.1)
+
+    def qwen_partial_rope_np(x, pos):
+        rot = x[..., :rotary_dim]
+        tail = x[..., rotary_dim:]
+        cos = state.cos_all_np[pos].reshape((1, 1, 1, rotary_dim))
+        sin = state.sin_all_np[pos].reshape((1, 1, 1, rotary_dim))
+        rotated = np.concatenate([-rot[..., half:], rot[..., :half]], axis=-1)
+        return np.concatenate([rot * cos + rotated * sin, tail], axis=-1).astype(np.float32)
+
+    q_ref_by_pos = {p: qwen_partial_rope_np(q_np, p) for p in positions}
+    k_ref_by_pos = {p: qwen_partial_rope_np(k_np, p) for p in positions}
+
+    def upload(arr):
+        return ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32)),
+            dtype=ttnn.bfloat16,
+            device=state.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+
+    q_rot_tt = None
+    q_tail_tt = None
+    k_rot_tt = None
+    k_tail_tt = None
+    cos_tt = None
+    sin_tt = None
+    try:
+        q_rot_tt = upload(q_np[..., :rotary_dim])
+        q_tail_tt = upload(q_np[..., rotary_dim:])
+        k_rot_tt = upload(k_np[..., :rotary_dim])
+        k_tail_tt = upload(k_np[..., rotary_dim:])
+        cos_cache = state.cos_all_np.reshape(1, 1, MAX_POS, rotary_dim)
+        sin_cache = state.sin_all_np.reshape(1, 1, MAX_POS, rotary_dim)
+        cos_tt = upload(cos_cache)
+        sin_tt = upload(sin_cache)
+
+        rows = []
+        for pos in positions:
+            try:
+                q_native_rot = ttnn.experimental.rotary_embedding(
+                    q_rot_tt, cos_tt, sin_tt,
+                    token_index=pos,
+                    compute_kernel_config=state.sdpa_compute_kernel_config)
+                k_native_rot = ttnn.experimental.rotary_embedding(
+                    k_rot_tt, cos_tt, sin_tt,
+                    token_index=pos,
+                    compute_kernel_config=state.sdpa_compute_kernel_config)
+                # rotary_embedding pads the head axis to tile height. Trim back
+                # to the production logical head count before reattaching tail.
+                q_native_rot_trim = ttnn.slice(
+                    q_native_rot, [0, 0, 0, 0], [1, 1, nq_per_chip, rotary_dim])
+                k_native_rot_trim = ttnn.slice(
+                    k_native_rot, [0, 0, 0, 0], [1, 1, nkv_per_chip, rotary_dim])
+                q_native = ttnn.concat([q_native_rot_trim, q_tail_tt], dim=-1)
+                k_native = ttnn.concat([k_native_rot_trim, k_tail_tt], dim=-1)
+                ttnn.synchronize_device(state.mesh)
+                q_host = ttnn.to_torch(
+                    q_native, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+                ).float().cpu().numpy()[:1].reshape(q_np.shape)
+                k_host = ttnn.to_torch(
+                    k_native, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+                ).float().cpu().numpy()[:1].reshape(k_np.shape)
+                rows.append({
+                    "position": pos,
+                    "accepted": True,
+                    "q_vs_manual": _pcc_and_maxdiff(q_host, q_ref_by_pos[pos]),
+                    "k_vs_manual": _pcc_and_maxdiff(k_host, k_ref_by_pos[pos]),
+                    "q_tail_vs_input": _pcc_and_maxdiff(q_host[..., rotary_dim:], q_np[..., rotary_dim:]),
+                    "k_tail_vs_input": _pcc_and_maxdiff(k_host[..., rotary_dim:], k_np[..., rotary_dim:]),
+                })
+                for tensor in (q_native_rot, k_native_rot, q_native_rot_trim,
+                               k_native_rot_trim, q_native, k_native):
+                    ttnn.deallocate(tensor)
+            except Exception as e:
+                rows.append({
+                    "position": pos,
+                    "accepted": False,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+
+        accepted = [r for r in rows if r.get("accepted")]
+        all_positions_accepted = len(accepted) == len(rows)
+        min_q_pcc = min((r["q_vs_manual"]["pcc"] for r in accepted), default=None)
+        min_k_pcc = min((r["k_vs_manual"]["pcc"] for r in accepted), default=None)
+        max_tail_diff = max(
+            ([r["q_tail_vs_input"]["max_abs_diff"] for r in accepted] +
+             [r["k_tail_vs_input"]["max_abs_diff"] for r in accepted]),
+            default=None,
+        )
+        pass_gate = (
+            all_positions_accepted and
+            min_q_pcc is not None and min_q_pcc >= 0.9999 and
+            min_k_pcc is not None and min_k_pcc >= 0.9999 and
+            max_tail_diff is not None and max_tail_diff <= 1e-2
+        )
+        result = {
+            "candidate": "rotary_embedding_slice_first_partial",
+            "production_shape": {
+                "q": list(q_np.shape),
+                "k": list(k_np.shape),
+                "rotary_dim": rotary_dim,
+                "tail_dim": head_dim - rotary_dim,
+            },
+            "positions": positions,
+            "op_count_removed_estimate": {
+                "manual_rope_ops_per_full_attention_layer": 20,
+                "native_partial_ops_per_full_attention_layer": 6,
+                "full_attention_layers": sum(
+                    1 for layer in state.layers if layer.get("type") == "full_attention"),
+                "note": "Operation count only; not a speedup claim.",
+            },
+            "summary": {
+                "all_positions_accepted": all_positions_accepted,
+                "min_q_pcc": min_q_pcc,
+                "min_k_pcc": min_k_pcc,
+                "max_tail_diff": max_tail_diff,
+                "pass_gate": pass_gate,
+            },
+            "rows": rows,
+        }
+        state.last_run = {
+            "cmd": "probe_rope_native_partial_tp",
+            "pass_gate": pass_gate,
+            "min_q_pcc": min_q_pcc,
+            "min_k_pcc": min_k_pcc,
+        }
+        return result
+    finally:
+        for tensor in (q_rot_tt, q_tail_tt, k_rot_tt, k_tail_tt, cos_tt, sin_tt):
+            if tensor is not None:
+                ttnn.deallocate(tensor)
+
+
+def handle_probe_rope_native_partial_trace_tp(state: MeshServerState, args: dict) -> dict:
+    """Compare and time the trace-safe native partial RoPE production variant."""
+    import ttnn
+    import time as _time
+
+    prompt = args.get("prompt", "The capital of France is")
+    iters = int(args.get("iters", 10))
+    warmup = int(args.get("warmup", 2))
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+    if state.tok is None or not state.layers:
+        return {"error": "server not fully loaded"}
+
+    prompt_ids = state.tok.encode(prompt)
+    if not prompt_ids:
+        return {"error": "prompt encoded to zero tokens"}
+    token_id = int(prompt_ids[0])
+
+    try:
+        baseline_id = _forward_argmax_id_with_cache_writer(
+            state, token_id=token_id, cur_pos=0, use_fused=False,
+            collective_mode="baseline", rope_mode="manual")
+    except Exception as e:
+        return {
+            "prompt": prompt,
+            "prompt_ids": list(prompt_ids),
+            "token_id": token_id,
+            "compatibility": {
+                "accepted": False,
+                "phase": "baseline_forward",
+                "error": f"{type(e).__name__}: {e}",
+            },
+            "trace_bench": None,
+        }
+    try:
+        native_id = _forward_argmax_id_with_cache_writer(
+            state, token_id=token_id, cur_pos=0, use_fused=False,
+            collective_mode="baseline", rope_mode="native_partial")
+    except Exception as e:
+        state.rope_mode = "manual"
+        _reset_state_buffers(state)
+        return {
+            "prompt": prompt,
+            "prompt_ids": list(prompt_ids),
+            "token_id": token_id,
+            "compatibility": {
+                "accepted": False,
+                "phase": "native_forward",
+                "baseline_argmax_id": baseline_id,
+                "error": f"{type(e).__name__}: {e}",
+            },
+            "trace_bench": None,
+        }
+    argmax_match = (baseline_id == native_id)
+
+    result = {
+        "prompt": prompt,
+        "prompt_ids": list(prompt_ids),
+        "token_id": token_id,
+        "compatibility": {
+            "accepted": True,
+            "baseline_argmax_id": baseline_id,
+            "native_argmax_id": native_id,
+            "argmax_match": argmax_match,
+            "mode": "native_partial_rope_row_no_token_index",
+            "note": (
+                "Argmax equality is a narrow production-forward check after "
+                "resetting mutable state. The earlier tensor PCC probe is the "
+                "stronger RoPE-local semantic gate."
+            ),
+        },
+        "trace_bench": None,
+    }
+
+    trace_id = None
+    try:
+        t_capture0 = _time.perf_counter()
+        trace_id, native_argmax_tt = _capture_temp_decode_trace(
+            state, use_fused=False, collective_mode="baseline",
+            rope_mode="native_partial")
+        capture_ms = (_time.perf_counter() - t_capture0) * 1000.0
+
+        def sync():
+            ttnn.synchronize_device(state.mesh)
+
+        def timed(fn):
+            sync()
+            t0 = _time.perf_counter()
+            fn()
+            sync()
+            return (_time.perf_counter() - t0) * 1000.0
+
+        for i in range(warmup):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            update_input_buffers(state, tid, pos)
+            ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+        sync()
+
+        execute_ms = []
+        update_execute_ms = []
+        for i in range(iters):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            execute_ms.append(timed(
+                lambda: ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)))
+
+            tid2 = prompt_ids[(i + 1) % len(prompt_ids)]
+            pos2 = (pos + 1) % MAX_POS
+
+            def update_execute(tid2=tid2, pos2=pos2):
+                update_input_buffers(state, tid2, pos2)
+                ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+
+            update_execute_ms.append(timed(update_execute))
+
+        result["trace_bench"] = {
+            "iters": iters,
+            "warmup": warmup,
+            "capture_ms": capture_ms,
+            "summary_ms": {
+                "native_execute_trace": _summary_ms(execute_ms),
+                "native_update_plus_execute": _summary_ms(update_execute_ms),
+            },
+            "samples_ms": {
+                "native_execute_trace": execute_ms,
+                "native_update_plus_execute": update_execute_ms,
+            },
+            "traced_argmax_id_sample": _read_argmax_id(state, native_argmax_tt),
+        }
+    except Exception as e:
+        result["trace_bench"] = {
+            "accepted": False,
+            "phase": "native_trace_or_bench",
+            "error": f"{type(e).__name__}: {e}",
+        }
+    finally:
+        if trace_id is not None:
+            ttnn.release_trace(state.mesh, trace_id)
+        state.rope_mode = "manual"
+        state.collective_mode = "baseline"
+        state.use_fused_paged_update = False
+        _reset_state_buffers(state)
+
+    state.last_run = {
+        "cmd": "probe_rope_native_partial_trace_tp",
+        "argmax_match": argmax_match,
+        "median_native_execute_ms": (
+            result["trace_bench"]["summary_ms"]["native_execute_trace"].get("median")
+            if result.get("trace_bench") and result["trace_bench"].get("summary_ms") else None
+        ),
+        "median_native_combined_ms": (
+            result["trace_bench"]["summary_ms"]["native_update_plus_execute"].get("median")
+            if result.get("trace_bench") and result["trace_bench"].get("summary_ms") else None
+        ),
+    }
+    return result
+
+
+def _profile_category(op_name: str, context: str) -> str:
+    if "rope" in context:
+        return "RoPE"
+    if "rms_norm" in context:
+        return "RMSNorm"
+    if "paged_scaled_dot_product_attention" in op_name:
+        return "SDPA"
+    if "paged_update_cache" in op_name or "paged_fused_update_cache" in op_name:
+        return "cache_update"
+    if op_name in ("ttnn.all_reduce", "ttnn.reduce_scatter", "ttnn.all_gather"):
+        return "collectives"
+    if op_name == "ttnn.linear":
+        return "matmul"
+    if op_name in ("ttnn.embedding", "ttnn.argmax", "ttnn.untilize"):
+        return "lm_head_or_io"
+    if "deltanet_conv" in context:
+        return "DeltaNet_conv"
+    if "deltanet_qkv_repeat" in context:
+        return "DeltaNet_qkv_repeat"
+    if "deltanet_decay_gate" in context:
+        return "DeltaNet_decay_gate"
+    if "deltanet_recurrence" in context:
+        return "DeltaNet_recurrence"
+    if "deltanet_output_gate" in context:
+        return "DeltaNet_output_gate"
+    if "deltanet_state_update" in context:
+        return "DeltaNet_state_update"
+    if "deltanet" in context:
+        return "DeltaNet_other"
+    if "attention" in context:
+        return "attention_other"
+    if "mlp" in context:
+        return "MLP_other"
+    return "other"
+
+
+def _summarize_profile_records(records: list[dict]) -> dict:
+    import numpy as np
+    from collections import Counter, defaultdict
+
+    category_counts = Counter(r["category"] for r in records)
+    op_counts = Counter(r["op"] for r in records)
+    category_ms = defaultdict(float)
+    op_ms = defaultdict(float)
+    for record in records:
+        ms = record.get("ms")
+        if ms is not None:
+            category_ms[record["category"]] += float(ms)
+            op_ms[record["op"]] += float(ms)
+
+    total_ms = sum(category_ms.values()) if category_ms else None
+    categories = []
+    for category, count in category_counts.most_common():
+        ms = category_ms.get(category)
+        categories.append({
+            "category": category,
+            "count": int(count),
+            "sync_bounded_ms": ms if category_ms else None,
+            "pct_of_profiled_ms": (
+                (100.0 * ms / total_ms) if total_ms and ms is not None else None
+            ),
+        })
+    top_ops = []
+    for op, count in op_counts.most_common(30):
+        ms = op_ms.get(op)
+        top_ops.append({
+            "op": op,
+            "count": int(count),
+            "sync_bounded_ms": ms if op_ms else None,
+            "pct_of_profiled_ms": (
+                (100.0 * ms / total_ms) if total_ms and ms is not None else None
+            ),
+        })
+
+    per_record_ms = [r["ms"] for r in records if r.get("ms") is not None]
+    return {
+        "total_ops": len(records),
+        "total_profiled_ms": float(total_ms) if total_ms is not None else None,
+        "per_op_ms_summary": {
+            "median": float(np.median(per_record_ms)) if per_record_ms else None,
+            "mean": float(np.mean(per_record_ms)) if per_record_ms else None,
+            "max": float(np.max(per_record_ms)) if per_record_ms else None,
+        },
+        "categories": categories,
+        "top_ops": top_ops,
+    }
+
+
+def handle_profile_decode_tp_ops(state: MeshServerState, args: dict) -> dict:
+    """In-server op-count and optional sync-bounded eager timing profile.
+
+    This is a safe fallback for qb2, where true Tracy/device-profiler timing is
+    not currently available in the resident server build. It profiles the same
+    production forward function used to capture the decode trace, but runs it
+    eagerly with TTNN calls monkey-patched inside this process.
+    """
+    import time as _time
+    import types
+    import ttnn
+
+    prompt = args.get("prompt", "The capital of France is")
+    timed = bool(args.get("timed", False))
+    include_records = bool(args.get("include_records", False))
+    deltanet_decay_mode = args.get("deltanet_decay_mode", "manual")
+    if deltanet_decay_mode not in ("manual", "native_softplus"):
+        return {"error": "deltanet_decay_mode must be manual or native_softplus"}
+    deltanet_recurrence_mode = args.get("deltanet_recurrence_mode", "manual")
+    if deltanet_recurrence_mode not in ("manual", "owned_gdn", "owned_gdn_inplace"):
+        return {"error": "deltanet_recurrence_mode must be manual, owned_gdn, or owned_gdn_inplace"}
+    if state.tok is None or not state.layers:
+        return {"error": "server not fully loaded"}
+    prompt_ids = state.tok.encode(prompt)
+    if not prompt_ids:
+        return {"error": "prompt encoded to zero tokens"}
+
+    # Ensure kernels are already compiled and the production trace exists.
+    _ensure_decode_trace(state)
+    _reset_state_buffers(state)
+
+    records = []
+    patched = []
+
+    def sync():
+        ttnn.synchronize_device(state.mesh)
+
+    def patch_attr(owner, attr, op_name):
+        if not hasattr(owner, attr):
+            return
+        orig = getattr(owner, attr)
+        if not callable(orig):
+            return
+
+        def wrapped(*f_args, **f_kwargs):
+            context = "/".join(state.profile_context_stack)
+            t0 = None
+            if timed:
+                sync()
+                t0 = _time.perf_counter()
+            out = orig(*f_args, **f_kwargs)
+            ms = None
+            if timed:
+                sync()
+                ms = (_time.perf_counter() - t0) * 1000.0
+            records.append({
+                "op": op_name,
+                "context": context,
+                "category": _profile_category(op_name, context),
+                "ms": ms,
+            })
+            return out
+
+        setattr(owner, attr, wrapped)
+        patched.append((owner, attr, orig))
+
+    for name in (
+        "embedding", "reshape", "linear", "slice", "concat", "neg", "add",
+        "sub", "mul", "div", "sqrt", "sum", "exp", "log", "sigmoid", "silu",
+        "rms_norm", "repeat", "copy", "pad", "to_memory_config", "all_reduce",
+        "reduce_scatter", "all_gather", "argmax", "untilize",
+    ):
+        patch_attr(ttnn, name, f"ttnn.{name}")
+    for name in (
+        "paged_update_cache", "paged_fused_update_cache", "rotary_embedding",
+        "rotary_embedding_llama_fused_qk", "qwen36_gdn_decode_owned",
+    ):
+        patch_attr(ttnn.experimental, name, f"ttnn.experimental.{name}")
+    patch_attr(
+        ttnn.transformer,
+        "paged_scaled_dot_product_attention_decode",
+        "ttnn.transformer.paged_scaled_dot_product_attention_decode",
+    )
+
+    # Add high-level context without changing production code paths.
+    orig_dn = globals()["deltanet_step_tp"]
+    orig_attn = globals()["gated_attn_step_tp"]
+    orig_mlp = globals()["mlp_step_tp"]
+    orig_norm = globals()["_rms_norm_manual"]
+    orig_all_reduce = globals()["_tp_all_reduce"]
+
+    def dn_wrapped(*f_args, **f_kwargs):
+        with _profile_scope(state, "deltanet"):
+            return orig_dn(*f_args, **f_kwargs)
+
+    def attn_wrapped(*f_args, **f_kwargs):
+        with _profile_scope(state, "attention"):
+            return orig_attn(*f_args, **f_kwargs)
+
+    def mlp_wrapped(*f_args, **f_kwargs):
+        with _profile_scope(state, "mlp"):
+            return orig_mlp(*f_args, **f_kwargs)
+
+    def norm_wrapped(*f_args, **f_kwargs):
+        with _profile_scope(state, "rms_norm"):
+            return orig_norm(*f_args, **f_kwargs)
+
+    def all_reduce_wrapped(*f_args, **f_kwargs):
+        with _profile_scope(state, "collective"):
+            return orig_all_reduce(*f_args, **f_kwargs)
+
+    globals()["deltanet_step_tp"] = dn_wrapped
+    globals()["gated_attn_step_tp"] = attn_wrapped
+    globals()["mlp_step_tp"] = mlp_wrapped
+    globals()["_rms_norm_manual"] = norm_wrapped
+    globals()["_tp_all_reduce"] = all_reduce_wrapped
+
+    old_decay = state.deltanet_decay_mode
+    old_recurrence = state.deltanet_recurrence_mode
+    state.deltanet_decay_mode = deltanet_decay_mode
+    state.deltanet_recurrence_mode = deltanet_recurrence_mode
+    state.profile_records = records
+    state.profile_context_stack = []
+    try:
+        update_input_buffers(state, int(prompt_ids[0]), 0)
+        sync()
+        t0 = _time.perf_counter()
+        out = forward_token_tp_inner(state)
+        sync()
+        eager_forward_ms = (_time.perf_counter() - t0) * 1000.0
+        argmax_id = _read_argmax_id(state, out)
+    finally:
+        state.deltanet_decay_mode = old_decay
+        state.deltanet_recurrence_mode = old_recurrence
+        state.profile_records = None
+        state.profile_context_stack = []
+        globals()["deltanet_step_tp"] = orig_dn
+        globals()["gated_attn_step_tp"] = orig_attn
+        globals()["mlp_step_tp"] = orig_mlp
+        globals()["_rms_norm_manual"] = orig_norm
+        globals()["_tp_all_reduce"] = orig_all_reduce
+        for owner, attr, orig in reversed(patched):
+            setattr(owner, attr, orig)
+        _reset_state_buffers(state)
+
+    result = {
+        "prompt": prompt,
+        "prompt_ids": list(prompt_ids),
+        "token_id": int(prompt_ids[0]),
+        "timed": timed,
+        "deltanet_decay_mode": deltanet_decay_mode,
+        "deltanet_recurrence_mode": deltanet_recurrence_mode,
+        "eager_forward_ms": eager_forward_ms,
+        "argmax_id": argmax_id,
+        "summary": _summarize_profile_records(records),
+        "limitations": [
+            "This profiles eager execution of the production trace body inside the resident server.",
+            "When timed=true, every recorded op is sync-bounded; totals are not equal to execute_trace replay time.",
+            "Use categories and counts to choose candidates; require full trace/full decode measurement before speedup claims.",
+        ],
+    }
+    if include_records:
+        result["records"] = records
+    state.last_run = {
+        "cmd": "profile_decode_tp_ops",
+        "timed": timed,
+        "total_ops": result["summary"]["total_ops"],
+        "eager_forward_ms": eager_forward_ms,
+    }
+    return result
+
+
+def handle_probe_deltanet_recurrence_matmul_tp(state: MeshServerState, args: dict) -> dict:
+    """Validate a no-rebuild matmul formulation of the DeltaNet recurrence."""
+    import time as _time
+    import numpy as np
+    import torch
+    import ttnn
+    from full_layer_tp_probe import K_DIM, V_DIM, NV_PER_CHIP, VAL_DIM_CHIP
+
+    if state.mesh is None or state.cfg is None:
+        return {"error": "server not fully loaded"}
+
+    iters = int(args.get("iters", 20))
+    warmup = int(args.get("warmup", 3))
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+
+    rng = np.random.default_rng(442)
+    H_np = (rng.standard_normal((NV_PER_CHIP, K_DIM, V_DIM)).astype(np.float32) * 0.03)
+    q_np = (rng.standard_normal((NV_PER_CHIP, K_DIM)).astype(np.float32) * 0.03)
+    k_np = (rng.standard_normal((NV_PER_CHIP, K_DIM)).astype(np.float32) * 0.03)
+    v_np = (rng.standard_normal((NV_PER_CHIP, V_DIM)).astype(np.float32) * 0.03)
+    decay_np = np.exp(-np.abs(rng.standard_normal((NV_PER_CHIP,)).astype(np.float32)) * 0.05)
+    beta_np = 1.0 / (1.0 + np.exp(-rng.standard_normal((NV_PER_CHIP,)).astype(np.float32)))
+
+    def upload(arr):
+        return ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32)),
+            dtype=ttnn.float32,
+            device=state.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+
+    def recurrence_manual(H, q, k, v, decay, beta):
+        H_4d = ttnn.reshape(H, [1, NV_PER_CHIP, K_DIM, V_DIM])
+        H_decayed = ttnn.mul(H_4d, ttnn.reshape(decay, [1, NV_PER_CHIP, 1, 1]))
+        k_col = ttnn.reshape(k, [1, NV_PER_CHIP, K_DIM, 1])
+        kv_mem = ttnn.reshape(ttnn.sum(ttnn.mul(H_decayed, k_col), dim=-2),
+                              [1, NV_PER_CHIP, V_DIM])
+        v_3d = ttnn.reshape(v, [1, NV_PER_CHIP, V_DIM])
+        delta = ttnn.mul(ttnn.sub(v_3d, kv_mem),
+                         ttnn.reshape(beta, [1, NV_PER_CHIP, 1]))
+        H_new = ttnn.add(
+            H_decayed,
+            ttnn.mul(k_col, ttnn.reshape(delta, [1, NV_PER_CHIP, 1, V_DIM])),
+        )
+        q_col = ttnn.reshape(q, [1, NV_PER_CHIP, K_DIM, 1])
+        out = ttnn.reshape(ttnn.sum(ttnn.mul(H_new, q_col), dim=-2),
+                           [1, VAL_DIM_CHIP])
+        return H_new, out
+
+    def recurrence_matmul(H, q, k, v, decay, beta):
+        H_4d = ttnn.reshape(H, [1, NV_PER_CHIP, K_DIM, V_DIM])
+        H_decayed = ttnn.mul(H_4d, ttnn.reshape(decay, [1, NV_PER_CHIP, 1, 1]))
+        k_row = ttnn.reshape(k, [1, NV_PER_CHIP, 1, K_DIM])
+        kv_mem = ttnn.reshape(
+            ttnn.matmul(k_row, H_decayed,
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
+                        dtype=ttnn.float32,
+                        compute_kernel_config=state.sdpa_compute_kernel_config),
+            [1, NV_PER_CHIP, V_DIM],
+        )
+        v_3d = ttnn.reshape(v, [1, NV_PER_CHIP, V_DIM])
+        delta = ttnn.mul(ttnn.sub(v_3d, kv_mem),
+                         ttnn.reshape(beta, [1, NV_PER_CHIP, 1]))
+        k_col = ttnn.reshape(k, [1, NV_PER_CHIP, K_DIM, 1])
+        outer = ttnn.matmul(
+            k_col,
+            ttnn.reshape(delta, [1, NV_PER_CHIP, 1, V_DIM]),
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            dtype=ttnn.float32,
+            compute_kernel_config=state.sdpa_compute_kernel_config,
+        )
+        H_new = ttnn.add(H_decayed, outer)
+        q_row = ttnn.reshape(q, [1, NV_PER_CHIP, 1, K_DIM])
+        out = ttnn.reshape(
+            ttnn.matmul(q_row, H_new,
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
+                        dtype=ttnn.float32,
+                        compute_kernel_config=state.sdpa_compute_kernel_config),
+            [1, VAL_DIM_CHIP],
+        )
+        return H_new, out
+
+    H_tt = q_tt = k_tt = v_tt = decay_tt = beta_tt = None
+    Hm = out_m = Hv = out_v = None
+    try:
+        H_tt = upload(H_np)
+        q_tt = upload(q_np)
+        k_tt = upload(k_np)
+        v_tt = upload(v_np)
+        decay_tt = upload(decay_np)
+        beta_tt = upload(beta_np)
+
+        Hm, out_m = recurrence_manual(H_tt, q_tt, k_tt, v_tt, decay_tt, beta_tt)
+        ttnn.synchronize_device(state.mesh)
+        try:
+            Hv, out_v = recurrence_matmul(H_tt, q_tt, k_tt, v_tt, decay_tt, beta_tt)
+            ttnn.synchronize_device(state.mesh)
+            accepted = True
+            error = None
+        except Exception as e:
+            accepted = False
+            error = f"{type(e).__name__}: {e}"
+
+        result = {
+            "candidate": "deltanet_recurrence_matmul_form",
+            "shape": {
+                "state": [NV_PER_CHIP, K_DIM, V_DIM],
+                "q": [NV_PER_CHIP, K_DIM],
+                "k": [NV_PER_CHIP, K_DIM],
+                "value": [NV_PER_CHIP, V_DIM],
+            },
+            "compatibility": {
+                "accepted": accepted,
+                "error": error,
+            },
+            "timing": None,
+        }
+        if accepted:
+            Hm_host = ttnn.to_torch(
+                Hm, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+            ).float().cpu().numpy()[:1].reshape(1, NV_PER_CHIP, K_DIM, V_DIM)
+            Hv_host = ttnn.to_torch(
+                Hv, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+            ).float().cpu().numpy()[:1].reshape(1, NV_PER_CHIP, K_DIM, V_DIM)
+            out_m_host = ttnn.to_torch(
+                out_m, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+            ).float().cpu().numpy()[:1].reshape(1, VAL_DIM_CHIP)
+            out_v_host = ttnn.to_torch(
+                out_v, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+            ).float().cpu().numpy()[:1].reshape(1, VAL_DIM_CHIP)
+            state_cmp = _pcc_and_maxdiff(Hv_host, Hm_host)
+            out_cmp = _pcc_and_maxdiff(out_v_host, out_m_host)
+            pass_gate = (
+                state_cmp["pcc"] >= 0.9999 and out_cmp["pcc"] >= 0.9999 and
+                state_cmp["max_abs_diff"] <= 1e-2 and out_cmp["max_abs_diff"] <= 1e-2
+            )
+
+            def sync():
+                ttnn.synchronize_device(state.mesh)
+
+            def timed_call(fn):
+                sync()
+                t0 = _time.perf_counter()
+                tmp_H, tmp_out = fn(H_tt, q_tt, k_tt, v_tt, decay_tt, beta_tt)
+                sync()
+                dt = (_time.perf_counter() - t0) * 1000.0
+                ttnn.deallocate(tmp_H)
+                ttnn.deallocate(tmp_out)
+                return dt
+
+            for _ in range(warmup):
+                timed_call(recurrence_manual)
+                timed_call(recurrence_matmul)
+            manual_ms = [timed_call(recurrence_manual) for _ in range(iters)]
+            matmul_ms = [timed_call(recurrence_matmul) for _ in range(iters)]
+            result["correctness"] = {
+                "state_vs_manual": state_cmp,
+                "out_vs_manual": out_cmp,
+                "pass_gate": pass_gate,
+            }
+            result["timing"] = {
+                "iters": iters,
+                "warmup": warmup,
+                "manual_ms": _summary_ms(manual_ms),
+                "matmul_ms": _summary_ms(matmul_ms),
+                "samples_ms": {
+                    "manual": manual_ms,
+                    "matmul": matmul_ms,
+                },
+                "note": "Synthetic recurrence body only; not trace or full-decode timing.",
+            }
+            state.last_run = {
+                "cmd": "probe_deltanet_recurrence_matmul_tp",
+                "accepted": True,
+                "pass_gate": pass_gate,
+                "manual_median_ms": result["timing"]["manual_ms"].get("median"),
+                "matmul_median_ms": result["timing"]["matmul_ms"].get("median"),
+            }
+        return result
+    finally:
+        for tensor in (Hm, out_m, Hv, out_v, H_tt, q_tt, k_tt, v_tt, decay_tt, beta_tt):
+            if tensor is not None:
+                try:
+                    ttnn.deallocate(tensor)
+                except Exception:
+                    pass
+
+
+def handle_probe_deltanet_native_gdn_real_tensors_tp(state: MeshServerState, args: dict) -> dict:
+    """Validate native Qwen36 GDN recurrence on real resident server tensors."""
+    import numpy as np
+    import torch
+    import ttnn
+    from full_layer_tp_probe import (
+        K_DIM, V_DIM, CONV_DIM_CHIP, KEY_DIM_CHIP, VAL_DIM_CHIP,
+        NK_PER_CHIP, NV_PER_CHIP, N_REP, EPS,
+    )
+
+    if state.mesh is None or state.cfg is None or not state.layers:
+        return {"error": "server not fully loaded"}
+    if not hasattr(ttnn.experimental, "qwen36_gdn_decode"):
+        return {"error": "ttnn.experimental.qwen36_gdn_decode is not exposed"}
+
+    prompt = args.get("prompt", "The capital of France is")
+    reset_state = bool(args.get("reset_state", True))
+    layer_idx = int(args.get("layer_idx", 0))
+    mode = args.get("mode", "fp32_cast")
+    if mode not in ("fp32_cast", "current_dtype"):
+        return {"error": f"unsupported mode {mode!r}"}
+    if layer_idx < 0 or layer_idx >= len(state.layers):
+        return {"error": f"layer_idx out of range: {layer_idx}"}
+    if state.layers[layer_idx]["type"] != "linear_attention":
+        return {"error": f"layer_idx {layer_idx} is not a linear_attention layer"}
+
+    if reset_state:
+        _reset_state_buffers(state)
+
+    cfg = state.cfg
+    HIDDEN = cfg["hidden"]
+    token_ids = state.tok.encode(prompt, add_special_tokens=False)
+    if not token_ids:
+        return {"error": "prompt produced no token ids"}
+    token_id = int(token_ids[0])
+    dn = state.layers[layer_idx]["dn"]
+
+    tensors = []
+
+    def remember(t):
+        tensors.append(t)
+        return t
+
+    def host(tensor):
+        return ttnn.to_torch(
+            tensor,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        ).float().cpu().numpy()
+
+    try:
+        tok_tt = remember(ttnn.from_torch(
+            torch.tensor([[token_id]], dtype=torch.int32),
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.uint32,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        ))
+        embed_out = remember(ttnn.embedding(
+            tok_tt,
+            state.embed_tt,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        ))
+        x_tt = remember(ttnn.reshape(embed_out, [1, HIDDEN]))
+
+        h_tt = remember(_rms_norm_manual(x_tt, dn["input_norm"], EPS, HIDDEN))
+        all_tt = remember(ttnn.linear(h_tt, dn["w_in"]))
+        mixed_qkv = remember(ttnn.slice(all_tt, [0, 0], [1, CONV_DIM_CHIP]))
+        a_tt = remember(ttnn.slice(
+            all_tt,
+            [0, CONV_DIM_CHIP + VAL_DIM_CHIP],
+            [1, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
+        ))
+        b_tt = remember(ttnn.slice(
+            all_tt,
+            [0, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
+            [1, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP],
+        ))
+
+        mixed_col = remember(ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1]))
+        conv_input = remember(ttnn.concat([dn["conv_st"], mixed_col], dim=-1))
+        conv_prod = remember(ttnn.mul(conv_input, dn["w_conv"]))
+        conv_out = remember(ttnn.silu(ttnn.sum(conv_prod, dim=-1)))
+
+        q_flat = remember(ttnn.slice(conv_out, [0], [KEY_DIM_CHIP]))
+        k_flat = remember(ttnn.slice(conv_out, [KEY_DIM_CHIP], [2 * KEY_DIM_CHIP]))
+        v_flat = remember(ttnn.slice(conv_out, [2 * KEY_DIM_CHIP], [CONV_DIM_CHIP]))
+
+        def gqa(t, n_kh, d):
+            t2 = remember(ttnn.reshape(t, [n_kh, 1, d]))
+            t3 = remember(ttnn.repeat(t2, ttnn.Shape([1, N_REP, 1])))
+            return remember(ttnn.reshape(t3, [n_kh * N_REP, d]))
+
+        q = gqa(q_flat, NK_PER_CHIP, K_DIM)
+        k = gqa(k_flat, NK_PER_CHIP, K_DIM)
+        v = remember(ttnn.reshape(v_flat, [NV_PER_CHIP, V_DIM]))
+
+        EPS_RMS = EPS / K_DIM
+        q = remember(_rms_norm_manual(q, dn["q_l2_scale"], EPS_RMS, K_DIM))
+        k = remember(_rms_norm_manual(k, dn["k_l2_scale"], EPS_RMS, K_DIM))
+
+        a_biased = remember(ttnn.add(a_tt, dn["dt_bias"]))
+        if state.deltanet_decay_mode == "native_softplus":
+            softplus_a = remember(ttnn.softplus(a_biased))
+        else:
+            softplus_a = remember(ttnn.log(ttnn.add(ttnn.exp(a_biased), 1.0)))
+        g = remember(ttnn.mul(ttnn.neg(ttnn.exp(dn["A_log"])), softplus_a))
+        beta = remember(ttnn.sigmoid(b_tt))
+        decay = remember(ttnn.reshape(ttnn.exp(g), [1, NV_PER_CHIP, 1, 1]))
+
+        # Do not register this for cleanup: it is a view of persistent dn["ssm"].
+        H_4d = ttnn.reshape(dn["ssm"], [1, NV_PER_CHIP, K_DIM, V_DIM])
+        q4 = remember(ttnn.reshape(q, [1, NV_PER_CHIP, 1, K_DIM]))
+        k4 = remember(ttnn.reshape(k, [1, NV_PER_CHIP, 1, K_DIM]))
+        v4 = remember(ttnn.reshape(v, [1, NV_PER_CHIP, 1, V_DIM]))
+        beta4 = remember(ttnn.reshape(beta, [1, NV_PER_CHIP, 1, 1]))
+
+        if mode == "fp32_cast":
+            H_in = remember(ttnn.typecast(H_4d, ttnn.float32))
+            q_in = remember(ttnn.typecast(q4, ttnn.float32))
+            k_in = remember(ttnn.typecast(k4, ttnn.float32))
+            v_in = remember(ttnn.typecast(v4, ttnn.float32))
+            decay_in = remember(ttnn.typecast(decay, ttnn.float32))
+            beta_in = remember(ttnn.typecast(beta4, ttnn.float32))
+        else:
+            H_in = remember(ttnn.add(H_4d, 0.0))
+            q_in = q4
+            k_in = k4
+            v_in = v4
+            decay_in = decay
+            beta_in = beta4
+
+        state_scaled = remember(ttnn.mul(H_in, decay_in))
+        k_col = remember(ttnn.reshape(k_in, [1, NV_PER_CHIP, K_DIM, 1]))
+        prediction = remember(ttnn.reshape(
+            ttnn.sum(ttnn.mul(state_scaled, k_col), dim=-2),
+            [1, NV_PER_CHIP, 1, V_DIM],
+        ))
+        delta = remember(ttnn.mul(ttnn.sub(v_in, prediction), beta_in))
+        H_manual = remember(ttnn.add(
+            state_scaled,
+            ttnn.mul(k_col, ttnn.reshape(delta, [1, NV_PER_CHIP, 1, V_DIM])),
+        ))
+        q_col = remember(ttnn.reshape(q_in, [1, NV_PER_CHIP, K_DIM, 1]))
+        out_manual = remember(ttnn.reshape(
+            ttnn.sum(ttnn.mul(H_manual, q_col), dim=-2),
+            [1, NV_PER_CHIP, 1, V_DIM],
+        ))
+
+        # qwen36_gdn_decode returns the input state tensor after updating it.
+        # Use a copied state so this probe cannot mutate dn["ssm"].
+        H_native_in = remember(ttnn.add(H_in, 0.0))
+        try:
+            H_native, out_native = ttnn.experimental.qwen36_gdn_decode(
+                H_native_in,
+                q_in,
+                k_in,
+                v_in,
+                decay_in,
+                beta_in,
+                normalize_qk_l2=False,
+                output_memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+            native_accepted = True
+            native_error = None
+            tensors.append(out_native)
+        except Exception as e:
+            native_accepted = False
+            native_error = f"{type(e).__name__}: {e}"
+            H_native = None
+            out_native = None
+
+        result = {
+            "candidate": "qwen36_gdn_decode_real_tensors",
+            "mode": mode,
+            "prompt": prompt,
+            "token_id": token_id,
+            "layer_idx": layer_idx,
+            "reset_state": reset_state,
+            "symbols": {
+                "qwen36_gdn_prepare_decode": hasattr(ttnn.experimental, "qwen36_gdn_prepare_decode"),
+                "qwen36_gdn_decode": hasattr(ttnn.experimental, "qwen36_gdn_decode"),
+            },
+            "shape": {
+                "state": [1, NV_PER_CHIP, K_DIM, V_DIM],
+                "qkv": [1, NV_PER_CHIP, 1, K_DIM],
+                "alpha_beta": [1, NV_PER_CHIP, 1, 1],
+            },
+            "compatibility": {
+                "accepted": native_accepted,
+                "error": native_error,
+            },
+        }
+        if native_accepted:
+            ttnn.synchronize_device(state.mesh)
+            Hm_host = host(H_manual)
+            Hn_host = host(H_native)
+            out_m_raw = host(out_manual)
+            out_n_raw = host(out_native)
+            out_leading = out_m_raw.size // (NV_PER_CHIP * V_DIM)
+            out_native_tile_rows = out_n_raw.size // (out_leading * NV_PER_CHIP * V_DIM)
+            out_m_host = out_m_raw.reshape(out_leading, NV_PER_CHIP, 1, V_DIM)
+            out_n_host = out_n_raw.reshape(
+                out_leading, NV_PER_CHIP, out_native_tile_rows, V_DIM
+            )[:, :, :1, :]
+            state_cmp = _pcc_and_maxdiff(Hn_host, Hm_host)
+            out_cmp = _pcc_and_maxdiff(out_n_host, out_m_host)
+            pass_gate = (
+                state_cmp["pcc"] >= 0.9999 and
+                out_cmp["pcc"] >= 0.9999 and
+                state_cmp["max_abs_diff"] <= 1e-2 and
+                out_cmp["max_abs_diff"] <= 1e-2
+            )
+            result["correctness"] = {
+                "state_vs_manual": state_cmp,
+                "output_vs_manual": out_cmp,
+                "pass_gate": pass_gate,
+                "host_shapes": {
+                    "state_manual": list(Hm_host.shape),
+                    "state_native": list(Hn_host.shape),
+                    "output_manual": list(out_m_host.shape),
+                    "output_native": list(out_n_host.shape),
+                },
+            }
+            state.last_run = {
+                "cmd": "probe_deltanet_native_gdn_real_tensors_tp",
+                "accepted": native_accepted,
+                "pass_gate": pass_gate,
+                "mode": mode,
+            }
+        return result
+    finally:
+        seen = set()
+        for tensor in reversed(tensors):
+            if tensor is None:
+                continue
+            ident = id(tensor)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            try:
+                ttnn.deallocate(tensor)
+            except Exception:
+                pass
+
+
+def handle_probe_deltanet_owned_gdn_real_tensors_tp(state: MeshServerState, args: dict) -> dict:
+    """Validate the owned GDN decode op on real resident DeltaNet tensors.
+
+    This intentionally runs inside the persistent server process. It does not
+    open devices directly and it does not mutate the resident SSM state.
+    """
+    import torch
+    import ttnn
+    from full_layer_tp_probe import (
+        K_DIM, V_DIM, CONV_DIM_CHIP, KEY_DIM_CHIP, VAL_DIM_CHIP,
+        NK_PER_CHIP, NV_PER_CHIP, N_REP, EPS,
+    )
+
+    if state.mesh is None or state.cfg is None or not state.layers:
+        return {"error": "server not fully loaded"}
+    if not hasattr(ttnn.experimental, "qwen36_gdn_decode_owned"):
+        return {"error": "ttnn.experimental.qwen36_gdn_decode_owned is not exposed"}
+
+    prompt = args.get("prompt", "The capital of France is")
+    reset_state = bool(args.get("reset_state", True))
+    layer_idx = int(args.get("layer_idx", 0))
+    use_pretransposed_k = bool(args.get("use_pretransposed_k", False))
+    compact_vectors = bool(args.get("compact_vectors", False))
+    native_io = bool(args.get("native_io", False))
+    stepwise = bool(args.get("stepwise", False))
+    seed_state = args.get("seed_state", "resident")
+    direct_state_input = bool(args.get("direct_state_input", False))
+    component_debug_modes = [int(x) for x in (args.get("component_debug_modes") or [])]
+    allowed_component_debug_modes = {2, 10, 11, 12}
+    bad_component_debug_modes = sorted(set(component_debug_modes) - allowed_component_debug_modes)
+    if bad_component_debug_modes:
+        return {"error": f"unsupported component_debug_modes {bad_component_debug_modes}"}
+    if seed_state not in ("resident", "manual_once"):
+        return {"error": f"unsupported seed_state {seed_state!r}"}
+    if direct_state_input and seed_state != "manual_once":
+        return {"error": "direct_state_input is only safe with seed_state='manual_once'"}
+    if layer_idx < 0 or layer_idx >= len(state.layers):
+        return {"error": f"layer_idx out of range: {layer_idx}"}
+    if state.layers[layer_idx]["type"] != "linear_attention":
+        return {"error": f"layer_idx {layer_idx} is not a linear_attention layer"}
+
+    if (compact_vectors or native_io) and use_pretransposed_k:
+        return {"error": "compact_vectors/native_io currently do not support use_pretransposed_k"}
+
+    if reset_state:
+        _reset_state_buffers(state)
+
+    cfg = state.cfg
+    HIDDEN = cfg["hidden"]
+    token_ids = state.tok.encode(prompt, add_special_tokens=False)
+    if not token_ids:
+        return {"error": "prompt produced no token ids"}
+    token_id = int(token_ids[0])
+    dn = state.layers[layer_idx]["dn"]
+
+    tensors = []
+
+    def remember(t):
+        tensors.append(t)
+        return t
+
+    def host(tensor):
+        return ttnn.to_torch(
+            tensor,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        ).float().cpu().numpy()
+
+    try:
+        tok_tt = remember(ttnn.from_torch(
+            torch.tensor([[token_id]], dtype=torch.int32),
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.uint32,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        ))
+        embed_out = remember(ttnn.embedding(
+            tok_tt,
+            state.embed_tt,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        ))
+        x_tt = remember(ttnn.reshape(embed_out, [1, HIDDEN]))
+
+        h_tt = remember(_rms_norm_manual(x_tt, dn["input_norm"], EPS, HIDDEN))
+        all_tt = remember(ttnn.linear(h_tt, dn["w_in"]))
+        mixed_qkv = remember(ttnn.slice(all_tt, [0, 0], [1, CONV_DIM_CHIP]))
+        a_tt = remember(ttnn.slice(
+            all_tt,
+            [0, CONV_DIM_CHIP + VAL_DIM_CHIP],
+            [1, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
+        ))
+        b_tt = remember(ttnn.slice(
+            all_tt,
+            [0, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
+            [1, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP],
+        ))
+
+        mixed_col = remember(ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1]))
+        conv_input = remember(ttnn.concat([dn["conv_st"], mixed_col], dim=-1))
+        conv_prod = remember(ttnn.mul(conv_input, dn["w_conv"]))
+        conv_out = remember(ttnn.silu(ttnn.sum(conv_prod, dim=-1)))
+
+        q_flat = remember(ttnn.slice(conv_out, [0], [KEY_DIM_CHIP]))
+        k_flat = remember(ttnn.slice(conv_out, [KEY_DIM_CHIP], [2 * KEY_DIM_CHIP]))
+        v_flat = remember(ttnn.slice(conv_out, [2 * KEY_DIM_CHIP], [CONV_DIM_CHIP]))
+
+        def gqa(t, n_kh, d):
+            t2 = remember(ttnn.reshape(t, [n_kh, 1, d]))
+            t3 = remember(ttnn.repeat(t2, ttnn.Shape([1, N_REP, 1])))
+            return remember(ttnn.reshape(t3, [n_kh * N_REP, d]))
+
+        q = gqa(q_flat, NK_PER_CHIP, K_DIM)
+        k = gqa(k_flat, NK_PER_CHIP, K_DIM)
+        v = remember(ttnn.reshape(v_flat, [NV_PER_CHIP, V_DIM]))
+
+        EPS_RMS = EPS / K_DIM
+        q = remember(_rms_norm_manual(q, dn["q_l2_scale"], EPS_RMS, K_DIM))
+        k = remember(_rms_norm_manual(k, dn["k_l2_scale"], EPS_RMS, K_DIM))
+
+        a_biased = remember(ttnn.add(a_tt, dn["dt_bias"]))
+        if state.deltanet_decay_mode == "native_softplus":
+            softplus_a = remember(ttnn.softplus(a_biased))
+        else:
+            softplus_a = remember(ttnn.log(ttnn.add(ttnn.exp(a_biased), 1.0)))
+        g = remember(ttnn.mul(ttnn.neg(ttnn.exp(dn["A_log"])), softplus_a))
+        beta = remember(ttnn.sigmoid(b_tt))
+        decay = remember(ttnn.reshape(ttnn.exp(g), [1, NV_PER_CHIP, 1, 1]))
+
+        # Do not register this for cleanup: this is persistent resident state.
+        H_4d = dn["ssm"]
+        q4 = remember(ttnn.reshape(q, [1, NV_PER_CHIP, 1, K_DIM]))
+        k4 = remember(ttnn.reshape(k, [1, NV_PER_CHIP, 1, K_DIM]))
+        v4 = remember(ttnn.reshape(v, [1, NV_PER_CHIP, 1, V_DIM]))
+        beta4 = remember(ttnn.reshape(beta, [1, NV_PER_CHIP, 1, 1]))
+
+        H_input = H_4d
+        if seed_state == "manual_once":
+            seed_state_scaled = remember(ttnn.mul(H_4d, decay))
+            seed_k_col = remember(ttnn.reshape(k4, [1, NV_PER_CHIP, K_DIM, 1]))
+            seed_prediction = remember(ttnn.reshape(
+                ttnn.sum(ttnn.mul(seed_state_scaled, seed_k_col), dim=-2),
+                [1, NV_PER_CHIP, 1, V_DIM],
+            ))
+            seed_delta = remember(ttnn.mul(ttnn.sub(v4, seed_prediction), beta4))
+            H_input = remember(ttnn.add(
+                seed_state_scaled,
+                ttnn.mul(seed_k_col, ttnn.reshape(seed_delta, [1, NV_PER_CHIP, 1, V_DIM])),
+            ))
+
+        # Manual reference in the same dtype/layout path as production.
+        state_scaled = remember(ttnn.mul(H_input, decay))
+        k_col = remember(ttnn.reshape(k4, [1, NV_PER_CHIP, K_DIM, 1]))
+        prediction = remember(ttnn.reshape(
+            ttnn.sum(ttnn.mul(state_scaled, k_col), dim=-2),
+            [1, NV_PER_CHIP, 1, V_DIM],
+        ))
+        delta = remember(ttnn.mul(ttnn.sub(v4, prediction), beta4))
+        H_manual = remember(ttnn.add(
+            state_scaled,
+            ttnn.mul(k_col, ttnn.reshape(delta, [1, NV_PER_CHIP, 1, V_DIM])),
+        ))
+        q_col = remember(ttnn.reshape(q4, [1, NV_PER_CHIP, K_DIM, 1]))
+        out_manual = remember(ttnn.reshape(
+            ttnn.sum(ttnn.mul(H_manual, q_col), dim=-2),
+            [1, NV_PER_CHIP, 1, V_DIM],
+        ))
+        matmul_reference_error = None
+        prediction_matmul = None
+        H_matmul = None
+        out_matmul = None
+        if stepwise:
+            try:
+                prediction_matmul = remember(ttnn.reshape(
+                    ttnn.matmul(
+                        k4,
+                        state_scaled,
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
+                        dtype=ttnn.float32,
+                        compute_kernel_config=state.sdpa_compute_kernel_config,
+                    ),
+                    [1, NV_PER_CHIP, 1, V_DIM],
+                ))
+                delta_matmul = remember(ttnn.mul(ttnn.sub(v4, prediction_matmul), beta4))
+                outer_matmul = remember(ttnn.matmul(
+                    k_col,
+                    delta_matmul,
+                    memory_config=ttnn.L1_MEMORY_CONFIG,
+                    dtype=ttnn.float32,
+                    compute_kernel_config=state.sdpa_compute_kernel_config,
+                ))
+                H_matmul = remember(ttnn.add(state_scaled, outer_matmul))
+                out_matmul = remember(ttnn.reshape(
+                    ttnn.matmul(
+                        q4,
+                        H_matmul,
+                        memory_config=ttnn.L1_MEMORY_CONFIG,
+                        dtype=ttnn.float32,
+                        compute_kernel_config=state.sdpa_compute_kernel_config,
+                    ),
+                    [1, NV_PER_CHIP, 1, V_DIM],
+                ))
+            except Exception as e:
+                matmul_reference_error = f"{type(e).__name__}: {e}"
+
+        # Owned op contract variants. The default copy path preserves resident
+        # state. direct_state_input is a diagnostic for the temporary seeded
+        # state path only, used to separate copy drift from kernel drift.
+        H_owned_copy_for_compare = None
+        if stepwise:
+            H_owned_copy_for_compare = remember(ttnn.add(H_input, 0.0))
+        H_owned_in = H_input if direct_state_input else remember(ttnn.add(H_input, 0.0))
+        if native_io:
+            q_rows = q4
+            k_rows = k4
+            v_rows = v4
+            decay_tiles = decay
+            beta_tiles = beta4
+        elif compact_vectors:
+            q_rows = remember(ttnn.pad(q4, [[0, 0], [0, 0], [0, 31], [0, 0]], value=0.0))
+            k_rows = remember(ttnn.pad(k4, [[0, 0], [0, 0], [0, 31], [0, 0]], value=0.0))
+            v_rows = remember(ttnn.pad(v4, [[0, 0], [0, 0], [0, 31], [0, 0]], value=0.0))
+            decay_tiles = remember(ttnn.repeat(decay, ttnn.Shape([1, 1, 32, 32])))
+            beta_tiles = remember(ttnn.repeat(beta4, ttnn.Shape([1, 1, 32, 32])))
+        else:
+            q_rows = remember(ttnn.repeat(q4, ttnn.Shape([1, 1, 32, 1])))
+            k_rows = remember(ttnn.repeat(k4, ttnn.Shape([1, 1, 32, 1])))
+            v_rows = remember(ttnn.repeat(v4, ttnn.Shape([1, 1, 32, 1])))
+            decay_tiles = remember(ttnn.repeat(decay, ttnn.Shape([1, 1, 32, 32])))
+            beta_tiles = remember(ttnn.repeat(beta4, ttnn.Shape([1, 1, 32, 32])))
+        k_col_tiles = None
+        if use_pretransposed_k:
+            k_col_tiles = remember(ttnn.repeat(k_col, ttnn.Shape([1, 1, 1, 32])))
+
+        try:
+            if use_pretransposed_k:
+                H_owned, out_owned = ttnn.experimental.qwen36_gdn_decode_owned(
+                    H_owned_in,
+                    q_rows,
+                    k_rows,
+                    v_rows,
+                    decay_tiles,
+                    beta_tiles,
+                    k_col=k_col_tiles,
+                    compact_vectors=compact_vectors,
+                    native_io=native_io,
+                    output_memory_config=ttnn.L1_MEMORY_CONFIG,
+                )
+            else:
+                H_owned, out_owned = ttnn.experimental.qwen36_gdn_decode_owned(
+                    H_owned_in,
+                    q_rows,
+                    k_rows,
+                    v_rows,
+                    decay_tiles,
+                    beta_tiles,
+                    compact_vectors=compact_vectors,
+                    native_io=native_io,
+                    output_memory_config=ttnn.L1_MEMORY_CONFIG,
+                )
+            owned_accepted = True
+            owned_error = None
+            tensors.append(out_owned)
+        except Exception as e:
+            owned_accepted = False
+            owned_error = f"{type(e).__name__}: {e}"
+            H_owned = None
+            out_owned = None
+
+        result = {
+            "candidate": "qwen36_gdn_decode_owned_real_tensors",
+            "prompt": prompt,
+            "token_id": token_id,
+            "layer_idx": layer_idx,
+            "reset_state": reset_state,
+            "use_pretransposed_k": use_pretransposed_k,
+            "compact_vectors": compact_vectors,
+                "native_io": native_io,
+                "seed_state": seed_state,
+                "direct_state_input": direct_state_input,
+                "symbols": {
+                "qwen36_gdn_decode_owned": hasattr(ttnn.experimental, "qwen36_gdn_decode_owned"),
+            },
+            "shape": {
+                "state": [1, NV_PER_CHIP, K_DIM, V_DIM],
+                "q_k_rows": [1, NV_PER_CHIP, 1 if native_io else 32, K_DIM],
+                "value_rows": [1, NV_PER_CHIP, 1 if native_io else 32, V_DIM],
+                "alpha_beta": [1, NV_PER_CHIP, 1 if native_io else 32, 1 if native_io else 32],
+                "out_manual": [1, NV_PER_CHIP, 1, V_DIM],
+                "out_owned": [1, VAL_DIM_CHIP] if native_io else [1, NV_PER_CHIP, 32, V_DIM],
+            },
+            "compatibility": {
+                "accepted": owned_accepted,
+                "error": owned_error,
+            },
+        }
+        if owned_accepted:
+            ttnn.synchronize_device(state.mesh)
+            Hm_host = host(H_manual)
+            Ho_host = host(H_owned)
+            out_m_raw = host(out_manual)
+            out_o_raw = host(out_owned)
+            out_leading = out_m_raw.size // (NV_PER_CHIP * V_DIM)
+            out_m_host = out_m_raw.reshape(out_leading, NV_PER_CHIP, 1, V_DIM)
+            out_owned_tile_rows = out_o_raw.size // (out_leading * NV_PER_CHIP * V_DIM)
+            out_o_host = out_o_raw.reshape(
+                out_leading, NV_PER_CHIP, out_owned_tile_rows, V_DIM
+            )[:, :, :1, :]
+            state_cmp = _pcc_and_maxdiff(Ho_host, Hm_host)
+            out_cmp = _pcc_and_maxdiff(out_o_host, out_m_host)
+            pass_gate = (
+                state_cmp["pcc"] >= 0.9999 and
+                out_cmp["pcc"] >= 0.9999 and
+                state_cmp["max_abs_diff"] <= 0.0015 and
+                out_cmp["max_abs_diff"] <= 0.0015
+            )
+            result["correctness"] = {
+                "state_vs_manual": state_cmp,
+                "output_vs_manual": out_cmp,
+                "pass_gate": pass_gate,
+                "host_shapes": {
+                    "state_manual": list(Hm_host.shape),
+                    "state_owned": list(Ho_host.shape),
+                    "output_manual": list(out_m_host.shape),
+                    "output_owned": list(out_o_host.shape),
+                },
+            }
+            if stepwise:
+                import numpy as np
+
+                def compare(name, actual, expected):
+                    cmp = _pcc_and_maxdiff(actual, expected)
+                    exact_or_tiny = (
+                        cmp["max_abs_diff"] <= 0.0015 and
+                        cmp["mean_abs_diff"] <= 0.0015
+                    )
+                    cmp["pass_gate"] = (
+                        exact_or_tiny and (cmp["pcc"] >= 0.9999 or cmp["max_abs_diff"] == 0.0)
+                    )
+                    cmp["name"] = name
+                    return cmp
+
+                def owned_debug(debug_mode):
+                    H_dbg_in = remember(ttnn.add(H_input, 0.0))
+                    kwargs = {
+                        "compact_vectors": compact_vectors,
+                        "native_io": native_io,
+                        "output_memory_config": ttnn.L1_MEMORY_CONFIG,
+                        "debug_mode": debug_mode,
+                    }
+                    if use_pretransposed_k:
+                        kwargs["k_col"] = k_col_tiles
+                    H_dbg, out_dbg = ttnn.experimental.qwen36_gdn_decode_owned(
+                        H_dbg_in,
+                        q_rows,
+                        k_rows,
+                        v_rows,
+                        decay_tiles,
+                        beta_tiles,
+                        **kwargs,
+                    )
+                    tensors.append(H_dbg)
+                    tensors.append(out_dbg)
+                    return H_dbg, out_dbg
+
+                def owned_debug_with_inputs(debug_mode, H_arg, alpha_arg, beta_arg):
+                    H_dbg_in = remember(ttnn.add(H_arg, 0.0))
+                    kwargs = {
+                        "compact_vectors": compact_vectors,
+                        "native_io": native_io,
+                        "output_memory_config": ttnn.L1_MEMORY_CONFIG,
+                        "debug_mode": debug_mode,
+                    }
+                    if use_pretransposed_k:
+                        kwargs["k_col"] = k_col_tiles
+                    H_dbg, out_dbg = ttnn.experimental.qwen36_gdn_decode_owned(
+                        H_dbg_in,
+                        q_rows,
+                        k_rows,
+                        v_rows,
+                        alpha_arg,
+                        beta_arg,
+                        **kwargs,
+                    )
+                    tensors.append(H_dbg)
+                    tensors.append(out_dbg)
+                    return H_dbg, out_dbg
+
+                def owned_out_first_row(tensor):
+                    raw = host(tensor)
+                    leading = out_m_raw.size // (NV_PER_CHIP * V_DIM)
+                    tile_rows = raw.size // (leading * NV_PER_CHIP * V_DIM)
+                    return raw.reshape(leading, NV_PER_CHIP, tile_rows, V_DIM)[:, :, :1, :]
+
+                def component_out_first_row(tensor):
+                    raw = host(tensor)
+                    if raw.ndim == 4:
+                        return raw[:, :, :1, :]
+                    return owned_out_first_row(tensor)
+
+                H_in_host = host(H_input)
+                H_copy_host = host(H_owned_copy_for_compare) if H_owned_copy_for_compare is not None else None
+                q_host = host(q4)
+                k_host = host(k4)
+                v_host = host(v4)
+                decay_host = host(decay)
+                beta_host = host(beta4)
+
+                k_col_host = np.reshape(k_host, k_host.shape[:-2] + (K_DIM, 1))
+                q_col_host = np.reshape(q_host, q_host.shape[:-2] + (K_DIM, 1))
+                cpu_state_scaled = H_in_host * decay_host
+                cpu_prediction = np.sum(cpu_state_scaled * k_col_host, axis=-2, keepdims=True)
+                cpu_delta = (v_host - cpu_prediction) * beta_host
+                cpu_state_next = cpu_state_scaled + k_col_host * cpu_delta
+                cpu_out = np.sum(cpu_state_next * q_col_host, axis=-2, keepdims=True)
+
+                state_scaled_host = host(state_scaled)
+                prediction_host = host(prediction)
+                delta_host = host(delta)
+                H_manual_host = host(H_manual)
+                out_manual_host = out_m_host
+                prediction_matmul_host = host(prediction_matmul) if prediction_matmul is not None else None
+                H_matmul_host = host(H_matmul) if H_matmul is not None else None
+                out_matmul_host = host(out_matmul) if out_matmul is not None else None
+
+                H_dbg2, out_dbg2 = owned_debug(2)
+                H_dbg3, out_dbg3 = owned_debug(3)
+                H_dbg4, out_dbg4 = owned_debug(4)
+                H_dbg5, out_dbg5 = owned_debug(5)
+                H_dbg9, out_dbg9 = owned_debug(9)
+
+                one_decay = remember(ttnn.add(ttnn.mul(decay, 0.0), 1.0))
+                if native_io:
+                    one_decay_tiles = one_decay
+                    k_prediction_rows = remember(ttnn.repeat(k4, ttnn.Shape([1, 1, 32, 1])))
+                else:
+                    one_decay_tiles = remember(ttnn.repeat(one_decay, ttnn.Shape([1, 1, 32, 32])))
+                    k_prediction_rows = k_rows
+                H_iso_pred, out_iso_pred = owned_debug_with_inputs(3, state_scaled, one_decay_tiles, beta_tiles)
+                out_component_pred = None
+                component_debug_tensors = {}
+                component_product0_expected_tt = None
+                component_reduce0_expected_tt = None
+                component_pred_error = None
+                if hasattr(ttnn.experimental, "qwen36_gdn_prediction"):
+                    try:
+                        if any(mode in component_debug_modes for mode in (11, 12)):
+                            # Build the mode 11/12 expected intermediates with TTNN
+                            # itself. CPU products/sums are still useful sanity
+                            # checks, but they can hide bf16 materialization details.
+                            key_tile_rows = 32
+                            # Match the manual recurrence order: materialize
+                            # the full k_col, multiply the full state, then
+                            # slice the first key tile for debug comparison.
+                            k_col_full = remember(ttnn.reshape(k4, [1, NV_PER_CHIP, K_DIM, 1]))
+                            k_col_full = remember(ttnn.repeat(
+                                k_col_full,
+                                ttnn.Shape([1, 1, 1, V_DIM]),
+                            ))
+                            product_full = remember(ttnn.mul(state_scaled, k_col_full))
+                            component_product0_expected_tt = remember(ttnn.slice(
+                                product_full,
+                                [0, 0, 0, 0],
+                                [1, NV_PER_CHIP, key_tile_rows, V_DIM],
+                            ))
+                            if 12 in component_debug_modes:
+                                component_reduce0_expected_tt = remember(ttnn.reshape(
+                                    ttnn.sum(component_product0_expected_tt, dim=-2),
+                                    [1, NV_PER_CHIP, 1, V_DIM],
+                                ))
+                        out_component_pred = ttnn.experimental.qwen36_gdn_prediction(
+                            state_scaled,
+                            k_prediction_rows,
+                            output_memory_config=ttnn.L1_MEMORY_CONFIG,
+                        )
+                        tensors.append(out_component_pred)
+                        for component_mode in component_debug_modes:
+                            out_component_debug = ttnn.experimental.qwen36_gdn_prediction(
+                                state_scaled,
+                                k_prediction_rows,
+                                debug_mode=component_mode,
+                                output_memory_config=ttnn.L1_MEMORY_CONFIG,
+                            )
+                            component_debug_tensors[component_mode] = out_component_debug
+                            tensors.append(out_component_debug)
+                    except Exception as e:
+                        component_pred_error = f"{type(e).__name__}: {e}"
+
+                ttnn.synchronize_device(state.mesh)
+                H_dbg2_host = host(H_dbg2)
+                H_dbg3_host = host(H_dbg3)
+                H_dbg4_host = host(H_dbg4)
+                H_dbg5_host = host(H_dbg5)
+                H_dbg9_host = host(H_dbg9)
+                H_iso_pred_host = host(H_iso_pred)
+                pred_dbg_host = owned_out_first_row(out_dbg3)
+                delta_dbg_host = owned_out_first_row(out_dbg4)
+                pred_iso_host = owned_out_first_row(out_iso_pred)
+                pred_component_host = (
+                    component_out_first_row(out_component_pred)
+                    if out_component_pred is not None
+                    else None
+                )
+                component_debug_hosts = {}
+                for component_mode, component_tensor in component_debug_tensors.items():
+                    if component_mode in (2, 12):
+                        component_debug_hosts[component_mode] = component_out_first_row(component_tensor)
+                    else:
+                        component_debug_hosts[component_mode] = host(component_tensor)
+                component_product0_expected_ttnn_host = (
+                    host(component_product0_expected_tt)
+                    if component_product0_expected_tt is not None
+                    else None
+                )
+                component_reduce0_expected_ttnn_host = (
+                    component_out_first_row(component_reduce0_expected_tt)
+                    if component_reduce0_expected_tt is not None
+                    else None
+                )
+                k0_col_expected = np.repeat(
+                    np.reshape(k_host[:, :, :1, :32], k_host.shape[:2] + (32, 1)),
+                    repeats=V_DIM,
+                    axis=-1,
+                )
+                product0_expected = state_scaled_host[:, :, :32, :] * k0_col_expected
+                reduce0_expected = np.sum(product0_expected, axis=-2, keepdims=True)
+                component_debug_results = {}
+                if 2 in component_debug_hosts:
+                    component_debug_results["component_prediction_strict"] = compare(
+                        "component_prediction_strict", component_debug_hosts[2], prediction_host
+                    )
+                if 10 in component_debug_hosts:
+                    component_debug_results["component_kcol0"] = compare(
+                        "component_kcol0", component_debug_hosts[10], k0_col_expected
+                    )
+                if 11 in component_debug_hosts:
+                    component_debug_results["component_product0"] = compare(
+                        "component_product0", component_debug_hosts[11], product0_expected
+                    )
+                    if component_product0_expected_ttnn_host is not None:
+                        component_debug_results["component_product0_vs_ttnn"] = compare(
+                            "component_product0_vs_ttnn",
+                            component_debug_hosts[11],
+                            component_product0_expected_ttnn_host,
+                        )
+                if 12 in component_debug_hosts:
+                    component_debug_results["component_reduce0"] = compare(
+                        "component_reduce0", component_debug_hosts[12], reduce0_expected
+                    )
+                    if component_reduce0_expected_ttnn_host is not None:
+                        component_debug_results["component_reduce0_vs_ttnn"] = compare(
+                            "component_reduce0_vs_ttnn",
+                            component_debug_hosts[12],
+                            component_reduce0_expected_ttnn_host,
+                        )
+
+                result["stepwise"] = {
+                    "cpu_vs_ttnn_manual": {
+                        "owned_copy_vs_input": (
+                            compare("owned_copy_vs_input", H_copy_host, H_in_host)
+                            if H_copy_host is not None
+                            else None
+                        ),
+                        "state_scaled": compare("state_scaled", state_scaled_host, cpu_state_scaled),
+                        "prediction": compare("prediction", prediction_host, cpu_prediction),
+                        "delta": compare("delta", delta_host, cpu_delta),
+                        "state_next": compare("state_next", H_manual_host, cpu_state_next),
+                        "out": compare("out", out_manual_host, cpu_out),
+                    },
+                    "owned_debug_vs_ttnn_manual": {
+                        "debug2_state_scaled": compare(
+                            "debug2_state_scaled", H_dbg2_host, state_scaled_host
+                        ),
+                        "debug3_state_scaled": compare(
+                            "debug3_state_scaled", H_dbg3_host, state_scaled_host
+                        ),
+                        "debug3_prediction": compare(
+                            "debug3_prediction", pred_dbg_host, prediction_host
+                        ),
+                        "isolated_prediction_state_scaled": compare(
+                            "isolated_prediction_state_scaled", H_iso_pred_host, state_scaled_host
+                        ),
+                        "isolated_prediction": compare(
+                            "isolated_prediction", pred_iso_host, prediction_host
+                        ),
+                        "component_prediction": (
+                            compare("component_prediction", pred_component_host, prediction_host)
+                            if pred_component_host is not None
+                            else None
+                        ),
+                        **component_debug_results,
+                        "component_prediction_error": component_pred_error,
+                        "debug4_state_scaled": compare(
+                            "debug4_state_scaled", H_dbg4_host, state_scaled_host
+                        ),
+                        "debug4_delta": compare(
+                            "debug4_delta", delta_dbg_host, delta_host
+                        ),
+                        "debug5_state_next": compare(
+                            "debug5_state_next", H_dbg5_host, H_manual_host
+                        ),
+                        "debug9_state_next": compare(
+                            "debug9_state_next", H_dbg9_host, H_manual_host
+                        ),
+                        "full_state_next": compare(
+                            "full_state_next", Ho_host, H_manual_host
+                        ),
+                        "full_out": compare("full_out", out_o_host, out_manual_host),
+                    },
+                    "ttnn_matmul_contract": {
+                        "error": matmul_reference_error,
+                        "prediction_matmul_vs_broadcast": (
+                            compare("prediction_matmul_vs_broadcast", prediction_matmul_host, prediction_host)
+                            if prediction_matmul_host is not None
+                            else None
+                        ),
+                        "state_next_matmul_vs_broadcast": (
+                            compare("state_next_matmul_vs_broadcast", H_matmul_host, H_manual_host)
+                            if H_matmul_host is not None
+                            else None
+                        ),
+                        "out_matmul_vs_broadcast": (
+                            compare("out_matmul_vs_broadcast", out_matmul_host, out_manual_host)
+                            if out_matmul_host is not None
+                            else None
+                        ),
+                        "component_prediction_vs_matmul": (
+                            compare("component_prediction_vs_matmul", pred_component_host, prediction_matmul_host)
+                            if pred_component_host is not None and prediction_matmul_host is not None
+                            else None
+                        ),
+                        "full_state_next_vs_matmul": (
+                            compare("full_state_next_vs_matmul", Ho_host, H_matmul_host)
+                            if H_matmul_host is not None
+                            else None
+                        ),
+                        "full_out_vs_matmul": (
+                            compare("full_out_vs_matmul", out_o_host, out_matmul_host)
+                            if out_matmul_host is not None
+                            else None
+                        ),
+                    },
+                }
+            state.last_run = {
+                "cmd": "probe_deltanet_owned_gdn_real_tensors_tp",
+                "accepted": owned_accepted,
+                "pass_gate": pass_gate,
+                "stepwise": stepwise,
+            }
+        return result
+    finally:
+        seen = set()
+        for tensor in reversed(tensors):
+            if tensor is None:
+                continue
+            ident = id(tensor)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            try:
+                ttnn.deallocate(tensor)
+            except Exception:
+                pass
+
+
+def handle_probe_deltanet_native_gdn_synthetic_mesh_tp(state: MeshServerState, args: dict) -> dict:
+    """Validate native Qwen36 GDN recurrence on synthetic tensors on the resident mesh."""
+    import numpy as np
+    import torch
+    import ttnn
+
+    if state.mesh is None:
+        return {"error": "server mesh is not loaded"}
+    if not hasattr(ttnn.experimental, "qwen36_gdn_decode"):
+        return {"error": "ttnn.experimental.qwen36_gdn_decode is not exposed"}
+
+    slots = int(args.get("slots", 12))
+    key_dim = int(args.get("key_dim", 128))
+    value_dim = int(args.get("value_dim", 128))
+    seed = int(args.get("seed", 20260515))
+    scale = float(args.get("scale", 0.03125))
+    iters = int(args.get("iters", 0))
+    warmup = int(args.get("warmup", 0))
+    distribution = args.get("distribution", "replicated")
+    if distribution not in ("replicated", "sharded_dim0"):
+        return {"error": f"unsupported distribution {distribution!r}"}
+
+    rng = np.random.default_rng(seed)
+    if distribution == "replicated":
+        state_np = rng.normal(0.0, scale, size=(1, slots, key_dim, value_dim)).astype(np.float32)
+        q_np = rng.normal(0.0, scale, size=(1, slots, 1, key_dim)).astype(np.float32)
+        k_np = rng.normal(0.0, scale, size=(1, slots, 1, key_dim)).astype(np.float32)
+        value_np = rng.normal(0.0, scale, size=(1, slots, 1, value_dim)).astype(np.float32)
+        alpha_np = rng.uniform(0.75, 0.995, size=(1, slots, 1, 1)).astype(np.float32)
+        beta_np = rng.uniform(0.05, 0.95, size=(1, slots, 1, 1)).astype(np.float32)
+    else:
+        mesh_devices = int(state.mesh.get_num_devices())
+        global_slots = slots * mesh_devices
+        state_np = rng.normal(0.0, scale, size=(global_slots, key_dim, value_dim)).astype(np.float32)
+        q_np = rng.normal(0.0, scale, size=(global_slots, key_dim)).astype(np.float32)
+        k_np = rng.normal(0.0, scale, size=(global_slots, key_dim)).astype(np.float32)
+        value_np = rng.normal(0.0, scale, size=(global_slots, value_dim)).astype(np.float32)
+        alpha_np = rng.uniform(0.75, 0.995, size=(global_slots,)).astype(np.float32)
+        beta_np = rng.uniform(0.05, 0.95, size=(global_slots,)).astype(np.float32)
+
+    tensors = []
+
+    def remember(t):
+        tensors.append(t)
+        return t
+
+    def upload(arr):
+        return remember(ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(arr)),
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        ))
+
+    def upload_sharded_dim0(arr):
+        return remember(ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(arr)),
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0),
+        ))
+
+    def host(tensor):
+        return ttnn.to_torch(
+            tensor,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        ).float().cpu().numpy()
+
+    try:
+        if distribution == "replicated":
+            state_manual = upload(state_np)
+            state_native_seed = upload(state_np)
+            q = upload(q_np)
+            k = upload(k_np)
+            value = upload(value_np)
+            alpha = upload(alpha_np)
+            beta = upload(beta_np)
+        else:
+            state_manual = remember(ttnn.reshape(upload_sharded_dim0(state_np), [1, slots, key_dim, value_dim]))
+            state_native_seed = remember(ttnn.reshape(upload_sharded_dim0(state_np), [1, slots, key_dim, value_dim]))
+            q = remember(ttnn.reshape(upload_sharded_dim0(q_np), [1, slots, 1, key_dim]))
+            k = remember(ttnn.reshape(upload_sharded_dim0(k_np), [1, slots, 1, key_dim]))
+            value = remember(ttnn.reshape(upload_sharded_dim0(value_np), [1, slots, 1, value_dim]))
+            alpha = remember(ttnn.reshape(upload_sharded_dim0(alpha_np), [1, slots, 1, 1]))
+            beta = remember(ttnn.reshape(upload_sharded_dim0(beta_np), [1, slots, 1, 1]))
+
+        def manual(state_in):
+            state_scaled = remember(ttnn.mul(state_in, alpha))
+            k_col = remember(ttnn.reshape(k, [1, slots, key_dim, 1]))
+            prediction = remember(ttnn.reshape(
+                ttnn.sum(ttnn.mul(state_scaled, k_col), dim=-2),
+                [1, slots, 1, value_dim],
+            ))
+            delta = remember(ttnn.mul(ttnn.sub(value, prediction), beta))
+            state_next = remember(ttnn.add(
+                state_scaled,
+                ttnn.mul(k_col, ttnn.reshape(delta, [1, slots, 1, value_dim])),
+            ))
+            q_col = remember(ttnn.reshape(q, [1, slots, key_dim, 1]))
+            out = remember(ttnn.reshape(
+                ttnn.sum(ttnn.mul(state_next, q_col), dim=-2),
+                [1, slots, 1, value_dim],
+            ))
+            return state_next, out
+
+        def native(state_in):
+            state_next, out = ttnn.experimental.qwen36_gdn_decode(
+                state_in,
+                q,
+                k,
+                value,
+                alpha,
+                beta,
+                normalize_qk_l2=False,
+                output_memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+            tensors.append(out)
+            return state_next, out
+
+        manual_state, manual_out = manual(state_manual)
+        native_state_in = remember(ttnn.add(state_native_seed, 0.0))
+        native_state, native_out = native(native_state_in)
+        ttnn.synchronize_device(state.mesh)
+
+        manual_state_host = host(manual_state)
+        native_state_host = host(native_state)
+        manual_out_raw = host(manual_out)
+        native_out_raw = host(native_out)
+        out_leading = manual_out_raw.size // (slots * value_dim)
+        native_tile_rows = native_out_raw.size // (out_leading * slots * value_dim)
+        manual_out_host = manual_out_raw.reshape(out_leading, slots, 1, value_dim)
+        native_out_host = native_out_raw.reshape(out_leading, slots, native_tile_rows, value_dim)[:, :, :1, :]
+
+        state_cmp = _pcc_and_maxdiff(native_state_host, manual_state_host)
+        out_cmp = _pcc_and_maxdiff(native_out_host, manual_out_host)
+        pass_gate = (
+            state_cmp["pcc"] >= 0.9999 and
+            out_cmp["pcc"] >= 0.9999 and
+            state_cmp["max_abs_diff"] <= 1e-2 and
+            out_cmp["max_abs_diff"] <= 1e-2
+        )
+
+        timing = {
+            "iters": iters,
+            "warmup": warmup,
+            "note": (
+                "Synthetic resident-mesh correctness control only. Timing is "
+                "disabled here because qwen36_gdn_decode mutates state and a "
+                "naive repeated loop can fragment or exhaust resident L1."
+            ),
+        }
+        if iters > 0:
+            timing["skipped"] = True
+            timing["skipped_reason"] = (
+                "Use a dedicated raw-device or trace-safe timing harness after "
+                "correctness isolation. This endpoint intentionally avoids "
+                "running repeated mutating native-GDN calls inside the resident "
+                "server."
+            )
+
+        result = {
+            "candidate": "qwen36_gdn_decode_synthetic_mesh",
+            "distribution": distribution,
+            "seed": seed,
+            "scale": scale,
+            "symbols": {
+                "qwen36_gdn_prepare_decode": hasattr(ttnn.experimental, "qwen36_gdn_prepare_decode"),
+                "qwen36_gdn_decode": hasattr(ttnn.experimental, "qwen36_gdn_decode"),
+            },
+            "shape": {
+                "state": [1, slots, key_dim, value_dim],
+                "qkv": [1, slots, 1, key_dim],
+                "alpha_beta": [1, slots, 1, 1],
+            },
+            "correctness": {
+                "state_vs_manual": state_cmp,
+                "output_vs_manual": out_cmp,
+                "pass_gate": pass_gate,
+                "host_shapes": {
+                    "state_manual": list(manual_state_host.shape),
+                    "state_native": list(native_state_host.shape),
+                    "output_manual": list(manual_out_host.shape),
+                    "output_native": list(native_out_host.shape),
+                },
+            },
+            "timing": timing,
+        }
+        state.last_run = {
+            "cmd": "probe_deltanet_native_gdn_synthetic_mesh_tp",
+            "pass_gate": pass_gate,
+            "state_pcc": state_cmp["pcc"],
+            "output_pcc": out_cmp["pcc"],
+        }
+        return result
+    finally:
+        seen = set()
+        for tensor in reversed(tensors):
+            if tensor is None:
+                continue
+            ident = id(tensor)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            try:
+                ttnn.deallocate(tensor)
+            except Exception:
+                pass
+
+
+def handle_probe_deltanet_softplus_decay_tp(state: MeshServerState, args: dict) -> dict:
+    """Validate native softplus in the DeltaNet decay/gate path."""
+    import time as _time
+    import numpy as np
+    import torch
+    import ttnn
+    from full_layer_tp_probe import NV_PER_CHIP
+
+    prompt = args.get("prompt", "The capital of France is")
+    iters = int(args.get("iters", 10))
+    warmup = int(args.get("warmup", 2))
+    max_tokens = int(args.get("max_tokens", 20))
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+    if max_tokens <= 0:
+        return {"error": "max_tokens must be > 0"}
+    if state.tok is None or not state.layers:
+        return {"error": "server not fully loaded"}
+
+    rng = np.random.default_rng(443)
+    a_np = (rng.standard_normal((1, NV_PER_CHIP)).astype(np.float32) * 0.2)
+    b_np = (rng.standard_normal((1, NV_PER_CHIP)).astype(np.float32) * 0.2)
+    dt_bias_np = (rng.standard_normal((NV_PER_CHIP,)).astype(np.float32) * 0.1)
+    A_log_np = (rng.standard_normal((NV_PER_CHIP,)).astype(np.float32) * 0.1)
+
+    def upload(arr):
+        return ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32)),
+            dtype=ttnn.bfloat16,
+            device=state.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+
+    def decay_manual(a, b, dt_bias, A_log):
+        a_biased = ttnn.add(a, dt_bias)
+        softplus_a = ttnn.log(ttnn.add(ttnn.exp(a_biased), 1.0))
+        g = ttnn.mul(ttnn.neg(ttnn.exp(A_log)), softplus_a)
+        beta = ttnn.sigmoid(b)
+        decay = ttnn.reshape(ttnn.exp(g), [1, NV_PER_CHIP, 1, 1])
+        return softplus_a, beta, decay
+
+    def decay_native(a, b, dt_bias, A_log):
+        a_biased = ttnn.add(a, dt_bias)
+        softplus_a = ttnn.softplus(a_biased)
+        g = ttnn.mul(ttnn.neg(ttnn.exp(A_log)), softplus_a)
+        beta = ttnn.sigmoid(b)
+        decay = ttnn.reshape(ttnn.exp(g), [1, NV_PER_CHIP, 1, 1])
+        return softplus_a, beta, decay
+
+    tensors = []
+    tensor_gate = None
+    try:
+        a_tt = upload(a_np)
+        b_tt = upload(b_np)
+        dt_bias_tt = upload(dt_bias_np)
+        A_log_tt = upload(A_log_np)
+        tensors.extend([a_tt, b_tt, dt_bias_tt, A_log_tt])
+        manual = decay_manual(a_tt, b_tt, dt_bias_tt, A_log_tt)
+        native = decay_native(a_tt, b_tt, dt_bias_tt, A_log_tt)
+        tensors.extend(manual)
+        tensors.extend(native)
+        ttnn.synchronize_device(state.mesh)
+
+        def host(tensor, shape):
+            return ttnn.to_torch(
+                tensor,
+                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+            ).float().cpu().numpy()[:1].reshape(shape)
+
+        softplus_cmp = _pcc_and_maxdiff(
+            host(native[0], (1, NV_PER_CHIP)),
+            host(manual[0], (1, NV_PER_CHIP)),
+        )
+        beta_cmp = _pcc_and_maxdiff(
+            host(native[1], (1, NV_PER_CHIP)),
+            host(manual[1], (1, NV_PER_CHIP)),
+        )
+        decay_cmp = _pcc_and_maxdiff(
+            host(native[2], (1, NV_PER_CHIP, 1, 1)),
+            host(manual[2], (1, NV_PER_CHIP, 1, 1)),
+        )
+        tensor_pass_gate = (
+            softplus_cmp["pcc"] >= 0.9999 and
+            beta_cmp["pcc"] >= 0.9999 and
+            decay_cmp["pcc"] >= 0.9999 and
+            softplus_cmp["max_abs_diff"] <= 1e-2 and
+            beta_cmp["max_abs_diff"] <= 1e-2 and
+            decay_cmp["max_abs_diff"] <= 1e-2
+        )
+        tensor_gate = {
+            "softplus_vs_manual": softplus_cmp,
+            "beta_vs_manual": beta_cmp,
+            "decay_vs_manual": decay_cmp,
+            "pass_gate": tensor_pass_gate,
+            "shape": {
+                "a": [1, NV_PER_CHIP],
+                "b": [1, NV_PER_CHIP],
+                "dt_bias": [NV_PER_CHIP],
+                "A_log": [NV_PER_CHIP],
+            },
+        }
+    except Exception as e:
+        return {
+            "candidate": "deltanet_native_softplus_decay_gate",
+            "tensor_gate": {
+                "pass_gate": False,
+                "error": f"{type(e).__name__}: {e}",
+            },
+            "compatibility": None,
+            "trace_bench": None,
+        }
+    finally:
+        for tensor in reversed(tensors):
+            try:
+                ttnn.deallocate(tensor)
+            except Exception:
+                pass
+
+    if not tensor_gate["pass_gate"]:
+        state.last_run = {
+            "cmd": "probe_deltanet_softplus_decay_tp",
+            "tensor_pass_gate": False,
+        }
+        return {
+            "candidate": "deltanet_native_softplus_decay_gate",
+            "tensor_gate": tensor_gate,
+            "compatibility": None,
+            "trace_bench": None,
+        }
+
+    prompt_ids = state.tok.encode(prompt)
+    if not prompt_ids:
+        return {"error": "prompt encoded to zero tokens"}
+    token_id = int(prompt_ids[0])
+
+    try:
+        baseline_id = _forward_argmax_id_with_cache_writer(
+            state, token_id=token_id, cur_pos=0, use_fused=False,
+            collective_mode="baseline", rope_mode="manual",
+            deltanet_decay_mode="manual")
+        native_id = _forward_argmax_id_with_cache_writer(
+            state, token_id=token_id, cur_pos=0, use_fused=False,
+            collective_mode="baseline", rope_mode="manual",
+            deltanet_decay_mode="native_softplus")
+    except Exception as e:
+        state.deltanet_decay_mode = "manual"
+        _reset_state_buffers(state)
+        return {
+            "candidate": "deltanet_native_softplus_decay_gate",
+            "tensor_gate": tensor_gate,
+            "compatibility": {
+                "accepted": False,
+                "phase": "production_forward",
+                "error": f"{type(e).__name__}: {e}",
+            },
+            "trace_bench": None,
+        }
+
+    argmax_match = (baseline_id == native_id)
+    result = {
+        "candidate": "deltanet_native_softplus_decay_gate",
+        "prompt": prompt,
+        "prompt_ids": list(prompt_ids),
+        "token_id": token_id,
+        "tensor_gate": tensor_gate,
+        "compatibility": {
+            "accepted": True,
+            "baseline_argmax_id": baseline_id,
+            "native_argmax_id": native_id,
+            "argmax_match": argmax_match,
+            "mode": "native_softplus",
+        },
+        "trace_bench": None,
+        "decode_bench": None,
+    }
+    if not argmax_match:
+        state.last_run = {
+            "cmd": "probe_deltanet_softplus_decay_tp",
+            "tensor_pass_gate": True,
+            "argmax_match": False,
+        }
+        return result
+
+    trace_id = None
+    try:
+        t_capture0 = _time.perf_counter()
+        trace_id, native_argmax_tt = _capture_temp_decode_trace(
+            state, use_fused=False, collective_mode="baseline",
+            rope_mode="manual", deltanet_decay_mode="native_softplus")
+        capture_ms = (_time.perf_counter() - t_capture0) * 1000.0
+
+        def sync():
+            ttnn.synchronize_device(state.mesh)
+
+        def timed(fn):
+            sync()
+            t0 = _time.perf_counter()
+            fn()
+            sync()
+            return (_time.perf_counter() - t0) * 1000.0
+
+        for i in range(warmup):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            update_input_buffers(state, tid, pos)
+            ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+        sync()
+
+        execute_ms = []
+        update_execute_ms = []
+        for i in range(iters):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            execute_ms.append(timed(
+                lambda: ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)))
+            tid2 = prompt_ids[(i + 1) % len(prompt_ids)]
+            pos2 = (pos + 1) % MAX_POS
+
+            def update_execute(tid2=tid2, pos2=pos2):
+                update_input_buffers(state, tid2, pos2)
+                ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+
+            update_execute_ms.append(timed(update_execute))
+
+        result["trace_bench"] = {
+            "iters": iters,
+            "warmup": warmup,
+            "capture_ms": capture_ms,
+            "summary_ms": {
+                "native_execute_trace": _summary_ms(execute_ms),
+                "native_update_plus_execute": _summary_ms(update_execute_ms),
+            },
+            "samples_ms": {
+                "native_execute_trace": execute_ms,
+                "native_update_plus_execute": update_execute_ms,
+            },
+            "traced_argmax_id_sample": _read_argmax_id(state, native_argmax_tt),
+            "note": (
+                "Temporary trace component timing only; compare against a "
+                "same-session manual baseline before any end-to-end claim."
+            ),
+        }
+
+        if len(prompt_ids) + max_tokens > MAX_POS:
+            result["decode_bench"] = {
+                "accepted": False,
+                "error": (
+                    f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} "
+                    f"> MAX_POS {MAX_POS}"
+                ),
+            }
+        else:
+            _ensure_decode_trace(state)
+
+            def run_decode(trace_to_run, argmax_tensor):
+                _reset_state_buffers(state)
+                t_prefill0 = _time.perf_counter()
+                last_argmax = None
+                for pos, tid in enumerate(prompt_ids):
+                    update_input_buffers(state, int(tid), pos)
+                    ttnn.execute_trace(state.mesh, trace_to_run, cq_id=0, blocking=False)
+                    last_argmax = argmax_tensor
+                ttnn.synchronize_device(state.mesh)
+                prefill_ms = (_time.perf_counter() - t_prefill0) * 1000.0
+
+                generated_ids = []
+                decode_times = []
+                cur_pos = len(prompt_ids)
+                eos_id = getattr(state.tok, "eos_token_id", None)
+                stopped_on_eos = False
+                for _step in range(max_tokens):
+                    next_id = _read_argmax_id(state, last_argmax)
+                    generated_ids.append(next_id)
+                    if eos_id is not None and next_id == eos_id:
+                        stopped_on_eos = True
+                        break
+                    td0 = _time.perf_counter()
+                    update_input_buffers(state, next_id, cur_pos)
+                    ttnn.execute_trace(state.mesh, trace_to_run, cq_id=0, blocking=False)
+                    ttnn.synchronize_device(state.mesh)
+                    decode_times.append((_time.perf_counter() - td0) * 1000.0)
+                    last_argmax = argmax_tensor
+                    cur_pos += 1
+                return {
+                    "generated_ids": generated_ids,
+                    "n_generated_tokens": len(generated_ids),
+                    "prefill_ms": prefill_ms,
+                    "decode_ms": _summary_ms(decode_times),
+                    "ms_per_tok": (
+                        float(np.mean(decode_times)) if decode_times else float("nan")
+                    ),
+                    "tok_per_sec": (
+                        1000.0 / float(np.mean(decode_times))
+                        if decode_times and float(np.mean(decode_times)) > 0 else 0.0
+                    ),
+                    "stopped_on_eos": stopped_on_eos,
+                }
+
+            manual_decode = run_decode(state.trace_id, state.traced_argmax_tt)
+            native_decode = run_decode(trace_id, native_argmax_tt)
+            result["decode_bench"] = {
+                "max_tokens": max_tokens,
+                "manual": manual_decode,
+                "native_softplus": native_decode,
+                "generated_ids_match": (
+                    manual_decode["generated_ids"] == native_decode["generated_ids"]
+                ),
+                "note": (
+                    "Full decode loop timing includes token readback and buffer "
+                    "updates, using same-session manual and temporary native traces."
+                ),
+            }
+    except Exception as e:
+        result["trace_bench"] = {
+            "accepted": False,
+            "phase": "native_trace_or_bench",
+            "error": f"{type(e).__name__}: {e}",
+        }
+    finally:
+        if trace_id is not None:
+            ttnn.release_trace(state.mesh, trace_id)
+        state.deltanet_decay_mode = "manual"
+        state.rope_mode = "manual"
+        state.collective_mode = "baseline"
+        state.use_fused_paged_update = False
+        _reset_state_buffers(state)
+
+    state.last_run = {
+        "cmd": "probe_deltanet_softplus_decay_tp",
+        "tensor_pass_gate": tensor_gate["pass_gate"],
+        "argmax_match": argmax_match,
+        "median_native_execute_ms": (
+            result["trace_bench"]["summary_ms"]["native_execute_trace"].get("median")
+            if result.get("trace_bench") and result["trace_bench"].get("summary_ms") else None
+        ),
+        "median_native_combined_ms": (
+            result["trace_bench"]["summary_ms"]["native_update_plus_execute"].get("median")
+            if result.get("trace_bench") and result["trace_bench"].get("summary_ms") else None
+        ),
+    }
+    return result
+
+
+def handle_probe_deltanet_owned_gdn_trace_tp(state: MeshServerState, args: dict) -> dict:
+    """Guarded production-trace probe for the owned GDN recurrence path."""
+    import time as _time
+    import numpy as np
+    import ttnn
+
+    if state.mesh is None or state.cfg is None or not state.layers:
+        return {"error": "server not fully loaded"}
+    if not hasattr(ttnn.experimental, "qwen36_gdn_decode_owned"):
+        return {"error": "ttnn.experimental.qwen36_gdn_decode_owned is not exposed"}
+
+    prompt = args.get("prompt", "The capital of France is")
+    iters = int(args.get("iters", 10))
+    warmup = int(args.get("warmup", 2))
+    max_tokens = int(args.get("max_tokens", 20))
+    decay_mode = args.get("deltanet_decay_mode", "manual")
+    if decay_mode not in ("manual", "native_softplus"):
+        return {"error": "deltanet_decay_mode must be manual or native_softplus"}
+    recurrence_mode = args.get("deltanet_recurrence_mode", "owned_gdn")
+    if recurrence_mode not in ("owned_gdn", "owned_gdn_inplace"):
+        return {"error": "deltanet_recurrence_mode must be owned_gdn or owned_gdn_inplace"}
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+    if max_tokens < 0:
+        return {"error": "max_tokens must be >= 0"}
+
+    prompt_ids = state.tok.encode(prompt)
+    if not prompt_ids:
+        return {"error": "prompt encoded to zero tokens"}
+    token_id = int(prompt_ids[0])
+
+    try:
+        baseline_id = _forward_argmax_id_with_cache_writer(
+            state, token_id=token_id, cur_pos=0, use_fused=False,
+            collective_mode="baseline", rope_mode="manual",
+            deltanet_decay_mode="manual", deltanet_recurrence_mode="manual")
+        owned_id = _forward_argmax_id_with_cache_writer(
+            state, token_id=token_id, cur_pos=0, use_fused=False,
+            collective_mode="baseline", rope_mode="manual",
+            deltanet_decay_mode=decay_mode, deltanet_recurrence_mode=recurrence_mode)
+    except Exception as e:
+        state.deltanet_recurrence_mode = "manual"
+        _reset_state_buffers(state)
+        return {
+            "candidate": "deltanet_owned_gdn_recurrence",
+            "compatibility": {
+                "accepted": False,
+                "phase": "production_forward",
+                "error": f"{type(e).__name__}: {e}",
+            },
+            "trace_bench": None,
+            "decode_bench": None,
+        }
+
+    argmax_match = baseline_id == owned_id
+    result = {
+        "candidate": "deltanet_owned_gdn_recurrence",
+        "prompt": prompt,
+        "prompt_ids": list(prompt_ids),
+        "token_id": token_id,
+        "compatibility": {
+            "accepted": True,
+            "baseline_argmax_id": baseline_id,
+            "owned_argmax_id": owned_id,
+            "argmax_match": argmax_match,
+            "mode": recurrence_mode,
+            "decay_mode": decay_mode,
+        },
+        "trace_bench": None,
+        "decode_bench": None,
+    }
+    if not argmax_match:
+        state.last_run = {
+            "cmd": "probe_deltanet_owned_gdn_trace_tp",
+            "argmax_match": False,
+        }
+        return result
+
+    trace_id = None
+    try:
+        _ensure_decode_trace(state)
+        t_capture0 = _time.perf_counter()
+        trace_id, owned_argmax_tt = _capture_temp_decode_trace(
+            state, use_fused=False, collective_mode="baseline",
+            rope_mode="manual", deltanet_decay_mode=decay_mode,
+            deltanet_recurrence_mode=recurrence_mode)
+        capture_ms = (_time.perf_counter() - t_capture0) * 1000.0
+
+        def sync():
+            ttnn.synchronize_device(state.mesh)
+
+        def timed(fn):
+            sync()
+            t0 = _time.perf_counter()
+            fn()
+            sync()
+            return (_time.perf_counter() - t0) * 1000.0
+
+        for i in range(warmup):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            update_input_buffers(state, tid, pos)
+            ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+        sync()
+
+        manual_execute_ms = []
+        owned_execute_ms = []
+        manual_update_execute_ms = []
+        owned_update_execute_ms = []
+        for i in range(iters):
+            tid = prompt_ids[i % len(prompt_ids)]
+            pos = i % MAX_POS
+            manual_execute_ms.append(timed(
+                lambda: ttnn.execute_trace(state.mesh, state.trace_id, cq_id=0, blocking=False)))
+            owned_execute_ms.append(timed(
+                lambda: ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)))
+
+            tid2 = prompt_ids[(i + 1) % len(prompt_ids)]
+            pos2 = (pos + 1) % MAX_POS
+
+            def manual_update_execute(tid2=tid2, pos2=pos2):
+                update_input_buffers(state, tid2, pos2)
+                ttnn.execute_trace(state.mesh, state.trace_id, cq_id=0, blocking=False)
+
+            def owned_update_execute(tid2=tid2, pos2=pos2):
+                update_input_buffers(state, tid2, pos2)
+                ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+
+            manual_update_execute_ms.append(timed(manual_update_execute))
+            owned_update_execute_ms.append(timed(owned_update_execute))
+
+        result["trace_bench"] = {
+            "iters": iters,
+            "warmup": warmup,
+            "capture_ms": capture_ms,
+            "summary_ms": {
+                "manual_execute_trace": _summary_ms(manual_execute_ms),
+                "owned_execute_trace": _summary_ms(owned_execute_ms),
+                "manual_update_plus_execute": _summary_ms(manual_update_execute_ms),
+                "owned_update_plus_execute": _summary_ms(owned_update_execute_ms),
+            },
+            "samples_ms": {
+                "manual_execute_trace": manual_execute_ms,
+                "owned_execute_trace": owned_execute_ms,
+                "manual_update_plus_execute": manual_update_execute_ms,
+                "owned_update_plus_execute": owned_update_execute_ms,
+            },
+            "traced_argmax_id_sample": _read_argmax_id(state, owned_argmax_tt),
+            "note": "Same-session temporary trace timing; still gated by decode correctness below.",
+        }
+
+        if len(prompt_ids) + max_tokens > MAX_POS:
+            result["decode_bench"] = {
+                "accepted": False,
+                "error": (
+                    f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} "
+                    f"> MAX_POS {MAX_POS}"
+                ),
+            }
+        else:
+            def run_decode(trace_to_run, argmax_tensor):
+                _reset_state_buffers(state)
+                t_prefill0 = _time.perf_counter()
+                last_argmax = None
+                for pos, tid in enumerate(prompt_ids):
+                    update_input_buffers(state, int(tid), pos)
+                    ttnn.execute_trace(state.mesh, trace_to_run, cq_id=0, blocking=False)
+                    last_argmax = argmax_tensor
+                ttnn.synchronize_device(state.mesh)
+                prefill_ms = (_time.perf_counter() - t_prefill0) * 1000.0
+
+                generated_ids = []
+                decode_times = []
+                cur_pos = len(prompt_ids)
+                eos_id = getattr(state.tok, "eos_token_id", None)
+                stopped_on_eos = False
+                for _step in range(max_tokens):
+                    next_id = _read_argmax_id(state, last_argmax)
+                    generated_ids.append(next_id)
+                    if eos_id is not None and next_id == eos_id:
+                        stopped_on_eos = True
+                        break
+                    td0 = _time.perf_counter()
+                    update_input_buffers(state, next_id, cur_pos)
+                    ttnn.execute_trace(state.mesh, trace_to_run, cq_id=0, blocking=False)
+                    ttnn.synchronize_device(state.mesh)
+                    decode_times.append((_time.perf_counter() - td0) * 1000.0)
+                    last_argmax = argmax_tensor
+                    cur_pos += 1
+                return {
+                    "generated_ids": generated_ids,
+                    "n_generated_tokens": len(generated_ids),
+                    "prefill_ms": prefill_ms,
+                    "decode_ms": _summary_ms(decode_times),
+                    "ms_per_tok": (
+                        float(np.mean(decode_times)) if decode_times else float("nan")
+                    ),
+                    "tok_per_sec": (
+                        1000.0 / float(np.mean(decode_times))
+                        if decode_times and float(np.mean(decode_times)) > 0 else 0.0
+                    ),
+                    "stopped_on_eos": stopped_on_eos,
+                }
+
+            manual_decode = run_decode(state.trace_id, state.traced_argmax_tt)
+            owned_decode = run_decode(trace_id, owned_argmax_tt)
+            result["decode_bench"] = {
+                "max_tokens": max_tokens,
+                "manual": manual_decode,
+                "owned_gdn": owned_decode,
+                "owned_mode": recurrence_mode,
+                "decay_mode": decay_mode,
+                "generated_ids_match": (
+                    manual_decode["generated_ids"] == owned_decode["generated_ids"]
+                ),
+                "note": (
+                    "Full decode loop timing includes token readback and buffer "
+                    "updates, using same-session manual and temporary owned traces."
+                ),
+            }
+    except Exception as e:
+        result["trace_bench"] = {
+            "accepted": False,
+            "phase": "owned_trace_or_bench",
+            "error": f"{type(e).__name__}: {e}",
+        }
+    finally:
+        if trace_id is not None:
+            ttnn.release_trace(state.mesh, trace_id)
+        state.deltanet_recurrence_mode = "manual"
+        state.deltanet_decay_mode = "manual"
+        state.rope_mode = "manual"
+        state.collective_mode = "baseline"
+        state.use_fused_paged_update = False
+        _reset_state_buffers(state)
+
+    state.last_run = {
+        "cmd": "probe_deltanet_owned_gdn_trace_tp",
+        "owned_mode": recurrence_mode,
+        "decay_mode": decay_mode,
+        "argmax_match": argmax_match,
+        "generated_ids_match": (
+            result.get("decode_bench", {}).get("generated_ids_match")
+            if result.get("decode_bench") else None
+        ),
+        "median_manual_execute_ms": (
+            result["trace_bench"]["summary_ms"]["manual_execute_trace"].get("median")
+            if result.get("trace_bench") and result["trace_bench"].get("summary_ms") else None
+        ),
+        "median_owned_execute_ms": (
+            result["trace_bench"]["summary_ms"]["owned_execute_trace"].get("median")
+            if result.get("trace_bench") and result["trace_bench"].get("summary_ms") else None
+        ),
+    }
+    return result
+
+
+def handle_probe_deltanet_owned_gdn_divergence_tp(state: MeshServerState, args: dict) -> dict:
+    """Eager top-k diagnostic for manual-vs-owned GDN decode divergence."""
+    import torch
+    import ttnn
+
+    if state.mesh is None or state.cfg is None or not state.layers:
+        return {"error": "server not fully loaded"}
+    if not hasattr(ttnn.experimental, "qwen36_gdn_decode_owned"):
+        return {"error": "ttnn.experimental.qwen36_gdn_decode_owned is not exposed"}
+
+    prompt = args.get("prompt", "In Python, a simple function to add two numbers is")
+    max_tokens = int(args.get("max_tokens", 24))
+    top_k = int(args.get("top_k", 8))
+    top_k = max(1, min(top_k, 32))
+    if max_tokens < 0:
+        return {"error": "max_tokens must be >= 0"}
+
+    prompt_ids = state.tok.encode(prompt)
+    if not prompt_ids:
+        return {"error": "prompt encoded to zero tokens"}
+    if len(prompt_ids) + max_tokens > MAX_POS:
+        return {
+            "error": (
+                f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} "
+                f"> MAX_POS {MAX_POS}"
+            )
+        }
+
+    def logits_summary(logits_tt):
+        logits_host = ttnn.to_torch(
+            logits_tt,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        row = logits_host.reshape(-1, state.vocab_size)[0].float().cpu()
+        k = min(top_k, row.numel())
+        vals, idx = torch.topk(row, k=k)
+        entries = [
+            {"token_id": int(i), "logit": float(v)}
+            for i, v in zip(idx.tolist(), vals.tolist())
+        ]
+        return {
+            "top_k": entries,
+            "argmax_id": int(idx[0]),
+            "top2_margin": (
+                float(vals[0] - vals[1]) if k > 1 else None
+            ),
+        }
+
+    def run_mode(mode: str):
+        old_recurrence = state.deltanet_recurrence_mode
+        state.deltanet_recurrence_mode = mode
+        records = []
+        generated_ids = []
+        logits_tt = None
+        try:
+            _reset_state_buffers(state)
+            for pos, tid in enumerate(prompt_ids):
+                if logits_tt is not None:
+                    ttnn.deallocate(logits_tt)
+                update_input_buffers(state, int(tid), pos)
+                logits_tt = forward_token_tp_inner(state, return_logits=True)
+                ttnn.synchronize_device(state.mesh)
+
+            cur_pos = len(prompt_ids)
+            eos_id = getattr(state.tok, "eos_token_id", None)
+            for step in range(max_tokens):
+                summary = logits_summary(logits_tt)
+                next_id = int(summary["argmax_id"])
+                generated_ids.append(next_id)
+                records.append({
+                    "step": step,
+                    "token_id": next_id,
+                    "top2_margin": summary["top2_margin"],
+                    "top_k": summary["top_k"],
+                })
+                if eos_id is not None and next_id == eos_id:
+                    break
+                ttnn.deallocate(logits_tt)
+                logits_tt = None
+                update_input_buffers(state, next_id, cur_pos)
+                logits_tt = forward_token_tp_inner(state, return_logits=True)
+                ttnn.synchronize_device(state.mesh)
+                cur_pos += 1
+        finally:
+            if logits_tt is not None:
+                try:
+                    ttnn.deallocate(logits_tt)
+                except Exception:
+                    pass
+            state.deltanet_recurrence_mode = old_recurrence
+            _reset_state_buffers(state)
+        return {
+            "generated_ids": generated_ids,
+            "records": records,
+        }
+
+    old_recurrence = state.deltanet_recurrence_mode
+    old_decay = state.deltanet_decay_mode
+    old_rope = state.rope_mode
+    old_collective = state.collective_mode
+    old_fused = state.use_fused_paged_update
+    try:
+        state.deltanet_decay_mode = "manual"
+        state.rope_mode = "manual"
+        state.collective_mode = "baseline"
+        state.use_fused_paged_update = False
+        manual = run_mode("manual")
+        owned = run_mode("owned_gdn")
+    finally:
+        state.deltanet_recurrence_mode = old_recurrence
+        state.deltanet_decay_mode = old_decay
+        state.rope_mode = old_rope
+        state.collective_mode = old_collective
+        state.use_fused_paged_update = old_fused
+        _reset_state_buffers(state)
+
+    first_diff = None
+    for i, (manual_id, owned_id) in enumerate(zip(
+            manual["generated_ids"], owned["generated_ids"])):
+        if int(manual_id) != int(owned_id):
+            first_diff = i
+            break
+
+    first_diff_detail = None
+    if first_diff is not None:
+        first_diff_detail = {
+            "step": first_diff,
+            "manual": manual["records"][first_diff],
+            "owned_gdn": owned["records"][first_diff],
+        }
+
+    result = {
+        "candidate": "deltanet_owned_gdn_recurrence",
+        "diagnostic": "eager_topk_decode_divergence",
+        "prompt": prompt,
+        "prompt_ids": list(prompt_ids),
+        "max_tokens": max_tokens,
+        "top_k": top_k,
+        "generated_ids_match": manual["generated_ids"] == owned["generated_ids"],
+        "first_diff_step": first_diff,
+        "first_diff": first_diff_detail,
+        "manual": manual,
+        "owned_gdn": owned,
+        "note": (
+            "This endpoint is diagnostic only. It uses eager forwards and reads "
+            "top-k logits to explain divergence; it is not a performance run."
+        ),
+    }
+    state.last_run = {
+        "cmd": "probe_deltanet_owned_gdn_divergence_tp",
+        "generated_ids_match": result["generated_ids_match"],
+        "first_diff_step": first_diff,
+    }
+    return result
+
+
+def handle_probe_deltanet_owned_gdn_teacher_forced_tp(state: MeshServerState, args: dict) -> dict:
+    """Teacher-forced manual-vs-owned GDN comparison on the same token stream."""
+    import math
+    import torch
+    import ttnn
+
+    if state.mesh is None or state.cfg is None or not state.layers:
+        return {"error": "server not fully loaded"}
+    if not hasattr(ttnn.experimental, "qwen36_gdn_decode_owned"):
+        return {"error": "ttnn.experimental.qwen36_gdn_decode_owned is not exposed"}
+
+    prompt = args.get("prompt", "In Python, a simple function to add two numbers is")
+    max_tokens = int(args.get("max_tokens", 24))
+    top_k = int(args.get("top_k", 8))
+    state_layers = args.get("state_layers")
+    if state_layers is None:
+        state_layers = [
+            i for i, layer in enumerate(state.layers)
+            if layer.get("type") == "linear_attention"
+        ][:8]
+    else:
+        state_layers = [int(i) for i in state_layers]
+    top_k = max(1, min(top_k, 32))
+    if max_tokens < 0:
+        return {"error": "max_tokens must be >= 0"}
+
+    prompt_ids = state.tok.encode(prompt)
+    if not prompt_ids:
+        return {"error": "prompt encoded to zero tokens"}
+    if len(prompt_ids) + max_tokens > MAX_POS:
+        return {
+            "error": (
+                f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} "
+                f"> MAX_POS {MAX_POS}"
+            )
+        }
+
+    def logits_row(logits_tt):
+        logits_host = ttnn.to_torch(
+            logits_tt,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return logits_host.reshape(-1, state.vocab_size)[0].float().cpu()
+
+    def topk_summary(row):
+        k = min(top_k, row.numel())
+        vals, idx = torch.topk(row, k=k)
+        return {
+            "argmax_id": int(idx[0]),
+            "top2_margin": (
+                float(vals[0] - vals[1]) if k > 1 else None
+            ),
+            "top_k": [
+                {"token_id": int(i), "logit": float(v)}
+                for i, v in zip(idx.tolist(), vals.tolist())
+            ],
+        }
+
+    def row_compare(manual_row, owned_row):
+        diff = (manual_row - owned_row).float()
+        manual64 = manual_row.double()
+        owned64 = owned_row.double()
+        manual_centered = manual64 - manual64.mean()
+        owned_centered = owned64 - owned64.mean()
+        denom = torch.sqrt(
+            torch.sum(manual_centered * manual_centered)
+            * torch.sum(owned_centered * owned_centered)
+        )
+        pcc = float(torch.sum(manual_centered * owned_centered) / denom) if float(denom) > 0 else math.nan
+        return {
+            "max_abs": float(torch.max(torch.abs(diff))),
+            "mean_abs": float(torch.mean(torch.abs(diff))),
+            "rms": float(torch.sqrt(torch.mean(diff * diff))),
+            "pcc": pcc,
+        }
+
+    def collect_state_snapshots():
+        snapshots = {}
+        for layer_idx in state_layers:
+            if layer_idx < 0 or layer_idx >= len(state.layers):
+                continue
+            layer = state.layers[layer_idx]
+            if layer.get("type") != "linear_attention":
+                continue
+            ssm = layer["dn"]["ssm"]
+            host = ttnn.to_torch(
+                ssm,
+                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+            )
+            snapshots[str(layer_idx)] = host.float().cpu().reshape(-1)
+        return snapshots
+
+    def compare_states(manual_states, owned_states):
+        out = {}
+        for key, manual_state in manual_states.items():
+            owned_state = owned_states.get(key)
+            if owned_state is None:
+                continue
+            out[key] = row_compare(manual_state, owned_state)
+        return out
+
+    def set_modes(mode: str):
+        state.deltanet_recurrence_mode = mode
+        state.deltanet_decay_mode = "manual"
+        state.rope_mode = "manual"
+        state.collective_mode = "baseline"
+        state.use_fused_paged_update = False
+
+    def make_teacher_tokens():
+        set_modes("manual")
+        generated = []
+        logits_tt = None
+        try:
+            _reset_state_buffers(state)
+            for pos, tid in enumerate(prompt_ids):
+                if logits_tt is not None:
+                    ttnn.deallocate(logits_tt)
+                update_input_buffers(state, int(tid), pos)
+                logits_tt = forward_token_tp_inner(state, return_logits=True)
+                ttnn.synchronize_device(state.mesh)
+            cur_pos = len(prompt_ids)
+            for _step in range(max_tokens):
+                row = logits_row(logits_tt)
+                next_id = int(torch.argmax(row).item())
+                generated.append(next_id)
+                ttnn.deallocate(logits_tt)
+                logits_tt = None
+                update_input_buffers(state, next_id, cur_pos)
+                logits_tt = forward_token_tp_inner(state, return_logits=True)
+                ttnn.synchronize_device(state.mesh)
+                cur_pos += 1
+        finally:
+            if logits_tt is not None:
+                try:
+                    ttnn.deallocate(logits_tt)
+                except Exception:
+                    pass
+            _reset_state_buffers(state)
+        return generated
+
+    def run_forced(mode: str, teacher_ids):
+        set_modes(mode)
+        rows = []
+        records = []
+        logits_tt = None
+        try:
+            _reset_state_buffers(state)
+            for pos, tid in enumerate(prompt_ids):
+                if logits_tt is not None:
+                    ttnn.deallocate(logits_tt)
+                update_input_buffers(state, int(tid), pos)
+                logits_tt = forward_token_tp_inner(state, return_logits=True)
+                ttnn.synchronize_device(state.mesh)
+
+            cur_pos = len(prompt_ids)
+            for step, forced_id in enumerate(teacher_ids):
+                row = logits_row(logits_tt)
+                rows.append(row)
+                summary = topk_summary(row)
+                summary.update({
+                    "step": step,
+                    "forced_token_id": int(forced_id),
+                    "forced_token_logit": float(row[int(forced_id)]),
+                })
+                records.append(summary)
+                ttnn.deallocate(logits_tt)
+                logits_tt = None
+                update_input_buffers(state, int(forced_id), cur_pos)
+                logits_tt = forward_token_tp_inner(state, return_logits=True)
+                ttnn.synchronize_device(state.mesh)
+                cur_pos += 1
+            state_snapshots = collect_state_snapshots()
+        finally:
+            if logits_tt is not None:
+                try:
+                    ttnn.deallocate(logits_tt)
+                except Exception:
+                    pass
+        return {
+            "rows": rows,
+            "records": records,
+            "states": state_snapshots,
+        }
+
+    old_recurrence = state.deltanet_recurrence_mode
+    old_decay = state.deltanet_decay_mode
+    old_rope = state.rope_mode
+    old_collective = state.collective_mode
+    old_fused = state.use_fused_paged_update
+    try:
+        teacher_ids = make_teacher_tokens()
+        manual = run_forced("manual", teacher_ids)
+        owned = run_forced("owned_gdn", teacher_ids)
+    finally:
+        state.deltanet_recurrence_mode = old_recurrence
+        state.deltanet_decay_mode = old_decay
+        state.rope_mode = old_rope
+        state.collective_mode = old_collective
+        state.use_fused_paged_update = old_fused
+        _reset_state_buffers(state)
+
+    step_comparisons = []
+    first_argmax_diff = None
+    first_forced_token_rank_change = None
+    for step, (manual_row, owned_row) in enumerate(zip(manual["rows"], owned["rows"])):
+        manual_rec = manual["records"][step]
+        owned_rec = owned["records"][step]
+        comp = row_compare(manual_row, owned_row)
+        forced_id = int(teacher_ids[step])
+        manual_better = int(manual_rec["argmax_id"]) == forced_id
+        owned_better = int(owned_rec["argmax_id"]) == forced_id
+        if first_argmax_diff is None and manual_rec["argmax_id"] != owned_rec["argmax_id"]:
+            first_argmax_diff = step
+        if first_forced_token_rank_change is None and manual_better != owned_better:
+            first_forced_token_rank_change = step
+        step_comparisons.append({
+            "step": step,
+            "forced_token_id": forced_id,
+            "manual_argmax_id": manual_rec["argmax_id"],
+            "owned_argmax_id": owned_rec["argmax_id"],
+            "manual_forced_token_logit": manual_rec["forced_token_logit"],
+            "owned_forced_token_logit": owned_rec["forced_token_logit"],
+            "forced_token_logit_delta_manual_minus_owned": (
+                manual_rec["forced_token_logit"] - owned_rec["forced_token_logit"]
+            ),
+            "manual_top2_margin": manual_rec["top2_margin"],
+            "owned_top2_margin": owned_rec["top2_margin"],
+            "logit_compare": comp,
+        })
+
+    result = {
+        "candidate": "deltanet_owned_gdn_recurrence",
+        "diagnostic": "teacher_forced_manual_vs_owned_gdn",
+        "prompt": prompt,
+        "prompt_ids": list(prompt_ids),
+        "teacher_generated_ids": teacher_ids,
+        "max_tokens": max_tokens,
+        "top_k": top_k,
+        "state_layers": state_layers,
+        "first_argmax_diff_step": first_argmax_diff,
+        "first_forced_token_rank_change_step": first_forced_token_rank_change,
+        "step_comparisons": step_comparisons,
+        "manual_records": manual["records"],
+        "owned_gdn_records": owned["records"],
+        "final_state_compare": compare_states(manual["states"], owned["states"]),
+        "note": (
+            "Teacher-forced diagnostic: both modes receive the same manual-greedy "
+            "teacher token stream. This separates numeric drift from autoregressive "
+            "trajectory drift and is not a performance benchmark."
+        ),
+    }
+    state.last_run = {
+        "cmd": "probe_deltanet_owned_gdn_teacher_forced_tp",
+        "first_argmax_diff_step": first_argmax_diff,
+        "first_forced_token_rank_change_step": first_forced_token_rank_change,
+    }
+    return result
+
+
+def handle_probe_deltanet_owned_gdn_benchmark_tp(state: MeshServerState, args: dict) -> dict:
+    """Run the guarded owned-GDN trace probe over a fixed prompt set."""
+    import math
+    import statistics
+
+    default_prompts = [
+        "The capital of France is",
+        "Write a short explanation of tensor parallelism.",
+        "In Python, a simple function to add two numbers is",
+        "The main bottleneck in batch-one language model decode is",
+        "Summarize why recurrent state updates matter in hybrid attention models.",
+    ]
+    prompts = args.get("prompts")
+    if prompts is None:
+        prompt = args.get("prompt")
+        prompts = [prompt] if prompt else default_prompts
+    elif isinstance(prompts, str):
+        prompts = [prompts]
+    else:
+        prompts = list(prompts)
+    prompts = [str(p) for p in prompts if str(p)]
+    if not prompts:
+        return {"error": "no prompts supplied"}
+
+    iters = int(args.get("iters", 6))
+    warmup = int(args.get("warmup", 2))
+    max_tokens = int(args.get("max_tokens", 64))
+    decay_mode = args.get("deltanet_decay_mode", "manual")
+    if decay_mode not in ("manual", "native_softplus"):
+        return {"error": "deltanet_decay_mode must be manual or native_softplus"}
+    recurrence_mode = args.get("deltanet_recurrence_mode", "owned_gdn")
+    if recurrence_mode not in ("owned_gdn", "owned_gdn_inplace"):
+        return {"error": "deltanet_recurrence_mode must be owned_gdn or owned_gdn_inplace"}
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+    if max_tokens < 0:
+        return {"error": "max_tokens must be >= 0"}
+
+    prompt_results = []
+    for prompt in prompts:
+        prompt_results.append(handle_probe_deltanet_owned_gdn_trace_tp(state, {
+            "prompt": prompt,
+            "iters": iters,
+            "warmup": warmup,
+            "max_tokens": max_tokens,
+            "deltanet_decay_mode": decay_mode,
+            "deltanet_recurrence_mode": recurrence_mode,
+        }))
+
+    def finite(value):
+        return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+    def summarize(values):
+        xs = [float(x) for x in values if finite(x)]
+        if not xs:
+            return {"count": 0}
+        return {
+            "count": len(xs),
+            "min": min(xs),
+            "max": max(xs),
+            "mean": statistics.fmean(xs),
+            "median": statistics.median(xs),
+        }
+
+    def trace_median(result, key):
+        trace = result.get("trace_bench") or {}
+        summary = trace.get("summary_ms") or {}
+        item = summary.get(key) or {}
+        return item.get("median")
+
+    def decode_ms_per_tok(result, key):
+        decode = result.get("decode_bench") or {}
+        item = decode.get(key) or {}
+        return item.get("ms_per_tok")
+
+    accepted = []
+    manual_trace = []
+    owned_trace = []
+    manual_update_trace = []
+    owned_update_trace = []
+    manual_decode = []
+    owned_decode = []
+    trace_delta = []
+    trace_delta_pct = []
+    decode_delta = []
+    decode_delta_pct = []
+
+    per_prompt_summary = []
+    for result in prompt_results:
+        compat = result.get("compatibility") or {}
+        decode = result.get("decode_bench") or {}
+        ok = (
+            compat.get("accepted") is True
+            and compat.get("argmax_match") is True
+            and decode.get("generated_ids_match") is True
+        )
+        accepted.append(ok)
+
+        mt = trace_median(result, "manual_execute_trace")
+        ot = trace_median(result, "owned_execute_trace")
+        mut = trace_median(result, "manual_update_plus_execute")
+        out = trace_median(result, "owned_update_plus_execute")
+        md = decode_ms_per_tok(result, "manual")
+        od = decode_ms_per_tok(result, "owned_gdn")
+
+        if finite(mt):
+            manual_trace.append(mt)
+        if finite(ot):
+            owned_trace.append(ot)
+        if finite(mut):
+            manual_update_trace.append(mut)
+        if finite(out):
+            owned_update_trace.append(out)
+        if finite(md):
+            manual_decode.append(md)
+        if finite(od):
+            owned_decode.append(od)
+        if finite(mt) and finite(ot):
+            delta = float(mt) - float(ot)
+            trace_delta.append(delta)
+            if float(mt) > 0.0:
+                trace_delta_pct.append(100.0 * delta / float(mt))
+        if finite(md) and finite(od):
+            delta = float(md) - float(od)
+            decode_delta.append(delta)
+            if float(md) > 0.0:
+                decode_delta_pct.append(100.0 * delta / float(md))
+
+        per_prompt_summary.append({
+            "prompt": result.get("prompt"),
+            "accepted": ok,
+            "argmax_match": compat.get("argmax_match"),
+            "generated_ids_match": decode.get("generated_ids_match"),
+            "manual_execute_trace_median_ms": mt,
+            "owned_execute_trace_median_ms": ot,
+            "manual_update_plus_execute_median_ms": mut,
+            "owned_update_plus_execute_median_ms": out,
+            "manual_decode_ms_per_tok": md,
+            "owned_decode_ms_per_tok": od,
+            "n_generated_tokens_manual": (decode.get("manual") or {}).get("n_generated_tokens"),
+            "n_generated_tokens_owned": (decode.get("owned_gdn") or {}).get("n_generated_tokens"),
+            "error": result.get("error") or (result.get("trace_bench") or {}).get("error"),
+        })
+
+    result = {
+        "candidate": "deltanet_owned_gdn_recurrence",
+        "benchmark": "multi_prompt_guarded_trace_decode",
+        "num_prompts": len(prompts),
+        "iters": iters,
+        "warmup": warmup,
+        "max_tokens": max_tokens,
+        "owned_mode": recurrence_mode,
+        "decay_mode": decay_mode,
+        "all_prompts_passed": all(accepted),
+        "per_prompt_summary": per_prompt_summary,
+        "aggregate": {
+            "manual_execute_trace_median_ms": summarize(manual_trace),
+            "owned_execute_trace_median_ms": summarize(owned_trace),
+            "execute_trace_delta_ms_manual_minus_owned": summarize(trace_delta),
+            "execute_trace_delta_pct_manual_minus_owned": summarize(trace_delta_pct),
+            "manual_update_plus_execute_median_ms": summarize(manual_update_trace),
+            "owned_update_plus_execute_median_ms": summarize(owned_update_trace),
+            "manual_decode_ms_per_tok": summarize(manual_decode),
+            "owned_decode_ms_per_tok": summarize(owned_decode),
+            "decode_delta_ms_per_tok_manual_minus_owned": summarize(decode_delta),
+            "decode_delta_pct_manual_minus_owned": summarize(decode_delta_pct),
+        },
+        "prompt_results": prompt_results,
+        "note": (
+            "Each prompt reuses the guarded single-prompt manual-vs-owned flow. "
+            "Timing claims are valid only for prompts whose argmax and generated "
+            "token streams match."
+        ),
+    }
+    state.last_run = {
+        "cmd": "probe_deltanet_owned_gdn_benchmark_tp",
+        "owned_mode": recurrence_mode,
+        "decay_mode": decay_mode,
+        "all_prompts_passed": result["all_prompts_passed"],
+        "num_prompts": len(prompts),
+        "median_manual_decode_ms_per_tok": (
+            result["aggregate"]["manual_decode_ms_per_tok"].get("median")
+        ),
+        "median_owned_decode_ms_per_tok": (
+            result["aggregate"]["owned_decode_ms_per_tok"].get("median")
+        ),
+    }
+    return result
+
+
 def handle_generate_tp(state: MeshServerState, args: dict):
     """Multi-chip TP generate — streams by default (mirrors server.py UX).
 
@@ -1583,6 +5040,19 @@ HANDLERS = {
     "bench_decode_tp_components": handle_bench_decode_tp_components,
     "probe_fused_paged_update_cache_tp": handle_probe_fused_paged_update_cache_tp,
     "probe_explicit_all_reduce_tp": handle_probe_explicit_all_reduce_tp,
+    "probe_rope_fused_qk_tp": handle_probe_rope_fused_qk_tp,
+    "probe_rope_native_partial_tp": handle_probe_rope_native_partial_tp,
+    "probe_rope_native_partial_trace_tp": handle_probe_rope_native_partial_trace_tp,
+    "profile_decode_tp_ops": handle_profile_decode_tp_ops,
+    "probe_deltanet_recurrence_matmul_tp": handle_probe_deltanet_recurrence_matmul_tp,
+    "probe_deltanet_native_gdn_synthetic_mesh_tp": handle_probe_deltanet_native_gdn_synthetic_mesh_tp,
+    "probe_deltanet_native_gdn_real_tensors_tp": handle_probe_deltanet_native_gdn_real_tensors_tp,
+    "probe_deltanet_owned_gdn_real_tensors_tp": handle_probe_deltanet_owned_gdn_real_tensors_tp,
+    "probe_deltanet_owned_gdn_trace_tp": handle_probe_deltanet_owned_gdn_trace_tp,
+    "probe_deltanet_owned_gdn_divergence_tp": handle_probe_deltanet_owned_gdn_divergence_tp,
+    "probe_deltanet_owned_gdn_teacher_forced_tp": handle_probe_deltanet_owned_gdn_teacher_forced_tp,
+    "probe_deltanet_owned_gdn_benchmark_tp": handle_probe_deltanet_owned_gdn_benchmark_tp,
+    "probe_deltanet_softplus_decay_tp": handle_probe_deltanet_softplus_decay_tp,
     "shutdown":       handle_shutdown,
 }
 

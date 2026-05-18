@@ -1,0 +1,90 @@
+{
+  "candidate": "qwen36_gdn_decode_owned_real_tensors",
+  "prompt": "The capital of France is",
+  "token_id": 760,
+  "layer_idx": 0,
+  "reset_state": true,
+  "use_pretransposed_k": true,
+  "symbols": {
+    "qwen36_gdn_decode_owned": true
+  },
+  "shape": {
+    "state": [
+      1,
+      12,
+      128,
+      128
+    ],
+    "q_k_rows": [
+      1,
+      12,
+      32,
+      128
+    ],
+    "value_rows": [
+      1,
+      12,
+      32,
+      128
+    ],
+    "alpha_beta": [
+      1,
+      12,
+      32,
+      32
+    ],
+    "out_manual": [
+      1,
+      12,
+      1,
+      128
+    ],
+    "out_owned": [
+      1,
+      12,
+      32,
+      128
+    ]
+  },
+  "compatibility": {
+    "accepted": true,
+    "error": null
+  },
+  "correctness": {
+    "state_vs_manual": {
+      "pcc": 0.9999999792358177,
+      "max_abs_diff": 0.00390625
+    },
+    "output_vs_manual": {
+      "pcc": 0.999999195685178,
+      "max_abs_diff": 0.0009765625
+    },
+    "pass_gate": false,
+    "host_shapes": {
+      "state_manual": [
+        4,
+        12,
+        128,
+        128
+      ],
+      "state_owned": [
+        4,
+        12,
+        128,
+        128
+      ],
+      "output_manual": [
+        4,
+        12,
+        1,
+        128
+      ],
+      "output_owned": [
+        4,
+        12,
+        1,
+        128
+      ]
+    }
+  }
+}
