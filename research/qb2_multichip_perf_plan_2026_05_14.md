@@ -106,6 +106,24 @@ Validation:
 - Result: trace replay is the dominant measured region; update/input overhead
   is small.
 
+Follow-up Tracy/device pass:
+
+- Harness: `experiments/utils/qb2_tp_tracy_profile_probe.py`.
+- Synced artifacts:
+  `research/probe_logs/qb2_tp_tracy_p25_sync_20260515_0446/.logs/`.
+- Summary:
+  `.cache/qb2_tp_tracy/p25_manual_sync_summary_20260515_0446.json`.
+- Measured replay stayed consistent with H0: `execute_trace` median
+  `82.293 ms`, `update+execute` median `82.799 ms`.
+- `--sync-host-device` enabled coarse cross-chip timing analysis. After
+  applying sync scale/shift, the four devices' median trace starts were within
+  about `0.051 ms` across six trace runs, with per-device `TRACE-FW` spans of
+  about `82.18-82.22 ms`.
+- Interpretation: TP replay is active on all chips over the same 82 ms window.
+  This does not yet prove communication/computation overlap inside the token;
+  the current logs do not label collective intervals versus matmul intervals
+  during replay, and the final TT op/device join failed on missing op `1026`.
+
 ### H1: Move remaining position updates on device
 
 Hypothesis: P25 still writes `tok_buf`, `cur_pos_buf`, and `rot_idxs_buf` from
@@ -245,6 +263,137 @@ Validation:
 - Read current tt-metal docs/reference before coding.
 - Probe Q/K RoPE equivalence at production shapes.
 - Only run full decode after the tensor-level gate passes.
+
+First validation result:
+
+```text
+.cache/qb2_tp_rope/results_fused_qk_timeout_20260515_0009.json
+```
+
+`ttnn.experimental.rotary_embedding_llama_fused_qk` was tested through a
+resident-server compatibility endpoint on production-shaped synthetic Q/K
+tensors. The handler reached the fused path but did not return after several
+minutes. Recovery required killing the client, stopping `server_tp` with
+SIGTERM, and resetting qb2 with `tt-smi -r 0,1,2,3`.
+
+Conclusion: invalidate `rotary_embedding_llama_fused_qk` for the production
+qb2 path until a smaller isolated probe proves the op cannot wedge on this
+mesh/layout. The server endpoint now refuses this path by default unless
+`allow_wedge_prone_fused_qk=true` is passed explicitly. Next RoPE attempt, if
+any, should use the non-fused slice-first `ttnn.experimental.rotary_embedding`
+recipe or a pure tensor-equivalence probe that cannot enter the fused QK kernel.
+
+Second validation result:
+
+```text
+.cache/qb2_tp_rope/results_native_partial_pass_20260515_0030.json
+```
+
+The slice-first `ttnn.experimental.rotary_embedding` recipe was tested through
+the resident qb2 server on production-shaped synthetic Q/K tensors. It applies
+native RoPE to only the 64 rotary dims, trims the op's padded head axis back to
+the logical Q/K head counts, and concats the 192 pass-through dims.
+
+Result: correctness gate passed for positions `0, 1, 7, 31, 32, 127, 255`.
+All positions were accepted, min Q PCC was `0.9999975134451065`, min K PCC was
+`0.9999975515805819`, and max tail diff was `0.000914454460144043`.
+
+Conclusion: this candidate is allowed to move to a guarded production trace
+variant and measured full-decode comparison. This is not a speedup claim; the
+only current evidence is semantic compatibility plus operation-count reduction
+inside the RoPE subgraph.
+
+Trace production-variant result:
+
+```text
+.cache/qb2_tp_rope/results_native_partial_trace_20260515_0041.json
+.cache/qb2_tp_rope/results_manual_baseline_after_native_20260515_0042.json
+```
+
+The guarded production variant uses the dynamic on-device cos/sin row with
+`token_index=None` rather than baking a Python `token_index` into the trace.
+It matched the manual baseline argmax on a reset production forward, captured a
+temporary decode trace, and ran a 20-iteration sync-bounded component benchmark.
+
+Same-session 20/3 medians:
+
+| Path | execute_trace ms | update+execute ms |
+| --- | ---: | ---: |
+| manual P25 | `82.20996847376227` | `82.74531294591725` |
+| native partial RoPE | `81.79361710790545` | `82.47091504745185` |
+| measured delta | `0.4163513658568263` | `0.27439789846539497` |
+
+Conclusion: native partial RoPE is trace-compatible and has a small measured
+component win. It should not become the default on this evidence alone; require
+a full-decode comparison before claiming an end-to-end speedup.
+
+## Resident-server decode profile
+
+```text
+research/qb2_decode_profile_2026_05_15.md
+.cache/qb2_tp_profile/results_decode_op_counts_20260515_0129.json
+.cache/qb2_tp_profile/results_decode_op_timed_20260515_0130.json
+```
+
+Because qb2 is not currently running a Tracy/profiler-enabled server build, the
+fresh profile is a resident-server eager proxy of the same production trace
+body, not true per-op device timing inside `execute_trace`.
+
+The count profile records `4268` TTNN calls in one decode body. Largest
+categories by count are DeltaNet recurrence (`816`), DeltaNet decay/gate
+(`480`), DeltaNet other (`384`), DeltaNet QKV repeat (`336`), matmul (`321`),
+attention other (`320`), RoPE (`320`), and RMSNorm (`305`).
+
+The sync-bounded eager timing proxy puts the largest single bucket at DeltaNet
+recurrence (`117.053 ms`, `17.42%` of profiled eager-op time), followed by
+matmul (`77.583 ms`, `11.54%`), DeltaNet decay/gate (`73.958 ms`, `11.00%`),
+and DeltaNet conv (`63.987 ms`, `9.52%`). These percentages rank candidates;
+they are not trace replay percentages and are not speedup claims.
+
+Conclusion: the next primary experiment should target DeltaNet recurrence/body
+fusion or an equivalent reduction of DeltaNet small-op count. Cache update,
+SDPA, and LM-head/IO are not first-order targets in the current measured shape.
+
+## DeltaNet follow-up probes
+
+Artifacts:
+
+```text
+.cache/qb2_tp_deltanet/results_recurrence_matmul_20260515_0236.json
+.cache/qb2_tp_deltanet/results_softplus_decay_full_decode_20260515_0324.json
+```
+
+Reference GDN fused ops (`qwen36_gdn_prepare_decode`,
+`qwen36_gdn_decode`, and `qwen36_causal_conv_decode`) exist in the
+`experiments/.refs/tt-qwen-36` tree, but qb2's installed `ttnn.experimental`
+does not expose them. Treat those as unavailable unless we choose a TTNN rebuild.
+
+The no-rebuild recurrence-as-matmul rewrite was accepted by the API and had a
+lower synthetic median on the isolated body (`1.2022379087284207 ms` versus
+`1.2938075233250856 ms`), but it failed the strict correctness gate:
+`out_vs_manual.pcc = 0.9998950430336081`, below `0.9999`. Conclusion: do not
+promote this path.
+
+The lower-risk native softplus candidate replaces the manual
+`log(exp(a + dt_bias) + 1)` sequence in the DeltaNet decay/gate path with
+`ttnn.softplus(a + dt_bias)`. It passed the tensor gate:
+
+- softplus PCC `0.9999966887762556`, max diff `0.00390625`
+- decay PCC `0.9999961572547352`, max diff `0.00390625`
+- one-step production argmax matched (`2614`)
+
+Same-session full-decode comparison on prompt `"The capital of France is"`,
+20 generated tokens:
+
+| Path | generated IDs match | ms/tok | tok/s |
+| --- | ---: | ---: | ---: |
+| manual P25 | yes | `82.78564305510372` | `12.079389168172321` |
+| native DeltaNet softplus | yes | `82.22602661699057` | `12.161599449016396` |
+
+This is a measured one-prompt/20-token result, so it is valid evidence for this
+case, not a broad benchmark. Next validation before default promotion should be
+a standard longer/multi-prompt decode run, and then a combined native-softplus
+plus native-partial-RoPE run if both remain clean.
 
 ## Deprioritized unless new evidence appears
 
