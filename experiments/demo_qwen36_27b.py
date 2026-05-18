@@ -11,7 +11,7 @@ time. For iterative work, use the persistent inference server instead:
     cd ~/tt-xla && .venv/bin/python -m experiments.serve.server &
     # Then from a separate shell on the same host:
     cd ~/tt-xla && .venv/bin/python -m experiments.serve.client bench_decode
-    cd ~/tt-xla && .venv/bin/python -m experiments.serve.client bench_decode_paged \\
+    cd ~/tt-xla && .venv/bin/python -m experiments.serve.client generate_long \\
         --max-pos 8192
 
 The persistent server amortizes weight load across many requests and supports
@@ -55,7 +55,7 @@ Optimization stack landed in 91f:
   - ATTN-QKV fusion in gated_attn_step (q_proj|k_proj|v_proj concat)
 
 This script uses the eager non-paged path. For long context support use
-`bench_decode_paged` via the server (which exercises `gated_attn_step_ondevice_paged`).
+`generate_long` via the server (which exercises `gated_attn_step_ondevice_paged`).
 """
 import os, sys, json, time, gc, argparse
 import numpy as np

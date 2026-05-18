@@ -1,8 +1,14 @@
 # HANDOFF.md — TT-XLA Qwen3.6-27B Agent Onboarding
 
-Last updated: 2026-05-14. Authoritative entry point for any agent picking up this project. Read this end-to-end before touching code. Cite memory notes by filename (e.g. `feedback_paged_sdpa_shipped_tp.md`) — they live in `~/.claude/projects/-Users-adityasriram-Labs-stanford-cs440lx-tt-xla/memory/`.
+Last updated: 2026-05-18. Authoritative entry point for any agent picking up this project. Read this end-to-end before touching code. Cite memory notes by filename when using older memory-bank findings, and cite in-repo research files for the current GDN work.
+
+**Context-compacted agent?** Read `research/ACTIVE_CONTEXT.md` first. It is the
+short active-state file for current measurements, invalidated paths, and next
+actions. Do not spend tokens re-summarizing this whole handoff unless the user
+explicitly asks for a comprehensive audit.
 
 ## Table of contents
+0. [Current snapshot](#0-current-snapshot)
 1. [What this project is](#1-what-this-project-is)
 2. [Non-negotiables](#2-non-negotiables)
 3. [Hosts (qb1 vs qb2)](#3-hosts)
@@ -21,39 +27,144 @@ Last updated: 2026-05-14. Authoritative entry point for any agent picking up thi
 16. [Quick-start checklist](#16-quick-start-checklist-first-30-min-as-a-new-agent)
 17. [Glossary](#17-glossary)
 
-**Newcomer? Start with §16 (Quick-start checklist), then read §3 + §4 + §14 before writing any code.**
+**Newcomer? Start with §0 + §16, then read §2, §3, §4, and §14 before writing any code.**
 
 ---
 
+## 0. Current snapshot
+
+If you are coming in cold or after context compaction, read this section and
+`research/ACTIVE_CONTEXT.md` before touching any code.
+
+### Active goal
+
+The active goal is **Qwen3.6-27B decode performance optimization on
+Tenstorrent Blackhole P150**, with the main focus on **multi-chip TP on qb2**.
+The target is not a friend's number; it is to move measured end-to-end decode
+as close to the hardware ceiling as correctness permits.
+
+The current production-ish path is:
+
+- qb2, 4× P150, `(1,4)` mesh, `server_tp.py`
+- traced decode with paged SDPA, vocab-sharded LM head, on-device argmax, and
+  on-device embedding/cos/sin lookup
+- known end-to-end decode ballpark from the P25 line: about **82 ms/token**
+  (~12 tok/s) on `generate_tp`
+
+### Current bottleneck hypothesis
+
+The 82 ms/token shape is not mostly Python/host overhead. The device trace is
+large: 64 layers, many TTNN kernels, many layout/view operations, many
+collectives, and a batch-1 decode graph with skinny GEMV-like matmuls. The
+likely perf frontier is reducing small-op count and memory/layout traffic while
+keeping correctness.
+
+### Current custom GDN status
+
+The most recent work is a custom GDN/DeltaNet recurrence effort. It is **not
+ready for integration**.
+
+Files:
+
+- `experiments/owned_ops/qwen36_gdn_decode_owned/`
+- `experiments/owned_ops/qwen36_gdn_prediction/`
+- `experiments/serve/server_tp.py`
+- `research/ACTIVE_CONTEXT.md`
+
+Current hard findings:
+
+- Full owned GDN launches on qb2 but fails the strict promotion gate:
+  state PCC `0.9999997911075303`, state max diff `0.015625`; output PCC
+  `0.9999971009389962`, output max diff `0.001953125`.
+- `owned_copy_vs_input` is exact. The issue is not a trivial state-copy bug.
+- The standalone prediction component is close but not default-safe:
+  `component_prediction` max diff `0.0078125` vs current TTNN
+  broadcast-reduce recurrence.
+- Debug mode 10 K materialization is exact.
+- Debug mode 11 product tile vs TTNN intermediate has PCC
+  `0.9999995951668267`, max diff `0.00390625`.
+- Debug mode 12 one-tile reduce vs TTNN intermediate has PCC
+  `0.9999996063019564`, max diff `0.0078125`.
+- Debug mode 2 full strict prediction is wedge-prone/too slow in the resident
+  server path. Do **not** run all component debug modes together.
+- The clean `ttnn.matmul(k4, state_scaled)` formulation is shape-valid:
+  `[1,12,1,128] @ [1,12,128,128] -> [1,12,1,128]`, but it is **not**
+  numerically equivalent to the current TTNN broadcast-reduce contract:
+  prediction max diff `0.0625`, PCC `0.999993423459592`. Switching the
+  reference to matmul changes the model contract; it does not make the custom
+  kernel correct.
+
+Key artifacts:
+
+```text
+.cache/qb2_tp_deltanet/results_owned_gdn_matmul_contract_nativeio_seeded_l0_20260518.json
+.cache/qb2_tp_deltanet/results_owned_gdn_component_mode10_kcol_nativeio_seeded_l0_20260518.json
+.cache/qb2_tp_deltanet/results_owned_gdn_component_mode11_product_ttnn_expected_nativeio_seeded_l0_20260518.json
+.cache/qb2_tp_deltanet/results_owned_gdn_component_mode12_reduce_ttnn_expected_nativeio_seeded_l0_20260518.json
+.cache/qb2_tp_deltanet/results_owned_gdn_component_mode11_product_fullorder_ttnn_expected_nativeio_seeded_l0_20260518.json
+.cache/qb2_tp_deltanet/results_owned_gdn_component_mode12_reduce_fullorder_ttnn_expected_nativeio_seeded_l0_20260518.json
+```
+
+Immediate next GDN step:
+
+1. Do **not** integrate or default-enable owned GDN.
+2. Either make the owned prediction/reduction mimic the existing TTNN
+   broadcast-reduce rounding/materialization schedule more closely, or produce
+   a documented BF16-equivalence argument plus teacher-forced/generated-token
+   validation proving the drift is harmless.
+3. Keep tests staged: K materialization -> product tile -> one-tile reduce ->
+   full prediction -> full recurrence -> teacher-forced tokens -> generated
+   tokens -> measured decode.
+
+### Current remote state
+
+As of the last update in this handoff, qb2 resident server was restored and
+healthy:
+
+```bash
+ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp status'
+```
+
+Do not assume that remains true. Check status first.
+
+### Non-current / parked
+
+- PJRT plugin is parked for the distant future. Keep it clean, but do not
+  prioritize it over Qwen3.6-27B bring-up/perf.
+- Friend repo is reference-only. It contains useful TT-Metal patterns and also
+  known/possible GDN errors. Do not treat it as ground truth.
+
 ## 1. What this project is
 
-Stanford **CS440LX exploratory research**: build deep understanding of Tenstorrent Blackhole P150 hardware + JAX/XLA internals, then ship a JAX/XLA backend for Tenstorrent. Active line of work is bringing up **Qwen3.6-27B** (MoE-free hybrid recurrent: DeltaNet + Gated Attention + dense MLP, 64 layers, ~27B params) on **4× P150 with tensor parallelism**. The 27B work is correctness-validated single-chip and now multi-chip; see section 8 for the roadmap and shipped wins.
+Stanford **CS440LX exploratory research**: build deep understanding of Tenstorrent Blackhole P150 hardware + JAX/XLA internals, then eventually ship a JAX/XLA backend for Tenstorrent. Active line of work is bringing up and optimizing **Qwen3.6-27B** (hybrid recurrent: DeltaNet/GDN + Gated Attention + dense MLP, 64 layers, ~27B params) on **P150**.
 
-The 27B bring-up is the proving ground — once correctness and perf are saturated, learnings funnel back into the PJRT plugin (`pjrt_plugin/`) that will be the actual JAX backend.
+The 27B bring-up is the proving ground. Once correctness and perf are saturated, learnings can flow back into the PJRT plugin (`pjrt_plugin/`). For now, prioritize model bring-up and performance optimization over PJRT work.
 
 ---
 
 ## 2. Non-negotiables
 
-These come from `CLAUDE.md` (project root) and the auto-memory `feedback_non_negotiables.md`. Hard rules — violating them silently wastes hours.
+Hard rules. Violating them silently wastes hours.
 
 | # | Rule | Rationale |
 |---|---|---|
-| 1 | **Plan first, act later** | Every claim grounded in experiment. No hand-wavy code. |
-| 2 | **Research-driven workflow** | Most output is Q&A, wiki entries, design memos. Code follows. |
-| 3 | **No code bloat** | Think more, type less. Concise + correct. |
+| 1 | **Correctness before performance** | Do not optimize, integrate, or default-enable a path that has not passed its equivalence gate. |
+| 2 | **Hypothesis-driven workflow** | Every claim grounded in experiment. Record rejected hypotheses and artifacts. |
+| 3 | **No code bloat** | Think more, type less. Concise, scoped changes only. |
 | 4 | **Remote execution only** — `ssh qb1` / `ssh qb2` | The local Mac has no Tenstorrent hardware. `ssh tenstorrent` (legacy) is GONE. |
-| 5 | **Single device by default** | Both hosts have 4 chips. Stick to 1 until saturated unless multi-chip is a real-need decision (memory or fabric requirement). |
+| 5 | **qb2 is the multi-chip target** | Main agent work is multi-chip TP/perf on qb2. Use qb1 for single-chip only when available. |
 | 6 | **No inline scripts** (`python -c '...'`) | Always write a permanent helper in `experiments/utils/` and run that. See `reference_inline_script_helpers.md`. |
 | 7 | **No `/tmp`** | All scratch goes in project dirs — `.cache/`, `experiments/`, `research/`, `wiki/`. |
 | 8 | **Frequent commits** | Auto-commit allowed (`feedback_commits.md`). Watchdog kills sessions silent > 600s. |
 | 9 | **No local execution of device code** | Local Mac is read/write/edit + git only. No `ttnn` imports locally. |
-| 10 | **Correctness first** | If cosine < 0.99, STOP and ablate (`feedback_correctness_first.md`). Don't optimize broken math. |
+| 10 | **No hallucinated improvements** | Do not claim `X ms` or `%` speedup unless measured end-to-end or theoretically justified and clearly labeled as a bound. |
 | 11 | **Numpy oracle, not HuggingFace AutoModel** | `AutoModel.from_pretrained` crashes on remote; build pure-numpy fp32 reference + construct `DecoderLayer` directly with `safe_open` weights (`reference_hf_oracle_pattern.md`). |
 | 12 | **Sync-bounded timing** | ttnn dispatch is async. `ttnn.synchronize_device(device)` BEFORE start AND AFTER stop, every benchmark (`feedback_sync_bounded_timing.md`). |
 | 13 | **Stdout line-buffering for SSH probes** | SSH pipes are block-buffered. Add `sys.stdout.reconfigure(line_buffering=True)` at top of every helper (`feedback_python_stdout_buffering.md`). |
 | 14 | **Doc-first** | Before any non-trivial ttnn/mesh/fabric work, read `experiments/.refs/tt-metal/tech_reports/` + `models/demos/llama3_70b_galaxy/`. Cite doc path in design (`feedback_consult_docs_before_acting.md`). |
 | 15 | **Never cite projection as measurement** | Per-block × layer count is a CEILING not tok/s. Real numbers require full `bench_decode` (`feedback_real_vs_projected.md`). |
+| 16 | **Resident server owns the chips** | If a server is up, use its socket endpoints. Do not start raw TTNN probes on that host unless the user approves stopping/restarting the server. |
+| 17 | **Custom GDN gate** | No full GDN integration until isolated contraction, full recurrence, teacher-forced tokens, generated tokens, and perf are all validated. |
 
 ---
 
@@ -63,8 +174,8 @@ Two hosts, both active concurrently. Each has 4× Tenstorrent Blackhole P150. **
 
 | Host | Chips | Fabric | Use case | Bootstrap time |
 |------|-------|--------|----------|----------------|
-| `qb1` | 4× P150 | NO inter-chip fabric | **Single-chip only.** Server `server.py`. Long-context drift work, ttnn op probes, Tracy profiling. | ~11 min weight load |
-| `qb2` | 4× P150 | Working fabric | **Multi-chip TP.** Server `server_tp.py`. (1,4) mesh, all_gather/all_reduce, distributed layers. | ~5-10 min sharded load |
+| `qb1` | 4× P150 | NO inter-chip fabric | **Single-chip only.** Server `server.py`. Long-context drift work, single-chip GDN/perf probes, Tracy profiling. Ask user before using if they are running experiments. | ~11 min weight load |
+| `qb2` | 4× P150 | Working fabric | **Primary target.** Multi-chip TP, profiling, all GDN integration checks that touch TP. Server `server_tp.py`. `(1,4)` mesh, all_gather/all_reduce, distributed layers. | ~5-10 min sharded load |
 
 ```
 ❌ WRONG                              ✓ RIGHT
@@ -117,7 +228,17 @@ Wire format: newline-terminated JSON. `pack_request(cmd, args)` + `read_line` + 
 | `generate_stream` | Token-by-token streaming |
 | `shutdown` | Clean teardown |
 
-qb2 (`server_tp.py`) is a SUBSET focused on multi-chip TP — at minimum `handle_generate_tp`. Verify with `grep -n "^def handle_" experiments/serve/server_tp.py`.
+qb2 (`server_tp.py`) is now the main multi-chip development surface. It has
+`generate_tp`, decode profiling/benchmark endpoints, RoPE/collective probes,
+and multiple DeltaNet/GDN probes. Verify the current surface with:
+
+```bash
+rg -n '^def handle_|HANDLERS' experiments/serve/server_tp.py
+ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp status'
+```
+
+Prefer resident-server probes on qb2. Raw TTNN scripts contend with the server
+because TTNN opens all chips.
 
 ### Sample client call (from a probe helper)
 
@@ -146,6 +267,7 @@ tt-xla/
 │   └── ...
 ├── wiki/                     # Q&A wiki — learning-by-building
 ├── research/                 # raw notes, scraped content, integration outlines
+│   └── ACTIVE_CONTEXT.md      # current active-state handoff for compactions
 ├── experiments/              # all device code (runs on qb1/qb2)
 │   ├── 01_jax_basics.py ... 99_moe_dram_sharded.py   # numbered experiments (chronological)
 │   ├── 91*_qwen36_27b_*.py                            # 27B bringup series (CURRENT FOCUS)
@@ -158,6 +280,7 @@ tt-xla/
 │   │   ├── scripts/          # serve.sh, serve_tp.sh, drift sweeps
 │   │   └── tests/
 │   ├── utils/                # permanent probe helpers (no inline scripts!)
+│   ├── owned_ops/            # custom TTNN/TT-Metal op bring-up; current GDN work lives here
 │   ├── tt_jax/               # tt-metal -> JAX integration scaffolding
 │   ├── .refs/                # vendored tt-metal references (read-only)
 │   └── logs/
@@ -165,7 +288,11 @@ tt-xla/
 └── tt_docs_corpus/           # scraped tt-metal / tenstorrent docs
 ```
 
-Current focus: `experiments/91*` series + `experiments/serve/server*.py`. The single most-touched production file is **`experiments/serve/server_tp.py`** (qb2 multi-chip).
+Current focus: `experiments/serve/server_tp.py`,
+`experiments/owned_ops/qwen36_gdn_decode_owned/`,
+`experiments/owned_ops/qwen36_gdn_prediction/`, and
+`research/ACTIVE_CONTEXT.md`. The single most-touched production file is
+**`experiments/serve/server_tp.py`** (qb2 multi-chip).
 
 ---
 
@@ -176,7 +303,10 @@ Auto-memory lives at:
 ~/.claude/projects/-Users-adityasriram-Labs-stanford-cs440lx-tt-xla/memory/
 ```
 
-The index is `MEMORY.md`. ~140 entries as of 2026-05-14, organized by theme:
+The historical index is `MEMORY.md`. It had ~140 entries as of 2026-05-14 and
+has since been supplemented by in-repo current-state files such as
+`research/ACTIVE_CONTEXT.md` and the `experiments/owned_ops/*/README.md`
+documents. Use the in-repo docs first for GDN/current TP state.
 
 | Group | Examples | Topic |
 |-------|----------|-------|
@@ -206,7 +336,7 @@ From `reference_p150_roofline_priority.md` and `feedback_realistic_tp_ceiling.md
 | Single-chip post QK rms_norm fusion | 192.81 ms/tok = 5.19 tok/s | `feedback_qk_rms_norm_shipped.md` |
 | TP traced baseline (pre-paged-SDPA) | 7.02 tok/s | commit `9369e1b` |
 | **TP shipped (paged SDPA + HiFi2 B3)** | **11.43 tok/s** | `feedback_paged_sdpa_shipped_tp.md`, commit `4741253` |
-| Friend's daily-driver | ~15.3-15.5 tok/s | competitive target |
+| Friend's daily-driver | ~15.3-15.5 tok/s | reference point only, not the target |
 | El Reg Llama-3.1-70B 4×P150 measured | 1.78× TP4 vs TP1 (~41% of theoretical) | `feedback_realistic_tp_ceiling.md` — realistic ceiling, not 4× |
 
 ### Targets (single-chip, bf16/bf8 mix, MAX_POS=256)
@@ -229,7 +359,7 @@ Of the 142 ms/tok at 7.02 tok/s pre-paged-SDPA:
 - 1.9 ms update_input_buffers
 - ~0 ms sync barrier
 
-The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_optimizations_menu.md` + `_v2_addendum.md`) plus the post-P22/P25 memory notes. Vocab-sharded lm_head and on-device embed/cos/sin lookup have shipped. Distributed RMSNorm and DRAM-sharded MLP were probed negative at current shapes. Current likely levers are all_gather_concat / CCL cleanup, on-device cur_pos increment, native RoPE, and deeper DeltaNet/GDN fusion.
+The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_optimizations_menu.md` + `_v2_addendum.md`) plus the post-P22/P25 memory notes. Vocab-sharded lm_head and on-device embed/cos/sin lookup have shipped. Distributed RMSNorm and DRAM-sharded MLP were probed negative at current shapes. Current likely levers are fresh profiling, CCL cleanup/overlap, native RoPE, and deeper DeltaNet/GDN fusion, but every candidate must be validated against full decode and correctness gates.
 
 ---
 
@@ -269,25 +399,26 @@ The remaining lever set is the **multi-chip TP opt menu** (`research/multi_chip_
 | `2d30af7` | P14: TRACE CAPTURE WORKS ON (1,4) MESH | unblock |
 | `4cd0ce1` | server_tp.py: paged KV cache refactor — enables trace | enabler |
 
-### Current state (as of 2026-05-14)
+### Current state (as of 2026-05-18)
 
 | Metric | Value | Note |
 |--------|-------|------|
-| Production perf (qb2 multi-chip TP traced) | **12.07 tok/s** | commit `56de5d2` P25 ship; P22/P25 notes in `MEMORY.md` |
+| Production perf (qb2 multi-chip TP traced) | **~12 tok/s / ~82 ms-token** | P25 line. Treat exact number as run-dependent; re-benchmark before reporting. |
 | Production perf (qb1 single-chip) | 5.19 tok/s | `feedback_qk_rms_norm_shipped.md` |
 | Long-context cliff (qb1, HiFi2 B3) | none up to L=500 | `feedback_fp32_sdpa_cliff_probe.md` |
 | Speculative decode (D'3) | DON'T SHIP at 57.9% acceptance | `feedback_d3_dont_ship_yet.md` |
 | El Reg ceiling (4× P150 Llama70B BFP8) | 1.78× (~9.2 tok/s equivalent) | `feedback_realistic_tp_ceiling.md` — we're above this |
 | Optimization target | approach hardware ceiling | compare against roofline / measured full-decode tok/s, not friend's implementation |
+| Custom GDN status | **not integration-ready** | see §0 and `research/ACTIVE_CONTEXT.md` |
 
 ### Next investigation list (post-P25, prioritized)
 
-1. **Fresh full-decode breakdown at 12.07 tok/s**. Re-run `tp_decompose_probe.py` or equivalent against P25 before trusting any old 7.02 tok/s decomposition.
-2. **On-device `ttnn.plus_one(cur_pos)`**. P25 shipped token/cos/sin lookup, but `server_tp.py` still writes `cur_pos_buf` and `rot_idxs_buf` from host each step.
-3. **all_gather_concat / CCL cleanup** (2-5 ms/tok candidate). See `research/multi_chip_optimizations_menu_v2_addendum.md` #16; validate under full trace, not isolation only.
-4. **Native RoPE / fewer RoPE dispatches**. Manual rotate-only remains in production; prior native-RoPE attempts were blocked by shape/padding constraints, so start from current tt-metal docs before retrying.
-5. **DeltaNet/GDN fusion frontier**. Current decode budget is dominated by DeltaNet + attention compute; Python-level reshapes/repeats/small ops are the likely path before custom C++ kernels.
-6. **Do not re-open killed candidates without new evidence:** distributed RMSNorm Step 1 (`feedback_distributed_rms_norm_failed.md`) and single-P150 DRAM-sharded MLP (`feedback_dram_sharded_mlp_probe.md`) were negative at current shapes.
+1. **Fresh full-decode/profile breakdown for current P25-ish path.** The old 7.02 tok/s decomposition is stale. Use current resident qb2 server and group ops into DeltaNet recurrence, attention, MLP, collectives, RoPE, layout/view ops, LM head.
+2. **Custom GDN correctness, not integration.** The current owned GDN path is close but fails strict equivalence. Next work is product/reduce rounding/materialization parity or a documented BF16 tolerance argument plus token-level validation.
+3. **Native RoPE / fewer RoPE dispatches.** Manual rotate-only remains in production; prior fused QK RoPE was wedge-prone. Any retry must start from isolated correctness probes.
+4. **CCL cleanup / overlap.** Look for whether collectives can be overlapped with compute or replaced with better topology/axis usage. Do not claim overlap without Tracy/profile evidence.
+5. **On-device position update.** P25 shipped token/cos/sin lookup, but check whether `cur_pos_buf`/`rot_idxs_buf` still require host writes in the current path.
+6. **Do not re-open killed candidates without new evidence:** distributed RMSNorm Step 1 (`feedback_distributed_rms_norm_failed.md`), single-P150 DRAM-sharded MLP (`feedback_dram_sharded_mlp_probe.md`), and GDN full strict debug mode 2 were negative/wedge-prone at current shapes.
 
 ---
 
@@ -301,7 +432,7 @@ $ ssh qb2 'tail -f ~/tt-xla/.cache/server_tp.log'   # wait for "Stage A/B/C/D/E 
 $ ssh qb2 'bash ~/tt-xla/experiments/serve/scripts/serve_tp.sh status'
 ```
 
-### Reproduce current qb2 TP smoke/perf (P25, commit `56de5d2`)
+### Reproduce current qb2 TP smoke/perf (P25 line)
 
 Server must be up on qb2. Then:
 
@@ -318,6 +449,52 @@ $ ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp \
     generate_tp --prompt "The capital of France is" --max-tokens 10'
 # expected: " Paris." continuation
 ```
+
+### Reproduce current GDN equivalence state (qb2 resident server)
+
+Server must be up on qb2. These run through the resident server, not raw TTNN.
+Do not run `--component-debug-mode 2` unless you are prepared to restart the
+server; it has tied up the resident path before.
+
+```bash
+# Main real-tensor stepwise probe with the clean matmul-contract check.
+$ ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp \
+    probe_deltanet_owned_gdn_real_tensors_tp \
+    --prompt "The capital of France is" \
+    --layer-idx 0 --native-io --stepwise --seed-state manual_once \
+    --output-json .cache/qb2_tp_deltanet/results_owned_gdn_matmul_contract_nativeio_seeded_l0_20260518.json'
+
+# K materialization sanity: should be exact.
+$ ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp \
+    probe_deltanet_owned_gdn_real_tensors_tp \
+    --prompt "The capital of France is" \
+    --layer-idx 0 --native-io --stepwise --seed-state manual_once \
+    --component-debug-mode 10 \
+    --output-json .cache/qb2_tp_deltanet/results_owned_gdn_component_mode10_kcol_nativeio_seeded_l0_20260518.json'
+
+# Product/reduce diagnostics: close but not default-safe.
+$ ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp \
+    probe_deltanet_owned_gdn_real_tensors_tp \
+    --prompt "The capital of France is" \
+    --layer-idx 0 --native-io --stepwise --seed-state manual_once \
+    --component-debug-mode 11 \
+    --output-json .cache/qb2_tp_deltanet/results_owned_gdn_component_mode11_product_ttnn_expected_nativeio_seeded_l0_20260518.json'
+
+$ ssh qb2 'cd ~/tt-xla && .venv/bin/python -m experiments.serve.client_tp \
+    probe_deltanet_owned_gdn_real_tensors_tp \
+    --prompt "The capital of France is" \
+    --layer-idx 0 --native-io --stepwise --seed-state manual_once \
+    --component-debug-mode 12 \
+    --output-json .cache/qb2_tp_deltanet/results_owned_gdn_component_mode12_reduce_ttnn_expected_nativeio_seeded_l0_20260518.json'
+```
+
+Expected current conclusions:
+
+- `component_kcol0` exact.
+- `component_prediction` max diff `0.0078125` vs broadcast-reduce reference.
+- `prediction_matmul_vs_broadcast` max diff `0.0625`; matmul is shape-valid
+  but numerically different from the existing recurrence contract.
+- Full owned GDN `pass_gate: false`.
 
 ### Reproduce single-chip 5.19 tok/s (qb1)
 
@@ -360,16 +537,47 @@ $ ssh qb1 'cd ~/tt-xla && .venv/bin/python experiments/utils/syntax_check.py \
 
 ## 10. Tracing / profiling
 
-### Tracy (qb1 only — `reference_tracy_build_qb1.md`)
+### Tracy / profiling target split
+
+For **multi-chip TP profiling**, qb2 is the target. Start with resident-server
+profiling/breakdown helpers so you do not contend with the server:
+`experiments/utils/tp_decompose_probe.py`, the profiling endpoints in
+`experiments/serve/server_tp.py`, and any current qb2-specific helper in
+`experiments/utils/`.
+
+Known Tracy setup:
 
 - Tracy-enabled build: `~/tt-metal-tracy/` on qb1
 - Wrapper script: `run_with_tracy_build.sh`
-- The default ttnn build's Tracy API is a no-op. Setting `TT_METAL_DEVICE_PROFILER=1` on the non-Tracy build aborts (`feedback_ttnn_device_profiler_build.md`).
-- qb2 has NO Tracy build yet — host-side dispatch breakdown only (`tracy_traced_decode_probe.py` + `tracy_analyze_ops.py`).
+- Use this for single-chip Tracy comparisons unless/until qb2 has a verified
+  Tracy-capable build.
+- The default ttnn build's Tracy API is a no-op. Setting
+  `TT_METAL_DEVICE_PROFILER=1` on the non-Tracy build aborts
+  (`feedback_ttnn_device_profiler_build.md`).
+- Historically qb2 did not have the same Tracy setup as qb1. Verify the current
+  qb2 profiling toolchain before assuming device-side Tracy is available.
 
 ```bash
 $ ssh qb1 'bash ~/tt-xla/run_with_tracy_build.sh experiments/utils/<probe>.py'
 ```
+
+### Current profiling conclusion
+
+The current multi-chip decode shape should be treated as a **device graph**
+problem, not a Python-loop problem. The working hypothesis from recent P25
+profiling/discussion is:
+
+- batch-1 decode is skinny, so many matmuls are GEMV-like and underutilize the
+  machine
+- trace replay removes Python overhead but does not fuse many TTNN kernels
+- DeltaNet recurrence, RoPE/QK plumbing, layout/view ops, cache updates,
+  collectives, and LM-head path all contribute
+- full-attention layers are only 16/64, so fixing SDPA/KV alone cannot explain
+  the full remaining gap
+
+The next profile should produce a current per-op breakdown grouped into:
+matmul, RMSNorm, RoPE, DeltaNet recurrence, collectives, cache update, SDPA,
+and LM head. Use that breakdown to choose fusion targets; do not guess.
 
 ### Sync-bounded timing (`feedback_sync_bounded_timing.md`)
 
@@ -555,6 +763,27 @@ Always write a permanent helper in `experiments/utils/`. See `reference_inline_s
 
 Our ttnn build's `update_cache_for_token_` has no `cur_pos_tensor=` kwarg (only int `update_index`). Means non-paged path is NOT traceable. Any traced multi-step decode MUST use `paged_update_cache` with `update_idxs_tensor=`. Verified 91f single-chip already does this.
 
+### 14.13 Matmul shape-valid does not mean numerically equivalent
+
+For GDN prediction, the clean formulation:
+
+```text
+ttnn.matmul(k4, state_scaled)
+[1,12,1,128] @ [1,12,128,128] -> [1,12,1,128]
+```
+
+works, but it differs from the existing TTNN broadcast-reduce recurrence by
+max diff `0.0625` on real layer-0 seeded tensors. The custom component is much
+closer to broadcast-reduce than to matmul. Do not change the correctness
+reference to matmul unless you are intentionally changing the numerical
+contract and have token-level validation.
+
+### 14.14 GDN debug mode 2 is wedge-prone
+
+`qwen36_gdn_prediction(debug_mode=2)` full strict prediction tied up the qb2
+resident server and required killing/restarting it. Modes 10, 11, and 12 are
+safe enough to run individually; do not run all debug modes together.
+
 ---
 
 ## 15. Friend repo (REFERENCE ONLY)
@@ -577,8 +806,8 @@ Comparison table at `research/friend_repo_borrow_list.md`. Key gaps:
 
 | Component | Friend | Ours |
 |-----------|--------|------|
-| GDN recurrence | Custom C++ `ttnn.experimental.qwen36_gdn_decode` | Python recurrence body |
-| GDN Q/K/V prep | Custom C++ `qwen36_gdn_prepare_decode` | Python slice+reshape+repeat_interleave |
+| GDN recurrence | Custom C++ `ttnn.experimental.qwen36_gdn_decode` | Manual TTNN broadcast-reduce in production; owned custom GDN exists but is **not default-safe** |
+| GDN Q/K/V prep | Custom C++ `qwen36_gdn_prepare_decode` | Python/TTNN slice+reshape+repeat_interleave; not the current blocker |
 | RMSNorm | Distributed `rms_norm_pre_all_gather` + `_post_all_gather` | Single fused `ttnn.rms_norm` on replicated x |
 | RoPE | `ttnn.experimental.rotary_embedding` + slice/concat | Manual rotate-only |
 | LM head | Vocab-sharded, DRAM-sharded multi-split, no final all_reduce | Vocab-sharded + on-device argmax shipped in P22; still has final all_gather |
@@ -587,7 +816,9 @@ Comparison table at `research/friend_repo_borrow_list.md`. Key gaps:
 | Cos/Sin | Precomputed device cache → `ttnn.embedding` | On-device `ttnn.embedding` shipped in P25 |
 | Argmax | `all_gather → untilize → ttnn.argmax` | On-device argmax shipped in P22 |
 
-The next ship list (§8 Next ship list) directly maps to closing this gap on the items that need no custom C++.
+The current custom GDN work should use friend code only for TT-Metal wiring and
+dataflow patterns. The friend's recurrence has known/possible errors for our
+contract and must not be used as ground truth.
 
 ---
 
@@ -596,15 +827,15 @@ The next ship list (§8 Next ship list) directly maps to closing this gap on the
 | # | Action | Time |
 |---|--------|------|
 | 1 | Read `CLAUDE.md` (project root) | 3 min |
-| 2 | Read this `HANDOFF.md` end-to-end | 10 min |
-| 3 | Read `MEMORY.md` index (skim — note the structure, don't read every linked note yet) | 8 min |
-| 4 | Read `reference_how_to_run_stuff.md` carefully | 5 min |
-| 5 | Verify hosts are reachable: `ssh qb1 'tt-smi -s'` and `ssh qb2 'tt-smi -s'` | 1 min |
-| 6 | Check server status on both hosts: `serve.sh status` / `serve_tp.sh status` | 1 min |
-| 7 | If server is up on the host you need: use the protocol pattern in §4. If you need raw device: ASK USER before stopping the server. | — |
-| 8 | Read 3-4 memory notes most relevant to the task | varies |
-| 9 | Write a plan (design memo). Cite memory notes + doc paths inline. | 15 min |
-| 10 | Get user sign-off on plan BEFORE writing probe code | — |
+| 2 | Read §0 of this `HANDOFF.md` and `research/ACTIVE_CONTEXT.md` | 10 min |
+| 3 | Read this `HANDOFF.md` end-to-end | 10 min |
+| 4 | Read `MEMORY.md` index if available; otherwise use in-repo `research/` and `experiments/owned_ops/*/README.md` | 8 min |
+| 5 | Read `reference_how_to_run_stuff.md` carefully if present | 5 min |
+| 6 | Verify hosts are reachable: `ssh qb1 'tt-smi -s'` and `ssh qb2 'tt-smi -s'` | 1 min |
+| 7 | Check server status on both hosts: `serve.sh status` / `serve_tp.sh status` or `client_tp status` | 1 min |
+| 8 | If server is up on the host you need: use the protocol pattern in §4. If you need raw device: ASK USER before stopping the server. | — |
+| 9 | Read 3-4 notes most relevant to the task | varies |
+| 10 | Write a plan/design memo with hypothesis, oracle, success gate, and rollback. | 15 min |
 
 ### Sanity checks before you write a single line of code
 
@@ -614,6 +845,9 @@ The next ship list (§8 Next ship list) directly maps to closing this gap on the
 - [ ] You have a cited tt-metal doc path (for non-trivial ttnn work)
 - [ ] You have an oracle to compare against (HF or numpy fp32)
 - [ ] You have a success criterion in cosine + tok/s terms
+- [ ] For GDN work: you understand that `ttnn.matmul(k, state_scaled)` is
+      shape-valid but numerically different from the current broadcast-reduce
+      recurrence contract
 
 ---
 
@@ -636,7 +870,7 @@ The next ship list (§8 Next ship list) directly maps to closing this gap on the
 | **rms_norm_pre/post_all_gather** | Distributed RMSNorm — pre computes partial stats, all_gather, post applies norm |
 | **all_reduce / all_gather / reduce_scatter** | CCL collectives across mesh chips |
 | **CCL** | Collective Communication Library (Tenstorrent's term) |
-| **Tracy** | Sampling profiler for device-side op timing — qb1 only |
+| **Tracy** | Sampling profiler for device-side op timing. Known configured on qb1; verify qb2 before using for multi-chip. |
 | **trace** | Pre-compiled execution graph replayed each token — `ttnn.begin_trace_capture` / `execute_trace` |
 | **paged_update_cache** | In-place KV cache write with `update_idxs_tensor` — traceable |
 | **L1** | On-chip SRAM (vs DRAM, HBM-like external memory) |
@@ -647,4 +881,3 @@ The next ship list (§8 Next ship list) directly maps to closing this gap on the
 | **dram_prefetcher** | Streams weights into Global Circular Buffer to hide DRAM load — Galaxy's biggest lever |
 | **Agent X/Y/W/O/...** | Sub-agent contributions in 4-agent parallel research pattern |
 | **Branch III / C' / C'7 / D'** | Project-internal branch labels for phases of the 27B effort |
-
