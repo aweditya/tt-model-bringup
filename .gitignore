@@ -22,3 +22,7 @@ research/probe_logs/qb2_tp_tracy_p25_sync_20260515_0446/
 
 # Claude Code local runtime/config — per-machine, not source
 .claude/
+
+# Scratch artifacts under .cache/ — leading-underscore = local-only convention
+# (e.g. large intermediate NPZs from cosine_ladder_tp runs)
+.cache/**/_*
