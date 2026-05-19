@@ -132,6 +132,14 @@ class MeshServerState:
         # G4 production flip will pre-split weights/state at bootstrap to
         # eliminate the per-step slice/restitch overhead.
         self.deltanet_conv1d_mode = "manual"
+        # 2026-05-19: owned decay/gate kernel gate work.
+        # "manual" = production manual log(exp+1) + neg-exp + sigmoid chain.
+        # "owned_decay_gate" = ttnn.experimental.qwen36_decay_gate_decode_owned
+        #   (reshapes dn['dt_bias']/dn['A_log'] rank-1 → rank-2 per step,
+        #    calls kernel, reshapes decay output back to [1, NV, 1, 1] for
+        #    downstream recurrence). G2 correctness gate; G4 default flip
+        #    will move the reshape to bootstrap for zero per-step overhead.
+        self.deltanet_decay_gate_mode = "manual"
         self.profile_records = None
         self.profile_context_stack = []
 
@@ -666,14 +674,31 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     k = _rms_norm_manual(k, dn['k_l2_scale'], EPS_RMS, K_DIM)
     # 7. gate/decay/beta on per-chip head subset
     with _profile_scope(state, "deltanet_decay_gate"):
-        a_biased = ttnn.add(a_tt, dn['dt_bias'])
-        if state.deltanet_decay_mode == "native_softplus":
-            softplus_a = ttnn.softplus(a_biased)
+        if state.deltanet_decay_gate_mode == "owned_decay_gate":
+            # Owned decay/gate kernel (G2 wire-in). Kernel expects rank-2
+            # [1, NV_PER_CHIP] for all 4 inputs; production dn['dt_bias'] +
+            # dn['A_log'] are rank-1 [NV_PER_CHIP] per chip (uploaded as
+            # dim=0 sharded [NV] numpy). Reshape per-step here; G4 default
+            # flip will pre-allocate rank-2 versions at bootstrap.
+            dt_bias_r2 = ttnn.reshape(dn['dt_bias'], [1, NV_PER_CHIP])
+            A_log_r2 = ttnn.reshape(dn['A_log'], [1, NV_PER_CHIP])
+            decay_compact, beta = ttnn.experimental.qwen36_decay_gate_decode_owned(
+                a_tt, b_tt, dt_bias_r2, A_log_r2)
+            ttnn.deallocate(dt_bias_r2)
+            ttnn.deallocate(A_log_r2)
+            # Downstream (manual + owned_gdn paths) expects decay shaped
+            # [1, NV_PER_CHIP, 1, 1] for broadcast against H_4d.
+            decay = ttnn.reshape(decay_compact, [1, NV_PER_CHIP, 1, 1])
+            ttnn.deallocate(decay_compact)
         else:
-            softplus_a = ttnn.log(ttnn.add(ttnn.exp(a_biased), 1.0))
-        g = ttnn.mul(ttnn.neg(ttnn.exp(dn['A_log'])), softplus_a)
-        beta = ttnn.sigmoid(b_tt)
-        decay = ttnn.reshape(ttnn.exp(g), [1, NV_PER_CHIP, 1, 1])
+            a_biased = ttnn.add(a_tt, dn['dt_bias'])
+            if state.deltanet_decay_mode == "native_softplus":
+                softplus_a = ttnn.softplus(a_biased)
+            else:
+                softplus_a = ttnn.log(ttnn.add(ttnn.exp(a_biased), 1.0))
+            g = ttnn.mul(ttnn.neg(ttnn.exp(dn['A_log'])), softplus_a)
+            beta = ttnn.sigmoid(b_tt)
+            decay = ttnn.reshape(ttnn.exp(g), [1, NV_PER_CHIP, 1, 1])
     # 8. Recurrence
     with _profile_scope(state, "deltanet_recurrence"):
         H_4d = dn['ssm']
@@ -5154,6 +5179,10 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     if conv1d_mode not in ("manual", "owned_conv1d"):
         return {"error": f"deltanet_conv1d_mode must be one of manual/owned_conv1d, got {conv1d_mode}"}
 
+    decay_gate_mode = str(args.get("deltanet_decay_gate_mode", "manual"))
+    if decay_gate_mode not in ("manual", "owned_decay_gate"):
+        return {"error": f"deltanet_decay_gate_mode must be one of manual/owned_decay_gate, got {decay_gate_mode}"}
+
     P = len(prompt_ids)
     M = len(generated_ids)
     if P + M > MAX_POS:
@@ -5169,8 +5198,10 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     _reset_state_buffers(state)
     old_mode = state.deltanet_recurrence_mode
     old_conv1d_mode = state.deltanet_conv1d_mode
+    old_decay_gate_mode = state.deltanet_decay_gate_mode
     state.deltanet_recurrence_mode = mode
     state.deltanet_conv1d_mode = conv1d_mode
+    state.deltanet_decay_gate_mode = decay_gate_mode
 
     logits_arr = np.empty((M, VOCAB), dtype=np.float32)
 
@@ -5206,6 +5237,7 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     finally:
         state.deltanet_recurrence_mode = old_mode
         state.deltanet_conv1d_mode = old_conv1d_mode
+        state.deltanet_decay_gate_mode = old_decay_gate_mode
 
     np.savez(out_path,
              logits=logits_arr,
@@ -5216,6 +5248,7 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         "cmd": "cosine_ladder_tp",
         "deltanet_recurrence_mode": mode,
         "deltanet_conv1d_mode": conv1d_mode,
+        "deltanet_decay_gate_mode": decay_gate_mode,
         "n_prompt": P,
         "n_steps": M,
     }
@@ -5225,6 +5258,7 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         "path": out_path,
         "deltanet_recurrence_mode": mode,
         "deltanet_conv1d_mode": conv1d_mode,
+        "deltanet_decay_gate_mode": decay_gate_mode,
         "n_prompt": P,
         "n_steps": M,
         "vocab": VOCAB,

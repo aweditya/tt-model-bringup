@@ -328,6 +328,7 @@ def cmd_cosine_ladder_tp(args):
             "generated_ids": generated_ids,
             "deltanet_recurrence_mode": mode,
             "deltanet_conv1d_mode": args.deltanet_conv1d_mode,
+            "deltanet_decay_gate_mode": args.deltanet_decay_gate_mode,
             "out_path": out_path,
         }))
         raw = P.read_line(sock, max_bytes=64 << 20)
@@ -617,6 +618,12 @@ def main():
                           "ttnn.experimental.qwen36_conv1d_decode_owned for the G3 long-"
                           "context correctness gate (slower than manual per-step due to "
                           "per-step weight/state slicing; G4 will pre-split at bootstrap).")
+    cl.add_argument("--deltanet-decay-gate-mode", choices=["manual", "owned_decay_gate"],
+                     default="manual",
+                     help="DeltaNet decay/gate kernel toggle. owned_decay_gate routes "
+                          "through ttnn.experimental.qwen36_decay_gate_decode_owned (G2 "
+                          "wire-in: reshapes dt_bias/A_log per-step; G4 will pre-allocate "
+                          "rank-2 versions at bootstrap).")
     cl.set_defaults(fn=cmd_cosine_ladder_tp)
     args = p.parse_args()
     args.fn(args)
