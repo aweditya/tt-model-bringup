@@ -63,7 +63,6 @@ Qwen36DecayGateDecodeOwnedProgramFactory::cached_program_t Qwen36DecayGateDecode
     auto* beta_buffer = beta_out.buffer();
 
     // The compute is tiny — 1 work block (1 tile per CB) on 1 core.
-    auto grid_size = a.device()->compute_with_storage_grid_size();
     CoreRangeSet single_core = CoreRangeSet(CoreRange(CoreCoord(0, 0), CoreCoord(0, 0)));
 
     const tt::DataFormat tensor_format = datatype_to_dataformat_converter(a.dtype());

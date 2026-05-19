@@ -3,6 +3,49 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
+## Current Status (2026-05-18 late evening) — owned_gdn DEFAULTED + conv1d G0 PASS + wire-in + decay/gate scaffolded
+
+**Latest session adds (after the owned_gdn default at `26cad39`)**:
+- Conv1d kernel (`qwen36_conv1d_decode_owned`): G0 PASS on qb2 at production
+  shape D=2560 with PCC 0.99999 (commit `50a6555`). Same "kernel is more
+  accurate than reference" signature as owned_gdn — explicit unrolled
+  4-tap mul/add/silu (no `ttnn.sum` reduce), state shift handled by the
+  writer kernel.
+- Conv1d wire-in to `deltanet_step_tp` behind `state.deltanet_conv1d_mode`
+  flag (commit `c98269d`); `cosine_ladder_tp` endpoint + client wrapper
+  extended with `--deltanet-conv1d-mode {manual,owned_conv1d}`. Per-step
+  slicing/restitch overhead is correctness-isolated for G3 only; G4 will
+  pre-split at bootstrap.
+- Decay/gate kernel (`qwen36_decay_gate_decode_owned`): G0 scaffold
+  committed (`db7531e`) — 17 files. NV_PER_CHIP=12 fits in 1 tile, simpler
+  than GDN/conv1d. Math: `softplus(a + dt_bias)` →
+  `-exp(A_log) * softplus_a` → `exp` for decay; `sigmoid(b)` for beta.
+  **Not yet built or tested on qb2** — installer + cmake build + .so sync
+  + standalone test is the next session's first task.
+
+**G3 long-context status (in progress this session)**: baseline cosine_ladder_tp
+with `--deltanet-conv1d-mode manual` ran on the JSON parser combinator prompt
+at 500 positions — production-decode rate stayed at 80.43 ms/tok (no
+regression from the wire-in when toggle is `manual`). Owned-conv1d run is
+queued for the next server lifetime (post-bootstrap restart, ~17 min).
+Compare via `experiments/utils/cosine_ladder_compare_two_npzs.py` once the
+owned NPZ lands.
+
+## Known workflow gaps (file as follow-ups next session)
+
+1. **`.so` sync after `cmake --build` is manual** — the build only writes to
+   `~/tenstorrent/tt-metal/build_tracy_gcc12_nodist/ttnn/_ttnn*.so` and does
+   NOT propagate to either `~/tenstorrent/tt-metal/ttnn/ttnn/_ttnn.so`
+   (PYTHONPATH-loaded) or `.venv/.../site-packages/ttnn/_ttnn.cpython-310...so`
+   (default-loaded). Have to `cp` after every build. Hit this twice today on
+   the conv1d bring-up. Worth a 30-line wrapper script or a `--sync-build`
+   flag on `integrate_into_ttmetal.py`.
+2. **Standalone tests need explicit env** — `TT_METAL_HOME` (kernel search
+   path), `PYTHONPATH`, `LD_LIBRARY_PATH` must all be set when invoking the
+   standalone test outside the serve_tp.sh wrapper. Worth a
+   `run_with_tt_env.sh` helper or a Python-side `os.environ` shim at the top
+   of each test.
+
 ## Current Status (2026-05-18 evening) — owned_gdn DEFAULTED
 
 The custom single-device GDN/DeltaNet recurrence kernel
