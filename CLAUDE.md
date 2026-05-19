@@ -1,7 +1,9 @@
-# TT-XLA: Tenstorrent Backend for JAX/XLA
+# tt-model-bringup: Tenstorrent Blackhole LLM bringup (Qwen3.6-family)
 
 ## Project Overview
-Exploratory research project for Stanford CS440LX. The goal is to understand Tenstorrent Blackhole hardware and JAX/XLA internals deeply enough to build a JAX backend for Tenstorrent devices.
+Exploratory research project for Stanford CS440LX. **Originally scoped as a JAX/XLA backend (hence the legacy `tt-xla` name); the work pivoted to direct TT-Metal model bringup + custom compute kernels for Qwen3.6 on Tenstorrent Blackhole.** Current production: Qwen3.6-27B on qb2 4× P150 mesh @ 12.93 tok/s with custom owned_gdn and owned_decay_gate kernels. Upcoming: Qwen3.6-35B-A3B MoE bringup.
+
+GitHub: `aweditya/tt-model-bringup` (renamed 2026-05-19). Local working dir stays `tt-xla/` (renaming breaks Claude settings); remote dirs on qb1/qb2 stay `~/tt-xla/` (renaming would break too many rsync paths).
 
 ## Non-Negotiables
 

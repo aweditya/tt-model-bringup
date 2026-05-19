@@ -1,6 +1,8 @@
-# HANDOFF.md — TT-XLA Qwen3.6-27B Agent Onboarding
+# HANDOFF.md — tt-model-bringup (Qwen3.6-27B + upcoming Qwen3.6-35B-A3B)
 
-Last updated: 2026-05-18 evening (post owned_gdn default-flip). Authoritative entry point for any agent picking up this project. Read this end-to-end before touching code. Cite memory notes by filename when using older memory-bank findings, and cite in-repo research files for the current GDN work.
+**Project renamed 2026-05-19**: GitHub repo is now `aweditya/tt-model-bringup`. Local dir stays `tt-xla/` (Claude settings dependency) and remote dirs on qb1/qb2 stay `~/tt-xla/` (rsync paths). All `~/tt-xla/` references below are still correct.
+
+Last updated: 2026-05-19 (post P1 num_links=2 ship, async-CCL branch closed). Authoritative entry point for any agent picking up this project. Read this end-to-end before touching code. Cite memory notes by filename when using older memory-bank findings, and cite in-repo research files for the current GDN work.
 
 **Context-compacted agent?** Read `research/ACTIVE_CONTEXT.md` first. It is the
 short active-state file for current measurements, invalidated paths, and next

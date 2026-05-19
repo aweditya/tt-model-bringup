@@ -182,3 +182,56 @@ Total: **1-2 days of focused work + 5 bootstraps × 17 min = ~1.5 hours of boots
 - Will not bump MAX_POS past 32k (no proven use case for daily-driver)
 - Will not test prompts in arbitrary languages (English code queries only)
 - Will not optimize tok/s at long context (correctness first; perf-at-context is its own follow-up)
+
+## ADDENDUM 2026-05-19 — Prefill is the bigger gap
+
+vLLM research agent flagged a CRITICAL finding that reshapes priorities:
+
+**`handle_generate_tp` has NO real prefill.** It loops the decode trace once
+per prompt token. At ~83 ms/tok:
+
+| Prompt length | TTFT (time-to-first-token) |
+|---|---|
+| 100 tokens | 8.3 sec |
+| 500 tokens | 42 sec |
+| 1000 tokens | 83 sec |
+| 4000 tokens | 5.5 min |
+| 8000 tokens | 11 min |
+| 32000 tokens | 44 min |
+
+A real prefill kernel would process the entire prompt in ONE forward pass
+with `seq_len = prompt_len` (compute-bound, batched SDPA). Without it, MAX_POS
+extension only enables you to ASK longer questions, not actually USE them.
+
+**Friend's `_prefill_forward_single_user`** at
+`/Users/adityasriram/Labs/stanford/cs440lx/tt-xla/experiments/.refs/tt-qwen-36/models/tt_transformers/tt/generator.py`
+shows the pattern. Per the build-from-scratch principle (`feedback_build_kernels_from_scratch.md`),
+we'd build our own `forward_prefill_tp_inner` mirroring the structure of
+`forward_token_tp_inner` but with `seq_len > 1`. Estimated effort: 3-5 days.
+
+**Revised plan:**
+
+- **Phase A (this plan as-is):** G0-G2 at MAX_POS ≤ 1024. Validates that the
+  decode-only path is correct at longer contexts via teacher-forced + needle-
+  haystack + autoregressive 500 tokens. ETA: 1 day. Still useful even with
+  slow prefill — confirms the math doesn't cliff past 500 tokens
+  autoregressive on TP.
+
+- **Phase B (NEW):** Build real prefill kernel. `forward_prefill_tp_inner`
+  with seq_len > 1, batched SDPA via `ttnn.transformer.scaled_dot_product_attention`
+  (no `_decode` suffix; takes Q at [B, n_heads, seq_len, head_dim]).
+  Separate trace for prefill. KV cache populated en masse. Verify TTFT
+  at 1k = ~1 sec, 8k = ~5 sec. ETA: 3-5 days.
+
+- **Phase C:** Bump MAX_POS to 8k+ AFTER prefill works. Re-run G3/G4 with
+  real prefill timing. ETA: 1 day.
+
+Total realistic effort for end-to-end usable 8k context: **~1 week** vs the
+1-2 days originally estimated. The MAX_POS bump itself is still cheap; the
+prefill kernel is the real engineering project.
+
+**Order of operations recommendation:**
+1. Do Phase A first (validates the AUTOREGRESSIVE correctness story, which
+   is non-obvious — fail-fast on bf16 cliff at MAX_POS > 512)
+2. If Phase A passes cleanly, build Phase B
+3. Phase C is mechanical after B
