@@ -98,6 +98,26 @@ def cmd_probe_ccl_components_tp(args):
         print(f"\n[save] {args.out}")
 
 
+def cmd_probe_multirow_construct_vs_per_position(args):
+    payload = {}
+    if args.prompt:
+        payload["prompt"] = args.prompt
+    data = _send("probe_multirow_construct_vs_per_position", payload, timeout=300.0)
+    if data.get("error"):
+        print(f"ERROR: {data['error']}", file=sys.stderr)
+        if data.get("verdict"):
+            print(f"VERDICT: {data['verdict']}", file=sys.stderr)
+        sys.exit(4)
+    print(f"seq_len={data['seq_len']}  raw_embed_shape={data.get('batched_embed_raw_shape')}  "
+          f"reshaped_to={data.get('batched_reshaped_to')}")
+    print(f"\nper-row cosine (batched_construct vs per_position_embed):")
+    for r in data["per_row"]:
+        print(f"  pos {r['pos']}: cos={r['cos']:.6f}  max_abs_diff={r['max_abs_diff']:.6e}")
+    print(f"\nmin_cos={data['min_cos']:.6f}  max_cos={data['max_cos']:.6f}  "
+          f"max_abs_diff={data['max_abs_diff']:.6e}")
+    print(f"\n{data['verdict']}")
+
+
 def cmd_probe_prefill_vs_decode_loop_tp(args):
     payload = {"mode": args.mode}
     if args.prompt:
@@ -542,6 +562,13 @@ def main():
     b.add_argument("--iters", type=int, default=20)
     b.add_argument("--warmup", type=int, default=3)
     b.set_defaults(fn=cmd_bench_decode_tp_components)
+    mrc = sub.add_parser("probe_multirow_construct_vs_per_position",
+                          help="B.2.1.5: validate direct batched ttnn.embedding "
+                               "→ [seq_len, HIDDEN] tensor supports correct row "
+                               "slicing. If pass, B.2.2 can avoid slice/concat "
+                               "plumbing entirely.")
+    mrc.add_argument("--prompt", default=None)
+    mrc.set_defaults(fn=cmd_probe_multirow_construct_vs_per_position)
     pvd = sub.add_parser("probe_prefill_vs_decode_loop_tp",
                           help="B.1 prefill validation harness: compare per-position logits "
                                "from sequential decode-loop reference vs forward_prefill_tp_inner. "

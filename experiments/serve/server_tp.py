@@ -2205,6 +2205,152 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     }
 
 
+def handle_probe_multirow_construct_vs_per_position(state: MeshServerState, args: dict) -> dict:
+    """B.2.1.5: validate that directly-constructed multi-row [seq_len, HIDDEN]
+    tensors support correct row-slicing.
+
+    Background: B.2.1 found that concat of TILE_LAYOUT [1, HIDDEN] tensors
+    + subsequent slice gives wrong row data (see
+    research/b2_1_findings_2026_05_19.md). Hypothesis: the bug is specific
+    to CONCAT — a multi-row tensor constructed DIRECTLY via a single
+    ttnn.embedding lookup might not have the same row-padding issue.
+
+    Approach:
+      A. Reference: per-position embed loop, save list of [1, HIDDEN] readbacks
+      B. Test: single ttnn.embedding call with [seq_len, 1] index tensor →
+         [seq_len, HIDDEN] directly. Slice each row and read back.
+      Compare per-row cosine (test vs reference).
+
+    Gate: per-row cos = 1.0 (math is identical lookup, just different
+    construction). If pass, B.2.2 can use batched construction throughout
+    without slice/concat plumbing. If fail, fall back to pre-allocated +
+    slice_write (option 2 in research note).
+    """
+    import ttnn
+    import torch
+    import numpy as np
+
+    if state.mesh is None:
+        return {"error": "mesh not loaded"}
+
+    prompt_ids = list(args.get("prompt_ids") or [])
+    if not prompt_ids:
+        if state.tok is None:
+            return {"error": "missing prompt_ids and tokenizer unavailable"}
+        prompt = str(args.get("prompt", "The capital of France is"))
+        prompt_ids = state.tok.encode(prompt)
+
+    seq_len = len(prompt_ids)
+    if seq_len < 2:
+        return {"error": f"seq_len must be >= 2, got {seq_len}"}
+    HIDDEN = state.cfg['hidden']
+
+    # Reference: per-position embed via existing path (tok_buf single-index lookup)
+    per_pos_refs = []
+    for pos, tid in enumerate(prompt_ids):
+        update_input_buffers(state, tid, pos)
+        embed_out = ttnn.embedding(
+            state.tok_buf, state.embed_tt,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        x_pos = ttnn.reshape(embed_out, [1, HIDDEN])
+        ttnn.synchronize_device(state.mesh)
+        ref_arr = ttnn.to_torch(
+            x_pos, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        )[0].float().cpu().numpy().reshape(HIDDEN)
+        per_pos_refs.append(ref_arr)
+        ttnn.deallocate(embed_out)
+        ttnn.deallocate(x_pos)
+
+    # Test: direct batched embed via single ttnn.embedding call with
+    # [seq_len, 1] index tensor.
+    prompt_ids_idx = ttnn.from_torch(
+        torch.tensor([[int(t)] for t in prompt_ids], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        dtype=ttnn.uint32,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    try:
+        batched_embed_raw = ttnn.embedding(
+            prompt_ids_idx, state.embed_tt,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+    except Exception as e:
+        ttnn.deallocate(prompt_ids_idx)
+        return {
+            "error": f"batched ttnn.embedding failed: {type(e).__name__}: {e}",
+            "verdict": "option 1 (direct batched embed) NOT VIABLE — fall back to slice_write",
+        }
+    # batched_embed_raw expected shape: [seq_len, 1, HIDDEN] per chip
+    # (per-chip replication via ReplicateTensorToMesh).
+    # Reshape to [seq_len, HIDDEN].
+    raw_shape = list(batched_embed_raw.shape)
+    try:
+        batched = ttnn.reshape(batched_embed_raw, [seq_len, HIDDEN])
+    except Exception as e:
+        ttnn.deallocate(batched_embed_raw)
+        ttnn.deallocate(prompt_ids_idx)
+        return {
+            "error": f"reshape to [seq_len, HIDDEN] failed: {type(e).__name__}: {e}",
+            "batched_embed_raw_shape": raw_shape,
+        }
+
+    # For each row, slice and compare to reference
+    per_row = []
+    for pos in range(seq_len):
+        x_pos_test = ttnn.slice(batched, [pos, 0], [pos + 1, HIDDEN])
+        ttnn.synchronize_device(state.mesh)
+        test_arr = ttnn.to_torch(
+            x_pos_test, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        )[0].float().cpu().numpy().reshape(HIDDEN)
+        ttnn.deallocate(x_pos_test)
+
+        ref = per_pos_refs[pos].astype(np.float64)
+        test = test_arr.astype(np.float64)
+        dot = float((ref * test).sum())
+        nref = float(np.linalg.norm(ref))
+        ntest = float(np.linalg.norm(test))
+        cos = dot / (nref * ntest + 1e-12)
+        max_diff = float(np.abs(ref - test).max())
+        per_row.append({"pos": pos, "cos": cos, "max_abs_diff": max_diff})
+
+    ttnn.deallocate(batched)
+    ttnn.deallocate(batched_embed_raw)
+    ttnn.deallocate(prompt_ids_idx)
+
+    all_cos = [r["cos"] for r in per_row]
+    all_diff = [r["max_abs_diff"] for r in per_row]
+    pass_gate = all(c >= 0.999 for c in all_cos)
+
+    state.last_run = {
+        "cmd": "probe_multirow_construct_vs_per_position",
+        "seq_len": seq_len,
+        "min_cos": min(all_cos),
+        "pass": pass_gate,
+    }
+    return {
+        "ok": True,
+        "seq_len": seq_len,
+        "batched_embed_raw_shape": raw_shape,
+        "batched_reshaped_to": [seq_len, HIDDEN],
+        "per_row": per_row,
+        "min_cos": min(all_cos),
+        "max_cos": max(all_cos),
+        "max_abs_diff": max(all_diff),
+        "pass_gate_0p999": pass_gate,
+        "verdict": (
+            "PASS — batched ttnn.embedding + slice works; B.2.2 can use direct "
+            "batched construction throughout"
+            if pass_gate else
+            "FAIL — even direct construction has TILE_LAYOUT row issues; "
+            "need pre-allocated tensor + slice_write (option 2) for B.2.2"
+        ),
+    }
+
+
 def _read_argmax_id(state: MeshServerState, argmax_tt) -> int:
     import ttnn
     idx_concat = ttnn.to_torch(
@@ -6599,6 +6745,7 @@ HANDLERS = {
     "probe_ccl_components_tp": handle_probe_ccl_components_tp,
     "probe_async_ccl_components_tp": handle_probe_async_ccl_components_tp,
     "probe_prefill_vs_decode_loop_tp": handle_probe_prefill_vs_decode_loop_tp,
+    "probe_multirow_construct_vs_per_position": handle_probe_multirow_construct_vs_per_position,
     "probe_fused_paged_update_cache_tp": handle_probe_fused_paged_update_cache_tp,
     "probe_explicit_all_reduce_tp": handle_probe_explicit_all_reduce_tp,
     "probe_rope_fused_qk_tp": handle_probe_rope_fused_qk_tp,
