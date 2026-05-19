@@ -680,12 +680,14 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
             # dn['A_log'] are rank-1 [NV_PER_CHIP] per chip (uploaded as
             # dim=0 sharded [NV] numpy). Reshape per-step here; G4 default
             # flip will pre-allocate rank-2 versions at bootstrap.
+            # reshape returns a VIEW of dn['dt_bias']/dn['A_log']; do NOT
+            # deallocate the reshaped handles or we free the underlying
+            # weight tensor and the next decode step crashes with
+            # "Tensor is not allocated".
             dt_bias_r2 = ttnn.reshape(dn['dt_bias'], [1, NV_PER_CHIP])
             A_log_r2 = ttnn.reshape(dn['A_log'], [1, NV_PER_CHIP])
             decay_compact, beta = ttnn.experimental.qwen36_decay_gate_decode_owned(
                 a_tt, b_tt, dt_bias_r2, A_log_r2)
-            ttnn.deallocate(dt_bias_r2)
-            ttnn.deallocate(A_log_r2)
             # Downstream (manual + owned_gdn paths) expects decay shaped
             # [1, NV_PER_CHIP, 1, 1] for broadcast against H_4d.
             decay = ttnn.reshape(decay_compact, [1, NV_PER_CHIP, 1, 1])
