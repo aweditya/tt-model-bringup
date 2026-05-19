@@ -99,7 +99,7 @@ def cmd_probe_ccl_components_tp(args):
 
 
 def cmd_probe_prefill_vs_decode_loop_tp(args):
-    payload = {}
+    payload = {"mode": args.mode}
     if args.prompt:
         payload["prompt"] = args.prompt
     data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
@@ -107,9 +107,9 @@ def cmd_probe_prefill_vs_decode_loop_tp(args):
         print(f"ERROR: {data['error']}", file=sys.stderr)
         sys.exit(4)
     pc = data["per_position_cosine"]
-    print(f"seq_len={data['seq_len']}  vocab={data['vocab']}")
+    print(f"mode={data['mode']}  seq_len={data['seq_len']}  vocab={data['vocab']}")
     print(f"reference (decode-loop) wall: {data['reference_ms']:.0f} ms")
-    print(f"test (forward_prefill_tp_inner) wall: {data['test_ms']:.0f} ms")
+    print(f"test ({data['mode']}) wall: {data['test_ms']:.0f} ms")
     print(f"\nper-position cosine: min={pc['min']:.6f}  median={pc['median']:.6f}  "
           f"mean={pc['mean']:.6f}  max={pc['max']:.6f}")
     print(f"max_abs_diff: {data['max_abs_diff']:.6e}")
@@ -549,6 +549,10 @@ def main():
                                "wrapped → cos = 1.0 trivially (validates harness itself).")
     pvd.add_argument("--prompt", default=None,
                       help="prompt to tokenize and validate (default: 'The capital of France is')")
+    pvd.add_argument("--mode", default="stub", choices=["stub", "batched_mlp"],
+                      help="prefill implementation under test: 'stub' (B.1 decode-loop "
+                           "wrapper; cos=1.0 expected) or 'batched_mlp' (B.2.1 layer-outer "
+                           "iteration with batched MLP per layer; gate cos>=0.999)")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     ccl = sub.add_parser("probe_ccl_components_tp",
                           help="micro-bench CCL primitives (all_reduce, reduce_scatter, all_gather) "

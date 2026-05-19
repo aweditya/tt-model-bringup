@@ -1045,6 +1045,147 @@ def forward_token_tp(state, token_id, cur_pos):
     return forward_token_tp_inner(state)
 
 
+def forward_prefill_tp_inner_v2_batched_mlp(state, prompt_ids, capture_logits=False):
+    """Phase B.2.1 prefill: layer-outer iteration with batched MLP per layer.
+
+    First non-trivial restructure away from the B.1 stub. Structure:
+
+      1. Per-position embedding (sequential, populates x_seq [seq_len, HIDDEN])
+      2. For each layer:
+         a. Per-position DN/Attn (sequential, slice from x_seq, run step,
+            accumulate outputs)
+         b. Concat per-position outputs into [seq_len, HIDDEN]
+         c. Batched MLP on the [seq_len, HIDDEN] tensor (mlp_step_tp
+            broadcasts on leading dim — no inter-position deps in MLP math)
+      3. Final norm on [seq_len, HIDDEN]
+      4. LM head: per-position via batched matmul (capture_logits=True) or
+         slice last position (production mode)
+
+    Gate: per-position cos >= 0.999 vs decode-loop reference. Any failure
+    here is a restructure plumbing bug (MLP math is trivially correct on
+    leading-dim batch), NOT a math change.
+
+    Sequential DN/Attn for now; B.2.2 batches Attn; B.3 batches DN via
+    Neumann chunked-parallel.
+    """
+    import ttnn
+    import numpy as np
+
+    cfg = state.cfg
+    HIDDEN = cfg['hidden']
+    seq_len = len(prompt_ids)
+    VOCAB = state.vocab_size
+
+    if seq_len < 1:
+        raise ValueError(f"prompt_ids must have len >= 1, got {seq_len}")
+    if seq_len > MAX_POS:
+        raise ValueError(f"prompt_ids len {seq_len} > MAX_POS {MAX_POS}")
+
+    # Step 1: per-position embed lookup, accumulate into x_seq [seq_len, HIDDEN].
+    # update_input_buffers writes tok_buf for ttnn.embedding to read.
+    embed_per_pos = []
+    for pos, tid in enumerate(prompt_ids):
+        update_input_buffers(state, tid, pos)
+        embed_out = ttnn.embedding(
+            state.tok_buf, state.embed_tt,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        x_pos = ttnn.reshape(embed_out, [1, HIDDEN])
+        embed_per_pos.append(x_pos)
+    x_seq = ttnn.concat(embed_per_pos, dim=0)  # [seq_len, HIDDEN]
+    for t in embed_per_pos:
+        ttnn.deallocate(t)
+
+    # Step 2: layer-outer, position-inner
+    for layer in state.layers:
+        # 2a. Per-position DN/Attn
+        layer_outs = []
+        for pos, tid in enumerate(prompt_ids):
+            # Update buffers so the per-position step has correct cur_pos
+            # (for KV cache writes in attention) and rot_idxs (for cos/sin lookup).
+            # tid value is irrelevant here — we use x_pos sliced from x_seq.
+            update_input_buffers(state, tid, pos)
+
+            # Look up cos_row, sin_row for this position
+            cos_row_raw = ttnn.embedding(
+                state.rot_idxs_buf, state.cos_table_tt,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            sin_row_raw = ttnn.embedding(
+                state.rot_idxs_buf, state.sin_table_tt,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            cos_row_tt = ttnn.reshape(cos_row_raw, [1, state.rotary_dim])
+            sin_row_tt = ttnn.reshape(sin_row_raw, [1, state.rotary_dim])
+
+            # Slice x_pos from x_seq for this position
+            x_pos = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
+
+            # Run DN or Attn for this position
+            if layer['type'] == 'linear_attention':
+                x_pos_out = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
+            else:
+                x_pos_out = gated_attn_step_tp(
+                    state, x_pos, layer['attn'],
+                    state.cur_pos_buf, 0,
+                    cos_row_tt, sin_row_tt, cfg)
+            ttnn.deallocate(x_pos)
+            ttnn.deallocate(cos_row_tt)
+            ttnn.deallocate(sin_row_tt)
+            layer_outs.append(x_pos_out)
+
+        # 2b. Concat per-position outputs
+        ttnn.deallocate(x_seq)
+        x_dn_seq = ttnn.concat(layer_outs, dim=0)  # [seq_len, HIDDEN]
+        for t in layer_outs:
+            ttnn.deallocate(t)
+
+        # 2c. Batched MLP on [seq_len, HIDDEN]
+        x_seq = mlp_step_tp(state, x_dn_seq, layer['mlp'])
+        ttnn.deallocate(x_dn_seq)
+
+    # Step 3: final norm on [seq_len, HIDDEN]
+    x_seq = _rms_norm_manual(x_seq, state.final_norm_tt, 1e-6, HIDDEN)
+
+    # Step 4: LM head
+    if capture_logits:
+        # Batched LM head — per-position via batched matmul
+        sharded_logits_tt = ttnn.linear(x_seq, state.lm_head_tt)
+        gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+        sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [seq_len, VOCAB])
+        rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+        ttnn.deallocate(sharded_logits_tt)
+        ttnn.deallocate(gathered_logits_tt)
+        ttnn.deallocate(sliced_logits_tt)
+
+        # Read back per-position
+        ttnn.synchronize_device(state.mesh)
+        full_arr = ttnn.to_torch(
+            rm_logits_tt,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        )[0].float().cpu().numpy()  # [seq_len, VOCAB]
+        ttnn.deallocate(rm_logits_tt)
+        ttnn.deallocate(x_seq)
+        return full_arr
+
+    # Production: slice last position then standard LM head
+    x_last = ttnn.slice(x_seq, [seq_len - 1, 0], [seq_len, HIDDEN])
+    ttnn.deallocate(x_seq)
+    sharded_logits_tt = ttnn.linear(x_last, state.lm_head_tt)
+    gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+    sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [1, VOCAB])
+    rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+    ttnn.deallocate(sharded_logits_tt)
+    ttnn.deallocate(gathered_logits_tt)
+    ttnn.deallocate(sliced_logits_tt)
+    ttnn.deallocate(x_last)
+    ttnn.synchronize_device(state.mesh)
+    return rm_logits_tt
+
+
 def forward_prefill_tp_inner(state, prompt_ids, capture_logits=False):
     """Process a multi-token prompt, populating KV cache + DeltaNet state.
 
@@ -1760,6 +1901,10 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         prompt = str(args.get("prompt", "The capital of France is"))
         prompt_ids = state.tok.encode(prompt)
 
+    mode = str(args.get("mode", "stub"))
+    if mode not in ("stub", "batched_mlp"):
+        return {"error": f"mode must be stub or batched_mlp, got {mode}"}
+
     seq_len = len(prompt_ids)
     if seq_len < 2:
         return {"error": f"prompt_ids must have len >= 2, got {seq_len}"}
@@ -1781,11 +1926,16 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         )[0].float().cpu().numpy().reshape(VOCAB)
     ref_ms = (_time.time() - t0) * 1000.0
 
-    # Path B — test: forward_prefill_tp_inner. Initial B.1 stub == reference,
-    # so cos = 1.0 within numerical noise.
+    # Path B — test: forward_prefill_tp_inner.
+    # mode="stub": calls decode-loop internally → cos = 1.0 trivially
+    # mode="batched_mlp": B.2.1 layer-outer with batched MLP per layer → expect cos ≥ 0.999
     _reset_state_buffers(state)
     t0 = _time.time()
-    test_logits = forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)
+    if mode == "stub":
+        test_logits = forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)
+    elif mode == "batched_mlp":
+        test_logits = forward_prefill_tp_inner_v2_batched_mlp(
+            state, prompt_ids, capture_logits=True)
     test_ms = (_time.time() - t0) * 1000.0
 
     # Per-position comparison
@@ -1803,11 +1953,13 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
 
     state.last_run = {
         "cmd": "probe_prefill_vs_decode_loop_tp",
+        "mode": mode,
         "seq_len": seq_len,
         "min_cosine": float(pos_cos.min()),
     }
     return {
         "ok": True,
+        "mode": mode,
         "seq_len": seq_len,
         "vocab": VOCAB,
         "reference_ms": ref_ms,
