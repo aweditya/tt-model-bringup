@@ -1269,10 +1269,17 @@ def forward_prefill_tp_inner_v2_batched_mlp(state, prompt_ids, capture_logits=Fa
 
         # Read back per-position
         ttnn.synchronize_device(state.mesh)
+        # ConcatMeshToTensor(dim=0) on a REPLICATED [seq_len, VOCAB] tensor
+        # produces [NCHIPS*seq_len, VOCAB] (each chip's seq_len rows
+        # concatenated). Take chip 0's view = first seq_len rows.
+        # (Bugfix: previous [0] indexed only the FIRST ROW, not chip 0's
+        # full [seq_len, VOCAB] view — caused per-position cosine = 1.0
+        # only at pos 0 because numpy broadcast that one vector against
+        # the reference's seq_len rows.)
         full_arr = ttnn.to_torch(
             rm_logits_tt,
             mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
-        )[0].float().cpu().numpy()  # [seq_len, VOCAB]
+        )[:seq_len].float().cpu().numpy()  # [seq_len, VOCAB]
         ttnn.deallocate(rm_logits_tt)
         ttnn.deallocate(x_seq)
         return full_arr
