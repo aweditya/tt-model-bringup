@@ -1045,6 +1045,57 @@ def forward_token_tp(state, token_id, cur_pos):
     return forward_token_tp_inner(state)
 
 
+def forward_prefill_tp_inner(state, prompt_ids, capture_logits=False):
+    """Process a multi-token prompt, populating KV cache + DeltaNet state.
+
+    Production usage: returns last-position logits tensor (handle_generate_tp
+    uses the argmax to sample the first generated token).
+
+    Validation usage (capture_logits=True): returns a [seq_len, VOCAB] numpy
+    array — per-position logits at fp32, host-side. Slow (sync per position)
+    but exact for the cosine comparison gate.
+
+    INITIAL STUB (Phase B.1): loops the existing decode `forward_token_tp_inner`
+    once per prompt token. Functionally identical to the current
+    `handle_generate_tp` prompt loop. This stub establishes the validation
+    harness; cos against the loop-reference path is trivially 1.0.
+
+    Phase B.2 will replace this body with parallel SDPA + paged_fill_cache +
+    parallel MLP while retaining sequential DeltaNet (still mirrors decode for
+    the recurrence). Phase B.3 upgrades DeltaNet to chunked-parallel via the
+    Neumann factorization.
+    """
+    import ttnn
+    import numpy as np
+
+    seq_len = len(prompt_ids)
+    if seq_len < 1:
+        raise ValueError(f"prompt_ids must have len >= 1, got {seq_len}")
+    if seq_len > MAX_POS:
+        raise ValueError(f"prompt_ids len {seq_len} > MAX_POS {MAX_POS}")
+
+    VOCAB = state.vocab_size
+    if capture_logits:
+        logits_arr = np.empty((seq_len, VOCAB), dtype=np.float32)
+
+    last_logits_tt = None
+    for pos, tid in enumerate(prompt_ids):
+        update_input_buffers(state, tid, pos)
+        last_logits_tt = forward_token_tp_inner(state, return_logits=True)
+        if capture_logits:
+            ttnn.synchronize_device(state.mesh)
+            arr = ttnn.to_torch(
+                last_logits_tt,
+                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+            )[0].float().cpu().numpy().reshape(VOCAB)
+            logits_arr[pos] = arr
+
+    if capture_logits:
+        return logits_arr
+    ttnn.synchronize_device(state.mesh)
+    return last_logits_tt
+
+
 # --- Handlers -----------------------------------------------------------------
 def handle_status(state: MeshServerState, args: dict) -> dict:
     return {
@@ -1665,6 +1716,117 @@ def handle_probe_async_ccl_components_tp(state: MeshServerState, args: dict) -> 
             "(2) explore fabric parallelism iff async_double_minus_2x_v1 < 0; "
             "(3) build single-layer overlap iff overlap_savings_ms > 0.5 * v1 "
             "(equivalently, async truly overlaps a meaningful comm window with compute)."
+        ),
+    }
+
+
+def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -> dict:
+    """B.1 prefill validation harness.
+
+    Compares per-position logits from:
+      A. Sequential decode-loop reference — established HF-validated path
+         via cosine_ladder_tp (cos ≥0.999 per memory feedback_long_context_
+         cosine_ladder.md).
+      B. forward_prefill_tp_inner (the function we're building). Starts as
+         a decode-loop wrapper (cos = 1.0 trivially); subsequent phases
+         (B.2, B.3) replace internals with parallel SDPA, paged_fill_cache,
+         and Neumann chunked-parallel DeltaNet, validated each step by this
+         same harness.
+
+    Gate per position: cos ≥ 0.999.
+
+    Strategy rationale (vs the numpy-ref approach we tried + abandoned at
+    research/b1_numpy_ref_vs_hf_failure_2026_05_19.md): 91b's pure-numpy
+    deltanet has drifted from HF without being caught, so a numpy ref is
+    not a trustworthy reference. owned_gdn (the shipped decode kernel) IS
+    HF-validated, so the decode-loop IS our authoritative reference for
+    prefill parity.
+
+    args:
+      prompt_ids: list[int] (optional — defaults to "The capital of France is")
+      prompt:     str       (optional — used if prompt_ids absent)
+    """
+    import time as _time
+    import numpy as np
+    import ttnn
+
+    if state.mesh is None or not state.layers:
+        return {"error": "mesh/weights not loaded"}
+
+    prompt_ids = list(args.get("prompt_ids") or [])
+    if not prompt_ids:
+        if state.tok is None:
+            return {"error": "missing prompt_ids and tokenizer unavailable"}
+        prompt = str(args.get("prompt", "The capital of France is"))
+        prompt_ids = state.tok.encode(prompt)
+
+    seq_len = len(prompt_ids)
+    if seq_len < 2:
+        return {"error": f"prompt_ids must have len >= 2, got {seq_len}"}
+    if seq_len > MAX_POS:
+        return {"error": f"prompt_ids len {seq_len} > MAX_POS {MAX_POS}"}
+
+    VOCAB = state.vocab_size
+
+    # Path A — reference: explicit sequential decode-loop, captured per-position.
+    _reset_state_buffers(state)
+    t0 = _time.time()
+    ref_logits = np.empty((seq_len, VOCAB), dtype=np.float32)
+    for pos, tid in enumerate(prompt_ids):
+        update_input_buffers(state, tid, pos)
+        logits_tt = forward_token_tp_inner(state, return_logits=True)
+        ttnn.synchronize_device(state.mesh)
+        ref_logits[pos] = ttnn.to_torch(
+            logits_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        )[0].float().cpu().numpy().reshape(VOCAB)
+    ref_ms = (_time.time() - t0) * 1000.0
+
+    # Path B — test: forward_prefill_tp_inner. Initial B.1 stub == reference,
+    # so cos = 1.0 within numerical noise.
+    _reset_state_buffers(state)
+    t0 = _time.time()
+    test_logits = forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)
+    test_ms = (_time.time() - t0) * 1000.0
+
+    # Per-position comparison
+    a64 = ref_logits.astype(np.float64)
+    b64 = test_logits.astype(np.float64)
+    dot = (a64 * b64).sum(axis=-1)
+    na = np.linalg.norm(a64, axis=-1)
+    nb = np.linalg.norm(b64, axis=-1)
+    pos_cos = dot / (na * nb + 1e-12)
+    max_abs_diff = float(np.abs(a64 - b64).max())
+
+    ref_top1 = np.argmax(ref_logits, axis=-1)
+    test_top1 = np.argmax(test_logits, axis=-1)
+    top1_agree = int((ref_top1 == test_top1).sum())
+
+    state.last_run = {
+        "cmd": "probe_prefill_vs_decode_loop_tp",
+        "seq_len": seq_len,
+        "min_cosine": float(pos_cos.min()),
+    }
+    return {
+        "ok": True,
+        "seq_len": seq_len,
+        "vocab": VOCAB,
+        "reference_ms": ref_ms,
+        "test_ms": test_ms,
+        "per_position_cosine": {
+            "min": float(pos_cos.min()),
+            "median": float(np.median(pos_cos)),
+            "mean": float(pos_cos.mean()),
+            "max": float(pos_cos.max()),
+        },
+        "per_position_cosine_arr": pos_cos.tolist(),
+        "max_abs_diff": max_abs_diff,
+        "top1_agreement": f"{top1_agree}/{seq_len}",
+        "pass_gate_0p999": bool(pos_cos.min() >= 0.999),
+        "note": (
+            "Gate: per-position cos >= 0.999 vs decode-loop reference. "
+            "Initial B.1 stub == reference so cos == 1.0 expected. "
+            "B.2/B.3 will progressively replace forward_prefill_tp_inner "
+            "internals with real parallel components."
         ),
     }
 
@@ -6062,6 +6224,7 @@ HANDLERS = {
     "bench_decode_tp_components": handle_bench_decode_tp_components,
     "probe_ccl_components_tp": handle_probe_ccl_components_tp,
     "probe_async_ccl_components_tp": handle_probe_async_ccl_components_tp,
+    "probe_prefill_vs_decode_loop_tp": handle_probe_prefill_vs_decode_loop_tp,
     "probe_fused_paged_update_cache_tp": handle_probe_fused_paged_update_cache_tp,
     "probe_explicit_all_reduce_tp": handle_probe_explicit_all_reduce_tp,
     "probe_rope_fused_qk_tp": handle_probe_rope_fused_qk_tp,

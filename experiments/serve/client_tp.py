@@ -98,6 +98,26 @@ def cmd_probe_ccl_components_tp(args):
         print(f"\n[save] {args.out}")
 
 
+def cmd_probe_prefill_vs_decode_loop_tp(args):
+    payload = {}
+    if args.prompt:
+        payload["prompt"] = args.prompt
+    data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
+    if data.get("error"):
+        print(f"ERROR: {data['error']}", file=sys.stderr)
+        sys.exit(4)
+    pc = data["per_position_cosine"]
+    print(f"seq_len={data['seq_len']}  vocab={data['vocab']}")
+    print(f"reference (decode-loop) wall: {data['reference_ms']:.0f} ms")
+    print(f"test (forward_prefill_tp_inner) wall: {data['test_ms']:.0f} ms")
+    print(f"\nper-position cosine: min={pc['min']:.6f}  median={pc['median']:.6f}  "
+          f"mean={pc['mean']:.6f}  max={pc['max']:.6f}")
+    print(f"max_abs_diff: {data['max_abs_diff']:.6e}")
+    print(f"top1 agreement: {data['top1_agreement']}")
+    verdict = "PASS" if data["pass_gate_0p999"] else "FAIL"
+    print(f"\nGate (per-pos cos >= 0.999): {verdict}")
+
+
 def cmd_probe_async_ccl_components_tp(args):
     data = _send("probe_async_ccl_components_tp", {
         "iters": args.iters,
@@ -522,6 +542,14 @@ def main():
     b.add_argument("--iters", type=int, default=20)
     b.add_argument("--warmup", type=int, default=3)
     b.set_defaults(fn=cmd_bench_decode_tp_components)
+    pvd = sub.add_parser("probe_prefill_vs_decode_loop_tp",
+                          help="B.1 prefill validation harness: compare per-position logits "
+                               "from sequential decode-loop reference vs forward_prefill_tp_inner. "
+                               "Gate: cos >= 0.999 per position. Initial B.1 stub is decode-loop "
+                               "wrapped → cos = 1.0 trivially (validates harness itself).")
+    pvd.add_argument("--prompt", default=None,
+                      help="prompt to tokenize and validate (default: 'The capital of France is')")
+    pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     ccl = sub.add_parser("probe_ccl_components_tp",
                           help="micro-bench CCL primitives (all_reduce, reduce_scatter, all_gather) "
                                "at production [1, HIDDEN] bf16 shape on (1,4) mesh; answers num_links "
