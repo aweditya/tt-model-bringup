@@ -25,6 +25,10 @@
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/compute/eltwise_unary/sfpu_split_includes.h"
+#include "api/compute/eltwise_unary/activations.h"  // sigmoid_tile (also silu)
+#include "api/compute/eltwise_unary/exp.h"          // exp_tile
+#include "api/compute/eltwise_unary/negative.h"     // negative_tile
+#include "api/compute/eltwise_unary/softplus.h"     // softplus_tile
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/tile_move_copy.h"
 
@@ -67,7 +71,10 @@ FORCE_INLINE void softplus_step(uint32_t cb_a, uint32_t cb_dt_bias, uint32_t cb_
     tile_regs_acquire();
     add_tiles(cb_a, cb_dt_bias, 0, 0, 0);
     softplus_tile_init();
-    softplus_tile(0);
+    // softplus_tile takes 4 fp32-bit-cast-as-u32 args:
+    //   idst, beta, beta_reciprocal, threshold.
+    // Standard softplus (beta=1): 1.0f = 0x3f800000; threshold 20.0f = 0x41a00000.
+    softplus_tile(0, 0x3f800000u, 0x3f800000u, 0x41a00000u);
     tile_regs_commit();
     tile_regs_wait();
     pack_tile(0, cb_softplus);
