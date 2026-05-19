@@ -5324,23 +5324,155 @@ def handle_probe_deltanet_conv1d_split_check_tp(state: MeshServerState, args: di
     compare("conv_st_split", conv_st_combined, conv_st_split_np, 3)
     compare("w_conv_split", w_conv_combined, w_conv_split_np, 4)
 
-    diagnosis = (
-        "split tensors MATCH the column slices of combined tensors. The "
-        "G3/G4 conv1d wire-in bug is NOT in the bootstrap pre-split upload. "
-        "Bug is in mesh kernel dispatch (next probe) or multi-step state evolution."
-        if all_match else
-        "split tensors DO NOT MATCH column slices of combined tensors. "
-        "The bootstrap pre-split (relayout_conv on [D, 1] input + ShardTensorToMesh) "
-        "produces a different result than slicing the combined tensor's column. "
-        "Fix: pre-split AT THE SLICE LEVEL (slice combined first, then upload each "
-        "column as its own tensor with ShardTensorToMesh), OR debug relayout_conv "
-        "for single-column input."
+    # =========================================================================
+    # CHECK B — memory_config / layout asymmetry between split tensors and
+    # column slices of the combined tensors. Even when data is bit-equivalent,
+    # different memory_config (interleaved/sharded, L1/DRAM, alignment) can
+    # cause the kernel to mis-interpret a tensor.
+    # =========================================================================
+    def tensor_meta(t):
+        try:
+            return {
+                "memory_config": str(t.memory_config()),
+                "layout": str(t.layout),
+                "dtype": str(t.dtype),
+                "shape": str(t.shape),
+            }
+        except Exception as e:
+            return {"error": f"meta probe failed: {type(e).__name__}: {e}"}
+
+    layout_check = {
+        "combined_conv_st": tensor_meta(dn["conv_st"]),
+        "combined_w_conv": tensor_meta(dn["w_conv"]),
+        "split_conv_st_0": tensor_meta(dn["conv_st_split"][0]),
+        "split_w_conv_0":  tensor_meta(dn["w_conv_split"][0]),
+        "live_slice_conv_st_0": tensor_meta(
+            ttnn.slice(dn["conv_st"], [0, 0], [dn["conv_st"].shape[0], 1])),
+        "live_slice_w_conv_0": tensor_meta(
+            ttnn.slice(dn["w_conv"], [0, 0], [dn["w_conv"].shape[0], 1])),
+    }
+    # If split's metadata differs from a live slice's metadata at any field, flag it.
+    layout_meta_match = (
+        layout_check["split_conv_st_0"].get("memory_config")
+            == layout_check["live_slice_conv_st_0"].get("memory_config")
+        and layout_check["split_w_conv_0"].get("memory_config")
+            == layout_check["live_slice_w_conv_0"].get("memory_config")
     )
+
+    # =========================================================================
+    # CHECK A — single-forward conv_out comparison. State is freshly zeroed
+    # before each run. Synthesize a fixed mixed_qkv (mesh-sharded dim=1 to
+    # match production layout). Run both manual and owned conv1d blocks;
+    # compare conv_out element-wise.
+    # =========================================================================
+    import numpy as np
+    import torch
+    from full_layer_tp_probe import CONV_DIM, CONV_DIM_CHIP
+    cfg = state.cfg
+    KERNEL = cfg["conv_kernel"]
+    rng = np.random.default_rng(int(args.get("seed", 0)))
+    mixed_full = rng.uniform(-0.1, 0.1, (1, CONV_DIM)).astype(np.float32)
+
+    def fresh_mixed():
+        return ttnn.from_torch(
+            torch.from_numpy(mixed_full),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+        )
+
+    # Reset state to zeros (also zeros split tensors).
+    _reset_state_buffers(state)
+
+    # --- MANUAL conv1d block (matches deltanet_step_tp else-branch) ---
+    mixed_tt = fresh_mixed()
+    mixed_col_m = ttnn.reshape(mixed_tt, [CONV_DIM_CHIP, 1])
+    conv_input = ttnn.concat([dn["conv_st"], mixed_col_m], dim=-1)
+    conv_prod = ttnn.mul(conv_input, dn["w_conv"])
+    conv_out_manual = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
+    manual_back = ttnn.to_torch(
+        conv_out_manual,
+        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    ).float().cpu().numpy()
+    if manual_back.ndim == 2 and manual_back.shape[1] == 1:
+        manual_back = manual_back[:, 0]
+    elif manual_back.ndim == 1:
+        pass
+    else:
+        manual_back = manual_back.reshape(-1)
+
+    # Reset state again to zero conv_st_split (manual run didn't touch them,
+    # but be defensive).
+    _reset_state_buffers(state)
+
+    # --- OWNED conv1d block (matches deltanet_step_tp if-branch) ---
+    mixed_tt2 = fresh_mixed()
+    state0, state1, state2 = dn["conv_st_split"]
+    w0, w1, w2, w3 = dn["w_conv_split"]
+    mixed_col_o = ttnn.reshape(mixed_tt2, [CONV_DIM_CHIP, 1])
+    _, _, _, conv_out_owned_2d = ttnn.experimental.qwen36_conv1d_decode_owned(
+        mixed_col_o, state0, state1, state2, w0, w1, w2, w3)
+    conv_out_owned = ttnn.reshape(conv_out_owned_2d, [CONV_DIM_CHIP])
+    owned_back = ttnn.to_torch(
+        conv_out_owned,
+        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    ).float().cpu().numpy().reshape(-1)
+
+    # Reset state one more time so we don't leave dn['conv_st_split'] polluted.
+    _reset_state_buffers(state)
+
+    forward_diff = np.abs(manual_back - owned_back)
+    forward_check = {
+        "manual_first_5": manual_back[:5].tolist(),
+        "owned_first_5": owned_back[:5].tolist(),
+        "max_abs_diff": float(forward_diff.max()),
+        "mean_abs_diff": float(forward_diff.mean()),
+        "p99_abs_diff": float(np.percentile(forward_diff, 99)),
+        "num_above_1e_3": int((forward_diff > 1e-3).sum()),
+        "shape_match": manual_back.shape == owned_back.shape,
+        "shape": list(manual_back.shape),
+    }
+    FORWARD_THRESHOLD = 0.05  # ~half a BF16 ULP at magnitude 1
+    forward_clean = forward_check["max_abs_diff"] <= FORWARD_THRESHOLD
+
+    # =========================================================================
+    # DIAGNOSIS — chained reasoning over all 3 checks
+    # =========================================================================
+    diagnosis_lines = []
+    if all_match:
+        diagnosis_lines.append(
+            "CHECK split-data: PASS (bootstrap pre-split is bit-exact vs slicing)")
+    else:
+        diagnosis_lines.append(
+            "CHECK split-data: FAIL (bootstrap pre-split doesn't match slice; "
+            "fix relayout_conv or pre-split-at-slice-level)")
+    if layout_meta_match:
+        diagnosis_lines.append(
+            "CHECK layout-meta: PASS (split and live-slice memory_config match)")
+    else:
+        diagnosis_lines.append(
+            "CHECK layout-meta: FAIL (split memory_config differs from live-slice's; "
+            "fix to upload split with same memory_config as ttnn.slice produces)")
+    if forward_clean:
+        diagnosis_lines.append(
+            "CHECK single-forward: PASS (owned kernel produces same conv_out as "
+            "manual chain on mesh at zero state). Bug is in MULTI-STEP state "
+            "evolution — kernel's per-call output is right, but state mutation "
+            "across forwards goes wrong.")
+    else:
+        diagnosis_lines.append(
+            "CHECK single-forward: FAIL (owned conv_out differs from manual at "
+            "step 0 with zero state, max_diff={:.4f}). Mesh kernel dispatch is "
+            "buggy — kernel produces wrong output per-call on mesh despite "
+            "passing G0 standalone single-device.".format(
+                forward_check["max_abs_diff"]))
 
     state.last_run = {
         "cmd": "probe_deltanet_conv1d_split_check_tp",
         "layer_idx": layer_idx,
         "all_match": all_match,
+        "layout_meta_match": layout_meta_match,
+        "forward_clean": forward_clean,
     }
 
     return {
@@ -5349,7 +5481,11 @@ def handle_probe_deltanet_conv1d_split_check_tp(state: MeshServerState, args: di
         "threshold": threshold,
         "comparisons": comparisons,
         "all_match": all_match,
-        "diagnosis": diagnosis,
+        "layout_check": layout_check,
+        "layout_meta_match": layout_meta_match,
+        "forward_check": forward_check,
+        "forward_clean": forward_clean,
+        "diagnosis": " | ".join(diagnosis_lines),
     }
 
 
