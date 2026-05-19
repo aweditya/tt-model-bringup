@@ -123,6 +123,15 @@ class MeshServerState:
         # explicitly. Set to "manual" to revert to the legacy TTNN
         # broadcast-reduce recurrence.
         self.deltanet_recurrence_mode = "owned_gdn"
+        # 2026-05-18 (later): owned conv1d kernel gate work.
+        # "manual" = production manual concat/mul/sum/silu/slice chain.
+        # "owned_conv1d" = ttnn.experimental.qwen36_conv1d_decode_owned
+        #   (per-step slices conv_st/w_conv into single-column views,
+        #    restitches state_next; slower than manual but correctness-
+        #    isolated for G3 cosine_ladder_tp validation).
+        # G4 production flip will pre-split weights/state at bootstrap to
+        # eliminate the per-step slice/restitch overhead.
+        self.deltanet_conv1d_mode = "manual"
         self.profile_records = None
         self.profile_context_stack = []
 
@@ -569,15 +578,46 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     ttnn.deallocate(all_tt)
     # 4. conv1d on per-chip slab
     with _profile_scope(state, "deltanet_conv"):
-        mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
-        ttnn.deallocate(mixed_qkv)
-        conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
-        ttnn.deallocate(mixed_col)
-        conv_prod = ttnn.mul(conv_input, dn['w_conv'])
-        conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
-        ttnn.deallocate(conv_prod)
-        conv_state_new = ttnn.slice(conv_input, [0, 1], [CONV_DIM_CHIP, cfg['conv_kernel']])
-        ttnn.deallocate(conv_input)
+        if state.deltanet_conv1d_mode == "owned_conv1d":
+            # Owned conv1d kernel path (G3 correctness validation).
+            # The kernel takes 4 separate tap CBs (state0/1/2/mixed) and 4
+            # separate weight CBs (w0..3), each shaped [D, 1] padded [D, 32].
+            # For G3 we slice the production [D, K-1=3] state and [D, K=4]
+            # weights per-step; G4 will pre-split at bootstrap to remove
+            # this overhead. The writer kernel mutates state0/1/2 in place
+            # with state1/state2/mixed (the shift), so the slice outputs
+            # ARE the shifted state for the next step — concat them to
+            # produce conv_state_new which the end-of-step ttnn.copy will
+            # write back into dn['conv_st'].
+            conv_st = dn['conv_st']
+            w_conv = dn['w_conv']
+            state0 = ttnn.slice(conv_st, [0, 0], [CONV_DIM_CHIP, 1])
+            state1 = ttnn.slice(conv_st, [0, 1], [CONV_DIM_CHIP, 2])
+            state2 = ttnn.slice(conv_st, [0, 2], [CONV_DIM_CHIP, 3])
+            w0 = ttnn.slice(w_conv, [0, 0], [CONV_DIM_CHIP, 1])
+            w1 = ttnn.slice(w_conv, [0, 1], [CONV_DIM_CHIP, 2])
+            w2 = ttnn.slice(w_conv, [0, 2], [CONV_DIM_CHIP, 3])
+            w3 = ttnn.slice(w_conv, [0, 3], [CONV_DIM_CHIP, 4])
+            mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
+            ttnn.deallocate(mixed_qkv)
+            s0_out, s1_out, s2_out, conv_out_2d = ttnn.experimental.qwen36_conv1d_decode_owned(
+                mixed_col, state0, state1, state2, w0, w1, w2, w3)
+            ttnn.deallocate(mixed_col)
+            conv_state_new = ttnn.concat([s0_out, s1_out, s2_out], dim=-1)
+            ttnn.deallocate(s0_out); ttnn.deallocate(s1_out); ttnn.deallocate(s2_out)
+            ttnn.deallocate(w0); ttnn.deallocate(w1); ttnn.deallocate(w2); ttnn.deallocate(w3)
+            conv_out = ttnn.reshape(conv_out_2d, [CONV_DIM_CHIP])
+            ttnn.deallocate(conv_out_2d)
+        else:
+            mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
+            ttnn.deallocate(mixed_qkv)
+            conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
+            ttnn.deallocate(mixed_col)
+            conv_prod = ttnn.mul(conv_input, dn['w_conv'])
+            conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
+            ttnn.deallocate(conv_prod)
+            conv_state_new = ttnn.slice(conv_input, [0, 1], [CONV_DIM_CHIP, cfg['conv_kernel']])
+            ttnn.deallocate(conv_input)
     # 5. Q/K/V per-chip head-sliced
     q_flat = ttnn.slice(conv_out, [0], [KEY_DIM_CHIP])
     k_flat = ttnn.slice(conv_out, [KEY_DIM_CHIP], [2 * KEY_DIM_CHIP])
@@ -5083,6 +5123,10 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     if mode not in ("manual", "owned_gdn", "owned_gdn_inplace"):
         return {"error": f"deltanet_recurrence_mode must be one of manual/owned_gdn/owned_gdn_inplace, got {mode}"}
 
+    conv1d_mode = str(args.get("deltanet_conv1d_mode", "manual"))
+    if conv1d_mode not in ("manual", "owned_conv1d"):
+        return {"error": f"deltanet_conv1d_mode must be one of manual/owned_conv1d, got {conv1d_mode}"}
+
     P = len(prompt_ids)
     M = len(generated_ids)
     if P + M > MAX_POS:
@@ -5097,7 +5141,9 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
 
     _reset_state_buffers(state)
     old_mode = state.deltanet_recurrence_mode
+    old_conv1d_mode = state.deltanet_conv1d_mode
     state.deltanet_recurrence_mode = mode
+    state.deltanet_conv1d_mode = conv1d_mode
 
     logits_arr = np.empty((M, VOCAB), dtype=np.float32)
 
@@ -5132,6 +5178,7 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         decode_ms = (_time.time() - t_decode) * 1000.0
     finally:
         state.deltanet_recurrence_mode = old_mode
+        state.deltanet_conv1d_mode = old_conv1d_mode
 
     np.savez(out_path,
              logits=logits_arr,
@@ -5141,6 +5188,7 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     state.last_run = {
         "cmd": "cosine_ladder_tp",
         "deltanet_recurrence_mode": mode,
+        "deltanet_conv1d_mode": conv1d_mode,
         "n_prompt": P,
         "n_steps": M,
     }
@@ -5149,6 +5197,7 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         "ok": True,
         "path": out_path,
         "deltanet_recurrence_mode": mode,
+        "deltanet_conv1d_mode": conv1d_mode,
         "n_prompt": P,
         "n_steps": M,
         "vocab": VOCAB,

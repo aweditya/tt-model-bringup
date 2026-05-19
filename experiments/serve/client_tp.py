@@ -308,6 +308,7 @@ def cmd_cosine_ladder_tp(args):
             "prompt_ids": prompt_ids,
             "generated_ids": generated_ids,
             "deltanet_recurrence_mode": mode,
+            "deltanet_conv1d_mode": args.deltanet_conv1d_mode,
             "out_path": out_path,
         }))
         raw = P.read_line(sock, max_bytes=64 << 20)
@@ -579,6 +580,12 @@ def main():
                      help="positions to teacher-force (P + M ≤ MAX_POS=256)")
     cl.add_argument("--modes", default="manual,owned_gdn",
                      help="comma-separated recurrence modes (e.g. manual,owned_gdn)")
+    cl.add_argument("--deltanet-conv1d-mode", choices=["manual", "owned_conv1d"],
+                     default="manual",
+                     help="DeltaNet conv1d kernel toggle. owned_conv1d routes through "
+                          "ttnn.experimental.qwen36_conv1d_decode_owned for the G3 long-"
+                          "context correctness gate (slower than manual per-step due to "
+                          "per-step weight/state slicing; G4 will pre-split at bootstrap).")
     cl.set_defaults(fn=cmd_cosine_ladder_tp)
     args = p.parse_args()
     args.fn(args)
