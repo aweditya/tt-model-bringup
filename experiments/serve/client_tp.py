@@ -12,6 +12,7 @@ import json
 import os
 import socket
 import sys
+from pathlib import Path as _Path
 
 from experiments.serve import protocol as P
 
@@ -58,6 +59,43 @@ def cmd_bench_decode_tp_components(args):
         "warmup": args.warmup,
     })
     print(json.dumps(data, indent=2, default=str))
+
+
+def cmd_probe_ccl_components_tp(args):
+    data = _send("probe_ccl_components_tp", {
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "shape": [1, args.hidden],
+    }, timeout=600.0)
+    # Pretty headline first; full JSON saved to artifact if requested.
+    variants = data.get("variants", {})
+    composites = data.get("composites", {})
+    print(f"shape={data.get('shape')} iters={data.get('iters')} warmup={data.get('warmup')}")
+    print("\nper-variant median (min, p99) ms:")
+    for name, v in variants.items():
+        s = v.get("summary_ms", {})
+        samples = v.get("samples_ms", [])
+        p99 = sorted(samples)[int(len(samples) * 0.99) - 1] if samples else float("nan")
+        print(f"  {name:<32} {s.get('median', float('nan')):.4f}  "
+              f"(min {s.get('min', float('nan')):.4f}, p99 {p99:.4f})")
+    print("\ncomposite vs single all_reduce:")
+    for name, c in composites.items():
+        delta = c.get("composite_minus_all_reduce_ms", float("nan"))
+        sign = "+" if delta >= 0 else ""
+        print(f"  {name}: RS {c.get('rs_median_ms', float('nan')):.4f} + AG "
+              f"{c.get('ag_median_ms', float('nan')):.4f} = "
+              f"{c.get('sum_median_ms', float('nan')):.4f} ms  "
+              f"vs AR {c.get('vs_all_reduce_median_ms', float('nan')):.4f} ms  "
+              f"(delta {sign}{delta:.4f} ms)")
+    errors = data.get("errors", {})
+    if errors:
+        print("\nerrors:")
+        for name, msg in errors.items():
+            print(f"  {name}: {msg}")
+    if args.out:
+        _Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        _Path(args.out).write_text(json.dumps(data, indent=2, default=str))
+        print(f"\n[save] {args.out}")
 
 
 def cmd_probe_fused_paged_update_cache_tp(args):
@@ -450,6 +488,17 @@ def main():
     b.add_argument("--iters", type=int, default=20)
     b.add_argument("--warmup", type=int, default=3)
     b.set_defaults(fn=cmd_bench_decode_tp_components)
+    ccl = sub.add_parser("probe_ccl_components_tp",
+                          help="micro-bench CCL primitives (all_reduce, reduce_scatter, all_gather) "
+                               "at production [1, HIDDEN] bf16 shape on (1,4) mesh; answers num_links "
+                               "free-bandwidth probe (P1) and composite-vs-fused probe (P2)")
+    ccl.add_argument("--iters", type=int, default=30)
+    ccl.add_argument("--warmup", type=int, default=5)
+    ccl.add_argument("--hidden", type=int, default=5120,
+                      help="HIDDEN dim of the bench tensor [1, HIDDEN]")
+    ccl.add_argument("--out", default=None,
+                      help="path to save full JSON artifact (default: print headline only)")
+    ccl.set_defaults(fn=cmd_probe_ccl_components_tp)
     f = sub.add_parser("probe_fused_paged_update_cache_tp",
                        help="validate fused K/V paged-cache writer in resident TP server")
     f.add_argument("--prompt", default="The capital of France is")

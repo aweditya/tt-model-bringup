@@ -1281,6 +1281,171 @@ def handle_bench_decode_tp_components(state: MeshServerState, args: dict) -> dic
     return result
 
 
+def handle_probe_ccl_components_tp(state: MeshServerState, args: dict) -> dict:
+    """Micro-bench CCL primitives at production TP shape.
+
+    Measures all_reduce / reduce_scatter / all_gather × num_links ∈ {1, 2}
+    at shape [1, HIDDEN=5120] bf16 on the (1, 4) mesh (cluster_axis=1,
+    topology=Linear).
+
+    Answers two questions from one bootstrap:
+      P1 (free win?): all_reduce(num_links=1) vs all_reduce(num_links=2).
+      P2 (composite?): single all_reduce vs reduce_scatter + all_gather
+        (the synchronous composite path); per-link variants compared.
+
+    All measurements are sync-bounded around a single ttnn call; warmup is
+    discarded. The composite latency is derived (rs + ag, same num_links)
+    rather than measured fused — kept simple for the gate decision.
+    """
+    import ttnn
+    import torch
+    import time as _time
+    import numpy as np
+
+    iters = int(args.get("iters", 30))
+    warmup = int(args.get("warmup", 5))
+    shape = args.get("shape", [1, 5120])
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+    if len(shape) != 2 or shape[0] != 1:
+        return {"error": f"shape must be [1, H], got {shape}"}
+    H = int(shape[1])
+    if H % 4 != 0:
+        return {"error": f"H={H} must be divisible by 4 (NCHIPS)"}
+
+    rng = np.random.default_rng(42)
+
+    def upload_replicated_2d(H_):
+        x = rng.standard_normal((1, H_)).astype(np.float32) * 0.05
+        return ttnn.from_torch(
+            torch.from_numpy(x),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def upload_sharded_2d(H_):
+        x = rng.standard_normal((1, H_)).astype(np.float32) * 0.05
+        return ttnn.from_torch(
+            torch.from_numpy(x),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def sync():
+        ttnn.synchronize_device(state.mesh)
+
+    def time_op(fn, x_in):
+        sync()
+        t0 = _time.perf_counter()
+        out = fn(x_in)
+        sync()
+        return (_time.perf_counter() - t0) * 1000.0, out
+
+    # ---- variant table ------------------------------------------------
+    # all_reduce + reduce_scatter take the per-chip [1, H] partial.
+    # all_gather takes a per-chip [1, H/4] slice that gets gathered to [1, H].
+    H_SHARD = H // 4
+    variants = []  # list of (name, x_factory, op_fn)
+    for L in (1, 2):
+        variants.append((
+            f"all_reduce_L{L}_linear",
+            lambda: upload_replicated_2d(H),
+            lambda x, L=L: ttnn.all_reduce(
+                x, cluster_axis=1,
+                memory_config=x.memory_config(),
+                num_links=L, topology=ttnn.Topology.Linear,
+            ),
+        ))
+        variants.append((
+            f"reduce_scatter_L{L}_linear",
+            lambda: upload_replicated_2d(H),
+            lambda x, L=L: ttnn.reduce_scatter(
+                x, dim=1, cluster_axis=1,
+                num_links=L, topology=ttnn.Topology.Linear,
+            ),
+        ))
+        variants.append((
+            f"all_gather_L{L}_linear",
+            lambda H_=H_SHARD: upload_sharded_2d(H),  # global [1,H], sharded → per-chip [1, H/4]
+            lambda x, L=L: ttnn.all_gather(
+                x, dim=1, cluster_axis=1,
+                num_links=L, topology=ttnn.Topology.Linear,
+            ),
+        ))
+
+    results = {}
+    errors = {}
+
+    for name, x_factory, op_fn in variants:
+        try:
+            x_in = x_factory()
+            # Warmup (discarded).
+            for _ in range(warmup):
+                _, out = time_op(op_fn, x_in)
+                if out is not None:
+                    ttnn.deallocate(out)
+            samples = []
+            for _ in range(iters):
+                ms, out = time_op(op_fn, x_in)
+                samples.append(ms)
+                if out is not None:
+                    ttnn.deallocate(out)
+            ttnn.deallocate(x_in)
+            results[name] = {
+                "samples_ms": samples,
+                "summary_ms": _summary_ms(samples),
+            }
+        except Exception as e:
+            errors[name] = repr(e)
+
+    # ---- derived composite (rs + ag at matching num_links) ------------
+    composites = {}
+    for L in (1, 2):
+        rs_key = f"reduce_scatter_L{L}_linear"
+        ag_key = f"all_gather_L{L}_linear"
+        ar_key = f"all_reduce_L{L}_linear"
+        if rs_key in results and ag_key in results:
+            rs_med = results[rs_key]["summary_ms"].get("median", float("nan"))
+            ag_med = results[ag_key]["summary_ms"].get("median", float("nan"))
+            ar_med = results.get(ar_key, {}).get("summary_ms", {}).get("median", float("nan"))
+            composites[f"composite_L{L}_linear"] = {
+                "rs_median_ms": rs_med,
+                "ag_median_ms": ag_med,
+                "sum_median_ms": rs_med + ag_med,
+                "vs_all_reduce_median_ms": ar_med,
+                "composite_minus_all_reduce_ms": (rs_med + ag_med) - ar_med,
+            }
+
+    state.last_run = {
+        "cmd": "probe_ccl_components_tp",
+        "shape": shape,
+        "iters": iters,
+        "n_variants": len(results),
+        "n_errors": len(errors),
+    }
+    return {
+        "ok": True,
+        "shape": shape,
+        "iters": iters,
+        "warmup": warmup,
+        "variants": results,
+        "composites": composites,
+        "errors": errors,
+        "note": (
+            "Sync-bounded per-op timing. all_reduce + reduce_scatter input is "
+            "replicated [1, H] on each chip; all_gather input is sharded along "
+            "dim=1 (per-chip [1, H/4]). Composite latency is derived (rs + ag, "
+            "same num_links). Compare composite_minus_all_reduce_ms against zero "
+            "to decide composite-vs-fused; compare L2 vs L1 within all_reduce "
+            "to decide the free-bandwidth probe."
+        ),
+    }
+
+
 def _read_argmax_id(state: MeshServerState, argmax_tt) -> int:
     import ttnn
     idx_concat = ttnn.to_torch(
@@ -5672,6 +5837,7 @@ HANDLERS = {
     "status":         handle_status,
     "generate_tp":    handle_generate_tp,
     "bench_decode_tp_components": handle_bench_decode_tp_components,
+    "probe_ccl_components_tp": handle_probe_ccl_components_tp,
     "probe_fused_paged_update_cache_tp": handle_probe_fused_paged_update_cache_tp,
     "probe_explicit_all_reduce_tp": handle_probe_explicit_all_reduce_tp,
     "probe_rope_fused_qk_tp": handle_probe_rope_fused_qk_tp,
