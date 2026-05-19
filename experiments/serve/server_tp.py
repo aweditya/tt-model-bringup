@@ -5490,6 +5490,136 @@ def handle_probe_deltanet_conv1d_split_check_tp(state: MeshServerState, args: di
     }
 
 
+def handle_probe_deltanet_owned_decay_gate_real_tensors_tp(state: MeshServerState, args: dict) -> dict:
+    """G1 real-tensor probe for owned decay/gate kernel.
+
+    For each DeltaNet layer (or a single layer if --layer-idx is set),
+    reads the production dn['dt_bias'] + dn['A_log'] weights, synthesizes
+    random a/b inputs of the same shape, runs:
+      - numpy oracle (manual log(exp+1) softplus chain)
+      - owned kernel (ttnn.experimental.qwen36_decay_gate_decode_owned)
+    and compares decay + beta outputs element-wise. Sweeps all 48 DeltaNet
+    layers by default. Gate: PCC ≥ 0.99999, max_abs_diff ≤ threshold.
+
+    args:
+      layer_idx: int or None (default None — sweep all DeltaNet layers)
+      seed:      int (default 0)
+      max_abs_diff: float (default 0.01)
+    """
+    import numpy as np
+    import torch
+    import ttnn
+    from full_layer_tp_probe import N_V_HEADS  # 48
+
+    if state.mesh is None or not state.layers:
+        return {"error": "server not loaded"}
+    if not hasattr(ttnn.experimental, "qwen36_decay_gate_decode_owned"):
+        return {"error": "ttnn.experimental.qwen36_decay_gate_decode_owned not exposed"}
+
+    seed = int(args.get("seed", 0))
+    threshold = float(args.get("max_abs_diff", 0.01))
+    layer_idx_filter = args.get("layer_idx")
+    NV = N_V_HEADS  # 48
+
+    dn_indices = [i for i, L in enumerate(state.layers) if L["type"] == "linear_attention"]
+    if layer_idx_filter is not None:
+        idx = int(layer_idx_filter)
+        if idx < 0 or idx >= len(dn_indices):
+            return {"error": f"layer_idx out of DeltaNet range; {len(dn_indices)} layers"}
+        dn_indices = [dn_indices[idx]]
+
+    rng = np.random.default_rng(seed)
+
+    def numpy_oracle(a, b, dt_bias, A_log):
+        a_biased = a + dt_bias
+        softplus_a = np.log(np.exp(a_biased) + 1.0)
+        g = -np.exp(A_log) * softplus_a
+        decay = np.exp(g)
+        beta = 1.0 / (1.0 + np.exp(-b))
+        return decay, beta
+
+    def mesh_upload_row(np_2d):
+        # np_2d shape [1, NV]; sharded dim=1 across mesh → per-chip [1, NV_PER_CHIP].
+        return ttnn.from_torch(
+            torch.from_numpy(np_2d.astype(np.float32)),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1))
+
+    def mesh_readback_row(tensor):
+        return ttnn.to_torch(
+            tensor, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+        ).float().cpu().numpy()
+
+    def pcc(a, b):
+        am = a.flatten() - a.mean()
+        bm = b.flatten() - b.mean()
+        return float(np.dot(am, bm) / (np.linalg.norm(am) * np.linalg.norm(bm) + 1e-30))
+
+    per_layer = {}
+    all_pass = True
+
+    for layer_idx in dn_indices:
+        dn = state.layers[layer_idx]["dn"]
+
+        # Read real dt_bias and A_log; production shards them dim=0 so per-chip
+        # is [NV_PER_CHIP]. Concat across mesh dim=0 gives full [NV] (rank-1).
+        dt_bias_full = ttnn.to_torch(
+            dn["dt_bias"], mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        ).float().cpu().numpy()
+        A_log_full = ttnn.to_torch(
+            dn["A_log"], mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        ).float().cpu().numpy()
+        # Flatten + reshape to [1, NV] for kernel input.
+        dt_bias_full = dt_bias_full.flatten()[:NV].reshape(1, NV)
+        A_log_full = A_log_full.flatten()[:NV].reshape(1, NV)
+
+        # Synthesize a/b matching production activation magnitudes.
+        a_full = rng.uniform(-1.0, 1.0, (1, NV)).astype(np.float32)
+        b_full = rng.uniform(-1.0, 1.0, (1, NV)).astype(np.float32)
+
+        oracle_decay, oracle_beta = numpy_oracle(a_full, b_full, dt_bias_full, A_log_full)
+
+        a_tt = mesh_upload_row(a_full)
+        b_tt = mesh_upload_row(b_full)
+        dt_bias_tt = mesh_upload_row(dt_bias_full)
+        A_log_tt = mesh_upload_row(A_log_full)
+
+        decay_tt, beta_tt = ttnn.experimental.qwen36_decay_gate_decode_owned(
+            a_tt, b_tt, dt_bias_tt, A_log_tt)
+
+        decay_kernel = mesh_readback_row(decay_tt)
+        beta_kernel = mesh_readback_row(beta_tt)
+
+        decay_diff = float(np.abs(decay_kernel - oracle_decay).max())
+        beta_diff = float(np.abs(beta_kernel - oracle_beta).max())
+        layer_pass = decay_diff <= threshold and beta_diff <= threshold
+        if not layer_pass:
+            all_pass = False
+
+        per_layer[str(layer_idx)] = {
+            "decay_max_diff": decay_diff,
+            "decay_pcc": pcc(decay_kernel, oracle_decay),
+            "beta_max_diff": beta_diff,
+            "beta_pcc": pcc(beta_kernel, oracle_beta),
+            "pass": layer_pass,
+        }
+
+    state.last_run = {
+        "cmd": "probe_deltanet_owned_decay_gate_real_tensors_tp",
+        "n_layers_swept": len(dn_indices),
+        "all_pass": all_pass,
+    }
+
+    return {
+        "ok": True,
+        "n_layers_swept": len(dn_indices),
+        "all_pass": all_pass,
+        "threshold": threshold,
+        "per_layer": per_layer,
+    }
+
+
 HANDLERS = {
     "status":         handle_status,
     "generate_tp":    handle_generate_tp,
@@ -5511,6 +5641,7 @@ HANDLERS = {
     "probe_deltanet_softplus_decay_tp": handle_probe_deltanet_softplus_decay_tp,
     "cosine_ladder_tp": handle_cosine_ladder_tp,
     "probe_deltanet_conv1d_split_check_tp": handle_probe_deltanet_conv1d_split_check_tp,
+    "probe_deltanet_owned_decay_gate_real_tensors_tp": handle_probe_deltanet_owned_decay_gate_real_tensors_tp,
     "shutdown":       handle_shutdown,
 }
 

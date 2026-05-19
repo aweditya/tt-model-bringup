@@ -254,6 +254,17 @@ def cmd_probe_deltanet_conv1d_split_check_tp(args):
     print(json.dumps(data, indent=2, default=str))
 
 
+def cmd_probe_deltanet_owned_decay_gate_real_tensors_tp(args):
+    payload = {
+        "seed": args.seed,
+        "max_abs_diff": args.max_abs_diff,
+    }
+    if args.layer_idx is not None:
+        payload["layer_idx"] = args.layer_idx
+    data = _send("probe_deltanet_owned_decay_gate_real_tensors_tp", payload)
+    print(json.dumps(data, indent=2, default=str))
+
+
 def cmd_cosine_ladder_tp(args):
     """Run cosine ladder for one or more recurrence modes and, if ≥2 modes,
     print + save a per-position comparison vs the first mode. Used to gate
@@ -580,6 +591,13 @@ def main():
     sp_check.add_argument("--layer-idx", type=int, default=0)
     sp_check.add_argument("--max-abs-diff", type=float, default=0.05)
     sp_check.set_defaults(fn=cmd_probe_deltanet_conv1d_split_check_tp)
+    dg_g1 = sub.add_parser("probe_deltanet_owned_decay_gate_real_tensors_tp",
+                            help="G1 real-tensor sweep for owned decay/gate kernel")
+    dg_g1.add_argument("--layer-idx", type=int, default=None,
+                        help="DeltaNet layer index (None = sweep all)")
+    dg_g1.add_argument("--seed", type=int, default=0)
+    dg_g1.add_argument("--max-abs-diff", type=float, default=0.01)
+    dg_g1.set_defaults(fn=cmd_probe_deltanet_owned_decay_gate_real_tensors_tp)
     g = sub.add_parser("generate_tp", help="multi-chip generate (streams)")
     g.add_argument("--prompt", required=True)
     g.add_argument("--max-tokens", type=int, default=60)
