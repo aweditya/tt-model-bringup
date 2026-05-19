@@ -1045,6 +1045,108 @@ def forward_token_tp(state, token_id, cur_pos):
     return forward_token_tp_inner(state)
 
 
+def forward_prefill_tp_inner_v2_per_position_list(state, prompt_ids, capture_logits=False):
+    """B.2.1 ISOLATION #2: layer-outer iter, keep per-position [1, HIDDEN]
+    tensors in a Python list — NO slice, NO concat of multi-position tensors.
+
+    If THIS mode gives cos=1.0, the slice/concat round-trip on TILE_LAYOUT
+    [seq_len, HIDDEN] tensors was the bug. If still <1.0, the layer-outer
+    iteration ordering itself is the problem.
+    """
+    import ttnn
+    import numpy as np
+
+    cfg = state.cfg
+    HIDDEN = cfg['hidden']
+    seq_len = len(prompt_ids)
+    VOCAB = state.vocab_size
+
+    # Step 1: per-position embed (each chip gets its own [1, HIDDEN])
+    x_per_pos = []  # list of [1, HIDDEN] tensors, one per position
+    for pos, tid in enumerate(prompt_ids):
+        update_input_buffers(state, tid, pos)
+        embed_out = ttnn.embedding(
+            state.tok_buf, state.embed_tt,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        x_pos = ttnn.reshape(embed_out, [1, HIDDEN])
+        x_per_pos.append(x_pos)
+
+    # Step 2: layer-outer, position-inner — operating on Python list
+    for layer in state.layers:
+        layer_outs = []
+        for pos, tid in enumerate(prompt_ids):
+            update_input_buffers(state, tid, pos)
+            cos_row_raw = ttnn.embedding(state.rot_idxs_buf, state.cos_table_tt,
+                                          layout=ttnn.TILE_LAYOUT,
+                                          memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            sin_row_raw = ttnn.embedding(state.rot_idxs_buf, state.sin_table_tt,
+                                          layout=ttnn.TILE_LAYOUT,
+                                          memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            cos_row_tt = ttnn.reshape(cos_row_raw, [1, state.rotary_dim])
+            sin_row_tt = ttnn.reshape(sin_row_raw, [1, state.rotary_dim])
+
+            x_pos = x_per_pos[pos]  # direct list access — no slice
+
+            if layer['type'] == 'linear_attention':
+                x_pos_dn = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
+            else:
+                x_pos_dn = gated_attn_step_tp(
+                    state, x_pos, layer['attn'],
+                    state.cur_pos_buf, 0,
+                    cos_row_tt, sin_row_tt, cfg)
+            ttnn.deallocate(cos_row_tt)
+            ttnn.deallocate(sin_row_tt)
+
+            x_pos_out = mlp_step_tp(state, x_pos_dn, layer['mlp'])
+            ttnn.deallocate(x_pos_dn)
+            layer_outs.append(x_pos_out)
+
+        # Deallocate previous layer's tensors
+        for t in x_per_pos:
+            ttnn.deallocate(t)
+        x_per_pos = layer_outs  # next layer reads from this list
+
+    # Per-position final norm + LM head (no batching, no slice/concat)
+    if capture_logits:
+        logits_arr = np.empty((seq_len, VOCAB), dtype=np.float32)
+        for pos in range(seq_len):
+            x_normed = _rms_norm_manual(x_per_pos[pos], state.final_norm_tt, 1e-6, HIDDEN)
+            sharded_logits_tt = ttnn.linear(x_normed, state.lm_head_tt)
+            gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+            sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [1, VOCAB])
+            rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+            ttnn.synchronize_device(state.mesh)
+            logits_arr[pos] = ttnn.to_torch(
+                rm_logits_tt,
+                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+            )[0].float().cpu().numpy().reshape(VOCAB)
+            ttnn.deallocate(x_normed)
+            ttnn.deallocate(sharded_logits_tt)
+            ttnn.deallocate(gathered_logits_tt)
+            ttnn.deallocate(sliced_logits_tt)
+            ttnn.deallocate(rm_logits_tt)
+        for t in x_per_pos:
+            ttnn.deallocate(t)
+        return logits_arr
+
+    # Production: only need last position's logits
+    x_last_normed = _rms_norm_manual(x_per_pos[-1], state.final_norm_tt, 1e-6, HIDDEN)
+    for t in x_per_pos:
+        ttnn.deallocate(t)
+    sharded_logits_tt = ttnn.linear(x_last_normed, state.lm_head_tt)
+    gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+    sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [1, VOCAB])
+    rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+    ttnn.deallocate(sharded_logits_tt)
+    ttnn.deallocate(gathered_logits_tt)
+    ttnn.deallocate(sliced_logits_tt)
+    ttnn.deallocate(x_last_normed)
+    ttnn.synchronize_device(state.mesh)
+    return rm_logits_tt
+
+
 def forward_prefill_tp_inner_v2_sequential_via_slices(state, prompt_ids, capture_logits=False):
     """B.2.1 ISOLATION: layer-outer iter with slice/concat plumbing AND
     sequential MLP per position. Used to localize whether B.2.1's batched_mlp
@@ -2015,8 +2117,9 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         prompt_ids = state.tok.encode(prompt)
 
     mode = str(args.get("mode", "stub"))
-    if mode not in ("stub", "batched_mlp", "sequential_via_slices"):
-        return {"error": f"mode must be one of stub/batched_mlp/sequential_via_slices, got {mode}"}
+    valid_modes = ("stub", "batched_mlp", "sequential_via_slices", "per_position_list")
+    if mode not in valid_modes:
+        return {"error": f"mode must be one of {valid_modes}, got {mode}"}
 
     seq_len = len(prompt_ids)
     if seq_len < 2:
@@ -2051,6 +2154,9 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
             state, prompt_ids, capture_logits=True)
     elif mode == "sequential_via_slices":
         test_logits = forward_prefill_tp_inner_v2_sequential_via_slices(
+            state, prompt_ids, capture_logits=True)
+    elif mode == "per_position_list":
+        test_logits = forward_prefill_tp_inner_v2_per_position_list(
             state, prompt_ids, capture_logits=True)
     test_ms = (_time.time() - t0) * 1000.0
 
