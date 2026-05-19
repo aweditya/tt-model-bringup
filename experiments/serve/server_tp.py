@@ -1045,6 +1045,112 @@ def forward_token_tp(state, token_id, cur_pos):
     return forward_token_tp_inner(state)
 
 
+def forward_prefill_tp_inner_v2_sequential_via_slices(state, prompt_ids, capture_logits=False):
+    """B.2.1 ISOLATION: layer-outer iter with slice/concat plumbing AND
+    sequential MLP per position. Used to localize whether B.2.1's batched_mlp
+    failure is from slice/concat round-trip (TILE_LAYOUT padding artifacts)
+    or from batched MLP itself.
+
+    If THIS path gives cos=1.0 vs decode-loop reference: slice/concat is fine
+    → bug is in batched MLP (`mlp_step_tp` on [seq_len, HIDDEN] differs from
+    per-row MLP).
+
+    If THIS path also gives cos<1.0: slice/concat introduces noise → fix the
+    tensor-handling plumbing before any batching.
+    """
+    import ttnn
+    import numpy as np
+
+    cfg = state.cfg
+    HIDDEN = cfg['hidden']
+    seq_len = len(prompt_ids)
+    VOCAB = state.vocab_size
+
+    # Step 1: per-position embed
+    embed_per_pos = []
+    for pos, tid in enumerate(prompt_ids):
+        update_input_buffers(state, tid, pos)
+        embed_out = ttnn.embedding(
+            state.tok_buf, state.embed_tt,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        x_pos = ttnn.reshape(embed_out, [1, HIDDEN])
+        embed_per_pos.append(x_pos)
+    x_seq = ttnn.concat(embed_per_pos, dim=0)
+    for t in embed_per_pos:
+        ttnn.deallocate(t)
+
+    # Step 2: layer-outer; per-position DN/Attn AND per-position MLP
+    for layer in state.layers:
+        layer_outs = []
+        for pos, tid in enumerate(prompt_ids):
+            update_input_buffers(state, tid, pos)
+            cos_row_raw = ttnn.embedding(state.rot_idxs_buf, state.cos_table_tt,
+                                          layout=ttnn.TILE_LAYOUT,
+                                          memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            sin_row_raw = ttnn.embedding(state.rot_idxs_buf, state.sin_table_tt,
+                                          layout=ttnn.TILE_LAYOUT,
+                                          memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            cos_row_tt = ttnn.reshape(cos_row_raw, [1, state.rotary_dim])
+            sin_row_tt = ttnn.reshape(sin_row_raw, [1, state.rotary_dim])
+
+            x_pos = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
+
+            if layer['type'] == 'linear_attention':
+                x_pos_dn = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
+            else:
+                x_pos_dn = gated_attn_step_tp(
+                    state, x_pos, layer['attn'],
+                    state.cur_pos_buf, 0,
+                    cos_row_tt, sin_row_tt, cfg)
+            ttnn.deallocate(x_pos)
+            ttnn.deallocate(cos_row_tt)
+            ttnn.deallocate(sin_row_tt)
+
+            # SEQUENTIAL MLP per position (vs batched_mlp's batched MLP)
+            x_pos_out = mlp_step_tp(state, x_pos_dn, layer['mlp'])
+            ttnn.deallocate(x_pos_dn)
+            layer_outs.append(x_pos_out)
+
+        ttnn.deallocate(x_seq)
+        x_seq = ttnn.concat(layer_outs, dim=0)
+        for t in layer_outs:
+            ttnn.deallocate(t)
+
+    x_seq = _rms_norm_manual(x_seq, state.final_norm_tt, 1e-6, HIDDEN)
+
+    if capture_logits:
+        sharded_logits_tt = ttnn.linear(x_seq, state.lm_head_tt)
+        gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+        sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [seq_len, VOCAB])
+        rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+        ttnn.deallocate(sharded_logits_tt)
+        ttnn.deallocate(gathered_logits_tt)
+        ttnn.deallocate(sliced_logits_tt)
+        ttnn.synchronize_device(state.mesh)
+        full_arr = ttnn.to_torch(
+            rm_logits_tt,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        )[0].float().cpu().numpy()
+        ttnn.deallocate(rm_logits_tt)
+        ttnn.deallocate(x_seq)
+        return full_arr
+
+    x_last = ttnn.slice(x_seq, [seq_len - 1, 0], [seq_len, HIDDEN])
+    ttnn.deallocate(x_seq)
+    sharded_logits_tt = ttnn.linear(x_last, state.lm_head_tt)
+    gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+    sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [1, VOCAB])
+    rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+    ttnn.deallocate(sharded_logits_tt)
+    ttnn.deallocate(gathered_logits_tt)
+    ttnn.deallocate(sliced_logits_tt)
+    ttnn.deallocate(x_last)
+    ttnn.synchronize_device(state.mesh)
+    return rm_logits_tt
+
+
 def forward_prefill_tp_inner_v2_batched_mlp(state, prompt_ids, capture_logits=False):
     """Phase B.2.1 prefill: layer-outer iteration with batched MLP per layer.
 
@@ -1902,8 +2008,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         prompt_ids = state.tok.encode(prompt)
 
     mode = str(args.get("mode", "stub"))
-    if mode not in ("stub", "batched_mlp"):
-        return {"error": f"mode must be stub or batched_mlp, got {mode}"}
+    if mode not in ("stub", "batched_mlp", "sequential_via_slices"):
+        return {"error": f"mode must be one of stub/batched_mlp/sequential_via_slices, got {mode}"}
 
     seq_len = len(prompt_ids)
     if seq_len < 2:
@@ -1935,6 +2041,9 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         test_logits = forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)
     elif mode == "batched_mlp":
         test_logits = forward_prefill_tp_inner_v2_batched_mlp(
+            state, prompt_ids, capture_logits=True)
+    elif mode == "sequential_via_slices":
+        test_logits = forward_prefill_tp_inner_v2_sequential_via_slices(
             state, prompt_ids, capture_logits=True)
     test_ms = (_time.time() - t0) * 1000.0
 
