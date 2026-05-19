@@ -329,6 +329,7 @@ def cmd_cosine_ladder_tp(args):
             "deltanet_recurrence_mode": mode,
             "deltanet_conv1d_mode": args.deltanet_conv1d_mode,
             "deltanet_decay_gate_mode": args.deltanet_decay_gate_mode,
+            "rope_mode": args.rope_mode,
             "out_path": out_path,
         }))
         raw = P.read_line(sock, max_bytes=64 << 20)
@@ -624,6 +625,12 @@ def main():
                           "through ttnn.experimental.qwen36_decay_gate_decode_owned (G2 "
                           "wire-in: reshapes dt_bias/A_log per-step; G4 will pre-allocate "
                           "rank-2 versions at bootstrap).")
+    cl.add_argument("--rope-mode", choices=["manual", "native_partial"],
+                     default="manual",
+                     help="Gated-attention RoPE path toggle. native_partial routes through "
+                          "slice-first ttnn.experimental.rotary_embedding on rotary_dim=64 "
+                          "with passthrough concat (G3 long-context correctness gate). "
+                          "Prior isolation + guarded-trace probes PASSED May 14-15.")
     cl.set_defaults(fn=cmd_cosine_ladder_tp)
     args = p.parse_args()
     args.fn(args)

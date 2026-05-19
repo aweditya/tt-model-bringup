@@ -5188,6 +5188,10 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     if decay_gate_mode not in ("manual", "owned_decay_gate"):
         return {"error": f"deltanet_decay_gate_mode must be one of manual/owned_decay_gate, got {decay_gate_mode}"}
 
+    rope_mode = str(args.get("rope_mode", state.rope_mode))
+    if rope_mode not in ("manual", "native_partial"):
+        return {"error": f"rope_mode must be one of manual/native_partial, got {rope_mode}"}
+
     P = len(prompt_ids)
     M = len(generated_ids)
     if P + M > MAX_POS:
@@ -5204,9 +5208,11 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     old_mode = state.deltanet_recurrence_mode
     old_conv1d_mode = state.deltanet_conv1d_mode
     old_decay_gate_mode = state.deltanet_decay_gate_mode
+    old_rope_mode = state.rope_mode
     state.deltanet_recurrence_mode = mode
     state.deltanet_conv1d_mode = conv1d_mode
     state.deltanet_decay_gate_mode = decay_gate_mode
+    state.rope_mode = rope_mode
 
     logits_arr = np.empty((M, VOCAB), dtype=np.float32)
 
@@ -5243,6 +5249,7 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         state.deltanet_recurrence_mode = old_mode
         state.deltanet_conv1d_mode = old_conv1d_mode
         state.deltanet_decay_gate_mode = old_decay_gate_mode
+        state.rope_mode = old_rope_mode
 
     np.savez(out_path,
              logits=logits_arr,
@@ -5254,6 +5261,7 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         "deltanet_recurrence_mode": mode,
         "deltanet_conv1d_mode": conv1d_mode,
         "deltanet_decay_gate_mode": decay_gate_mode,
+        "rope_mode": rope_mode,
         "n_prompt": P,
         "n_steps": M,
     }
@@ -5264,6 +5272,7 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         "deltanet_recurrence_mode": mode,
         "deltanet_conv1d_mode": conv1d_mode,
         "deltanet_decay_gate_mode": decay_gate_mode,
+        "rope_mode": rope_mode,
         "n_prompt": P,
         "n_steps": M,
         "vocab": VOCAB,
