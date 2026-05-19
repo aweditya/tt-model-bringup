@@ -98,6 +98,40 @@ def cmd_probe_ccl_components_tp(args):
         print(f"\n[save] {args.out}")
 
 
+def cmd_probe_async_ccl_components_tp(args):
+    data = _send("probe_async_ccl_components_tp", {
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "hidden": args.hidden,
+        "matmul_k": args.matmul_k,
+        "matmul_n": args.matmul_n,
+    }, timeout=900.0)
+    variants = data.get("variants", {})
+    composites = data.get("composites", {})
+    print(f"shape={data.get('shape')} matmul={data.get('matmul_shape')} "
+          f"iters={data.get('iters')} warmup={data.get('warmup')}")
+    print("\nper-variant median (min, p99) ms:")
+    for name, v in variants.items():
+        s = v.get("summary_ms", {})
+        samples = v.get("samples_ms", [])
+        p99 = sorted(samples)[int(len(samples) * 0.99) - 1] if samples else float("nan")
+        print(f"  {name:<34} {s.get('median', float('nan')):.4f}  "
+              f"(min {s.get('min', float('nan')):.4f}, p99 {p99:.4f})")
+    print("\ncomposites:")
+    for k, v in composites.items():
+        sign = "+" if v >= 0 else ""
+        print(f"  {k:<28} {sign}{v:.4f} ms")
+    errors = data.get("errors", {})
+    if errors:
+        print("\nerrors:")
+        for name, msg in errors.items():
+            print(f"  {name}: {msg}")
+    if args.out:
+        _Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        _Path(args.out).write_text(json.dumps(data, indent=2, default=str))
+        print(f"\n[save] {args.out}")
+
+
 def cmd_probe_fused_paged_update_cache_tp(args):
     data = _send("probe_fused_paged_update_cache_tp", {
         "prompt": args.prompt,
@@ -499,6 +533,22 @@ def main():
     ccl.add_argument("--out", default=None,
                       help="path to save full JSON artifact (default: print headline only)")
     ccl.set_defaults(fn=cmd_probe_ccl_components_tp)
+    accl = sub.add_parser("probe_async_ccl_components_tp",
+                            help="G0 async-CCL component bench: sync_baseline vs "
+                                 "async_immediate_sync vs async_double vs async_with_matmul "
+                                 "at production [1,HIDDEN] bf16 shape; gates async-CCL G1 "
+                                 "single-layer overlap prototype")
+    accl.add_argument("--iters", type=int, default=30)
+    accl.add_argument("--warmup", type=int, default=5)
+    accl.add_argument("--hidden", type=int, default=5120,
+                       help="HIDDEN dim of the all_reduce bench tensor")
+    accl.add_argument("--matmul-k", type=int, default=5120,
+                       help="K dim of the overlap-test matmul (input dim)")
+    accl.add_argument("--matmul-n", type=int, default=32768,
+                       help="N dim of the overlap-test matmul (sharded output dim)")
+    accl.add_argument("--out", default=None,
+                       help="path to save full JSON artifact")
+    accl.set_defaults(fn=cmd_probe_async_ccl_components_tp)
     f = sub.add_parser("probe_fused_paged_update_cache_tp",
                        help="validate fused K/V paged-cache writer in resident TP server")
     f.add_argument("--prompt", default="The capital of France is")

@@ -1453,6 +1453,222 @@ def handle_probe_ccl_components_tp(state: MeshServerState, args: dict) -> dict:
     }
 
 
+def handle_probe_async_ccl_components_tp(state: MeshServerState, args: dict) -> dict:
+    """G0: async-CCL component bench at production [1, HIDDEN] shape.
+
+    Compares the SYNC all_reduce (production path, num_links=2) against
+    `ttnn.experimental.all_reduce_async` in three regimes:
+
+      v1 sync_baseline        — production today
+      v2 async_immediate_sync — async launch + immediate barrier; isolates
+                                pure async-vs-sync overhead
+      v3 async_double         — two async ARs back-to-back + single barrier;
+                                tests whether the eth fabric supports
+                                multiple in-flight collectives (parallelism)
+      v4 async_with_matmul    — async AR + an independent DRAM-bandwidth-
+                                bound matmul + single barrier; tests
+                                compute-comm overlap
+      v5 matmul_alone         — matmul without CCL (overlap math baseline)
+      v6 sync_ar_plus_matmul  — sync AR then matmul, both serialized
+                                (overlap math baseline)
+
+    Derived composites:
+      async_overhead_ms        = v2 - v1   (>0 → async slower than sync)
+      async_double_minus_2x    = v3 - 2*v1 (<0 → fabric parallelizes)
+      overlap_savings_ms       = v6 - v4   (>0 → comm overlapped with mm)
+      overlap_capacity_ms      = v5        (max possible save)
+
+    Gate for G1 (single-layer prototype):
+      either async_double_minus_2x < 0 OR overlap_savings_ms > 0.5×v1
+    """
+    import ttnn
+    import torch
+    import time as _time
+    import numpy as np
+
+    iters = int(args.get("iters", 30))
+    warmup = int(args.get("warmup", 5))
+    H = int(args.get("hidden", 5120))
+    K = int(args.get("matmul_k", 5120))
+    N = int(args.get("matmul_n", 32768))
+
+    if iters <= 0:
+        return {"error": "iters must be > 0"}
+    if H % 4 != 0:
+        return {"error": f"H={H} must be divisible by 4 (NCHIPS)"}
+    if N % 4 != 0:
+        return {"error": f"matmul_n={N} must be divisible by 4"}
+
+    grid = state.mesh.compute_with_storage_grid_size()
+    cores = ttnn.CoreRangeSet({
+        ttnn.CoreRange(
+            ttnn.CoreCoord(0, 0),
+            ttnn.CoreCoord(grid.x - 1, grid.y - 1),
+        )
+    })
+
+    # Pre-allocate semaphore POOLS (4 sets — enough headroom for double-buffered
+    # back-to-back launches in v3). Each AR-async call needs 2 barrier + 3 RS +
+    # 2 AG = 7 sems. We allocate 4 * 7 = 28 sems and pick set [0] / set [1] in v3.
+    def make_sem():
+        return ttnn.create_global_semaphore(state.mesh, cores, 0)
+
+    sem_sets = []
+    for _ in range(4):
+        sem_sets.append({
+            "barrier": [make_sem() for _ in range(2)],
+            "rs": [make_sem() for _ in range(3)],
+            "ag": [make_sem() for _ in range(2)],
+        })
+
+    rng = np.random.default_rng(42)
+
+    def fresh_input():
+        x = rng.standard_normal((1, H)).astype(np.float32) * 0.05
+        return ttnn.from_torch(
+            torch.from_numpy(x),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    # Persistent matmul tensors for v4/v5/v6 (~DRAM-bandwidth-bound matmul:
+    # [1, K] @ [K, N] sharded along N=dim1 → per-chip [K, N/4] weight ≈ 84 MB
+    # at default bf16 → ~0.16 ms at 512 GB/s peak. Realistic stand-in for the
+    # next-layer's MLP gate matmul we'd want to overlap.)
+    w_np = (rng.standard_normal((K, N)).astype(np.float32) * 0.01)
+    w_tt = ttnn.from_torch(
+        torch.from_numpy(w_np),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    h_mm_np = rng.standard_normal((1, K)).astype(np.float32) * 0.05
+    h_mm_tt = ttnn.from_torch(
+        torch.from_numpy(h_mm_np),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+
+    def sync():
+        ttnn.synchronize_device(state.mesh)
+
+    def measure(op_fn):
+        # Fresh input per iter to dodge any caching / state leaks.
+        x = fresh_input()
+        sync()
+        t0 = _time.perf_counter()
+        outs = op_fn(x)
+        sync()
+        dt = (_time.perf_counter() - t0) * 1000.0
+        if isinstance(outs, (list, tuple)):
+            for o in outs:
+                if o is not None:
+                    ttnn.deallocate(o)
+        elif outs is not None:
+            ttnn.deallocate(outs)
+        ttnn.deallocate(x)
+        return dt
+
+    def ar_sync(x, L=2):
+        return ttnn.all_reduce(
+            x, cluster_axis=1, memory_config=x.memory_config(),
+            num_links=L, topology=ttnn.Topology.Linear,
+        )
+
+    def ar_async(x, sem_idx=0, L=2):
+        s = sem_sets[sem_idx]
+        return ttnn.experimental.all_reduce_async(
+            x,
+            cluster_axis=1, mesh_device=state.mesh,
+            barrier_semaphores=s["barrier"],
+            rs_global_semaphores=s["rs"],
+            ag_global_semaphores=s["ag"],
+            math_op=ttnn.ReduceType.Sum,
+            num_links=L,
+            memory_config=x.memory_config(),
+            topology=ttnn.Topology.Linear,
+        )
+
+    def mm_op():
+        return ttnn.linear(h_mm_tt, w_tt)
+
+    variants = [
+        ("v1_sync_baseline_L2",         lambda x: ar_sync(x, L=2)),
+        ("v2_async_immediate_sync_L2",  lambda x: ar_async(x, sem_idx=0, L=2)),
+        ("v3_async_double_L1",          lambda x: [
+            ar_async(x, sem_idx=0, L=1),
+            ar_async(x, sem_idx=1, L=1),
+        ]),
+        ("v4_async_with_matmul_L2",     lambda x: [
+            ar_async(x, sem_idx=0, L=2),
+            mm_op(),
+        ]),
+        ("v5_matmul_alone",             lambda x: mm_op()),
+        ("v6_sync_ar_plus_matmul",      lambda x: [ar_sync(x, L=2), mm_op()]),
+    ]
+
+    results = {}
+    errors = {}
+
+    for name, op_fn in variants:
+        try:
+            for _ in range(warmup):
+                measure(op_fn)
+            samples = [measure(op_fn) for _ in range(iters)]
+            results[name] = {"samples_ms": samples, "summary_ms": _summary_ms(samples)}
+        except Exception as e:
+            errors[name] = repr(e)
+
+    # Cleanup persistent tensors.
+    ttnn.deallocate(w_tt)
+    ttnn.deallocate(h_mm_tt)
+
+    composites = {}
+
+    def med(name):
+        return results.get(name, {}).get("summary_ms", {}).get("median", float("nan"))
+
+    v1 = med("v1_sync_baseline_L2")
+    v2 = med("v2_async_immediate_sync_L2")
+    v3 = med("v3_async_double_L1")
+    v4 = med("v4_async_with_matmul_L2")
+    v5 = med("v5_matmul_alone")
+    v6 = med("v6_sync_ar_plus_matmul")
+    composites["async_overhead_ms"] = v2 - v1
+    composites["async_double_minus_2x_v1"] = v3 - 2 * v1
+    composites["overlap_savings_ms"] = v6 - v4
+    composites["overlap_capacity_ms"] = v5
+    composites["v6_serial_baseline_ms"] = v6
+
+    state.last_run = {
+        "cmd": "probe_async_ccl_components_tp",
+        "n_variants": len(results),
+        "n_errors": len(errors),
+    }
+    return {
+        "ok": True,
+        "iters": iters,
+        "warmup": warmup,
+        "shape": [1, H],
+        "matmul_shape": [K, N],
+        "variants": results,
+        "composites": composites,
+        "errors": errors,
+        "note": (
+            "G0 async-CCL component bench. Decision rules: "
+            "(1) ship async (cheaper than sync) iff async_overhead_ms < 0; "
+            "(2) explore fabric parallelism iff async_double_minus_2x_v1 < 0; "
+            "(3) build single-layer overlap iff overlap_savings_ms > 0.5 * v1 "
+            "(equivalently, async truly overlaps a meaningful comm window with compute)."
+        ),
+    }
+
+
 def _read_argmax_id(state: MeshServerState, argmax_tt) -> int:
     import ttnn
     idx_concat = ttnn.to_torch(
@@ -5845,6 +6061,7 @@ HANDLERS = {
     "generate_tp":    handle_generate_tp,
     "bench_decode_tp_components": handle_bench_decode_tp_components,
     "probe_ccl_components_tp": handle_probe_ccl_components_tp,
+    "probe_async_ccl_components_tp": handle_probe_async_ccl_components_tp,
     "probe_fused_paged_update_cache_tp": handle_probe_fused_paged_update_cache_tp,
     "probe_explicit_all_reduce_tp": handle_probe_explicit_all_reduce_tp,
     "probe_rope_fused_qk_tp": handle_probe_rope_fused_qk_tp,
