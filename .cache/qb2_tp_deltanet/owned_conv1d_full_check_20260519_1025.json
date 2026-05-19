@@ -1,0 +1,206 @@
+{
+  "ok": true,
+  "layer_idx": 0,
+  "threshold": 0.05,
+  "comparisons": {
+    "conv_st_split_0": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "actual_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "conv_st_split_1": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "actual_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "conv_st_split_2": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "actual_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "w_conv_split_0": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        0.00017547607421875,
+        -0.000469207763671875,
+        0.0004253387451171875
+      ],
+      "actual_first_3": [
+        0.00017547607421875,
+        -0.000469207763671875,
+        0.0004253387451171875
+      ]
+    },
+    "w_conv_split_1": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        -0.00011205673217773438,
+        -0.0011749267578125,
+        -0.00077056884765625
+      ],
+      "actual_first_3": [
+        -0.00011205673217773438,
+        -0.0011749267578125,
+        -0.00077056884765625
+      ]
+    },
+    "w_conv_split_2": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        -0.0015411376953125,
+        -0.0001811981201171875,
+        -0.0016632080078125
+      ],
+      "actual_first_3": [
+        -0.0015411376953125,
+        -0.0001811981201171875,
+        -0.0016632080078125
+      ]
+    },
+    "w_conv_split_3": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        -0.08056640625,
+        0.08203125,
+        0.07373046875
+      ],
+      "actual_first_3": [
+        -0.08056640625,
+        0.08203125,
+        0.07373046875
+      ]
+    }
+  },
+  "all_match": true,
+  "layout_check": {
+    "combined_conv_st": {
+      "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+      "layout": "Layout.TILE",
+      "dtype": "DataType.BFLOAT16",
+      "shape": "Shape([2560, 3])"
+    },
+    "combined_w_conv": {
+      "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+      "layout": "Layout.TILE",
+      "dtype": "DataType.BFLOAT16",
+      "shape": "Shape([2560, 4])"
+    },
+    "split_conv_st_0": {
+      "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+      "layout": "Layout.TILE",
+      "dtype": "DataType.BFLOAT16",
+      "shape": "Shape([2560, 1])"
+    },
+    "split_w_conv_0": {
+      "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+      "layout": "Layout.TILE",
+      "dtype": "DataType.BFLOAT16",
+      "shape": "Shape([2560, 1])"
+    },
+    "live_slice_conv_st_0": {
+      "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+      "layout": "Layout.TILE",
+      "dtype": "DataType.BFLOAT16",
+      "shape": "Shape([2560, 1])"
+    },
+    "live_slice_w_conv_0": {
+      "memory_config": "MemoryConfig(memory_layout=TensorMemoryLayout::INTERLEAVED,buffer_type=BufferType::DRAM,shard_spec=std::nullopt,nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0)",
+      "layout": "Layout.TILE",
+      "dtype": "DataType.BFLOAT16",
+      "shape": "Shape([2560, 1])"
+    }
+  },
+  "layout_meta_match": true,
+  "forward_check": {
+    "manual_first_5": [
+      -0.0010986328125,
+      -0.00188446044921875,
+      -0.0033721923828125,
+      -0.003143310546875,
+      -0.001739501953125
+    ],
+    "owned_first_5": [
+      -0.0010986328125,
+      -0.00189208984375,
+      -0.0033721923828125,
+      -0.003143310546875,
+      -0.00174713134765625
+    ],
+    "max_abs_diff": 6.103515625e-05,
+    "mean_abs_diff": 2.707842270410765e-07,
+    "p99_abs_diff": 7.62939453125e-06,
+    "num_above_1e_3": 0,
+    "shape_match": true,
+    "shape": [
+      10240
+    ]
+  },
+  "forward_clean": true,
+  "diagnosis": "CHECK split-data: PASS (bootstrap pre-split is bit-exact vs slicing) | CHECK layout-meta: PASS (split and live-slice memory_config match) | CHECK single-forward: PASS (owned kernel produces same conv_out as manual chain on mesh at zero state). Bug is in MULTI-STEP state evolution \u2014 kernel's per-call output is right, but state mutation across forwards goes wrong."
+}
