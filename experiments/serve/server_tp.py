@@ -114,7 +114,11 @@ class MeshServerState:
         # Experiment guard. Production default stays on the validated two-call
         # paged_update_cache path; probe endpoints may flip this temporarily.
         self.use_fused_paged_update = False
-        self.collective_mode = "baseline"
+        # 2026-05-19: defaulted to explicit_all_reduce after P1 probe
+        # (probe_ccl_components_tp) showed num_links=2 is 11.2% faster than
+        # num_links=1 at production [1, 5120] bf16 shape; the bare
+        # `ttnn.all_reduce(partial)` path uses unknown defaults.
+        self.collective_mode = "explicit_all_reduce"
         self.rope_mode = "manual"
         self.deltanet_decay_mode = "manual"
         # 2026-05-18: defaulted to "owned_gdn" after Tier 3 long-context gate
@@ -572,7 +576,10 @@ def _tp_all_reduce(state: MeshServerState, partial):
             partial,
             cluster_axis=1,
             memory_config=partial.memory_config(),
-            num_links=1,
+            # P1 SHIPPED 2026-05-19: num_links=2 measured 11.2% faster than
+            # num_links=1 at [1, 5120] bf16 (probe_ccl_components_tp). BH
+            # P150x4 supports 2 eth links per axis.
+            num_links=2,
             topology=ttnn.Topology.Linear,
         )
     try:
