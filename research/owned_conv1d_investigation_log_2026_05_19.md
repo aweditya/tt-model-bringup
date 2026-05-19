@@ -43,12 +43,48 @@ through the resident server's mesh-sharded `deltanet_step_tp` owned branch.
    (`--modes manual --deltanet-conv1d-mode owned_conv1d`) hung because
    of the cumulative-slowdown issue (see below); we never got a clean
    answer on whether owned_conv1d works without owned_gdn active.
-3. **Pre-split data correctness on mesh** —
-   `dn['w_conv_split'][k] != dn['w_conv'][:, k:k+1]` is possible if
-   `upload_sharded(relayout_conv(np[:, k:k+1]), dim=0)` doesn't produce
-   the same per-chip distribution as
-   `upload_sharded(relayout_conv(np), dim=0)[:, k:k+1]`. Single-device
-   probe can't catch this — needs a mesh-aware tensor-equality probe.
+3. ~~**Pre-split data correctness on mesh**~~ **REFUTED 2026-05-19** —
+   `probe_deltanet_conv1d_split_check_tp` (commit `1417feb`) confirmed
+   at layer 0 that ALL 7 split tensors (3 state + 4 weight) match
+   column slices of the combined tensors at `max_abs_diff = 0.0`
+   bit-exact. Bootstrap pre-split upload is correct on mesh.
+   Artifact: `.cache/qb2_tp_deltanet/owned_conv1d_split_check_layer0_20260519_0941.json`.
+
+## 2026-05-19 update — probe finding narrows the hypothesis
+
+The mesh-aware split-vs-combined probe REFUTED hypothesis 3 above. The
+G4 wire-in's pre-split tensors are byte-equivalent to slices of the
+combined tensors. Therefore the G4 13.2% disagreement (at step 0,
+cos 0.017 with all-zero state) cannot come from wrong split data.
+
+Remaining live hypotheses for the next investigation step:
+
+- **Hypothesis A (mesh kernel dispatch)**: when called with mesh-sharded
+  tensors, the owned conv1d op may be dispatched differently per-chip
+  than its single-device G0 test exercises. Need a mesh-aware
+  **single-forward conv_out comparison probe**: synthesize a fixed
+  `mixed_qkv`, reset state to zero, run the manual conv1d block, run
+  the owned conv1d block (kernel), compare conv_out element-wise. If
+  they differ at step 0 with zero state, the kernel itself produces
+  wrong output on mesh.
+- **Hypothesis B (memory_config/layout asymmetry)**: even though the
+  tensor data is bit-equivalent, `dn['conv_st_split'][k]` may have a
+  different `memory_config` (interleaved vs sharded, L1 vs DRAM,
+  alignment) than a slice of `dn['conv_st']` produces. The kernel may
+  silently mis-interpret such inputs. Test: read back the
+  `tensor.memory_config()` and `tensor.layout` of both and compare.
+- **Hypothesis C (mode-toggle JIT/cache thrash)**: switching
+  `state.deltanet_conv1d_mode` mid-lifetime may trigger different
+  kernel compilation paths whose interaction is buggy. Less likely
+  given G3 ran to completion at 7.8% disagreement (kernel produced
+  SOMETHING coherent), but worth a control experiment with the
+  default flipped to owned at bootstrap (so the trace captures it
+  natively).
+
+Recommended next single probe: extend
+`probe_deltanet_conv1d_split_check_tp` to also do the single-forward
+conv_out comparison described in Hypothesis A. ~30 lines of
+additional probe code; one fresh-server run answers definitively.
 
 ## Newly-confirmed workflow gotcha (2026-05-19 small hours)
 

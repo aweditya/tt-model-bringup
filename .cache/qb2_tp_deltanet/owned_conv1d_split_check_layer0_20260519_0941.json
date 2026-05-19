@@ -1,0 +1,142 @@
+{
+  "ok": true,
+  "layer_idx": 0,
+  "threshold": 0.05,
+  "comparisons": {
+    "conv_st_split_0": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "actual_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "conv_st_split_1": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "actual_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "conv_st_split_2": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "actual_first_3": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "w_conv_split_0": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        0.00017547607421875,
+        -0.000469207763671875,
+        0.0004253387451171875
+      ],
+      "actual_first_3": [
+        0.00017547607421875,
+        -0.000469207763671875,
+        0.0004253387451171875
+      ]
+    },
+    "w_conv_split_1": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        -0.00011205673217773438,
+        -0.0011749267578125,
+        -0.00077056884765625
+      ],
+      "actual_first_3": [
+        -0.00011205673217773438,
+        -0.0011749267578125,
+        -0.00077056884765625
+      ]
+    },
+    "w_conv_split_2": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        -0.0015411376953125,
+        -0.0001811981201171875,
+        -0.0016632080078125
+      ],
+      "actual_first_3": [
+        -0.0015411376953125,
+        -0.0001811981201171875,
+        -0.0016632080078125
+      ]
+    },
+    "w_conv_split_3": {
+      "shape_match": true,
+      "expected_shape": [
+        10240,
+        1
+      ],
+      "max_abs_diff": 0.0,
+      "pass_gate": true,
+      "expected_first_3": [
+        -0.08056640625,
+        0.08203125,
+        0.07373046875
+      ],
+      "actual_first_3": [
+        -0.08056640625,
+        0.08203125,
+        0.07373046875
+      ]
+    }
+  },
+  "all_match": true,
+  "diagnosis": "split tensors MATCH the column slices of combined tensors. The G3/G4 conv1d wire-in bug is NOT in the bootstrap pre-split upload. Bug is in mesh kernel dispatch (next probe) or multi-step state evolution."
+}
