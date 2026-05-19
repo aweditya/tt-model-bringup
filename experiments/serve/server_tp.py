@@ -5234,6 +5234,125 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     }
 
 
+def handle_probe_deltanet_conv1d_split_check_tp(state: MeshServerState, args: dict) -> dict:
+    """Mesh-aware probe for the owned conv1d wire-in bug investigation
+    (commit 64a31b1 documents the G3/G4 failures).
+
+    Reads back both the combined dn['conv_st']/dn['w_conv'] (rank-2,
+    [CONV_DIM_CHIP, K] padded [chip_rows, 32]) and the split tensors
+    dn['conv_st_split'][k]/dn['w_conv_split'][k] (rank-2, [CONV_DIM_CHIP, 1]
+    padded [chip_rows, 32]) from a chosen DeltaNet layer, via the mesh
+    composer. Compares each split[k] to the column-k slice of combined.
+
+    If split[k] != combined[:, k:k+1] at BF16-tolerance, the G4 bootstrap
+    pre-split upload is buggy on mesh (likely a relayout_conv interaction
+    with single-column input + ShardTensorToMesh dim=0). If they match,
+    the bug is in mesh kernel dispatch or multi-step state evolution.
+
+    args:
+      layer_idx:    int  (default 0) — DeltaNet layer to inspect
+      max_abs_diff: float (default 0.05) — BF16-tolerance threshold
+
+    Returns: {ok, layer_idx, comparisons, all_match, diagnosis}.
+    """
+    import numpy as np
+    import ttnn
+
+    if state.mesh is None or not state.layers:
+        return {"error": "server not fully loaded"}
+
+    layer_idx = int(args.get("layer_idx", 0))
+    threshold = float(args.get("max_abs_diff", 0.05))
+
+    dn_layers = [(i, L) for i, L in enumerate(state.layers) if L["type"] == "linear_attention"]
+    if not dn_layers:
+        return {"error": "no DeltaNet layers in state.layers"}
+    if layer_idx < 0 or layer_idx >= len(dn_layers):
+        return {"error": f"layer_idx out of range; only {len(dn_layers)} DeltaNet layers"}
+    dn = dn_layers[layer_idx][1]["dn"]
+    if "conv_st_split" not in dn or "w_conv_split" not in dn:
+        return {"error": "this server lacks pre-split conv_st/w_conv tensors (rebuild against G4 server_tp)"}
+
+    def readback(t):
+        return ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        ).float().cpu().numpy()
+
+    conv_st_combined = readback(dn["conv_st"])
+    w_conv_combined = readback(dn["w_conv"])
+    conv_st_split_np = [readback(t) for t in dn["conv_st_split"]]
+    w_conv_split_np = [readback(t) for t in dn["w_conv_split"]]
+
+    comparisons = {}
+    all_match = True
+
+    def compare(name, combined, split_list, K):
+        nonlocal all_match
+        for k in range(K):
+            if combined.ndim != 2:
+                comparisons[f"{name}_{k}"] = {
+                    "shape_match": False,
+                    "combined_shape": list(combined.shape),
+                    "reason": f"combined is not rank-2: shape {combined.shape}",
+                }
+                all_match = False
+                continue
+            expected = combined[:, k:k + 1]
+            actual = split_list[k]
+            if expected.shape != actual.shape:
+                comparisons[f"{name}_{k}"] = {
+                    "shape_match": False,
+                    "expected_shape": list(expected.shape),
+                    "actual_shape": list(actual.shape),
+                }
+                all_match = False
+                continue
+            diff = np.abs(expected - actual)
+            max_diff = float(diff.max())
+            pass_gate = max_diff <= threshold
+            comparisons[f"{name}_{k}"] = {
+                "shape_match": True,
+                "expected_shape": list(expected.shape),
+                "max_abs_diff": max_diff,
+                "pass_gate": pass_gate,
+                "expected_first_3": expected[:3].flatten().tolist(),
+                "actual_first_3": actual[:3].flatten().tolist(),
+            }
+            if not pass_gate:
+                all_match = False
+
+    compare("conv_st_split", conv_st_combined, conv_st_split_np, 3)
+    compare("w_conv_split", w_conv_combined, w_conv_split_np, 4)
+
+    diagnosis = (
+        "split tensors MATCH the column slices of combined tensors. The "
+        "G3/G4 conv1d wire-in bug is NOT in the bootstrap pre-split upload. "
+        "Bug is in mesh kernel dispatch (next probe) or multi-step state evolution."
+        if all_match else
+        "split tensors DO NOT MATCH column slices of combined tensors. "
+        "The bootstrap pre-split (relayout_conv on [D, 1] input + ShardTensorToMesh) "
+        "produces a different result than slicing the combined tensor's column. "
+        "Fix: pre-split AT THE SLICE LEVEL (slice combined first, then upload each "
+        "column as its own tensor with ShardTensorToMesh), OR debug relayout_conv "
+        "for single-column input."
+    )
+
+    state.last_run = {
+        "cmd": "probe_deltanet_conv1d_split_check_tp",
+        "layer_idx": layer_idx,
+        "all_match": all_match,
+    }
+
+    return {
+        "ok": True,
+        "layer_idx": layer_idx,
+        "threshold": threshold,
+        "comparisons": comparisons,
+        "all_match": all_match,
+        "diagnosis": diagnosis,
+    }
+
+
 HANDLERS = {
     "status":         handle_status,
     "generate_tp":    handle_generate_tp,
@@ -5254,6 +5373,7 @@ HANDLERS = {
     "probe_deltanet_owned_gdn_benchmark_tp": handle_probe_deltanet_owned_gdn_benchmark_tp,
     "probe_deltanet_softplus_decay_tp": handle_probe_deltanet_softplus_decay_tp,
     "cosine_ladder_tp": handle_cosine_ladder_tp,
+    "probe_deltanet_conv1d_split_check_tp": handle_probe_deltanet_conv1d_split_check_tp,
     "shutdown":       handle_shutdown,
 }
 
