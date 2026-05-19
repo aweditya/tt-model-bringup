@@ -248,6 +248,26 @@ def bootstrap(state: MeshServerState):
             w_in_tt = upload_sharded(w_in_sh, dim=1)
             w_conv_tt = upload_sharded(w_conv_sh, dim=0)
             conv_state_tt = upload_sharded(conv_state_sh, dim=0)
+            # G4 conv1d pre-split: 3 single-column conv_st tensors + 4 single-column
+            # w_conv tensors per layer. Used by the owned conv1d path to eliminate
+            # the per-step slice/concat that caused the G3 wire-in bug (commit
+            # df1cccc / e168c4d). Single-column source numpy arrays are created
+            # at construction so the bf16 tile lands with data in column 0 (the
+            # only position the owned kernel reads). The kernel mutates these
+            # tensors in place via its writer — no concat-and-copy roundtrip.
+            # Memory cost: 7 × [CONV_DIM/4, 1] bf16 × 48 DeltaNet layers ≈ 1.7 MB
+            # per chip — negligible vs the 21 GB residency footprint.
+            KERNEL = cfg['conv_kernel']  # 4
+            conv_state_split_tt = [
+                upload_sharded(
+                    relayout_conv(np.zeros((CONV_DIM, 1), dtype=np.float32)),
+                    dim=0)
+                for _ in range(KERNEL - 1)]
+            w_conv_split_tt = [
+                upload_sharded(
+                    relayout_conv(conv_w_np[:, k:k+1].astype(np.float32)),
+                    dim=0)
+                for k in range(KERNEL)]
             dt_bias_tt = upload_sharded(w_np['dt_bias'], dim=0)
             A_log_tt = upload_sharded(w_np['A_log'], dim=0)
             w_out_tt = upload_sharded(w_np['out_proj'], dim=0)
@@ -265,6 +285,8 @@ def bootstrap(state: MeshServerState):
                 'type': 'linear_attention',
                 'dn': {
                     'w_in': w_in_tt, 'w_conv': w_conv_tt, 'conv_st': conv_state_tt,
+                    'conv_st_split': conv_state_split_tt,
+                    'w_conv_split': w_conv_split_tt,
                     'dt_bias': dt_bias_tt, 'A_log': A_log_tt, 'w_out': w_out_tt,
                     'ssm': ssm_tt,
                     'input_norm': input_norm_tt,
@@ -579,33 +601,27 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     # 4. conv1d on per-chip slab
     with _profile_scope(state, "deltanet_conv"):
         if state.deltanet_conv1d_mode == "owned_conv1d":
-            # Owned conv1d kernel path (G3 correctness validation).
-            # The kernel takes 4 separate tap CBs (state0/1/2/mixed) and 4
-            # separate weight CBs (w0..3), each shaped [D, 1] padded [D, 32].
-            # For G3 we slice the production [D, K-1=3] state and [D, K=4]
-            # weights per-step; G4 will pre-split at bootstrap to remove
-            # this overhead. The writer kernel mutates state0/1/2 in place
-            # with state1/state2/mixed (the shift), so the slice outputs
-            # ARE the shifted state for the next step — concat them to
-            # produce conv_state_new which the end-of-step ttnn.copy will
-            # write back into dn['conv_st'].
-            conv_st = dn['conv_st']
-            w_conv = dn['w_conv']
-            state0 = ttnn.slice(conv_st, [0, 0], [CONV_DIM_CHIP, 1])
-            state1 = ttnn.slice(conv_st, [0, 1], [CONV_DIM_CHIP, 2])
-            state2 = ttnn.slice(conv_st, [0, 2], [CONV_DIM_CHIP, 3])
-            w0 = ttnn.slice(w_conv, [0, 0], [CONV_DIM_CHIP, 1])
-            w1 = ttnn.slice(w_conv, [0, 1], [CONV_DIM_CHIP, 2])
-            w2 = ttnn.slice(w_conv, [0, 2], [CONV_DIM_CHIP, 3])
-            w3 = ttnn.slice(w_conv, [0, 3], [CONV_DIM_CHIP, 4])
+            # Owned conv1d kernel — G4 PRE-SPLIT design (after the G3 wire-in
+            # bug investigation in df1cccc / e168c4d showed per-step slice+
+            # concat+copy_back was broken at multi-step state persistence).
+            #
+            # dn['conv_st_split'] holds 3 single-column state tensors (one per
+            # historical tap). dn['w_conv_split'] holds 4 single-column weight
+            # tensors. Both pre-allocated at Stage B bootstrap with data
+            # in tile-column 0 (the only position the kernel reads).
+            #
+            # The kernel mutates state0/1/2 IN PLACE via its writer (state0 ←
+            # state1, state1 ← state2, state2 ← mixed). No concat. No copy
+            # back to dn['conv_st']. Next forward call reads the already-
+            # shifted split tensors directly.
+            state0, state1, state2 = dn['conv_st_split']
+            w0, w1, w2, w3 = dn['w_conv_split']
             mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
             ttnn.deallocate(mixed_qkv)
-            s0_out, s1_out, s2_out, conv_out_2d = ttnn.experimental.qwen36_conv1d_decode_owned(
+            _, _, _, conv_out_2d = ttnn.experimental.qwen36_conv1d_decode_owned(
                 mixed_col, state0, state1, state2, w0, w1, w2, w3)
             ttnn.deallocate(mixed_col)
-            conv_state_new = ttnn.concat([s0_out, s1_out, s2_out], dim=-1)
-            ttnn.deallocate(s0_out); ttnn.deallocate(s1_out); ttnn.deallocate(s2_out)
-            ttnn.deallocate(w0); ttnn.deallocate(w1); ttnn.deallocate(w2); ttnn.deallocate(w3)
+            conv_state_new = None  # owned path mutates split tensors in place
             conv_out = ttnn.reshape(conv_out_2d, [CONV_DIM_CHIP])
             ttnn.deallocate(conv_out_2d)
         else:
@@ -715,8 +731,11 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
         else:
             ttnn.copy(H_new, dn['ssm'])
             ttnn.deallocate(H_new)
-        ttnn.copy(conv_state_new, dn['conv_st'])
-        ttnn.deallocate(conv_state_new)
+        # G4: owned conv1d mutates dn['conv_st_split'] tensors in place via
+        # its writer kernel — no concat-and-copy back. conv_state_new is None.
+        if conv_state_new is not None:
+            ttnn.copy(conv_state_new, dn['conv_st'])
+            ttnn.deallocate(conv_state_new)
     return x_out
 
 
@@ -1028,6 +1047,11 @@ def _reset_state_buffers(state):
         torch.zeros(CONV_DIM, cfg['conv_kernel'] - 1, dtype=torch.float32),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
         mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0))
+    # G4 conv1d pre-split: zero buffer for each split conv_st tap ([CONV_DIM, 1]).
+    conv_split_host = ttnn.from_torch(
+        torch.zeros(CONV_DIM, 1, dtype=torch.float32),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0))
     kv_host = ttnn.from_torch(
         torch.zeros(NUM_BLOCKS, cfg['n_kv_heads'], BLOCK_SIZE, cfg['head_dim'],
                        dtype=torch.float32),
@@ -1037,6 +1061,9 @@ def _reset_state_buffers(state):
         if layer['type'] == 'linear_attention':
             ttnn.copy_host_to_device_tensor(ssm_host, layer['dn']['ssm'])
             ttnn.copy_host_to_device_tensor(conv_host, layer['dn']['conv_st'])
+            # G4: also reset split tensors used by owned conv1d path.
+            for split_tt in layer['dn'].get('conv_st_split', []):
+                ttnn.copy_host_to_device_tensor(conv_split_host, split_tt)
         else:
             ttnn.copy_host_to_device_tensor(kv_host, layer['attn']['kc'])
             ttnn.copy_host_to_device_tensor(kv_host, layer['attn']['vc'])
