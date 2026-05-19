@@ -5378,6 +5378,7 @@ def handle_probe_deltanet_conv1d_split_check_tp(state: MeshServerState, args: di
             torch.from_numpy(mixed_full),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
             mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
         )
 
