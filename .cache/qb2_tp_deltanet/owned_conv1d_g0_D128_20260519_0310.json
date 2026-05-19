@@ -1,0 +1,28 @@
+{
+  "d": 128,
+  "dtype": "bfloat16",
+  "debug_fill": false,
+  "elapsed_ms": 14.623334864154458,
+  "max_abs_diff_threshold": 0.005,
+  "out": {
+    "max_abs_diff": 0.0038882791996002197,
+    "pcc": 0.9999913024089164,
+    "pass": true
+  },
+  "state0_next": {
+    "max_abs_diff": 0.0009236037731170654,
+    "pcc": 0.9999991064563444,
+    "pass": true
+  },
+  "state1_next": {
+    "max_abs_diff": 0.0009599626064300537,
+    "pcc": 0.999998567851708,
+    "pass": true
+  },
+  "state2_next": {
+    "max_abs_diff": 0.0009759068489074707,
+    "pcc": 0.999999043438723,
+    "pass": true
+  },
+  "pass_gate": true
+}

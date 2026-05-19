@@ -34,7 +34,7 @@ constexpr uint32_t ONE_TILE = 1;
 FORCE_INLINE void mul_front(uint32_t cb_a, uint32_t cb_b, uint32_t cb_out) {
     reconfig_data_format(cb_a, cb_b);
     pack_reconfig_data_format(cb_out);
-    mul_tiles_init(cb_a, cb_b, false, __builtin_LINE());
+    mul_tiles_init(cb_a, cb_b);
     cb_wait_front(cb_a, ONE_TILE);
     cb_wait_front(cb_b, ONE_TILE);
     cb_reserve_back(cb_out, ONE_TILE);
