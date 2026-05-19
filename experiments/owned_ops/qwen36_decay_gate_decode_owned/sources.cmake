@@ -1,0 +1,9 @@
+set(QWEN36_DECAY_GATE_DECODE_OWNED_SRC
+    qwen36_decay_gate_decode_owned/qwen36_decay_gate_decode_owned.cpp
+    qwen36_decay_gate_decode_owned/device/qwen36_decay_gate_decode_owned_device_operation.cpp
+    qwen36_decay_gate_decode_owned/device/qwen36_decay_gate_decode_owned_program_factory.cpp
+)
+
+set(QWEN36_DECAY_GATE_DECODE_OWNED_NANOBIND_SRC
+    qwen36_decay_gate_decode_owned/qwen36_decay_gate_decode_owned_nanobind.cpp
+)
