@@ -223,6 +223,52 @@ def main() -> int:
         print(f"  oracle[0:5]: {[f'{x:.4f}' for x in oracle[:5]]}")
 
         # ============================================================
+        # CHECK 4 — STATE SHIFT VERIFICATION
+        # The kernel mutates state0/1/2 in place. Expected post-kernel:
+        #   s0_out == original state1 (= conv_st[:, 1])
+        #   s1_out == original state2 (= conv_st[:, 2])
+        #   s2_out == original mixed
+        # If any of these mismatches, the writer kernel is shifting the
+        # wrong content to the wrong slot — the smoking-gun bug for the
+        # G3 multi-step divergence pattern (which ramps up over K=4 steps).
+        # ============================================================
+        print("\n=== CHECK 4 — state shift verification ===")
+        s0_back = ttnn.to_torch(s0_out).float().cpu().numpy()
+        s1_back = ttnn.to_torch(s1_out).float().cpu().numpy()
+        s2_back = ttnn.to_torch(s2_out).float().cpu().numpy()
+        if s0_back.ndim == 2 and s0_back.shape[1] == 1: s0_back = s0_back[:, 0]
+        if s1_back.ndim == 2 and s1_back.shape[1] == 1: s1_back = s1_back[:, 0]
+        if s2_back.ndim == 2 and s2_back.shape[1] == 1: s2_back = s2_back[:, 0]
+
+        expected_s0 = np_conv_st[:, 1]  # shift: new state0 = old state1
+        expected_s1 = np_conv_st[:, 2]  # shift: new state1 = old state2
+        expected_s2 = np_mixed          # shift: new state2 = old mixed
+
+        s0_diff = float(np.abs(s0_back - expected_s0).max())
+        s1_diff = float(np.abs(s1_back - expected_s1).max())
+        s2_diff = float(np.abs(s2_back - expected_s2).max())
+
+        report["check4_state_shift"] = {
+            "s0_out_max_diff_vs_expected_state1": s0_diff,
+            "s1_out_max_diff_vs_expected_state2": s1_diff,
+            "s2_out_max_diff_vs_expected_mixed":  s2_diff,
+            "s0_first_3": s0_back[:3].tolist(),
+            "s1_first_3": s1_back[:3].tolist(),
+            "s2_first_3": s2_back[:3].tolist(),
+            "expected_s0_first_3": expected_s0[:3].tolist(),
+            "expected_s1_first_3": expected_s1[:3].tolist(),
+            "expected_s2_first_3": expected_s2[:3].tolist(),
+        }
+        print(f"  s0_out (should == state1):  first[0]={s0_back[0]:.4f}  expected={expected_s0[0]:.4f}  max_diff={s0_diff:.6f}")
+        print(f"  s1_out (should == state2):  first[0]={s1_back[0]:.4f}  expected={expected_s1[0]:.4f}  max_diff={s1_diff:.6f}")
+        print(f"  s2_out (should == mixed):   first[0]={s2_back[0]:.4f}  expected={expected_s2[0]:.4f}  max_diff={s2_diff:.6f}")
+
+        # state shift threshold — bf16 should be exact byte-copy, max_diff
+        # within 1 BF16 ULP at the input magnitude (here ~0.05 at most).
+        SHIFT_TOL = 0.05
+        shift_clean = s0_diff <= SHIFT_TOL and s1_diff <= SHIFT_TOL and s2_diff <= SHIFT_TOL
+
+        # ============================================================
         # DIAGNOSIS
         # ============================================================
         slice_clean = all(
@@ -238,14 +284,26 @@ def main() -> int:
             "manual_chain_correct": manual_clean,
             "owned_matches_oracle": owned_oracle_clean,
             "owned_matches_manual": owned_manual_clean,
+            "state_shift_clean": shift_clean,
         }
 
-        if slice_clean and owned_oracle_clean and owned_manual_clean:
+        if not shift_clean:
+            diagnosis["conclusion"] = (
+                "STATE SHIFT BUG CONFIRMED. The kernel's writer is mutating state "
+                "slots with WRONG content. Expected: s0=state1, s1=state2, s2=mixed. "
+                "Actual mismatch in at least one slot. This explains the G3 multi-step "
+                "ramp pattern (cos drops to 0.80 after K=4 steps as the wrong state "
+                "values propagate through the recurrence). The bug is in the writer "
+                "kernel's CB-to-output-buffer mapping OR in the reader kernel's "
+                "shift-CB population order."
+            )
+        elif slice_clean and owned_oracle_clean and owned_manual_clean and shift_clean:
             diagnosis["conclusion"] = (
                 "BUG NOT REPRODUCED in this probe. Single-step single-layer slice + "
-                "owned kernel produces correct output. The G3 7.8% disagreement must "
-                "come from somewhere else — maybe the state-shift writes interact with "
-                "subsequent forward calls in a way this single-shot probe doesn't see."
+                "owned kernel produces correct output AND state shift is correct. The "
+                "G3 7.8% disagreement must come from somewhere else — likely the "
+                "concat-then-copy back to dn['conv_st'] (multi-step state persistence) "
+                "or mesh-sharding semantics this single-device probe doesn't exercise."
             )
         elif not slice_clean:
             diagnosis["conclusion"] = (

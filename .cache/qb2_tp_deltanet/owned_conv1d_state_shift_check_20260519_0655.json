@@ -1,0 +1,214 @@
+{
+  "d": 2560,
+  "dtype": "bfloat16",
+  "seed": 0,
+  "check1_slice_readback": {
+    "conv_st_col_0": {
+      "ttnn_shape_str": "Shape([2560, 1])",
+      "readback_shape": [
+        2560,
+        1
+      ],
+      "first_3_values": [
+        1.140625,
+        0.76953125,
+        0.5390625
+      ],
+      "expected_first_3": [
+        1.1369616985321045,
+        0.7697867155075073,
+        0.5409735441207886
+      ],
+      "max_abs_diff_vs_numpy_slice": 0.0039044618606567383
+    },
+    "conv_st_col_1": {
+      "ttnn_shape_str": "Shape([2560, 1])",
+      "readback_shape": [
+        2560,
+        1
+      ],
+      "first_3_values": [
+        2.171875,
+        1.890625,
+        1.6953125
+      ],
+      "expected_first_3": [
+        2.1727371215820312,
+        1.8923465013504028,
+        1.6982864141464233
+      ],
+      "max_abs_diff_vs_numpy_slice": 0.007810831069946289
+    },
+    "conv_st_col_2": {
+      "ttnn_shape_str": "Shape([2560, 1])",
+      "readback_shape": [
+        2560,
+        1
+      ],
+      "first_3_values": [
+        2.859375,
+        3.359375,
+        2.875
+      ],
+      "expected_first_3": [
+        2.8547728061676025,
+        3.354759931564331,
+        2.8801419734954834
+      ],
+      "max_abs_diff_vs_numpy_slice": 0.007807731628417969
+    },
+    "w_conv_col_0": {
+      "max_abs_diff_vs_numpy_slice": 0.0004880577325820923,
+      "readback_shape": [
+        2560,
+        1
+      ],
+      "first_3_values": [
+        0.06298828125,
+        0.1416015625,
+        0.0703125
+      ],
+      "expected_first_3": [
+        0.0628357082605362,
+        0.1412133425474167,
+        0.0702669695019722
+      ]
+    },
+    "w_conv_col_1": {
+      "max_abs_diff_vs_numpy_slice": 0.00048820674419403076,
+      "readback_shape": [
+        2560,
+        1
+      ],
+      "first_3_values": [
+        0.2373046875,
+        0.1962890625,
+        0.1650390625
+      ],
+      "expected_first_3": [
+        0.2374367117881775,
+        0.1965014934539795,
+        0.16538548469543457
+      ]
+    },
+    "w_conv_col_2": {
+      "max_abs_diff_vs_numpy_slice": 0.0009763538837432861,
+      "readback_shape": [
+        2560,
+        1
+      ],
+      "first_3_values": [
+        0.279296875,
+        0.33203125,
+        0.29296875
+      ],
+      "expected_first_3": [
+        0.2794707715511322,
+        0.33190321922302246,
+        0.292472243309021
+      ]
+    },
+    "w_conv_col_3": {
+      "max_abs_diff_vs_numpy_slice": 0.0009762942790985107,
+      "readback_shape": [
+        2560,
+        1
+      ],
+      "first_3_values": [
+        0.419921875,
+        0.408203125,
+        0.39453125
+      ],
+      "expected_first_3": [
+        0.4192805588245392,
+        0.4082120358943939,
+        0.3944332003593445
+      ]
+    }
+  },
+  "check2_manual_vs_oracle": {
+    "max_abs_diff": 0.02898383140563965,
+    "manual_first_5": [
+      2.890625,
+      2.96875,
+      2.703125,
+      3.390625,
+      2.34375
+    ],
+    "oracle_first_5": [
+      2.881263494491577,
+      2.970669746398926,
+      2.7035231590270996,
+      3.407604217529297,
+      2.352271795272827
+    ]
+  },
+  "check3_owned_vs_oracle_and_manual": {
+    "owned_vs_oracle_max_diff": 0.032944679260253906,
+    "owned_vs_manual_max_diff": 0.03125,
+    "owned_first_5": [
+      2.890625,
+      2.96875,
+      2.71875,
+      3.390625,
+      2.359375
+    ],
+    "manual_first_5": [
+      2.890625,
+      2.96875,
+      2.703125,
+      3.390625,
+      2.34375
+    ],
+    "oracle_first_5": [
+      2.881263494491577,
+      2.970669746398926,
+      2.7035231590270996,
+      3.407604217529297,
+      2.352271795272827
+    ]
+  },
+  "check4_state_shift": {
+    "s0_out_max_diff_vs_expected_state1": 0.007810831069946289,
+    "s1_out_max_diff_vs_expected_state2": 0.007807731628417969,
+    "s2_out_max_diff_vs_expected_mixed": 0.015575885772705078,
+    "s0_first_3": [
+      2.171875,
+      1.890625,
+      1.6953125
+    ],
+    "s1_first_3": [
+      2.859375,
+      3.359375,
+      2.875
+    ],
+    "s2_first_3": [
+      3.90625,
+      3.703125,
+      4.3125
+    ],
+    "expected_s0_first_3": [
+      2.1727371215820312,
+      1.8923465013504028,
+      1.6982864141464233
+    ],
+    "expected_s1_first_3": [
+      2.8547728061676025,
+      3.354759931564331,
+      2.8801419734954834
+    ],
+    "expected_s2_first_3": [
+      3.9030842781066895,
+      3.698953866958618,
+      4.303202152252197
+    ]
+  },
+  "diagnosis": {
+    "slice_readback_clean": true,
+    "manual_chain_correct": true,
+    "owned_matches_oracle": true,
+    "owned_matches_manual": true,
+    "state_shift_clean": true,
+    "conclusion": "BUG NOT REPRODUCED in this probe. Single-step single-layer slice + owned kernel produces correct output AND state shift is correct. The G3 7.8% disagreement must come from somewhere else \u2014 likely the concat-then-copy back to dn['conv_st'] (multi-step state persistence) or mesh-sharding semantics this single-device probe doesn't exercise."
+  }
+}

@@ -3,7 +3,59 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
-## Current Status (2026-05-18 late evening) — owned_gdn DEFAULTED + conv1d G0 PASS + wire-in + decay/gate scaffolded
+## Current Status (2026-05-19 small hours) — G3 conv1d wire-in FAILED, G4 pre-split fix bootstrapping
+
+**Newest session arc (after the late-evening 2026-05-18 wire-in `c98269d`)**:
+
+1. **G3 conv1d FAILED** (commit `df1cccc`): cosine_ladder_tp owned_conv1d
+   at 500 positions on JSON parser combinator showed 39/500 = 7.8% top-1
+   disagreement, first flip at step 17, median cosine 0.9833. Trajectory
+   was flat across 500 steps (NOT a slow drift) — divergence ramped up over
+   the first ~4 steps (the conv1d kernel size), then oscillated.
+
+2. **G1 single-device probe REFUTED** the initial slice-data-placement
+   hypothesis (commits `e168c4d` + the CHECK 4 state-shift extension in
+   this commit). Probe verified at single-device single-step:
+   - Slice readback: matches numpy at 1 BF16 ULP ✓
+   - Manual chain vs numpy oracle: max_diff 0.029 ✓
+   - Owned kernel on sliced inputs vs oracle + vs manual: max_diff 0.033 ✓
+   - State shift (s0_out=state1, s1_out=state2, s2_out=mixed): max_diff
+     ≤ 0.016 (1 BF16 ULP at input magnitude) ✓
+   Conclusion: kernel + slice + writer all WORK at single-device.
+
+3. **G4 pre-split fix shipped** (commit `142d63e`): replaces the per-step
+   slice+concat+copy_back chain with bootstrap-allocated split tensors.
+   - Bootstrap allocates `dn['conv_st_split'][0..2]` + `dn['w_conv_split'][0..3]`
+     per DeltaNet layer (one-time cost ~1.7 MB/chip total).
+   - deltanet_step_tp owned branch now uses split tensors directly. NO slice,
+     NO concat, NO copy back. Kernel mutates split tensors in place via writer.
+   - _reset_state_buffers zeros the split tensors too.
+   - End-of-step state update skips the conv_state_new copy when owned mode.
+   - Combined dn['conv_st'] / dn['w_conv'] still exist; manual path
+     unaffected; modes don't sync (G3 runs one mode at a time, OK).
+
+4. **qb2 currently cold-bootstrapping** the G4 server (poll `bszoz3cca`,
+   ~17 min). NO parallel work this time — see new lesson below. Next:
+   re-run G3 cosine_ladder_tp manual + owned_conv1d compare.
+
+## Known workflow lessons added 2026-05-19 small hours
+
+3. **NEVER run `cmake --build` on qb2 during a server bootstrap.** The
+   parallel CPU/memory pressure silently kills the bootstrap mid-stream
+   (mysterious mid-stream death after layer 40/64, no OOM in dmesg, no
+   error log). Eats ~5-10 min of wasted bootstrap, requires another full
+   17-min retry. If a build is needed alongside a server restart, finish
+   the build FIRST, then restart the server.
+
+4. **Multi-step state persistence is its own correctness gate.** G0 and
+   G1 single-step probes can ALL pass while the multi-step state-update
+   chain (slice → kernel → concat → copy_back → re-slice next step) is
+   broken in subtle ways. Future custom-op bring-ups that mutate state
+   should plan a multi-step probe alongside the single-step gate, OR
+   skip the slice/concat chain entirely via the bootstrap-pre-split
+   pattern (the G4 fix above is the proven pattern).
+
+## Previous Status (2026-05-18 late evening) — owned_gdn DEFAULTED + conv1d G0 PASS + wire-in + decay/gate scaffolded
 
 **Latest session adds (after the owned_gdn default at `26cad39`)**:
 - Conv1d kernel (`qwen36_conv1d_decode_owned`): G0 PASS on qb2 at production
