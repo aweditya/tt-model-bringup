@@ -139,7 +139,10 @@ class MeshServerState:
         #    calls kernel, reshapes decay output back to [1, NV, 1, 1] for
         #    downstream recurrence). G2 correctness gate; G4 default flip
         #    will move the reshape to bootstrap for zero per-step overhead.
-        self.deltanet_decay_gate_mode = "manual"
+        # G4 default flip (decay/gate G3 PASS: 6/500 = 1.2% top-1 disag at
+        # 500-token cosine ladder; med_cos 0.9988). Fused kernel ships as
+        # production default.
+        self.deltanet_decay_gate_mode = "owned_decay_gate"
         self.profile_records = None
         self.profile_context_stack = []
 

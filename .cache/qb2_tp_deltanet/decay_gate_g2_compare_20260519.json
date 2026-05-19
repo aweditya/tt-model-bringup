@@ -1,0 +1,77 @@
+{
+  "prompt": "Implement a JSON parser combinator in Rust",
+  "base_mode": "owned_gdn+manual_decay_gate",
+  "n_prompt": 8,
+  "n_steps": 20,
+  "vocab": 248320,
+  "prompt_ids": [
+    60856,
+    264,
+    4566,
+    6518,
+    3493,
+    16762,
+    303,
+    32671
+  ],
+  "generated_ids": [
+    13,
+    271,
+    248068,
+    271,
+    248069,
+    271,
+    71093,
+    34602,
+    198,
+    784,
+    1407,
+    476,
+    12143,
+    26,
+    271,
+    2490,
+    37606,
+    264,
+    4566,
+    869
+  ],
+  "comparisons": {
+    "owned_gdn+owned_decay_gate": {
+      "min_cos": 0.9824982285499573,
+      "med_cos": 0.9990746378898621,
+      "mean_cos": 0.9975431561470032,
+      "max_cos": 0.9998048543930054,
+      "top1_disagree_count": 1,
+      "top1_disagree_rate": 0.05,
+      "first_disagree_step": 3,
+      "cosines": [
+        0.9990943670272827,
+        0.9986395239830017,
+        0.9992717504501343,
+        0.9824982285499573,
+        0.9933174252510071,
+        0.9943400025367737,
+        0.9966860413551331,
+        0.9952646493911743,
+        0.9996283054351807,
+        0.9990153312683105,
+        0.9993587732315063,
+        0.999689519405365,
+        0.9988923072814941,
+        0.9991627931594849,
+        0.9998048543930054,
+        0.9991192817687988,
+        0.9994958639144897,
+        0.9990048408508301,
+        0.9990549087524414,
+        0.9995228052139282
+      ]
+    }
+  },
+  "source": "cosine_ladder_compare_two_npzs.py",
+  "source_npzs": {
+    "owned_gdn+manual_decay_gate": "/home/aditya/tt-xla/.cache/qb2_tp_deltanet/_cosine_ladder_tp_owned_gdn_20260519_1812.npz",
+    "owned_gdn+owned_decay_gate": "/home/aditya/tt-xla/.cache/qb2_tp_deltanet/_cosine_ladder_tp_owned_gdn_20260519_1813.npz"
+  }
+}
