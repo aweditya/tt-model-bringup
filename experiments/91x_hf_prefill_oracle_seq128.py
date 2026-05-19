@@ -133,10 +133,14 @@ def main():
             DecoderLayer = getattr(mqn, name)
             break
     RotaryEmb = None
-    for name in ('Qwen3_5RotaryEmbedding', 'Qwen3NextRotaryEmbedding'):
+    for name in ('Qwen3_5TextRotaryEmbedding', 'Qwen3_5RotaryEmbedding',
+                 'Qwen3NextRotaryEmbedding', 'Qwen3RotaryEmbedding'):
         if hasattr(mqn, name):
             RotaryEmb = getattr(mqn, name)
             break
+    if RotaryEmb is None:
+        rot_candidates = [c for c in dir(mqn) if 'Rotary' in c]
+        raise RuntimeError(f"No RotaryEmbedding class found; available: {rot_candidates}")
     print(f"  using DecoderLayer: {DecoderLayer.__name__}")
     print(f"  using RotaryEmb:    {RotaryEmb.__name__}")
 
