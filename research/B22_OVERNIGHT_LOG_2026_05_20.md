@@ -63,15 +63,33 @@ chain (DN reassembly via slice_write OR batched MLP) producing wrong x_seq.
 
 ### Test 7 — directly compare Layer 1 input between paths
 
-Status: bootstrapping (bnh7ucn32 polling)
-Hypothesis: v3's x_seq[0] at Layer 1 entry differs from decode's x at the
-equivalent L0/L1 boundary (despite chip_v0=0.019897 being replicated).
-Method: instrument forward_token_tp_inner to print x[0,:] chip_v0+means+
-norms at the L0 layer boundary, gated on first call only (pos 0).
+Status: COMPLETE (after fixing wiring bug — initial commit set flag in wrong path).
+Result: **SMOKING GUN. v3's x_seq[0] at L1 entry differs dramatically.**
 
-If v3 and decode print identical values → DN is non-deterministic (impossible)
-If they differ → bug is in v3's Layer 0 chain (slice_write reassembly or
-batched MLP affecting row 0)
+```
+                          DECODE (correct)    V3 PREFILL (broken)
+chip_v0 (elem [0,0])      0.000122            0.019897           163× larger
+chip_means                0.003242            0.000812           4× smaller
+chip_norms                18.3482             5.7399             3.2× smaller
+```
+
+Not a uniform scale factor. Element [0,0] is huge while overall norm is
+small → element-by-element divergence, not global scaling.
+
+Bug confirmed: v3's Layer 0 chain (DN reassembly OR batched MLP) produces
+wrong x_seq row 0. Test 8 narrows further by checking pre-MLP value.
+
+### Test 8 — pre-MLP diag in both paths
+
+Status: bootstrapping (b3qvvmqu8 polling)
+Add x[0,:] print BETWEEN DN and MLP at L0 in both paths (single-shot,
+gated to fire once per path).
+
+Expected outcomes:
+- pre-MLP matches between paths → batched MLP processing of row 0 is the bug
+- pre-MLP differs → DN reassembly chain (slice_write/to_layout/reshape) is the bug
+
+Either way, this narrows the search from "Layer 0 chain" to one specific op.
 
 Result: [TBD]
 
