@@ -583,6 +583,11 @@ def _rms_norm_manual(x_tt, weight_tt, eps, dim_size):
 def _tp_all_reduce(state: MeshServerState, partial):
     """All-reduce a row-parallel partial across the (1, 4) mesh.
 
+    DIAG (2026-05-20): when state.ccl_debug is True, prints partial shape +
+    memory_config + per-chip mean and chip0[0,0]. Use to compare prefill-path
+    vs decode-path partial values when CCL equivalence is known correct but
+    downstream cos != 0.999.
+
     NOTE (B.2.2 wedge fix 2026-05-19): ttnn.all_reduce's output tensor can
     enter a `DeallocatedTombStone` storage state because composite all_reduce
     deallocates intermediates during execution, leaving shared ownership in
@@ -599,6 +604,26 @@ def _tp_all_reduce(state: MeshServerState, partial):
     [5, HIDDEN]).
     """
     import ttnn
+
+    if getattr(state, 'ccl_debug', False):
+        _limit = getattr(state, 'ccl_debug_limit', 8)
+        _count = getattr(state, '_ccl_debug_count', 0)
+        if _count < _limit:
+            try:
+                _full = ttnn.to_torch(
+                    partial, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+                ).float()
+                _H = _full.shape[-1] // 4
+                _per_chip_means = [round(float(_full[..., c*_H:(c+1)*_H].mean()), 6) for c in range(4)]
+                _per_chip_v0 = [round(float(_full[..., 0, c*_H]), 6) for c in range(4)]
+                _tag = getattr(state, 'ccl_debug_tag', 'ar')
+                print(f"[{_tag} call={_count}] shape={list(partial.shape)} "
+                      f"mem={partial.memory_config().memory_layout} "
+                      f"chip_means={_per_chip_means} "
+                      f"chip_v0={_per_chip_v0}", flush=True)
+            except Exception as _e:
+                print(f"[ar diag error] {_e!r}", flush=True)
+            state._ccl_debug_count = _count + 1
 
     # B.2.2 workaround: composite reduce_scatter + all_gather (instead of
     # all_reduce) — different op chain at API surface, but per the
@@ -2577,8 +2602,14 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
 
     VOCAB = state.vocab_size
 
+    debug_ccl = bool(args.get("debug_ccl", False))
+
     # Path A — reference: explicit sequential decode-loop, captured per-position.
     _reset_state_buffers(state)
+    if debug_ccl:
+        state.ccl_debug = True
+        state.ccl_debug_tag = "dec"
+        state._ccl_debug_count = 0
     t0 = _time.time()
     ref_logits = np.empty((seq_len, VOCAB), dtype=np.float32)
     for pos, tid in enumerate(prompt_ids):
@@ -2594,6 +2625,9 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     # mode="stub": calls decode-loop internally → cos = 1.0 trivially
     # mode="batched_mlp": B.2.1 layer-outer with batched MLP per layer → expect cos ≥ 0.999
     _reset_state_buffers(state)
+    if debug_ccl:
+        state.ccl_debug_tag = "pre"
+        state._ccl_debug_count = 0
     t0 = _time.time()
     if mode == "stub":
         test_logits = forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)
@@ -2610,6 +2644,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         test_logits = forward_prefill_tp_inner_v3_parallel_attn(
             state, prompt_ids, capture_logits=True)
     test_ms = (_time.time() - t0) * 1000.0
+    if debug_ccl:
+        state.ccl_debug = False
 
     # Per-position comparison
     a64 = ref_logits.astype(np.float64)
@@ -3651,6 +3687,10 @@ def handle_probe_ccl_equivalence_tp(state: MeshServerState, args: dict) -> dict:
     if H % NCHIPS != 0:
         return {"error": f"H={H} must be divisible by NCHIPS={NCHIPS}"}
     shapes = args.get("shapes", [[1, H], [5, H]])
+    topology_name = str(args.get("topology", "Linear"))
+    if topology_name not in ("Linear", "Ring"):
+        return {"error": f"topology must be 'Linear' or 'Ring', got {topology_name!r}"}
+    topo = ttnn.Topology.Ring if topology_name == "Ring" else ttnn.Topology.Linear
 
     def upload_per_chip_constant(seq, H_):
         """Each chip i ends with [seq, H_] tensor filled with (i+1.0)."""
@@ -3679,23 +3719,23 @@ def handle_probe_ccl_equivalence_tp(state: MeshServerState, args: dict) -> dict:
             return ttnn.all_reduce(
                 partial, cluster_axis=1,
                 memory_config=partial.memory_config(),
-                num_links=2, topology=ttnn.Topology.Linear,
+                num_links=2, topology=topo,
             )
         if path == "composite":
             scattered = ttnn.reduce_scatter(
                 partial, dim=1, cluster_axis=1,
-                num_links=2, topology=ttnn.Topology.Linear,
+                num_links=2, topology=topo,
             )
             gathered = ttnn.all_gather(
                 scattered, dim=1, cluster_axis=1,
-                num_links=2, topology=ttnn.Topology.Linear,
+                num_links=2, topology=topo,
             )
             ttnn.deallocate(scattered)
             return gathered
         if path == "custom":
             gathered = ttnn.all_gather(
                 partial, dim=1, cluster_axis=1,
-                num_links=2, topology=ttnn.Topology.Linear,
+                num_links=2, topology=topo,
             )
             reshaped = ttnn.reshape(gathered, [seq, NCHIPS, H_])
             summed = ttnn.sum(reshaped, dim=1)
@@ -3758,6 +3798,7 @@ def handle_probe_ccl_equivalence_tp(state: MeshServerState, args: dict) -> dict:
         "ok": True,
         "expected_value": expected_value,
         "nchips": NCHIPS,
+        "topology": topology_name,
         "results": results,
         "note": (
             "Per-chip-constant probe: chip i = (i+1.0). Expected all-reduced "

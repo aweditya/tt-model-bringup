@@ -188,12 +188,15 @@ def cmd_probe_ccl_equivalence_tp(args):
         payload["hidden"] = args.hidden
     if args.shapes:
         payload["shapes"] = [[int(x) for x in s.split("x")] for s in args.shapes.split(",")]
+    if args.topology:
+        payload["topology"] = args.topology
     data = _send("probe_ccl_equivalence_tp", payload, timeout=300.0)
     if data.get("error"):
         print(f"ERROR: {data['error']}", file=sys.stderr); sys.exit(4)
     nchips = data.get("nchips", 4)
     expected = data.get("expected_value")
-    print(f"nchips={nchips}  expected (all-reduced) value: {expected}")
+    topology = data.get("topology", "?")
+    print(f"nchips={nchips}  topology={topology}  expected (all-reduced) value: {expected}")
     print(f"\nResults per (shape, path):")
     print(f"  {'shape':<12} {'path':<12} {'cos':<10} {'maxabs':<10} {'per_chip_means':<40} {'ms':<8} verdict")
     for shape_key in sorted(data["results"].keys()):
@@ -212,6 +215,8 @@ def cmd_probe_prefill_vs_decode_loop_tp(args):
     payload = {"mode": args.mode}
     if args.prompt:
         payload["prompt"] = args.prompt
+    if args.debug_ccl:
+        payload["debug_ccl"] = True
     data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
     if data.get("error"):
         print(f"ERROR: {data['error']}", file=sys.stderr)
@@ -692,6 +697,9 @@ def main():
                       help="prefill implementation under test: 'stub' (B.1 decode-loop "
                            "wrapper; cos=1.0 expected) or 'batched_mlp' (B.2.1 layer-outer "
                            "iteration with batched MLP per layer; gate cos>=0.999)")
+    pvd.add_argument("--debug-ccl", action="store_true",
+                      help="enable _tp_all_reduce shape+values diagnostic (first 8 calls "
+                           "per path; tag 'dec' for decode-loop, 'pre' for prefill)")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     cle = sub.add_parser("probe_ccl_equivalence_tp",
                           help="B.2.2 CCL semantics: verify all_reduce vs composite "
@@ -702,6 +710,8 @@ def main():
     cle.add_argument("--hidden", type=int, default=5120)
     cle.add_argument("--shapes", default=None,
                       help="comma-separated SxH shapes, e.g. '1x5120,5x5120' (default tests both)")
+    cle.add_argument("--topology", default=None, choices=["Linear", "Ring"],
+                      help="CCL topology to use (default Linear, matching production)")
     cle.set_defaults(fn=cmd_probe_ccl_equivalence_tp)
     ccl = sub.add_parser("probe_ccl_components_tp",
                           help="micro-bench CCL primitives (all_reduce, reduce_scatter, all_gather) "
