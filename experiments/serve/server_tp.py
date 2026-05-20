@@ -1484,32 +1484,43 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 ttnn.deallocate(x_pos_4d)
                 ttnn.deallocate(x_pos_rm)
                 # B.2.2 STATE INSPECTION (2026-05-20): if debug_state set, print
-                # this layer's dn['ssm'] and conv_st_split summary AFTER this
-                # position's DN call. Compare to decode-loop reference.
-                if getattr(state, 'debug_state', False) and layer_idx == 0:
-                    try:
-                        _ssm_t = ttnn.to_torch(
-                            layer['dn']['ssm'],
-                            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
-                        ).float()
-                        _ssm_mean = round(float(_ssm_t.mean()), 8)
-                        _ssm_norm = round(float(_ssm_t.norm()), 6)
-                        _ssm_v0 = round(float(_ssm_t.flatten()[0]), 8)
-                        _cs_summaries = []
-                        for k, _cs_tt in enumerate(layer['dn'].get('conv_st_split', [])):
-                            _cs = ttnn.to_torch(
-                                _cs_tt,
-                                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+                # Layer N AND Layer 1's state — so we can see if Layer 1 gets
+                # contaminated during Layer 0's processing.
+                if getattr(state, 'debug_state', False) and layer_idx <= 1:
+                    def _dump_state(li: int, label: str):
+                        try:
+                            if li >= len(state.layers):
+                                return
+                            lyr = state.layers[li]
+                            if lyr['type'] != 'linear_attention':
+                                return
+                            _ssm_t = ttnn.to_torch(
+                                lyr['dn']['ssm'],
+                                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
                             ).float()
-                            _cs_summaries.append(
-                                f"cs{k}(mean={float(_cs.mean()):.6g} norm={float(_cs.norm()):.4g})"
-                            )
-                        _tag = getattr(state, '_debug_state_tag', 'pre')
-                        print(f"  [{_tag} L0 state after pos{pos}] "
-                              f"ssm(mean={_ssm_mean} v0={_ssm_v0} norm={_ssm_norm}) "
-                              f"{' '.join(_cs_summaries)}", flush=True)
-                    except Exception as _e:
-                        print(f"  [v3 state err] {_e!r}", flush=True)
+                            _ssm_mean = round(float(_ssm_t.mean()), 8)
+                            _ssm_norm = round(float(_ssm_t.norm()), 6)
+                            _ssm_v0 = round(float(_ssm_t.flatten()[0]), 8)
+                            if 'conv_st' in lyr['dn']:
+                                _cs_c = ttnn.to_torch(
+                                    lyr['dn']['conv_st'],
+                                    mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+                                ).float()
+                                _cs_sum = (f"conv_st(mean={float(_cs_c.mean()):.6g} "
+                                           f"norm={float(_cs_c.norm()):.4g})")
+                            else:
+                                _cs_sum = "conv_st(missing)"
+                            _tag = getattr(state, '_debug_state_tag', 'pre')
+                            print(f"  [{_tag} L{li} state {label}] "
+                                  f"ssm(mean={_ssm_mean} v0={_ssm_v0} norm={_ssm_norm}) "
+                                  f"{_cs_sum}", flush=True)
+                        except Exception as _e:
+                            print(f"  [v3 state err L{li}] {_e!r}", flush=True)
+                    _dump_state(layer_idx, f"after pos{pos}")
+                    # Also peek at Layer 1's state — if non-zero while we're
+                    # still in Layer 0, it's been contaminated.
+                    if layer_idx == 0:
+                        _dump_state(1, f"L1view_during_L0_pos{pos}")
                 # B.2.2 Test 2: optional sync between per-position DN calls
                 # to test the async-ordering hypothesis. Adds ~5 syncs per
                 # DN layer × 32 DN layers = 160 syncs per forward.
@@ -2669,9 +2680,11 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     debug_ccl = bool(args.get("debug_ccl", False))
     debug_state = bool(args.get("debug_state", False))
 
-    def _print_dn_state(tag: str, layer_idx: int, pos_label: str):
-        """Read back layer's dn['ssm'] and conv_st_split, print summary."""
+    def _print_dn_state_one(tag: str, layer_idx: int, pos_label: str):
+        """Read back ONE layer's dn['ssm'], conv_st, conv_st_split. Print summary."""
         if not debug_state:
+            return
+        if layer_idx >= len(state.layers):
             return
         layer = state.layers[layer_idx]
         if layer['type'] != 'linear_attention':
@@ -2685,20 +2698,31 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
             ssm_mean = round(float(ssm.mean()), 8)
             ssm_norm = round(float(ssm.norm()), 6)
             ssm_v0 = round(float(ssm.flatten()[0]), 8)
-            cs_summaries = []
-            for k, cs_tt in enumerate(layer['dn'].get('conv_st_split', [])):
-                cs = _t.to_torch(
-                    cs_tt, mesh_composer=_t.ConcatMeshToTensor(state.mesh, dim=0)
+            # conv_st: COMBINED tensor used by manual conv1d (default mode)
+            if 'conv_st' in layer['dn']:
+                cs_combined = _t.to_torch(
+                    layer['dn']['conv_st'],
+                    mesh_composer=_t.ConcatMeshToTensor(state.mesh, dim=0)
                 ).float()
-                cs_summaries.append(
-                    f"cs{k}(mean={float(cs.mean()):.6g} norm={float(cs.norm()):.4g})"
+                cs_combined_summary = (
+                    f"conv_st(mean={float(cs_combined.mean()):.6g} "
+                    f"norm={float(cs_combined.norm()):.4g})"
                 )
-            print(f"  [{tag} L{layer_idx} state after {pos_label}] "
+            else:
+                cs_combined_summary = "conv_st(missing)"
+            print(f"  [{tag} L{layer_idx} state {pos_label}] "
                   f"ssm(mean={ssm_mean} v0={ssm_v0} norm={ssm_norm}) "
-                  f"{' '.join(cs_summaries)}",
+                  f"{cs_combined_summary}",
                   flush=True)
         except Exception as e:
             print(f"  [{tag} L{layer_idx} state err] {e!r}", flush=True)
+
+    def _print_dn_state(tag: str, layer_idx: int, pos_label: str):
+        """Print state for the specified layer AND layer 1 (always — to see
+        if Layer 1's state changes during Layer 0's processing)."""
+        _print_dn_state_one(tag, layer_idx, pos_label)
+        if layer_idx == 0:
+            _print_dn_state_one(tag, 1, f"{pos_label}_L1view")
     # B.2.2 TEST: optionally override the recurrence mode for the test path.
     # Used to test the hypothesis that owned_gdn(_inplace) kernels have hidden
     # state that contaminates layer-1+ DN output in v3 prefill context.
