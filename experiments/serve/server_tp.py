@@ -119,6 +119,11 @@ class MeshServerState:
         # num_links=1 at production [1, 5120] bf16 shape; the bare
         # `ttnn.all_reduce(partial)` path uses unknown defaults.
         self.collective_mode = "explicit_all_reduce"
+        # B.2.2 workaround: when True, _tp_all_reduce uses composite
+        # reduce_scatter + all_gather instead of all_reduce. Different code
+        # path → different output tensor lineage → may avoid the wedge in
+        # downstream slice + DN. v3 prefill toggles this on per-call.
+        self.force_composite_ccl = False
         self.rope_mode = "manual"
         self.deltanet_decay_mode = "manual"
         # 2026-05-18: defaulted to "owned_gdn" after Tier 3 long-context gate
@@ -588,27 +593,24 @@ def _tp_all_reduce(state: MeshServerState, partial):
     [5, HIDDEN]).
     """
     import ttnn
-    import torch
 
-    def _force_fresh(result):
-        """ttnn.clone with same mem_config was a no-op; force a genuine new
-        allocation by ttnn.add with a fresh zeros tensor — guarantees a brand-new
-        output Tensor whose storage was just allocated. Cost: tensor add on
-        [seq_len, HIDDEN] bf16, negligible (~us at our shapes)."""
-        shape = list(result.shape)
-        zeros_t = ttnn.from_torch(
-            torch.zeros(shape, dtype=torch.bfloat16),
-            layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
-            device=state.mesh,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    # B.2.2 workaround: composite reduce_scatter + all_gather (instead of
+    # all_reduce) — different op chain, possibly different output tensor
+    # lineage that downstream DN can consume. v3 prefill sets this flag.
+    if getattr(state, 'force_composite_ccl', False):
+        scattered = ttnn.reduce_scatter(
+            partial, dim=1, cluster_axis=1,
+            num_links=2, topology=ttnn.Topology.Linear,
         )
-        fresh = ttnn.add(result, zeros_t)
-        ttnn.deallocate(zeros_t)
-        return fresh
+        gathered = ttnn.all_gather(
+            scattered, dim=1, cluster_axis=1,
+            num_links=2, topology=ttnn.Topology.Linear,
+        )
+        ttnn.deallocate(scattered)
+        return gathered
 
     if state.collective_mode == "explicit_all_reduce":
-        result = ttnn.all_reduce(
+        return ttnn.all_reduce(
             partial,
             cluster_axis=1,
             memory_config=partial.memory_config(),
@@ -618,14 +620,11 @@ def _tp_all_reduce(state: MeshServerState, partial):
             num_links=2,
             topology=ttnn.Topology.Linear,
         )
-        return _force_fresh(result)
     try:
-        result = ttnn.all_reduce(partial)
-        return _force_fresh(result)
+        return ttnn.all_reduce(partial)
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
-        result = ttnn.all_gather(scattered, dim=1)
-        return _force_fresh(result)
+        return ttnn.all_gather(scattered, dim=1)
 
 
 def deltanet_step_tp(state, x_tt, dn, cfg):
@@ -1341,20 +1340,13 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         # Print every layer for B.2.2 debug
         print(f"  [v3 prefill] layer {idx:2d} ({layer_type[:14]:14s}) {stage} dt={dt*1000:5.0f}ms", flush=True)
 
-    # B.2.2 fix attempt 8: launder slice via ttnn.add(slice, zeros).
-    # Manual mode (fix 7) and force-fresh on all_reduce output (fixes 3-6) all
-    # failed. The deep op probe showed ALL standard ttnn ops PASS on the
-    # contaminated slice individually — so the bug must be specific to feeding
-    # the slice into the full DN sequence. Hypothesis: laundering POST-SLICE
-    # produces a "fresh" tensor (output of ttnn.add) that DN can consume.
-    # Pre-allocate one zeros buffer for the entire forward pass, reuse per pos.
-    _launder_zeros = ttnn.from_torch(
-        torch.zeros((1, HIDDEN), dtype=torch.bfloat16),
-        layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
-        device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-    )
+    # B.2.2 fix attempt 9: force composite CCL (reduce_scatter + all_gather)
+    # instead of all_reduce for the entire prefill forward. All_reduce
+    # output triggers a wedge when sliced + fed to DN (8 prior fix attempts
+    # all failed). User insight: the wedge is specific to TP-only ops. The
+    # composite path is a different op sequence — different output lineage —
+    # maybe avoids the wedge.
+    state.force_composite_ccl = True
 
     # ====== Step 3: Layer loop ======
     for layer_idx, layer in enumerate(state.layers):
@@ -1384,24 +1376,17 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 update_input_buffers(state, tid, pos)
                 _dbg_l = layer_idx <= 1  # DN debug only for layers 0 and 1
                 if _dbg_l: print(f"    [DN inner] layer={layer_idx} pos={pos} BEFORE slice", flush=True)
-                x_pos_view = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
-                # LAUNDER: add zeros to produce a fresh add-output tensor that
-                # breaks the all_reduce contamination lineage. The op probe
-                # confirmed ttnn.add on the contaminated slice works; we test
-                # whether DN can consume the add output.
-                x_pos = ttnn.add(x_pos_view, _launder_zeros)
+                x_pos = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
                 if _dbg_l:
                     ttnn.synchronize_device(state.mesh)
-                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice+launder shape={list(x_pos.shape)}", flush=True)
+                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice shape={list(x_pos.shape)}", flush=True)
                 # Run DN step (existing per-position decode step)
                 x_pos_out = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
                 if _dbg_l:
                     ttnn.synchronize_device(state.mesh)
                     print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER decode-step shape={list(x_pos_out.shape)}", flush=True)
-                # x_pos is now the LAUNDERED add output (a real new tensor,
-                # not a view). Safe to deallocate. x_pos_view is the slice;
-                # let GC handle that one.
-                ttnn.deallocate(x_pos)
+                # x_pos is a VIEW of x_seq — DO NOT deallocate (would free
+                # x_seq's underlying storage and break next iteration's slice).
                 # Reshape to rank-4 + convert to ROW_MAJOR for slice_write
                 x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
                 x_pos_rm = ttnn.to_layout(x_pos_4d, ttnn.ROW_MAJOR_LAYOUT)
@@ -1440,7 +1425,9 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
 
     ttnn.deallocate(cos_seq_tt)
     ttnn.deallocate(sin_seq_tt)
-    ttnn.deallocate(_launder_zeros)
+
+    # Restore default CCL mode
+    state.force_composite_ccl = False
 
     # ====== Step 4: Final norm + LM head ======
     x_seq = _rms_norm_manual(x_seq, state.final_norm_tt, 1e-6, HIDDEN)
