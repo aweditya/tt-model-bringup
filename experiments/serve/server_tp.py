@@ -3182,6 +3182,105 @@ def handle_probe_dn_source_isolation_tp(state: MeshServerState, args: dict) -> d
     }
 
 
+def handle_probe_dn_op_isolation_tp(state: MeshServerState, args: dict) -> dict:
+    """B.2.2 deep isolation: which specific ttnn op wedges on all_reduce-slice input?
+
+    Builds the "bad" source: slice of all_reduce output → x_pos [1, HIDDEN].
+    Then tests each ttnn op individually on it. Logs BEFORE/AFTER per op.
+    The last "BEFORE op X" without a matching "AFTER op X" identifies the
+    wedger.
+
+    Ordered LEAST-likely-to-wedge → MOST-likely so we get max info before
+    server dies:
+      1. ttnn.reshape (pure metadata op)
+      2. ttnn.add (eltwise binary)
+      3. ttnn.mul (eltwise binary)
+      4. ttnn.exp (eltwise unary)
+      5. ttnn.softplus (eltwise unary, used in DN)
+      6. ttnn.linear (matmul — DN's 2nd op)
+      7. ttnn.rms_norm — DN's FIRST op, suspected wedger
+    """
+    import ttnn
+    import torch
+    import numpy as np
+
+    if state.mesh is None or not state.layers:
+        return {"error": "mesh/weights not loaded"}
+
+    HIDDEN = state.cfg['hidden']
+    seq_len = int(args.get("seq_len", 5))
+
+    # Build "bad" source: all_reduce output, sliced to [1, HIDDEN]
+    rng = np.random.default_rng(42)
+    x_np = rng.standard_normal((seq_len, HIDDEN)).astype(np.float32) * 0.05
+    x_in = ttnn.from_torch(
+        torch.from_numpy(x_np),
+        layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    x_seq = _tp_all_reduce(state, x_in)
+    ttnn.deallocate(x_in)
+    ttnn.synchronize_device(state.mesh)
+    print(f"  [DN-op-iso] all_reduce output built, shape={list(x_seq.shape)}", flush=True)
+    x_pos = ttnn.slice(x_seq, [0, 0], [1, HIDDEN])
+    ttnn.synchronize_device(state.mesh)
+    print(f"  [DN-op-iso] sliced, shape={list(x_pos.shape)}", flush=True)
+
+    # Find layer 1 (DN) to grab its input_norm weight for rms_norm test
+    layer1 = None
+    for layer in state.layers:
+        if layer['type'] == 'linear_attention':
+            layer1 = layer
+            break
+    if layer1 is None:
+        return {"error": "no linear_attention layer"}
+    norm_weight = layer1['dn']['input_norm']
+    w_in = layer1['dn']['w_in']
+
+    results = []
+
+    def try_op(name, op_fn):
+        print(f"  [DN-op-iso] BEFORE {name}", flush=True)
+        ttnn.synchronize_device(state.mesh)
+        try:
+            out = op_fn()
+            ttnn.synchronize_device(state.mesh)
+            try:
+                shape = list(out.shape) if hasattr(out, 'shape') else "no-shape"
+            except Exception:
+                shape = "shape-read-failed"
+            print(f"  [DN-op-iso] AFTER {name} shape={shape}", flush=True)
+            results.append({"op": name, "result": "OK"})
+            if hasattr(out, 'shape'):
+                try:
+                    ttnn.deallocate(out)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"  [DN-op-iso] EXCEPTION {name}: {type(e).__name__}: {e}", flush=True)
+            results.append({"op": name, "result": "ERROR", "error": f"{type(e).__name__}: {e}"})
+
+    # ── Tests, ordered least-likely-to-wedge → most-likely ──
+    try_op("reshape", lambda: ttnn.reshape(x_pos, [HIDDEN]))
+    try_op("add", lambda: ttnn.add(x_pos, x_pos))
+    try_op("mul", lambda: ttnn.mul(x_pos, x_pos))
+    try_op("exp", lambda: ttnn.exp(x_pos))
+    try_op("softplus", lambda: ttnn.softplus(x_pos))
+    try_op("linear", lambda: ttnn.linear(x_pos, w_in))
+    try_op("rms_norm", lambda: ttnn.rms_norm(x_pos, weight=norm_weight, epsilon=1e-6))
+
+    ttnn.deallocate(x_pos)
+    ttnn.deallocate(x_seq)
+
+    state.last_run = {
+        "cmd": "probe_dn_op_isolation_tp",
+        "results": results,
+    }
+    return {"ok": True, "results": results, "seq_len": seq_len}
+
+
 def _read_argmax_id(state: MeshServerState, argmax_tt) -> int:
     import ttnn
     idx_concat = ttnn.to_torch(
@@ -7579,6 +7678,7 @@ HANDLERS = {
     "probe_multirow_construct_vs_per_position": handle_probe_multirow_construct_vs_per_position,
     "probe_slice_write_round_trip": handle_probe_slice_write_round_trip,
     "probe_dn_source_isolation_tp": handle_probe_dn_source_isolation_tp,
+    "probe_dn_op_isolation_tp": handle_probe_dn_op_isolation_tp,
     "probe_fused_paged_update_cache_tp": handle_probe_fused_paged_update_cache_tp,
     "probe_explicit_all_reduce_tp": handle_probe_explicit_all_reduce_tp,
     "probe_rope_fused_qk_tp": handle_probe_rope_fused_qk_tp,
