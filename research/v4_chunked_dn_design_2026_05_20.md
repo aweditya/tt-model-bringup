@@ -186,16 +186,58 @@ max|Δ|:       5×10⁻¹⁸       (fp64 noise floor)
 
 Both zero-state (chunk 0) and non-zero-state (mid-prefill) cases pass.
 
-**Stage 4b next session: port the validated numpy impl to ttnn** on the mesh.
-Each chip processes its NV_PER_CHIP heads independently (no CCL until the
-output stage). Reference impl: `chunked_recurrence` in the numpy probe.
-Reference primitives: `experiments/utils/neumann_inverse_probe.py` for the
-Neumann factorization of `(I-attn)⁻¹`.
+### v4 Stage 4b-i — Neumann inverse on mesh (commit `a78c88a`) ✅
 
-Integration path: extend the chunked DN stub to collect per-pos q/k/v into
-batched tensors (since conv1d isn't batched yet), then run the chunked
-recurrence on them, then per-pos output gate + w_out + all_reduce + residual.
-Stage 2 (batched conv1d) can land later — Stage 4b doesn't require it.
+`_neumann_inverse_via_mesh_tp(state, L_tt, C)` validated via
+`probe_neumann_inverse_mesh_tp` at production shape [NV_PER_CHIP=12, C, C]:
+
+```
+C=8:   overall cos 0.99999999  (5 matmuls)
+C=64:  overall cos 0.99999967  (11 matmuls)
+```
+
+Each chip computes its 12 heads independently — no CCL.
+
+### v4 Stage 4b-ii — chunked recurrence ttnn function (commit `fee43a4`) ✅
+
+`_chunked_recurrence_tp(state, q_seq, k_seq, v_seq, g_seq, beta_seq, S_prev, C)`
+implements the C'5 plan §1 math in ttnn on mesh. Validated via
+`probe_chunked_recurrence_tp` at production per-chip shape:
+
+```
+C=8, [NV_PER_CHIP=12, C, K_DIM=128, V_DIM=128]
+output cos:  0.99995983  max_diff: 0.000117  PASS
+state cos:   0.99997499  max_diff: 0.000265  PASS
+```
+
+bf16 precision floor reached. The 13-op chunked Neumann math (cumsum, exp,
+sub, broadcast mul, matmul ×6, Neumann inverse, transpose ×2) all work on
+mesh tensors at production shapes.
+
+**ALGORITHMIC RISK FOR STAGE 4 IS FULLY ELIMINATED.**
+
+### v4 Stage 4b-iii — integration (next session, task #82)
+
+This is now pure mechanical refactoring. Approach:
+1. Extract `_deltanet_pre_recurrence_tp(state, all_tt, dn, cfg)` from
+   `_deltanet_step_tp_from_inproj` lines covering conv1d + QKV split + GQA
+   + L2-norm. Returns `(q, k, v, z_tt)`.
+2. Extract `_deltanet_post_recurrence_tp(state, x_residual, out_per_head,
+   z_tt, dn, cfg)` covering output gate + w_out + all_reduce + residual.
+3. In `deltanet_chunked_neumann_tp`:
+   - Per-pos loop A: call pre-recurrence, slice_write collected q/k/v/z
+     into batched tensors.
+   - SINGLE call: `O_seq, S_new = _chunked_recurrence_tp(state, q_seq,
+     k_seq, v_seq, g_seq, beta_seq, S_prev, C)`
+   - `ttnn.copy(S_new, dn['ssm'])` ONCE.
+   - Per-pos loop B: slice `O_seq[pos]`, slice z[pos], call post-recurrence,
+     slice_write into dn_out_buf.
+
+Risk: shape/dtype mismatches across the new boundaries. Mitigation: refactor
+`deltanet_step_tp` first as a thin wrapper around the new pre/post helpers
++ the existing per-pos recurrence — validate it produces same cos as
+current production decode (probe `--mode stub`). Then integrate into chunked
+DN function and validate end-to-end.
 
 API surface and harness locked in. Future stages just replace one piece at a time.
 
