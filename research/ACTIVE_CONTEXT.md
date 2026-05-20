@@ -3,7 +3,69 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
-## Current Status (2026-05-19 small hours) — G3 conv1d wire-in FAILED, G4 pre-split fix bootstrapping
+## Current Status (2026-05-20) — B.2.2 prefill batched-attention bug isolated to slice or DN-of-MLP-input
+
+**Goal of current arc**: ship `forward_prefill_tp_inner_v3_parallel_attn`
+(batched attention + batched MLP + sequential DN) to reduce TTFT. Gate:
+per-position cos ≥ 0.999 vs decode-loop reference. Currently FAIL: cos
+median 0.57 with composite CCL, top1 0/5.
+
+**What we PROVED today (definitive findings)**:
+
+1. **CCL ops are mathematically equivalent** (probe_ccl_equivalence_tp,
+   commit `e0cabb4`). all_reduce, composite RS+AG, custom AG+reshape+sum
+   all give bit-correct [10,10,10,10] per-chip means on known per-chip-
+   constant inputs at both [1, 5120] and [5, 5120]. So cos 0.57 is NOT a
+   CCL math bug.
+
+2. **Ring topology WORKS on qb2** (probe with `--topology Ring`). All 6
+   path×shape variants PASS with cos=1.0 and replicated outputs. **qb2's
+   4 P150s are physically wired as a ring, not a line.** Currently every
+   call uses `Topology.Linear`. Adopt `Topology.Ring` for ~half hop-count
+   win (separate task #59). Not the B.2.2 fix.
+
+3. **Bug location narrowed** (probe with `--debug-ccl`, commit `5b990c8`).
+   `_tp_all_reduce` diag printed first 8 calls per path with shape + per-
+   chip mean + chip_v0:
+   - `[pre call=0]` BIT-IDENTICAL to `[dec call=0]` (layer 0 DN pos 0 partial).
+     → embedding + slice + layer 0 DN processing all work correctly.
+   - `[pre call=5]` row 0 ≈ `[dec call=1]` within bf16 noise (layer 0 MLP).
+     → batched MLP for pos 0 is correct.
+   - `[pre call=6]` STRUCTURALLY DIFFERS from `[dec call=2]` (layer 1 DN
+     pos 0 partial): chip_v0 differs by 4×–12×, one sign flips. NOT bf16
+     noise. NOT uniform scaling. Bug is between MLP output and layer 1
+     DN's first all_reduce.
+
+4. **Ruled out**: reshape-source-dealloc (call=0 matched bit-for-bit);
+   `_reset_state_buffers` is thorough (resets ssm + conv_st + conv_st_split
+   + kv per layer).
+
+**Diag IN FLIGHT (bootstrap polling `boaj8d4n9`, will signal when ready)**:
+commit `5b990c8` adds at layer 0+1 entry: prints `x_seq[0,:]` chip_v0 +
+chip_means. After slice at pos=0: prints `x_pos[0,:]` chip_v0 + chip_means.
+Three possible outcomes (pre-decided actions in TaskList #60):
+- `x_seq[0]` not replicated across chips → CCL output isn't truly replicated
+  in prefill context (contra equivalence probe)
+- `x_seq[0]` replicated AND == `x_pos[0]` → slice OK, bug is DN processing
+- `x_seq[0]` replicated AND != `x_pos[0]` → **slice corrupts MLP-output TILE**;
+  fix candidates: ROW_MAJOR round-trip before slice, or clone, or revert
+  v3 to per_position_list (B.2.1) and ship as Phase B.
+
+**Files touched this session**:
+- `experiments/serve/server_tp.py:583-650` (`_tp_all_reduce` diag)
+- `experiments/serve/server_tp.py:1404-1466` (v3 layer entry + DN inner diag)
+- `experiments/serve/server_tp.py:3610-3760` (`handle_probe_ccl_equivalence_tp`)
+- `experiments/serve/client_tp.py` (cmd_probe_ccl_equivalence_tp, --debug-ccl)
+- `research/all_reduce_kernel_audit.md` (kernel source audit)
+- `research/all_reduce_dataflow_teaching.md` (hardware mapping writeup)
+- `research/b2_2_wedge_root_cause.md` (initial wedge analysis — HYPOTHESIS
+  PARTIALLY INVALIDATED by today's findings; wedge mechanism #1 from audit
+  matches symptom but the specific tombstone path was not the bug)
+
+**Next-step decision tree when diag lands**:
+- See task #60 for the three outcome → action mappings.
+
+## Stale Status (2026-05-19 small hours) — G3 conv1d wire-in FAILED, G4 pre-split fix bootstrapping
 
 **Newest session arc (after the late-evening 2026-05-18 wire-in `c98269d`)**:
 
