@@ -570,9 +570,26 @@ def _rms_norm_manual(x_tt, weight_tt, eps, dim_size):
 
 
 def _tp_all_reduce(state: MeshServerState, partial):
+    """All-reduce a row-parallel partial across the (1, 4) mesh.
+
+    NOTE (B.2.2 wedge fix 2026-05-19): ttnn.all_reduce's output tensor can
+    enter a `DeallocatedTombStone` storage state because composite all_reduce
+    deallocates intermediates during execution, leaving shared ownership in
+    a zombie state. Decode paths never slice from all_reduce output so it
+    doesn't trigger; but prefill's per-position SLICE → deltanet_step_tp
+    chain hits Tensor::buffer()→DeviceStorage::get_mesh_buffer() validation
+    that silently hangs (99% CPU, no error) on the tombstone state.
+
+    Probe `probe_dn_source_isolation_tp` (commit 3822293) confirmed: linear /
+    embed / from_torch / slice_write outputs all work as DN input; only
+    all_reduce output wedges DN. Fix: ttnn.clone the result to force a fresh
+    Allocated storage, severing the tombstone link. Cost: one memory copy
+    per all_reduce call (~10KB at [1, HIDDEN], negligible; ~50KB at
+    [5, HIDDEN]).
+    """
     import ttnn
     if state.collective_mode == "explicit_all_reduce":
-        return ttnn.all_reduce(
+        result = ttnn.all_reduce(
             partial,
             cluster_axis=1,
             memory_config=partial.memory_config(),
@@ -582,11 +599,14 @@ def _tp_all_reduce(state: MeshServerState, partial):
             num_links=2,
             topology=ttnn.Topology.Linear,
         )
+        return ttnn.clone(result, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     try:
-        return ttnn.all_reduce(partial)
+        result = ttnn.all_reduce(partial)
+        return ttnn.clone(result, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
-        return ttnn.all_gather(scattered, dim=1)
+        result = ttnn.all_gather(scattered, dim=1)
+        return ttnn.clone(result, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
 def deltanet_step_tp(state, x_tt, dn, cfg):
@@ -1371,26 +1391,15 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
             new_x_seq = gated_attn_step_prefill_tp(
                 state, x_seq, layer['attn'], cos_seq_tt, sin_seq_tt, cfg, seq_len)
             ttnn.deallocate(x_seq)
-            # Same fix as below (B.2.2 wedge) — attn output also ends with
-            # all_reduce + add, has the same DeallocatedTombStone risk.
-            new_x_seq = ttnn.clone(new_x_seq, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             x_seq = new_x_seq
 
         _layer_dbg(layer_idx, layer['type'], stage="pre_mlp")
         # MLP: batched on [seq_len, HIDDEN] (broadcasts on leading dim)
+        # Note: the B.2.2 wedge fix is now in _tp_all_reduce (clones the
+        # result to escape DeallocatedTombStone state at the source), so we
+        # don't need to materialize again here.
         new_x_seq = mlp_step_tp(state, x_seq, layer['mlp'])
         ttnn.deallocate(x_seq)
-        # FIX (B.2.2 wedge): mlp_step_tp's last op is ttnn.add(x_residual,
-        # all_reduce_result). The all_reduce output can have a
-        # DeallocatedTombStone storage state which propagates through add.
-        # When the next layer's DN body slices this and feeds rms_norm,
-        # get_mesh_buffer() throws "Tensor is not allocated" during async
-        # device-op validation → silent wedge (99% CPU forever).
-        # Force a fresh allocation by round-tripping through to_memory_config
-        # with an identical config — internally this triggers create_device_tensor
-        # which severs the tombstone link. Cost: one memory copy per layer.
-        # See research/b2_2_wedge_root_cause.md.
-        new_x_seq = ttnn.clone(new_x_seq, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         x_seq = new_x_seq
         _layer_dbg(layer_idx, layer['type'], stage="end")
 
