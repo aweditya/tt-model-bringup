@@ -125,10 +125,106 @@ on tt-metal — the daily-driver long-context goal.
 - chunked attention (current paged SDPA already chunks internally via SDPAProgramConfig)
 - chunked MLP (already batched in v3; no further gain)
 
+## Progress
+
+### v4 Step 1 — scaffold (commit `432e606`, 2026-05-20) ✅
+- Added `deltanet_chunked_neumann_tp(state, x_seq, dn, cfg, seq_len)` as a
+  STUB that internally loops per-position calling `deltanet_step_tp`.
+- Added `state.use_chunked_dn` flag (default False → no behavior change).
+- v3 prefill's DN block routes through the stub when flag is set.
+- Probe gains `--use-chunked-dn` for A/B testing.
+- Validated: stub gives cos identical to v3 (trivially — same math).
+
+API surface and harness locked in. Future stages just replace the stub
+body. Each stage gated by per-stage flag for incremental rollout.
+
 ## Next steps when picking this up
 
-1. Re-read `research/c5_chunked_prefill_plan.md` end-to-end
-2. Find `feedback_c5_primitives_green` memory note for the validated primitives
-3. Scaffold `deltanet_step_tp_chunked(state, x_seq, dn, cfg, seq_len)` with C=8 single-chunk first
-4. Probe vs `deltanet_step_tp` per-position output, gate cos ≥ 0.9997
-5. Iterate
+Replace the STUB body in `deltanet_chunked_neumann_tp` (in `server_tp.py`,
+right after `deltanet_step_tp`) stage by stage. Each stage = one commit +
+validate via `--use-chunked-dn` flag on the probe.
+
+### Stage 1 — batched pre-processing (no Neumann yet)
+Trivial batched ops. No state interaction. Should give cos = same as v3
+because the math is identical, just batched.
+
+In the chunked function, replace per-position loop with:
+```python
+# Batched pre-norm + in_proj
+h_seq = _rms_norm_manual(x_seq, dn['input_norm'], EPS, HIDDEN)  # [C, HIDDEN]
+all_seq = ttnn.linear(h_seq, dn['w_in'])                         # [C, IN_PROJ_OUT_CHIP]
+# Batched slice — per-position is already a column slice
+mixed_qkv_seq = ttnn.slice(all_seq, [0, 0], [C, CONV_DIM_CHIP])
+z_seq = ttnn.slice(all_seq, [0, CONV_DIM_CHIP], [C, CONV_DIM_CHIP + VAL_DIM_CHIP])
+a_seq = ttnn.slice(all_seq, [0, CONV_DIM_CHIP + VAL_DIM_CHIP], [C, ...])
+b_seq = ttnn.slice(all_seq, [0, ...], [C, ...])
+# Then per-position loop for the rest (conv1d, decay, recurrence, output gate)
+```
+
+Validation: cos ≥ 0.9997 vs full per-position. Should be trivial.
+
+### Stage 2 — batched conv1d
+Replace per-position conv1d call with batched 1D conv over `[C + KERNEL-1, CONV_DIM_CHIP]`
+input. Need to prepend conv state taps (`conv_st`) as left padding.
+
+Risk: `ttnn.conv1d` may not exist or may have shape constraints. Fallback:
+materialize the kernel shifts via `ttnn.slice` + `ttnn.mul` + `ttnn.sum`,
+batched across positions.
+
+### Stage 3 — batched decay/gate computation
+For each position, compute `g_t = -exp(A_log) · softplus(A_t + dt_bias)` and
+`β_t = sigmoid(B_t)`. Batched form: input shape `[C, NV_PER_CHIP]`, output
+shape `[C, NV_PER_CHIP]`.
+
+Per C'5 plan: cumsum the `g` to get `G = cumsum(g)` per chunk. Use
+`ttnn.cumsum` (validated by `feedback_c5_primitives_green`).
+
+### Stage 4 — the Neumann (I-attn)^{-1} chunked recurrence
+
+This is THE algorithmic stage. Per C'5 plan §1:
+```
+K_β = β · K                                # [C, K_DIM]
+V_β = β · V                                # [C, V_DIM]
+G = cumsum(g)                              # [C]
+D = exp(G[:,None] - G[None,:]) ⊙ lower_tri # [C, C]
+attn = -(K_β @ K.T) ⊙ D                    # [C, C]
+T = (I - attn)^{-1}  ← Neumann factorization, batched per V-head
+V_prime = T @ V_β
+K_prime = T @ (K_β * exp(G)[:,None])
+A = (Q @ K.T) ⊙ D
+v_prime = K_prime @ S_prev                 # [C, V] from entering SSM state
+v_new = V_prime - v_prime
+attn_int = (Q * exp(G)[:,None]) @ S_prev   # [C, V]
+O = attn_int + A @ v_new                   # [C, V] chunk output
+S_new = exp(G[-1]) * S_prev + (K * exp(G[-1] - G)[:,None]).T @ v_new
+```
+
+Implement in fp32 per `feedback_c5_primitives_green`. Use
+`experiments/utils/neumann_inverse_probe.py:neumann_inverse_ttnn` as the
+reference impl for the inverse.
+
+### Stage 5 — multi-chunk loop + state threading
+
+Once single-chunk works at C=8, add chunk loop:
+- Process `seq_len` in chunks of `C` (default 8 → 32 → 64).
+- Carry `S` (SSM state) across chunks.
+- Last chunk may be partial (pad to C, mask out junk rows in output).
+
+### Stage 6 — output gate + residual
+
+Final stage: per-head `rms_norm` + `silu(z)` gate + `w_out` projection.
+These are already in the existing per-position fallback; batched form is
+straightforward.
+
+### Stages summary
+
+| Stage | What | Risk | Gate |
+|---|---|---|---|
+| 1 | Batched pre-norm + in_proj + slice | low | cos ≥ 0.9997 vs per-pos |
+| 2 | Batched conv1d | medium (op semantics) | cos ≥ 0.9997 |
+| 3 | Batched decay/gate + cumsum | low (primitives validated) | cos ≥ 0.9997 |
+| 4 | Neumann (I-attn)^{-1} recurrence | HIGH (algorithmic) | cos ≥ 0.9997 at C=8 |
+| 5 | Multi-chunk loop + state thread | medium | cos ≥ 0.9997 at C=64, seq=128 |
+| 6 | Batched output gate | low | end-to-end cos ≥ 0.9997 |
+
+Each stage = ~1 day-arc + 1-2 bootstraps. Total: 3-5 day-arcs to ship v4.
