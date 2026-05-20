@@ -1330,26 +1330,23 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 update_input_buffers(state, tid, pos)
                 _dbg_l = layer_idx <= 1  # DN debug only for layers 0 and 1
                 if _dbg_l: print(f"    [DN inner] layer={layer_idx} pos={pos} BEFORE slice", flush=True)
-                # Slice x_pos from x_seq (works on directly-constructed tensor)
-                x_pos_view = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
+                # Slice x_pos from x_seq. DO NOT deallocate x_pos afterwards —
+                # ttnn.slice can return a VIEW into x_seq; deallocating the
+                # view frees x_seq's underlying storage. (Same pattern as the
+                # earlier decay/gate-reshape bug; ref feedback_owned_decay_gate*.)
+                # Let Python GC handle the slice handle's lifetime.
+                x_pos = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
                 if _dbg_l:
                     ttnn.synchronize_device(state.mesh)
-                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice shape={list(x_pos_view.shape)}", flush=True)
-                # Force a fresh allocation+copy via to_memory_config — slice may
-                # return a view with subtly different underlying state that
-                # deltanet_step_tp's internal ops can't handle (per layer 1
-                # wedge investigation B.2.2 debug).
-                x_pos = ttnn.to_memory_config(x_pos_view, ttnn.DRAM_MEMORY_CONFIG)
-                ttnn.deallocate(x_pos_view)
-                if _dbg_l:
-                    ttnn.synchronize_device(state.mesh)
-                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER to_memory_config(DRAM) shape={list(x_pos.shape)}", flush=True)
+                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice shape={list(x_pos.shape)}", flush=True)
                 # Run DN step (existing per-position decode step)
                 x_pos_out = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
                 if _dbg_l:
                     ttnn.synchronize_device(state.mesh)
                     print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER decode-step shape={list(x_pos_out.shape)}", flush=True)
-                ttnn.deallocate(x_pos)
+                # NOTE: do NOT deallocate x_pos — it's a view into x_seq;
+                # deallocating it would free x_seq's underlying storage and
+                # break the next iteration's slice. Let GC handle x_pos.
                 # Reshape to rank-4 + convert to ROW_MAJOR for slice_write
                 x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
                 x_pos_rm = ttnn.to_layout(x_pos_4d, ttnn.ROW_MAJOR_LAYOUT)
