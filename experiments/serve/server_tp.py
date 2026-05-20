@@ -1304,6 +1304,12 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
 
     # ====== Step 3: Layer loop ======
     for layer_idx, layer in enumerate(state.layers):
+        # Layer-entry x_seq metadata (B.2.2 debug)
+        try:
+            print(f"  [v3 layer {layer_idx:2d} entry] x_seq.shape={list(x_seq.shape)} "
+                  f"layout={x_seq.layout} mem={x_seq.memory_config()}", flush=True)
+        except Exception as e:
+            print(f"  [v3 layer {layer_idx:2d} entry] metadata read failed: {e}", flush=True)
         _layer_dbg(layer_idx, layer['type'], stage="start")
         if layer['type'] == 'linear_attention':
             # DeltaNet: sequential per-position with slice_write assembly
@@ -1322,10 +1328,18 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 # Set state.cur_pos_buf etc (DeltaNet itself doesn't use them,
                 # but harmless and keeps invariants consistent across modes).
                 update_input_buffers(state, tid, pos)
+                _dbg_l = layer_idx <= 1  # DN debug only for layers 0 and 1
+                if _dbg_l: print(f"    [DN inner] layer={layer_idx} pos={pos} BEFORE slice", flush=True)
                 # Slice x_pos from x_seq (works on directly-constructed tensor)
                 x_pos = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
+                if _dbg_l:
+                    ttnn.synchronize_device(state.mesh)
+                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice shape={list(x_pos.shape)}", flush=True)
                 # Run DN step (existing per-position decode step)
                 x_pos_out = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
+                if _dbg_l:
+                    ttnn.synchronize_device(state.mesh)
+                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER decode-step shape={list(x_pos_out.shape)}", flush=True)
                 ttnn.deallocate(x_pos)
                 # Reshape to rank-4 + convert to ROW_MAJOR for slice_write
                 x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
