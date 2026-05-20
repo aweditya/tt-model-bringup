@@ -1009,8 +1009,17 @@ def _chunked_recurrence_tp(state, q_seq, k_seq, v_seq, g_seq, beta_seq, S_prev, 
     ttnn.deallocate(kkT)
 
     # --- T = (I - attn)^{-1} via Neumann factorization ---
-    T = _neumann_inverse_via_mesh_tp(state, attn, C)
+    # PRECISION FIX (2026-05-20): cast attn to fp32 BEFORE inverse (the
+    # Neumann series accumulates log2(C) matmuls; bf16 loses precision
+    # rapidly for C≥64). Cast T back to bf16 for downstream matmuls.
+    # Validated single-device: fp32 gives cos>0.99999 vs np.linalg.inv;
+    # bf16 only ~0.99 at C=64 (degrades to cos ~0.8 in full chunked path).
+    attn_fp32 = ttnn.typecast(attn, ttnn.float32)
     ttnn.deallocate(attn)
+    T_fp32 = _neumann_inverse_via_mesh_tp(state, attn_fp32, C)
+    ttnn.deallocate(attn_fp32)
+    T = ttnn.typecast(T_fp32, ttnn.bfloat16)
+    ttnn.deallocate(T_fp32)
 
     # --- V_prime = T @ v_beta ---
     V_prime = ttnn.matmul(T, v_beta)     # [NV_PER_CHIP, C, V_DIM]
