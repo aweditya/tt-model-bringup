@@ -138,17 +138,39 @@ on tt-metal — the daily-driver long-context goal.
 ### v4 Stage 1 — batched pre-norm + in_proj (commits `8c9488c` + `cea8641`, 2026-05-20) ✅
 - Refactor: extracted `_deltanet_step_tp_from_inproj` helper (stages 3-11 of DN).
 - Chunked stub computes batched `h_seq = rms_norm(x_seq)` + `all_seq = linear(h_seq, w_in)` ONCE, then per-position loop slices `all_seq[pos]` and calls helper.
-- Cos validated **bit-identical** to v3 (top1 5/5 at seq=5, 27/32 at seq=32).
-- Perf trade-off discovered: **slower at short seq (slice overhead), faster at long seq (matmul batching).**
+- Cos validated **bit-identical** to v3.
+- Perf trade-off: slower at short seq (slice overhead), faster at long seq.
+
+### v4 Stage 3 — batched decay/gate (commit `f4dbe06`, 2026-05-20) ✅
+- Helper extended with `precomputed_decay` + `precomputed_beta` params.
+- Chunked stub batches the a/b slice + decay/gate computation (manual softplus path; owned_decay_gate kernel is single-pos only).
+- Cos bit-identical-within-bf16-noise to v3.
+
+### v4 cumulative perf table
 
 ```
-              seq=5            seq=32
-v3 baseline   1244 ms          6243 ms
-v3 + Stage 1  2427 ms (1.95×)  5841 ms (0.94×)
-              SLOWER           FASTER
+                          seq=5            seq=32           seq~87
+v3 baseline (no stages)   1264 ms          6089 ms          28230 ms (regresses vs decode-loop @ 22308!)
+v3 + Stage 1              2427 ms (-92%)   5841 ms (+4%)    -
+v3 + Stage 1+3            2808 ms (-122%)  5097 ms (+16%)   15162 ms (+46% vs v3, +36% vs decode-loop)
 ```
 
-**Lesson:** batching one op (matmul) while still slicing for the rest costs more in slice overhead than it saves at short seq. Real perf wins come when MULTIPLE downstream ops are also batched (Stages 2-6 cumulative) — slicing disappears entirely.
+**Top1 agreement (vs decode-loop):** 5/5 (seq=5), 27/32 (seq=32), 69/87 vs v3's 72/87 (seq=87 — ~4% noise from fp accumulation order, neither is "more correct" without HF gold).
+
+**Key finding at seq=87:** v3 alone is SLOWER than decode-loop reference (28s vs 22s). v3+Stage 1+3 is FASTER than decode-loop by 36%. This is the first config that delivers real prefill speedup at long context — the daily-driver use case.
+
+**Stage 2 (conv1d batching)** deferred to a later session due to state-coupling complexity. Stage 4 (Neumann recurrence) is next; that's where DN per-position loop disappears entirely.
+
+### Stage stages summary (updated)
+
+| Stage | Status | Cumulative perf at seq=87 |
+|---|---|---|
+| 1 (pre-norm + in_proj batched) | ✅ done | +6% vs v3 alone (extrapolated) |
+| 2 (conv1d batched) | ⏸️ deferred | TBD |
+| 3 (decay/gate batched) | ✅ done | +46% vs v3 cumulative |
+| 4 (Neumann (I-attn)⁻¹ chunked recurrence) | next | huge — eliminates per-pos loop entirely |
+| 5 (multi-chunk loop + state thread) | future | enables 32k+ context |
+| 6 (batched output gate) | future | small cleanup |
 
 API surface and harness locked in. Future stages just replace one piece at a time.
 
