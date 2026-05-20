@@ -734,7 +734,8 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     return _deltanet_step_tp_from_inproj(state, x_tt, all_tt, dn, cfg)
 
 
-def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg):
+def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg,
+                                   precomputed_decay=None, precomputed_beta=None):
     """Inner DN body, starting AFTER rms_norm + in_proj.
 
     Used by both `deltanet_step_tp` (which runs rms+linear inline) and the
@@ -748,6 +749,11 @@ def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg):
                       version; this is what gets added to `reduced`.
       all_tt:         [1, IN_PROJ_OUT_CHIP] — the output of `linear(h_tt, w_in)`,
                       i.e., already past stages 1+2 of the DN forward.
+      precomputed_decay:  optional [1, NV_PER_CHIP, 1, 1] — if provided, skip
+                          the a-slice + decay-gate computation; use this directly.
+                          Pair with precomputed_beta. (v4 Stage 3 path.)
+      precomputed_beta:   optional [1, NV_PER_CHIP] — if provided, skip the
+                          b-slice + decay-gate computation. Pair with decay.
     """
     import ttnn
     from full_layer_tp_probe import (
@@ -755,13 +761,16 @@ def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg):
         NK_PER_CHIP, NV_PER_CHIP, N_REP, EPS,
     )
 
+    _have_pre_decay = (precomputed_decay is not None and precomputed_beta is not None)
+
     # 3. slice per-chip [Q | K | V | Z | A | B]
     mixed_qkv = ttnn.slice(all_tt, [0, 0], [1, CONV_DIM_CHIP])
     z_tt = ttnn.slice(all_tt, [0, CONV_DIM_CHIP], [1, CONV_DIM_CHIP + VAL_DIM_CHIP])
-    a_tt = ttnn.slice(all_tt, [0, CONV_DIM_CHIP + VAL_DIM_CHIP],
-                      [1, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP])
-    b_tt = ttnn.slice(all_tt, [0, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
-                      [1, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP])
+    if not _have_pre_decay:
+        a_tt = ttnn.slice(all_tt, [0, CONV_DIM_CHIP + VAL_DIM_CHIP],
+                          [1, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP])
+        b_tt = ttnn.slice(all_tt, [0, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
+                          [1, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP])
     ttnn.deallocate(all_tt)
     # 4. conv1d on per-chip slab
     with _profile_scope(state, "deltanet_conv"):
@@ -831,7 +840,12 @@ def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg):
     k = _rms_norm_manual(k, dn['k_l2_scale'], EPS_RMS, K_DIM)
     # 7. gate/decay/beta on per-chip head subset
     with _profile_scope(state, "deltanet_decay_gate"):
-        if state.deltanet_decay_gate_mode == "owned_decay_gate":
+        if _have_pre_decay:
+            # v4 Stage 3: chunked function pre-computed decay + beta batched.
+            # Skip the a/b slice + decay-gate computation; use what was passed.
+            decay = precomputed_decay  # [1, NV_PER_CHIP, 1, 1]
+            beta = precomputed_beta    # [1, NV_PER_CHIP]
+        elif state.deltanet_decay_gate_mode == "owned_decay_gate":
             # Owned decay/gate kernel (G2 wire-in). Kernel expects rank-2
             # [1, NV_PER_CHIP] for all 4 inputs; production dn['dt_bias'] +
             # dn['A_log'] are rank-1 [NV_PER_CHIP] per chip (uploaded as
@@ -963,7 +977,9 @@ def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
     """
     import ttnn
     import torch
-    from full_layer_tp_probe import IN_PROJ_OUT_CHIP, EPS
+    from full_layer_tp_probe import (
+        IN_PROJ_OUT_CHIP, EPS, CONV_DIM_CHIP, VAL_DIM_CHIP, NV_PER_CHIP,
+    )
 
     HIDDEN = cfg['hidden']
 
@@ -972,8 +988,33 @@ def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
     all_seq = ttnn.linear(h_seq, dn['w_in'])  # [seq_len, IN_PROJ_OUT_CHIP]
     ttnn.deallocate(h_seq)
 
-    # Per-position loop: slice all_seq[pos] and pass to refactored helper.
-    # The helper handles slices 3-11 of DN (conv1d/QKV/decay/recurrence/...).
+    # === STAGE 3: batched decay/gate computation (position-independent) ===
+    # Slice a_seq, b_seq from all_seq batched, compute decay_seq + beta_seq
+    # batched via the manual softplus path (owned_decay_gate kernel is
+    # single-pos only). Per-pos loop slices decay_pos + beta_pos and passes
+    # to helper as precomputed (skipping a/b slice + decay-gate stage in
+    # helper). Note: forces "manual" decay-gate computation regardless of
+    # state.deltanet_decay_gate_mode default — manual is mathematically
+    # equivalent to owned within bf16 noise.
+    a_seq = ttnn.slice(all_seq, [0, CONV_DIM_CHIP + VAL_DIM_CHIP],
+                       [seq_len, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP])
+    b_seq = ttnn.slice(all_seq, [0, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
+                       [seq_len, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP])
+    a_biased_seq = ttnn.add(a_seq, dn['dt_bias'])
+    if state.deltanet_decay_mode == "native_softplus":
+        softplus_a_seq = ttnn.softplus(a_biased_seq)
+    else:
+        softplus_a_seq = ttnn.log(ttnn.add(ttnn.exp(a_biased_seq), 1.0))
+    g_seq = ttnn.mul(ttnn.neg(ttnn.exp(dn['A_log'])), softplus_a_seq)
+    beta_seq = ttnn.sigmoid(b_seq)   # [seq_len, NV_PER_CHIP]
+    decay_seq = ttnn.exp(g_seq)       # [seq_len, NV_PER_CHIP]
+    ttnn.deallocate(a_seq)
+    ttnn.deallocate(b_seq)
+    ttnn.deallocate(a_biased_seq)
+    ttnn.deallocate(softplus_a_seq)
+    ttnn.deallocate(g_seq)
+
+    # Per-position loop: slice all_seq[pos] + decay/beta and pass to helper.
     dn_buf_init = torch.zeros((1, 1, seq_len, HIDDEN), dtype=torch.bfloat16)
     dn_out_buf = ttnn.from_torch(
         dn_buf_init,
@@ -986,9 +1027,16 @@ def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
     for pos in range(seq_len):
         x_pos = ttnn.slice(x_seq_tt, [pos, 0], [pos + 1, HIDDEN])      # residual
         all_pos = ttnn.slice(all_seq, [pos, 0], [pos + 1, IN_PROJ_OUT_CHIP])
+        decay_pos_2d = ttnn.slice(decay_seq, [pos, 0], [pos + 1, NV_PER_CHIP])
+        beta_pos = ttnn.slice(beta_seq, [pos, 0], [pos + 1, NV_PER_CHIP])
+        # Reshape decay to [1, NV_PER_CHIP, 1, 1] (what helper's downstream expects)
+        decay_pos = ttnn.reshape(decay_pos_2d, [1, NV_PER_CHIP, 1, 1])
+        ttnn.deallocate(decay_pos_2d)
         # x_pos is a VIEW of x_seq_tt — DO NOT deallocate (per B.2.2 lesson)
-        # all_pos is a fresh slice of all_seq — helper deallocs it internally.
-        x_pos_out = _deltanet_step_tp_from_inproj(state, x_pos, all_pos, dn, cfg)
+        # all_pos, decay_pos, beta_pos are fresh slices — helper deallocs internally.
+        x_pos_out = _deltanet_step_tp_from_inproj(
+            state, x_pos, all_pos, dn, cfg,
+            precomputed_decay=decay_pos, precomputed_beta=beta_pos)
         x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
         x_pos_rm = ttnn.to_layout(x_pos_4d, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.experimental.slice_write(
@@ -1002,6 +1050,8 @@ def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
         ttnn.deallocate(x_pos_rm)
 
     ttnn.deallocate(all_seq)
+    ttnn.deallocate(decay_seq)
+    ttnn.deallocate(beta_seq)
 
     # Reassemble into [seq_len, HIDDEN] TILE via clone (per B.2.2 fix).
     dn_out_4d_tile = ttnn.to_layout(dn_out_buf, ttnn.TILE_LAYOUT)
