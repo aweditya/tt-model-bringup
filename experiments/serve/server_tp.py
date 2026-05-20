@@ -1467,8 +1467,15 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         layout=ttnn.TILE_LAYOUT,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
-    cos_seq_tt = ttnn.reshape(cos_seq_raw, [seq_len, ROTARY_DIM])
-    sin_seq_tt = ttnn.reshape(sin_seq_raw, [seq_len, ROTARY_DIM])
+    # B.2.2 FIX (2026-05-20): same reshape-view trap as x_seq. cos/sin views
+    # are held until each gated_attn layer for RoPE — if backing buffer gets
+    # reused, RoPE silently uses wrong angles. Defensive clone.
+    _cos_view = ttnn.reshape(cos_seq_raw, [seq_len, ROTARY_DIM])
+    _sin_view = ttnn.reshape(sin_seq_raw, [seq_len, ROTARY_DIM])
+    cos_seq_tt = ttnn.clone(_cos_view)
+    sin_seq_tt = ttnn.clone(_sin_view)
+    ttnn.deallocate(_cos_view)
+    ttnn.deallocate(_sin_view)
     ttnn.deallocate(positions_idx)
     ttnn.deallocate(cos_seq_raw)
     ttnn.deallocate(sin_seq_raw)
