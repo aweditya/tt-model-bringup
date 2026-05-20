@@ -1293,18 +1293,18 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
 
     import time as _time
     _last_t = _time.time()
-    def _layer_dbg(idx, layer_type):
+    def _layer_dbg(idx, layer_type, stage="end"):
         nonlocal _last_t
         ttnn.synchronize_device(state.mesh)
         now = _time.time()
         dt = now - _last_t
         _last_t = now
-        # Only print every 8 layers to limit noise
-        if idx % 8 == 0 or layer_type == 'full_attention':
-            print(f"  [v3 prefill] layer {idx} ({layer_type}) done in {dt*1000:.0f} ms", flush=True)
+        # Print every layer for B.2.2 debug
+        print(f"  [v3 prefill] layer {idx:2d} ({layer_type[:14]:14s}) {stage} dt={dt*1000:5.0f}ms", flush=True)
 
     # ====== Step 3: Layer loop ======
     for layer_idx, layer in enumerate(state.layers):
+        _layer_dbg(layer_idx, layer['type'], stage="start")
         if layer['type'] == 'linear_attention':
             # DeltaNet: sequential per-position with slice_write assembly
             # Pre-allocate ROW_MAJOR working buffer [1, 1, seq_len, HIDDEN]
@@ -1353,11 +1353,12 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
             ttnn.deallocate(x_seq)
             x_seq = new_x_seq
 
+        _layer_dbg(layer_idx, layer['type'], stage="pre_mlp")
         # MLP: batched on [seq_len, HIDDEN] (broadcasts on leading dim)
         new_x_seq = mlp_step_tp(state, x_seq, layer['mlp'])
         ttnn.deallocate(x_seq)
         x_seq = new_x_seq
-        _layer_dbg(layer_idx, layer['type'])
+        _layer_dbg(layer_idx, layer['type'], stage="end")
 
     ttnn.deallocate(cos_seq_tt)
     ttnn.deallocate(sin_seq_tt)
