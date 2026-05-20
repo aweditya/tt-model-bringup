@@ -1341,6 +1341,17 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         # Print every layer for B.2.2 debug
         print(f"  [v3 prefill] layer {idx:2d} ({layer_type[:14]:14s}) {stage} dt={dt*1000:5.0f}ms", flush=True)
 
+    # B.2.2 wedge workaround test: temporarily force manual modes for DN
+    # custom kernels. The deep op-isolation probe (5add77c) showed all
+    # standard ttnn ops (rms_norm, linear, etc.) work fine on slice-of-
+    # all_reduce input. So the wedge must be in one of the OWNED kernels
+    # (qwen36_gdn_decode_owned, qwen36_decay_gate_decode_owned) which were
+    # built/validated against single-token decode inputs only.
+    _old_recurrence_mode = state.deltanet_recurrence_mode
+    _old_decay_gate_mode = state.deltanet_decay_gate_mode
+    state.deltanet_recurrence_mode = "manual"
+    state.deltanet_decay_gate_mode = "manual"
+
     # ====== Step 3: Layer loop ======
     for layer_idx, layer in enumerate(state.layers):
         # Layer-entry x_seq metadata (B.2.2 debug)
@@ -1424,6 +1435,10 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
 
     ttnn.deallocate(cos_seq_tt)
     ttnn.deallocate(sin_seq_tt)
+
+    # Restore default modes (production decode uses owned kernels for perf).
+    state.deltanet_recurrence_mode = _old_recurrence_mode
+    state.deltanet_decay_gate_mode = _old_decay_gate_mode
 
     # ====== Step 4: Final norm + LM head ======
     x_seq = _rms_norm_manual(x_seq, state.final_norm_tt, 1e-6, HIDDEN)
