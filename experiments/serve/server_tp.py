@@ -588,6 +588,25 @@ def _tp_all_reduce(state: MeshServerState, partial):
     [5, HIDDEN]).
     """
     import ttnn
+    import torch
+
+    def _force_fresh(result):
+        """ttnn.clone with same mem_config was a no-op; force a genuine new
+        allocation by ttnn.add with a fresh zeros tensor — guarantees a brand-new
+        output Tensor whose storage was just allocated. Cost: tensor add on
+        [seq_len, HIDDEN] bf16, negligible (~us at our shapes)."""
+        shape = list(result.shape)
+        zeros_t = ttnn.from_torch(
+            torch.zeros(shape, dtype=torch.bfloat16),
+            layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        fresh = ttnn.add(result, zeros_t)
+        ttnn.deallocate(zeros_t)
+        return fresh
+
     if state.collective_mode == "explicit_all_reduce":
         result = ttnn.all_reduce(
             partial,
@@ -599,14 +618,14 @@ def _tp_all_reduce(state: MeshServerState, partial):
             num_links=2,
             topology=ttnn.Topology.Linear,
         )
-        return ttnn.clone(result, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        return _force_fresh(result)
     try:
         result = ttnn.all_reduce(partial)
-        return ttnn.clone(result, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        return _force_fresh(result)
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
         result = ttnn.all_gather(scattered, dim=1)
-        return ttnn.clone(result, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        return _force_fresh(result)
 
 
 def deltanet_step_tp(state, x_tt, dn, cfg):
