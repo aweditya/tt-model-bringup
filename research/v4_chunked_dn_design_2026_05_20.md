@@ -216,28 +216,51 @@ mesh tensors at production shapes.
 
 **ALGORITHMIC RISK FOR STAGE 4 IS FULLY ELIMINATED.**
 
-### v4 Stage 4b-iii — integration (next session, task #82)
+### v4 Stage 4b-iii — integration (commit `674a41b`, 2026-05-20) ✅ correctness / ⚠ perf
 
-This is now pure mechanical refactoring. Approach:
-1. Extract `_deltanet_pre_recurrence_tp(state, all_tt, dn, cfg)` from
-   `_deltanet_step_tp_from_inproj` lines covering conv1d + QKV split + GQA
-   + L2-norm. Returns `(q, k, v, z_tt)`.
-2. Extract `_deltanet_post_recurrence_tp(state, x_residual, out_per_head,
-   z_tt, dn, cfg)` covering output gate + w_out + all_reduce + residual.
-3. In `deltanet_chunked_neumann_tp`:
-   - Per-pos loop A: call pre-recurrence, slice_write collected q/k/v/z
-     into batched tensors.
-   - SINGLE call: `O_seq, S_new = _chunked_recurrence_tp(state, q_seq,
-     k_seq, v_seq, g_seq, beta_seq, S_prev, C)`
-   - `ttnn.copy(S_new, dn['ssm'])` ONCE.
-   - Per-pos loop B: slice `O_seq[pos]`, slice z[pos], call post-recurrence,
-     slice_write into dn_out_buf.
+Integrated `_chunked_dn_with_chunked_recurrence_tp` as the chunked-DN path
+when seq_len is a power of 2 (Neumann constraint). Non-power-of-2 falls
+back to Stage 1+3 per-pos.
 
-Risk: shape/dtype mismatches across the new boundaries. Mitigation: refactor
-`deltanet_step_tp` first as a thin wrapper around the new pre/post helpers
-+ the existing per-pos recurrence — validate it produces same cos as
-current production decode (probe `--mode stub`). Then integrate into chunked
-DN function and validate end-to-end.
+**Correctness PASS:**
+
+| | top1 v3 baseline | top1 v4 chunked | cos median |
+|---|---|---|---|
+| seq=8  | 7/8 | 7/8 | 0.996 |
+| seq=32 | 27/32 | 27/32 | 0.956 (v3: 0.992) |
+
+Math is equivalent up to bf16 noise. Top-1 matches per-position recurrence.
+
+**Perf: NOT A WIN at current shapes.**
+
+| | v3 baseline wall | v4 FULL chunked wall | ratio |
+|---|---|---|---|
+| seq=8  | 1571 ms | 6359 ms | 4.0× SLOWER |
+| seq=32 | 6005 ms | 14613 ms | 2.4× SLOWER |
+
+Honest post-mortem:
+- Per-op dispatch dominates at small C. ~20 chunked sub-ops × dispatch ≥ per-pos × C × small-dispatch.
+- Batched matmul on [12, 32, 128] not always faster than 32 × matmul on [12, 128] (TILE alignment, kernel setup).
+- Per-pos collect step (slice_write into batched buffer) adds non-trivial overhead.
+- JIT compilation on first-call of every new shape (each forward sees fresh).
+- bf16 accumulation in long matmul chain costs precision (cos 0.992 → 0.956 at seq=32).
+
+The C'5 design estimate (10-20× at long contexts) was based on op count,
+which underestimated dispatch + collect overheads on this hardware/runtime.
+
+**Future optimization paths (not in scope this session):**
+- Try larger C (64+) — where matmul amortization matters more
+- fp32 for Neumann inverse to recover cos precision
+- Trace capture (no per-call dispatch tax — biggest potential win)
+- Stage 2 (batched conv1d) so q/k/v are batched-produced, no slice_write
+  collect step needed
+- Reduce intermediate allocations (deallocate aggressively, reuse buffers)
+
+**Current best chunked-prefill config (shipped + ready for opt-in use):**
+v3 Stages 1+3 (without Stage 4b-iii) at `--use-chunked-dn` for non-power-of-2 seq.
+At seq=87 this beats v3 alone by 46% and eager decode-loop reference by 36%.
+Still slower than production traced decode-loop prefill — wire-in to
+`handle_generate_tp` would be a regression today.
 
 API surface and harness locked in. Future stages just replace one piece at a time.
 
