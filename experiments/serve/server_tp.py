@@ -940,31 +940,40 @@ def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
       x_out_seq_tt: [seq_len, HIDDEN] bf16 TILE, residual-added DN output
                    (replicated, mirrors deltanet_step_tp's output contract per position)
 
-    STATUS (2026-05-20, v4 step 1): STUB. Internally loops per-position
-    calling deltanet_step_tp. Same math as v3 — gives cos = 1.0 vs v3
-    trivially. The point of this stub is to lock in the function signature
-    and probe harness so future sessions can replace the body with real
-    chunked Neumann math one stage at a time.
+    STATUS (2026-05-20, v4 Stage 1, task #77): batched pre-norm + in_proj
+    run ONCE per chunk on [seq_len, HIDDEN] / [seq_len, IN_PROJ_OUT_CHIP]
+    instead of per-position. Per-position loop slices the in_proj output
+    and calls `_deltanet_step_tp_from_inproj` (the refactored helper that
+    holds stages 3-11 of DN).
+
+    Saving: (seq_len - 1) × (rms_norm + in_proj) ops per DN layer.
+    Same math as v3 — cos should be bit-identical.
 
     Design doc: research/v4_chunked_dn_design_2026_05_20.md
     Reference impl plan: research/c5_chunked_prefill_plan.md
     Validated primitives: feedback_c5_primitives_green (Neumann factorization
     + ttnn.cumsum both confirmed at production shape on single-chip).
 
-    NEXT SESSION work: replace the per-position loop below with:
-      1. ttnn.cumsum(g) per-chunk → G
-      2. exp(G_a - G_b) lower-tri → D
-      3. Neumann factorization of -(K_β @ K^T) ⊙ D → T = (I - attn)^{-1}
-      4. T @ V_β, T @ (K_β ⊙ exp(G)) → chunk-rotated values
-      5. Standard chunked recurrence per chunk; carry SSM state across chunks
+    NEXT STAGES (per design doc §Stages):
+      Stage 2: batched conv1d
+      Stage 3: batched decay/gate + cumsum
+      Stage 4: Neumann (I - attn)^{-1} chunked recurrence  ← THE BIG ONE
+      Stage 5: multi-chunk loop + state thread
+      Stage 6: batched output gate
     """
     import ttnn
     import torch
+    from full_layer_tp_probe import IN_PROJ_OUT_CHIP, EPS
 
     HIDDEN = cfg['hidden']
 
-    # STUB BODY: per-position loop, reassemble into [seq_len, HIDDEN].
-    # This mirrors the v3 DN inner loop EXACTLY so cos validation is trivial.
+    # === STAGE 1: batched pre-norm + in_proj (run ONCE for the whole chunk) ===
+    h_seq = _rms_norm_manual(x_seq_tt, dn['input_norm'], EPS, HIDDEN)
+    all_seq = ttnn.linear(h_seq, dn['w_in'])  # [seq_len, IN_PROJ_OUT_CHIP]
+    ttnn.deallocate(h_seq)
+
+    # Per-position loop: slice all_seq[pos] and pass to refactored helper.
+    # The helper handles slices 3-11 of DN (conv1d/QKV/decay/recurrence/...).
     dn_buf_init = torch.zeros((1, 1, seq_len, HIDDEN), dtype=torch.bfloat16)
     dn_out_buf = ttnn.from_torch(
         dn_buf_init,
@@ -975,9 +984,11 @@ def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
     for pos in range(seq_len):
-        x_pos = ttnn.slice(x_seq_tt, [pos, 0], [pos + 1, HIDDEN])
-        x_pos_out = deltanet_step_tp(state, x_pos, dn, cfg)
+        x_pos = ttnn.slice(x_seq_tt, [pos, 0], [pos + 1, HIDDEN])      # residual
+        all_pos = ttnn.slice(all_seq, [pos, 0], [pos + 1, IN_PROJ_OUT_CHIP])
         # x_pos is a VIEW of x_seq_tt — DO NOT deallocate (per B.2.2 lesson)
+        # all_pos is a fresh slice of all_seq — helper deallocs it internally.
+        x_pos_out = _deltanet_step_tp_from_inproj(state, x_pos, all_pos, dn, cfg)
         x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
         x_pos_rm = ttnn.to_layout(x_pos_4d, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.experimental.slice_write(
@@ -989,6 +1000,8 @@ def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
         ttnn.deallocate(x_pos_out)
         ttnn.deallocate(x_pos_4d)
         ttnn.deallocate(x_pos_rm)
+
+    ttnn.deallocate(all_seq)
 
     # Reassemble into [seq_len, HIDDEN] TILE via clone (per B.2.2 fix).
     dn_out_4d_tile = ttnn.to_layout(dn_out_buf, ttnn.TILE_LAYOUT)
