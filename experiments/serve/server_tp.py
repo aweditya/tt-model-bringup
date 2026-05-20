@@ -715,13 +715,15 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
 
     `dn` = per-layer sharded weights dict (see Stage B): w_in, w_conv, conv_st,
     dt_bias, A_log, w_out, ssm, input_norm, linear_attn_norm, q_l2_scale, k_l2_scale.
+
+    REFACTOR (2026-05-20, task #77 prep): inner body moved to
+    `_deltanet_step_tp_from_inproj` so the v4 chunked stub can call the
+    inner body with pre-computed batched in_proj output. This wrapper is
+    behaviorally identical to the pre-refactor function — verify with
+    `probe_prefill_vs_decode_loop_tp` cos numbers unchanged.
     """
     import ttnn
-    import numpy as np
-    from full_layer_tp_probe import (
-        N_K_HEADS, N_V_HEADS, K_DIM, V_DIM, CONV_DIM_CHIP, KEY_DIM_CHIP, VAL_DIM_CHIP,
-        NK_PER_CHIP, NV_PER_CHIP, N_REP, EPS,
-    )
+    from full_layer_tp_probe import EPS
 
     HIDDEN = cfg['hidden']
     # 1. Pre-norm (manual: see _rms_norm_manual doc)
@@ -729,6 +731,30 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     # 2. in_proj (replicated x × sharded weight → per-chip slab)
     all_tt = ttnn.linear(h_tt, dn['w_in'])
     ttnn.deallocate(h_tt)
+    return _deltanet_step_tp_from_inproj(state, x_tt, all_tt, dn, cfg)
+
+
+def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg):
+    """Inner DN body, starting AFTER rms_norm + in_proj.
+
+    Used by both `deltanet_step_tp` (which runs rms+linear inline) and the
+    v4 chunked stub `deltanet_chunked_neumann_tp` (which runs rms+linear
+    batched once per chunk, then loops per-position calling this helper
+    with sliced `all_tt`).
+
+    Args:
+      x_residual_tt:  [1, HIDDEN] — the original input, used for the final
+                      residual add at the end. NOT the rms_norm'd or in_proj'd
+                      version; this is what gets added to `reduced`.
+      all_tt:         [1, IN_PROJ_OUT_CHIP] — the output of `linear(h_tt, w_in)`,
+                      i.e., already past stages 1+2 of the DN forward.
+    """
+    import ttnn
+    from full_layer_tp_probe import (
+        N_K_HEADS, N_V_HEADS, K_DIM, V_DIM, CONV_DIM_CHIP, KEY_DIM_CHIP, VAL_DIM_CHIP,
+        NK_PER_CHIP, NV_PER_CHIP, N_REP, EPS,
+    )
+
     # 3. slice per-chip [Q | K | V | Z | A | B]
     mixed_qkv = ttnn.slice(all_tt, [0, 0], [1, CONV_DIM_CHIP])
     z_tt = ttnn.slice(all_tt, [0, CONV_DIM_CHIP], [1, CONV_DIM_CHIP + VAL_DIM_CHIP])
@@ -879,7 +905,7 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     reduced = _tp_all_reduce(state, partial)
     ttnn.deallocate(partial)
     # 11. residual add + update SSM/conv state in place
-    x_out = ttnn.add(x_tt, reduced)
+    x_out = ttnn.add(x_residual_tt, reduced)
     ttnn.deallocate(reduced)
     with _profile_scope(state, "deltanet_state_update"):
         if state.deltanet_recurrence_mode == "owned_gdn_inplace":
