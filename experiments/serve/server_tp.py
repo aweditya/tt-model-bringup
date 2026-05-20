@@ -3245,16 +3245,19 @@ def handle_probe_dn_op_isolation_tp(state: MeshServerState, args: dict) -> dict:
     ttnn.synchronize_device(state.mesh)
     print(f"  [DN-op-iso] sliced, shape={list(x_pos.shape)}", flush=True)
 
-    # Find layer 1 (DN) to grab its input_norm weight for rms_norm test
-    layer1 = None
-    for layer in state.layers:
-        if layer['type'] == 'linear_attention':
-            layer1 = layer
-            break
-    if layer1 is None:
-        return {"error": "no linear_attention layer"}
-    norm_weight = layer1['dn']['input_norm']
-    w_in = layer1['dn']['w_in']
+    # B.2.2 FIX: previous probe used "first linear_attention layer" which is
+    # layer index 0. But v3 wedges at LAYER 1 specifically. Test rms_norm +
+    # linear with EXPLICIT layer indices (0, 1, 2 — all DN layers; 4, 5
+    # also DN; layer 3 is full_attention).
+    dn_indices_to_test = [0, 1, 2, 4]
+    layer_weights = {}
+    for idx in dn_indices_to_test:
+        if idx >= len(state.layers):
+            continue
+        lyr = state.layers[idx]
+        if lyr['type'] != 'linear_attention':
+            continue
+        layer_weights[idx] = lyr['dn']
 
     results = []
 
@@ -3279,14 +3282,19 @@ def handle_probe_dn_op_isolation_tp(state: MeshServerState, args: dict) -> dict:
             print(f"  [DN-op-iso] EXCEPTION {name}: {type(e).__name__}: {e}", flush=True)
             results.append({"op": name, "result": "ERROR", "error": f"{type(e).__name__}: {e}"})
 
-    # ── Tests, ordered least-likely-to-wedge → most-likely ──
+    # ── Generic ops (input only, no per-layer weight) ──
     try_op("reshape", lambda: ttnn.reshape(x_pos, [HIDDEN]))
     try_op("add", lambda: ttnn.add(x_pos, x_pos))
     try_op("mul", lambda: ttnn.mul(x_pos, x_pos))
     try_op("exp", lambda: ttnn.exp(x_pos))
     try_op("softplus", lambda: ttnn.softplus(x_pos))
-    try_op("linear", lambda: ttnn.linear(x_pos, w_in))
-    try_op("rms_norm", lambda: ttnn.rms_norm(x_pos, weight=norm_weight, epsilon=1e-6))
+
+    # ── Per-layer ops (test EACH DN layer's weights individually) ──
+    for idx, dn in sorted(layer_weights.items()):
+        try_op(f"linear_layer{idx}",
+               lambda dn=dn: ttnn.linear(x_pos, dn['w_in']))
+        try_op(f"rms_norm_layer{idx}",
+               lambda dn=dn: ttnn.rms_norm(x_pos, weight=dn['input_norm'], epsilon=1e-6))
 
     ttnn.deallocate(x_pos)
     ttnn.deallocate(x_seq)
