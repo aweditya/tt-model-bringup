@@ -81,15 +81,36 @@ wrong x_seq row 0. Test 8 narrows further by checking pre-MLP value.
 
 ### Test 8 — pre-MLP diag in both paths
 
-Status: bootstrapping (b3qvvmqu8 polling)
-Add x[0,:] print BETWEEN DN and MLP at L0 in both paths (single-shot,
-gated to fire once per path).
+Status: COMPLETE
+Result: **DN reassembly is fine. Bug is in MLP.**
 
-Expected outcomes:
-- pre-MLP matches between paths → batched MLP processing of row 0 is the bug
-- pre-MLP differs → DN reassembly chain (slice_write/to_layout/reshape) is the bug
+```
+PRE-MLP (after Layer 0 DN, before MLP):
+  decode: chip_v0=-0.019531  chip_means=0.002435  chip_norms=12.8629
+  v3:     chip_v0=-0.019531  chip_means=0.002432  chip_norms=12.8622
+  → MATCH within bf16 noise ✓
+```
 
-Either way, this narrows the search from "Layer 0 chain" to one specific op.
+DN per-position loop + slice_write + to_layout + reshape + dealloc all work
+correctly. The full v3 DN reassembly chain produces a `x_seq` whose row 0
+is bit-for-bit (within bf16 noise) the same as decode's post-Layer-0-DN x.
+
+Bug is somewhere in the MLP step on batched [5, 5120] input.
+
+### Test 9 — dump _tp_all_reduce OUTPUT in both paths
+
+Status: bootstrapping (b57y4xk1g polling)
+
+MLP partial INPUT to all_reduce already verified to match between paths
+(`[pre call=5]` row 0 ≈ `[dec call=1]`). So the bug must be in either:
+- `_tp_all_reduce` OUTPUT (the custom AG+reshape+sum on multi-row real data)
+- The residual add `out = x_tt + reduced` on multi-row
+
+Test 9 adds output diag to _tp_all_reduce showing chip_v0+means+norms of
+the result. Compare row 0 of v3's MLP all_reduce output to decode's.
+
+If outputs match → residual add corrupts row 0 on multi-row
+If outputs differ → custom AG+sum has row-dependent bug on real (non-constant) data
 
 Result: [TBD]
 
