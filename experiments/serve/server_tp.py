@@ -1371,12 +1371,26 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
             new_x_seq = gated_attn_step_prefill_tp(
                 state, x_seq, layer['attn'], cos_seq_tt, sin_seq_tt, cfg, seq_len)
             ttnn.deallocate(x_seq)
+            # Same fix as below (B.2.2 wedge) — attn output also ends with
+            # all_reduce + add, has the same DeallocatedTombStone risk.
+            new_x_seq = ttnn.to_memory_config(new_x_seq, ttnn.DRAM_MEMORY_CONFIG)
             x_seq = new_x_seq
 
         _layer_dbg(layer_idx, layer['type'], stage="pre_mlp")
         # MLP: batched on [seq_len, HIDDEN] (broadcasts on leading dim)
         new_x_seq = mlp_step_tp(state, x_seq, layer['mlp'])
         ttnn.deallocate(x_seq)
+        # FIX (B.2.2 wedge): mlp_step_tp's last op is ttnn.add(x_residual,
+        # all_reduce_result). The all_reduce output can have a
+        # DeallocatedTombStone storage state which propagates through add.
+        # When the next layer's DN body slices this and feeds rms_norm,
+        # get_mesh_buffer() throws "Tensor is not allocated" during async
+        # device-op validation → silent wedge (99% CPU forever).
+        # Force a fresh allocation by round-tripping through to_memory_config
+        # with an identical config — internally this triggers create_device_tensor
+        # which severs the tombstone link. Cost: one memory copy per layer.
+        # See research/b2_2_wedge_root_cause.md.
+        new_x_seq = ttnn.to_memory_config(new_x_seq, ttnn.DRAM_MEMORY_CONFIG)
         x_seq = new_x_seq
         _layer_dbg(layer_idx, layer['type'], stage="end")
 
