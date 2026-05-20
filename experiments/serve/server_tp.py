@@ -1341,16 +1341,20 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         # Print every layer for B.2.2 debug
         print(f"  [v3 prefill] layer {idx:2d} ({layer_type[:14]:14s}) {stage} dt={dt*1000:5.0f}ms", flush=True)
 
-    # B.2.2 wedge workaround test: temporarily force manual modes for DN
-    # custom kernels. The deep op-isolation probe (5add77c) showed all
-    # standard ttnn ops (rms_norm, linear, etc.) work fine on slice-of-
-    # all_reduce input. So the wedge must be in one of the OWNED kernels
-    # (qwen36_gdn_decode_owned, qwen36_decay_gate_decode_owned) which were
-    # built/validated against single-token decode inputs only.
-    _old_recurrence_mode = state.deltanet_recurrence_mode
-    _old_decay_gate_mode = state.deltanet_decay_gate_mode
-    state.deltanet_recurrence_mode = "manual"
-    state.deltanet_decay_gate_mode = "manual"
+    # B.2.2 fix attempt 8: launder slice via ttnn.add(slice, zeros).
+    # Manual mode (fix 7) and force-fresh on all_reduce output (fixes 3-6) all
+    # failed. The deep op probe showed ALL standard ttnn ops PASS on the
+    # contaminated slice individually — so the bug must be specific to feeding
+    # the slice into the full DN sequence. Hypothesis: laundering POST-SLICE
+    # produces a "fresh" tensor (output of ttnn.add) that DN can consume.
+    # Pre-allocate one zeros buffer for the entire forward pass, reuse per pos.
+    _launder_zeros = ttnn.from_torch(
+        torch.zeros((1, HIDDEN), dtype=torch.bfloat16),
+        layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
 
     # ====== Step 3: Layer loop ======
     for layer_idx, layer in enumerate(state.layers):
@@ -1380,23 +1384,24 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 update_input_buffers(state, tid, pos)
                 _dbg_l = layer_idx <= 1  # DN debug only for layers 0 and 1
                 if _dbg_l: print(f"    [DN inner] layer={layer_idx} pos={pos} BEFORE slice", flush=True)
-                # Slice x_pos from x_seq. DO NOT deallocate x_pos afterwards —
-                # ttnn.slice can return a VIEW into x_seq; deallocating the
-                # view frees x_seq's underlying storage. (Same pattern as the
-                # earlier decay/gate-reshape bug; ref feedback_owned_decay_gate*.)
-                # Let Python GC handle the slice handle's lifetime.
-                x_pos = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
+                x_pos_view = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
+                # LAUNDER: add zeros to produce a fresh add-output tensor that
+                # breaks the all_reduce contamination lineage. The op probe
+                # confirmed ttnn.add on the contaminated slice works; we test
+                # whether DN can consume the add output.
+                x_pos = ttnn.add(x_pos_view, _launder_zeros)
                 if _dbg_l:
                     ttnn.synchronize_device(state.mesh)
-                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice shape={list(x_pos.shape)}", flush=True)
+                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice+launder shape={list(x_pos.shape)}", flush=True)
                 # Run DN step (existing per-position decode step)
                 x_pos_out = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
                 if _dbg_l:
                     ttnn.synchronize_device(state.mesh)
                     print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER decode-step shape={list(x_pos_out.shape)}", flush=True)
-                # NOTE: do NOT deallocate x_pos — it's a view into x_seq;
-                # deallocating it would free x_seq's underlying storage and
-                # break the next iteration's slice. Let GC handle x_pos.
+                # x_pos is now the LAUNDERED add output (a real new tensor,
+                # not a view). Safe to deallocate. x_pos_view is the slice;
+                # let GC handle that one.
+                ttnn.deallocate(x_pos)
                 # Reshape to rank-4 + convert to ROW_MAJOR for slice_write
                 x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
                 x_pos_rm = ttnn.to_layout(x_pos_4d, ttnn.ROW_MAJOR_LAYOUT)
@@ -1435,10 +1440,7 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
 
     ttnn.deallocate(cos_seq_tt)
     ttnn.deallocate(sin_seq_tt)
-
-    # Restore default modes (production decode uses owned kernels for perf).
-    state.deltanet_recurrence_mode = _old_recurrence_mode
-    state.deltanet_decay_gate_mode = _old_decay_gate_mode
+    ttnn.deallocate(_launder_zeros)
 
     # ====== Step 4: Final norm + LM head ======
     x_seq = _rms_norm_manual(x_seq, state.final_norm_tt, 1e-6, HIDDEN)
