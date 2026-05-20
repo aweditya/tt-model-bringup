@@ -99,18 +99,35 @@ Bug is somewhere in the MLP step on batched [5, 5120] input.
 
 ### Test 9 — dump _tp_all_reduce OUTPUT in both paths
 
-Status: bootstrapping (b57y4xk1g polling)
+Status: COMPLETE
+Result: **The all_reduce OUTPUT matches between paths. Bug is the residual add.**
 
-MLP partial INPUT to all_reduce already verified to match between paths
-(`[pre call=5]` row 0 ≈ `[dec call=1]`). So the bug must be in either:
-- `_tp_all_reduce` OUTPUT (the custom AG+reshape+sum on multi-row real data)
-- The residual add `out = x_tt + reduced` on multi-row
+```
+MLP all_reduce OUTPUT for layer 0:
+  dec call=1 OUT  chip_v0=0.019653  chip_means=0.000813  chip_norms=5.7723
+  pre call=5 OUT  chip_v0=0.019897  chip_means=0.000812  chip_norms=5.7399
+  → MATCH within bf16 noise ✓
+```
 
-Test 9 adds output diag to _tp_all_reduce showing chip_v0+means+norms of
-the result. Compare row 0 of v3's MLP all_reduce output to decode's.
+But comparing to post-MLP x_seq[0,:]:
+- decode post-MLP chip_v0 = 0.000122 = (pre-MLP -0.019531) + (reduced 0.019653) ✓
+- v3 post-MLP chip_v0 = 0.019897 = (reduced 0.019897) ONLY, no residual added ✗
 
-If outputs match → residual add corrupts row 0 on multi-row
-If outputs differ → custom AG+sum has row-dependent bug on real (non-constant) data
+**THE BUG: `ttnn.add(x_tt, reduced)` inside `mlp_step_tp` is dropping the
+residual term entirely for multi-row [5, 5120] input.** Post-MLP = reduced,
+NOT x_tt + reduced.
+
+### Test 10 — diag inside mlp_step_tp around ttnn.add
+
+Status: bootstrapping (b1jn83t6l polling)
+
+Prints x_tt[0,0], reduced[0,0], and out[0,0] (with memory_config) around
+the residual add inside mlp_step_tp. Fires once per probe path.
+
+Three candidate causes for the missing residual:
+1. ttnn.add bug on multi-row [5, 5120] — returns 2nd arg only
+2. x_tt silently zeroed by some upstream MLP op
+3. Mismatched memory_config between x_tt and reduced causing add to misbehave
 
 Result: [TBD]
 
