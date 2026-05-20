@@ -1101,7 +1101,7 @@ def forward_token_tp_inner(state, return_logits: bool = False):
     )
     cos_row_tt = ttnn.reshape(cos_row_raw, [1, state.rotary_dim])
     sin_row_tt = ttnn.reshape(sin_row_raw, [1, state.rotary_dim])
-    for layer in state.layers:
+    for _li, layer in enumerate(state.layers):
         if layer['type'] == 'linear_attention':
             x_tt = deltanet_step_tp(state, x_tt, layer['dn'], cfg)
         else:
@@ -1110,6 +1110,24 @@ def forward_token_tp_inner(state, return_logits: bool = False):
                                        0,  # vestigial cur_pos int (paged path ignores it)
                                        cos_row_tt, sin_row_tt, cfg)
         x_tt = mlp_step_tp(state, x_tt, layer['mlp'])
+        # B.2.2 Test 7: print x at layer-1 entry on first call only
+        if _li == 0 and getattr(state, 'debug_layer_boundary', False):
+            _lcount = getattr(state, '_layer_bd_count', 0)
+            if _lcount < 1:
+                try:
+                    _xf = ttnn.to_torch(
+                        x_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+                    ).float()
+                    _Hcc = _xf.shape[-1] // 4
+                    _cv = [round(float(_xf[..., 0, c*_Hcc]), 6) for c in range(4)]
+                    _cm = [round(float(_xf[..., 0, c*_Hcc:(c+1)*_Hcc].mean()), 6) for c in range(4)]
+                    _cn = [round(float(_xf[..., 0, c*_Hcc:(c+1)*_Hcc].norm()), 4) for c in range(4)]
+                    _tg = getattr(state, '_debug_state_tag', 'dec')
+                    print(f"  [{_tg} L1 entry x_after_L0[0,:]] chip_v0={_cv} chip_means={_cm} chip_norms={_cn}",
+                          flush=True)
+                    state._layer_bd_count = _lcount + 1
+                except Exception as _e:
+                    print(f"  [decode L1 entry diag err] {_e!r}", flush=True)
     x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
     # P22 vocab-sharded LM head + on-device argmax (see Agent X's resolution at
     # feedback_lm_head_argmax_unknown.md). Per-chip linear produces
@@ -1421,7 +1439,8 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 _Hc = _full.shape[-1] // 4
                 _chip_v = [round(float(_full[0, c*_Hc]), 6) for c in range(4)]
                 _chip_m = [round(float(_full[0, c*_Hc:(c+1)*_Hc].mean()), 6) for c in range(4)]
-                print(f"  [v3 L{layer_idx} x_seq[0,:]] chip_v0={_chip_v} chip_means={_chip_m}",
+                _chip_n = [round(float(_full[0, c*_Hc:(c+1)*_Hc].norm()), 4) for c in range(4)]
+                print(f"  [v3 L{layer_idx} x_seq[0,:]] chip_v0={_chip_v} chip_means={_chip_m} chip_norms={_chip_n}",
                       flush=True)
             except Exception as e:
                 print(f"  [v3 L{layer_idx} x_seq diag err] {e!r}", flush=True)
@@ -2779,6 +2798,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     if debug_state:
         state.debug_state = True
         state._debug_state_tag = "pre"
+        state.debug_layer_boundary = True
+        state._layer_bd_count = 0
     force_sync = bool(args.get("force_sync_per_position", False))
     if force_sync:
         state.force_sync_per_position = True
@@ -2809,6 +2830,7 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.force_sync_per_position = False
     if debug_state:
         state.debug_state = False
+        state.debug_layer_boundary = False
 
     # Per-position comparison
     a64 = ref_logits.astype(np.float64)
