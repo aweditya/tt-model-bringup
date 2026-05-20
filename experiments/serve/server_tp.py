@@ -2901,6 +2901,9 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state._layer_bd_count = 0
         # NOTE: do NOT reset _pre_mlp_count here — the limit is 2 (one for dec
         # path which already happened, one for pre path which is about to).
+        # RESET _mlp_resid_count for the test path — decode used both slots,
+        # we need fresh slots for the test path to print.
+        state._mlp_resid_count = 0
     force_sync = bool(args.get("force_sync_per_position", False))
     if force_sync:
         state.force_sync_per_position = True
