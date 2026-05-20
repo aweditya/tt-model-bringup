@@ -2650,6 +2650,11 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         "manual", "owned_gdn", "owned_gdn_inplace"
     ):
         return {"error": f"test_dn_mode must be manual/owned_gdn/owned_gdn_inplace, got {test_dn_mode!r}"}
+    test_decay_gate_mode = args.get("test_decay_gate_mode")
+    if test_decay_gate_mode is not None and test_decay_gate_mode not in (
+        "manual", "owned_decay_gate"
+    ):
+        return {"error": f"test_decay_gate_mode must be manual/owned_decay_gate, got {test_decay_gate_mode!r}"}
 
     # Path A — reference: explicit sequential decode-loop, captured per-position.
     _reset_state_buffers(state)
@@ -2681,6 +2686,12 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.deltanet_recurrence_mode = test_dn_mode
         print(f"[probe] override deltanet_recurrence_mode={test_dn_mode} for test path "
               f"(was {_orig_dn_mode})", flush=True)
+    _orig_dg_mode = None
+    if test_decay_gate_mode is not None:
+        _orig_dg_mode = state.deltanet_decay_gate_mode
+        state.deltanet_decay_gate_mode = test_decay_gate_mode
+        print(f"[probe] override deltanet_decay_gate_mode={test_decay_gate_mode} for test path "
+              f"(was {_orig_dg_mode})", flush=True)
     force_sync = bool(args.get("force_sync_per_position", False))
     if force_sync:
         state.force_sync_per_position = True
@@ -2705,6 +2716,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.ccl_debug = False
     if _orig_dn_mode is not None:
         state.deltanet_recurrence_mode = _orig_dn_mode
+    if _orig_dg_mode is not None:
+        state.deltanet_decay_gate_mode = _orig_dg_mode
     if force_sync:
         state.force_sync_per_position = False
 

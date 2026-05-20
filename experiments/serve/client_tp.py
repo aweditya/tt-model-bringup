@@ -219,6 +219,8 @@ def cmd_probe_prefill_vs_decode_loop_tp(args):
         payload["debug_ccl"] = True
     if args.test_dn_mode:
         payload["test_dn_mode"] = args.test_dn_mode
+    if args.test_decay_gate_mode:
+        payload["test_decay_gate_mode"] = args.test_decay_gate_mode
     if args.force_sync_per_position:
         payload["force_sync_per_position"] = True
     data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
@@ -712,6 +714,10 @@ def main():
     pvd.add_argument("--force-sync-per-position", action="store_true",
                       help="add ttnn.synchronize_device between per-position DN calls in v3 "
                            "to test the async-ordering hypothesis")
+    pvd.add_argument("--test-decay-gate-mode", default=None,
+                      choices=["manual", "owned_decay_gate"],
+                      help="override deltanet_decay_gate_mode for the TEST path only. "
+                           "Use 'manual' to test whether owned_decay_gate kernel is the culprit.")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     cle = sub.add_parser("probe_ccl_equivalence_tp",
                           help="B.2.2 CCL semantics: verify all_reduce vs composite "
