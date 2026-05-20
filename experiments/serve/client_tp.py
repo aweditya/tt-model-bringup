@@ -219,6 +219,8 @@ def cmd_probe_prefill_vs_decode_loop_tp(args):
         payload["debug_ccl"] = True
     if args.test_dn_mode:
         payload["test_dn_mode"] = args.test_dn_mode
+    if args.force_sync_per_position:
+        payload["force_sync_per_position"] = True
     data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
     if data.get("error"):
         print(f"ERROR: {data['error']}", file=sys.stderr)
@@ -707,6 +709,9 @@ def main():
                       help="override deltanet_recurrence_mode for the TEST path only "
                            "(reference still uses production default). Use 'manual' to "
                            "test whether owned_gdn kernel has hidden cross-call state.")
+    pvd.add_argument("--force-sync-per-position", action="store_true",
+                      help="add ttnn.synchronize_device between per-position DN calls in v3 "
+                           "to test the async-ordering hypothesis")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     cle = sub.add_parser("probe_ccl_equivalence_tp",
                           help="B.2.2 CCL semantics: verify all_reduce vs composite "

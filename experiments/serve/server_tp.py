@@ -1483,6 +1483,11 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 ttnn.deallocate(x_pos_out)
                 ttnn.deallocate(x_pos_4d)
                 ttnn.deallocate(x_pos_rm)
+                # B.2.2 Test 2: optional sync between per-position DN calls
+                # to test the async-ordering hypothesis. Adds ~5 syncs per
+                # DN layer × 32 DN layers = 160 syncs per forward.
+                if getattr(state, 'force_sync_per_position', False):
+                    ttnn.synchronize_device(state.mesh)
 
             # Convert dn_out_buf to TILE_LAYOUT [seq_len, HIDDEN]
             ttnn.deallocate(x_seq)
@@ -2676,6 +2681,10 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.deltanet_recurrence_mode = test_dn_mode
         print(f"[probe] override deltanet_recurrence_mode={test_dn_mode} for test path "
               f"(was {_orig_dn_mode})", flush=True)
+    force_sync = bool(args.get("force_sync_per_position", False))
+    if force_sync:
+        state.force_sync_per_position = True
+        print(f"[probe] force_sync_per_position=True for test path", flush=True)
     t0 = _time.time()
     if mode == "stub":
         test_logits = forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)
@@ -2696,6 +2705,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.ccl_debug = False
     if _orig_dn_mode is not None:
         state.deltanet_recurrence_mode = _orig_dn_mode
+    if force_sync:
+        state.force_sync_per_position = False
 
     # Per-position comparison
     a64 = ref_logits.astype(np.float64)
