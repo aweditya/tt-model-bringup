@@ -98,6 +98,22 @@ def cmd_probe_ccl_components_tp(args):
         print(f"\n[save] {args.out}")
 
 
+def cmd_probe_dn_source_isolation_tp(args):
+    payload = {"seq_len": args.seq_len}
+    data = _send("probe_dn_source_isolation_tp", payload, timeout=300.0)
+    if data.get("error"):
+        print(f"ERROR: {data['error']}", file=sys.stderr); sys.exit(4)
+    print(f"seq_len={data['seq_len']}")
+    print(f"\nresults:")
+    for r in data["results"]:
+        ok = r.get("result") == "OK"
+        marker = "[PASS]" if ok else f"[{r.get('result')}]"
+        ms_part = f" ({r.get('ms', 0):.0f}ms)" if ok else ""
+        err_part = f" {r.get('error')}" if not ok else ""
+        print(f"  {marker} {r['name']}{ms_part}{err_part}")
+    print(f"\n{data.get('note', '')}")
+
+
 def cmd_probe_slice_write_round_trip(args):
     payload = {}
     if args.seq_len:
@@ -596,6 +612,12 @@ def main():
     b.add_argument("--iters", type=int, default=20)
     b.add_argument("--warmup", type=int, default=3)
     b.set_defaults(fn=cmd_bench_decode_tp_components)
+    dni = sub.add_parser("probe_dn_source_isolation_tp",
+                          help="B.2.2 isolation: test deltanet_step_tp at layer 1 "
+                               "with 7 source tensor types in sequence. Wedge "
+                               "tells us which source breaks DN.")
+    dni.add_argument("--seq-len", type=int, default=5)
+    dni.set_defaults(fn=cmd_probe_dn_source_isolation_tp)
     swr = sub.add_parser("probe_slice_write_round_trip",
                           help="B.2.1.5b: probe pre-alloc + slice_write per-row write + readback. "
                                "Tests ROW_MAJOR write and TILE_LAYOUT conversion. Decides whether "

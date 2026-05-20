@@ -2911,6 +2911,249 @@ def handle_probe_slice_write_round_trip(state: MeshServerState, args: dict) -> d
     }
 
 
+def handle_probe_dn_source_isolation_tp(state: MeshServerState, args: dict) -> dict:
+    """B.2.2 wedge isolation: which source tensor type wedges deltanet_step_tp?
+
+    Tests deltanet_step_tp(state.layers[1]['dn'], x_pos) where x_pos is sliced
+    from various source tensor types. Each test runs sequentially. If one
+    wedges, the server dies — but the log will show which test was last to
+    print "BEFORE DN". That's the wedger.
+
+    Test order (most-likely-to-work → most-dangerous):
+      1. from_torch upload (zeros) — fresh tensor, no compute lineage
+      2. batched embed (already validated B.2.1.5a) — sanity check
+      3. slice_write-assembled (B.2.1.5b primitive) — validated for readback
+      4. linear (matmul) output — first computed tensor, no all_reduce
+      5. all_reduce output — agent's hypothesized culprit
+      6. ttnn.add of two fresh tensors — confirms add isn't the issue alone
+      7. mlp_step_tp output — known wedger (skipped if we wedged earlier)
+
+    Layer 1's DN state is reset between tests via _reset_state_buffers.
+    """
+    import ttnn
+    import torch
+    import numpy as np
+    import time as _time
+
+    if state.mesh is None or not state.layers:
+        return {"error": "mesh/weights not loaded"}
+
+    cfg = state.cfg
+    HIDDEN = cfg['hidden']
+    seq_len = int(args.get("seq_len", 5))
+
+    # Find layer 1 (should be linear_attention per the i % 4 != 3 pattern)
+    layer1 = None
+    for layer in state.layers:
+        if layer['type'] == 'linear_attention':
+            layer1 = layer
+            break
+    if layer1 is None:
+        return {"error": "no linear_attention layer found"}
+
+    results = []
+
+    def _sync():
+        ttnn.synchronize_device(state.mesh)
+
+    def _log(msg):
+        print(f"  [DN-iso] {msg}", flush=True)
+
+    def run_one_test(name, source_factory):
+        _reset_state_buffers(state)
+        update_input_buffers(state, 0, 0)  # cur_pos = 0
+        _log(f"=== TEST '{name}' ===")
+        try:
+            x_seq = source_factory()
+            _sync()
+            _log(f"  {name}: source built, shape={list(x_seq.shape)}")
+            x_pos = ttnn.slice(x_seq, [0, 0], [1, HIDDEN])
+            _sync()
+            _log(f"  {name}: sliced, shape={list(x_pos.shape)}")
+            _log(f"  {name}: BEFORE deltanet_step_tp")
+            t0 = _time.time()
+            x_pos_out = deltanet_step_tp(state, x_pos, layer1['dn'], cfg)
+            _sync()
+            dt_ms = (_time.time() - t0) * 1000.0
+            _log(f"  {name}: AFTER deltanet_step_tp dt={dt_ms:.0f}ms shape={list(x_pos_out.shape)}")
+            ttnn.deallocate(x_pos_out)
+            ttnn.deallocate(x_seq)
+            return {"name": name, "result": "OK", "ms": dt_ms}
+        except Exception as e:
+            _log(f"  {name}: EXCEPTION: {type(e).__name__}: {e}")
+            return {"name": name, "result": "ERROR", "error": f"{type(e).__name__}: {e}"}
+
+    # ── Test 1: from_torch upload (fresh tensor) ──
+    rng = np.random.default_rng(42)
+    def src_from_torch():
+        x_np = rng.standard_normal((seq_len, HIDDEN)).astype(np.float32) * 0.05
+        return ttnn.from_torch(
+            torch.from_numpy(x_np),
+            layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+    results.append(run_one_test("from_torch", src_from_torch))
+
+    # ── Test 2: batched embed output ──
+    def src_embed():
+        idx = ttnn.from_torch(
+            torch.tensor([[t] for t in range(seq_len)], dtype=torch.int32),
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        embed_raw = ttnn.embedding(
+            idx, state.embed_tt,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        x_seq = ttnn.reshape(embed_raw, [seq_len, HIDDEN])
+        ttnn.deallocate(idx)
+        ttnn.deallocate(embed_raw)
+        return x_seq
+    results.append(run_one_test("embed", src_embed))
+
+    # ── Test 3: slice_write-assembled buffer ──
+    def src_slice_write():
+        # Build [1, 1, seq_len, HIDDEN] via slice_write from per-position fresh tensors
+        dst = ttnn.from_torch(
+            torch.zeros((1, 1, seq_len, HIDDEN), dtype=torch.bfloat16),
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        for pos in range(seq_len):
+            x_np = rng.standard_normal((1, 1, 1, HIDDEN)).astype(np.float32) * 0.05
+            src = ttnn.from_torch(
+                torch.from_numpy(x_np).to(torch.bfloat16),
+                layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+                device=state.mesh,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            ttnn.experimental.slice_write(
+                src, dst,
+                [0, 0, pos, 0], [1, 1, pos + 1, HIDDEN], [1, 1, 1, 1],
+            )
+            ttnn.deallocate(src)
+        dst_tile_4d = ttnn.to_layout(dst, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(dst)
+        x_seq = ttnn.reshape(dst_tile_4d, [seq_len, HIDDEN])
+        ttnn.deallocate(dst_tile_4d)
+        return x_seq
+    results.append(run_one_test("slice_write", src_slice_write))
+
+    # ── Test 4: ttnn.linear output (no all_reduce) ──
+    def src_linear():
+        # Fresh input × fresh weight = fresh matmul result
+        x_in_np = rng.standard_normal((seq_len, HIDDEN)).astype(np.float32) * 0.05
+        x_in = ttnn.from_torch(
+            torch.from_numpy(x_in_np),
+            layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        # Use layer 1's input_norm weight as a "linear" — it's actually a vector
+        # but ttnn.linear with a vector works? Probably not — use w_in instead.
+        # Actually just create a square fresh weight for the test
+        w_np = rng.standard_normal((HIDDEN, HIDDEN)).astype(np.float32) * 0.02
+        w_tt = ttnn.from_torch(
+            torch.from_numpy(w_np),
+            layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        x_seq = ttnn.linear(x_in, w_tt)  # [seq_len, HIDDEN]
+        ttnn.deallocate(x_in)
+        ttnn.deallocate(w_tt)
+        return x_seq
+    results.append(run_one_test("linear", src_linear))
+
+    # ── Test 5: all_reduce output directly ──
+    def src_all_reduce():
+        x_in_np = rng.standard_normal((seq_len, HIDDEN)).astype(np.float32) * 0.05
+        x_in = ttnn.from_torch(
+            torch.from_numpy(x_in_np),
+            layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        x_seq = _tp_all_reduce(state, x_in)
+        ttnn.deallocate(x_in)
+        return x_seq
+    results.append(run_one_test("all_reduce", src_all_reduce))
+
+    # ── Test 6: ttnn.add of two fresh tensors ──
+    def src_add():
+        a_np = rng.standard_normal((seq_len, HIDDEN)).astype(np.float32) * 0.05
+        b_np = rng.standard_normal((seq_len, HIDDEN)).astype(np.float32) * 0.05
+        a = ttnn.from_torch(
+            torch.from_numpy(a_np),
+            layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        b = ttnn.from_torch(
+            torch.from_numpy(b_np),
+            layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        x_seq = ttnn.add(a, b)
+        ttnn.deallocate(a)
+        ttnn.deallocate(b)
+        return x_seq
+    results.append(run_one_test("add", src_add))
+
+    # ── Test 7: full mlp_step_tp output (known wedger) ──
+    # Find an MLP layer dict
+    mlp_layer = state.layers[0]['mlp']
+    def src_mlp():
+        idx = ttnn.from_torch(
+            torch.tensor([[t] for t in range(seq_len)], dtype=torch.int32),
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        embed_raw = ttnn.embedding(
+            idx, state.embed_tt,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        x_seq = ttnn.reshape(embed_raw, [seq_len, HIDDEN])
+        ttnn.deallocate(idx)
+        ttnn.deallocate(embed_raw)
+        x_seq_out = mlp_step_tp(state, x_seq, mlp_layer)
+        ttnn.deallocate(x_seq)
+        return x_seq_out
+    results.append(run_one_test("mlp_step_tp", src_mlp))
+
+    state.last_run = {
+        "cmd": "probe_dn_source_isolation_tp",
+        "seq_len": seq_len,
+        "n_tests_completed": len(results),
+        "results": results,
+    }
+    return {
+        "ok": True,
+        "seq_len": seq_len,
+        "results": results,
+        "note": (
+            "If any test wedged, the server is now dead. Check the server log "
+            "for the LAST 'BEFORE deltanet_step_tp' print without a matching "
+            "'AFTER deltanet_step_tp' — that's the wedger."
+        ),
+    }
+
+
 def _read_argmax_id(state: MeshServerState, argmax_tt) -> int:
     import ttnn
     idx_concat = ttnn.to_torch(
@@ -7307,6 +7550,7 @@ HANDLERS = {
     "probe_prefill_vs_decode_loop_tp": handle_probe_prefill_vs_decode_loop_tp,
     "probe_multirow_construct_vs_per_position": handle_probe_multirow_construct_vs_per_position,
     "probe_slice_write_round_trip": handle_probe_slice_write_round_trip,
+    "probe_dn_source_isolation_tp": handle_probe_dn_source_isolation_tp,
     "probe_fused_paged_update_cache_tp": handle_probe_fused_paged_update_cache_tp,
     "probe_explicit_all_reduce_tp": handle_probe_explicit_all_reduce_tp,
     "probe_rope_fused_qk_tp": handle_probe_rope_fused_qk_tp,
