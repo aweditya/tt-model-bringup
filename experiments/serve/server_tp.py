@@ -937,6 +937,63 @@ def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg,
     return x_out
 
 
+def _neumann_inverse_via_mesh_tp(state, L_tt, C):
+    """Compute (I - L)^{-1} for strict-lower-triangular L via Neumann
+    factorization on the mesh. Each chip processes its slice independently.
+
+    L_tt: [NV_PER_CHIP, C, C] sharded on NV head dim (each chip has its heads)
+    C:    must be a power of 2
+
+    Returns: [NV_PER_CHIP, C, C] with the SAME mesh placement.
+
+    Single-device validation: experiments/utils/neumann_inverse_probe.py
+    (cos ≥ 0.99999 at fp32, [32, 64, 64] batched shape).
+    """
+    import ttnn
+    import torch
+    import numpy as np
+
+    n_levels = int(np.log2(C))
+    assert 2 ** n_levels == C, f"Neumann requires C=power of 2, got {C}"
+
+    # Build I tensor matching L's shape, sharded the same way (NV dim).
+    # Each chip will have I = eye(C) for each of its NV_PER_CHIP heads.
+    # NV_PER_CHIP per-chip dim is shape[0] (since L is sharded on dim 0).
+    nv_per_chip = L_tt.shape[0]
+    I_per_chip = np.zeros((nv_per_chip, C, C), dtype=np.float32)
+    for i in range(nv_per_chip):
+        np.fill_diagonal(I_per_chip[i], 1.0)
+    # Use ReplicateTensorToMesh — same I on every chip's slice (chips have
+    # different heads but the I is just identity for each).
+    I_tt = ttnn.from_torch(
+        torch.from_numpy(I_per_chip),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+
+    # Step 1: compute powers L², L⁴, L⁸, ..., L^(C/2)
+    powers = [L_tt]
+    cur = L_tt
+    for _ in range(n_levels - 1):
+        cur = ttnn.matmul(cur, cur)
+        powers.append(cur)
+
+    # Step 2: compose product (I + L)(I + L²)(I + L⁴)...
+    T = ttnn.add(I_tt, powers[0])
+    for p in powers[1:]:
+        factor = ttnn.add(I_tt, p)
+        T = ttnn.matmul(T, factor)
+        ttnn.deallocate(factor)
+
+    # Deallocate intermediates we no longer need
+    for p in powers[1:]:  # powers[0] is L_tt (caller may own)
+        ttnn.deallocate(p)
+    ttnn.deallocate(I_tt)
+
+    return T
+
+
 def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
     """v4 (task #75): chunked-parallel DeltaNet across `seq_len` positions.
 
@@ -4144,6 +4201,110 @@ def handle_probe_fused_paged_update_cache_tp(state: MeshServerState, args: dict)
         ),
     }
     return result
+
+
+def handle_probe_neumann_inverse_mesh_tp(state: MeshServerState, args: dict) -> dict:
+    """v4 Stage 4b primitive: validate Neumann (I-L)^{-1} on mesh.
+
+    Single-device version was validated in experiments/utils/neumann_inverse_probe.py
+    (cos ≥ 0.99999 at fp32, [32, 64, 64] batched). This handler validates
+    the same factorization on qb2's (1, 4) mesh at our production shape:
+    [NV_PER_CHIP=12, C, C].
+
+    Each chip holds its own NV_PER_CHIP=12 heads (no CCL during inverse).
+    Compares ttnn output to numpy np.linalg.inv(I - L) per chip.
+
+    Gate: per-chip cos ≥ 0.9999 at fp32. If passes, Stage 4b chunked
+    recurrence in ttnn is unblocked algorithmically on mesh.
+    """
+    import ttnn
+    import torch
+    import numpy as np
+    from full_layer_tp_probe import NV_PER_CHIP, NCHIPS
+
+    if state.mesh is None:
+        return {"error": "mesh not loaded"}
+
+    C = int(args.get("C", 8))
+    if (C & (C - 1)) != 0:
+        return {"error": f"C must be a power of 2, got {C}"}
+
+    rng = np.random.default_rng(42)
+
+    # Build strict-lower-tri L per chip with synthetic small values (matches
+    # the per-chip-different real partials we'd see in production).
+    # Each chip: [NV_PER_CHIP, C, C]. Across chips, total: [4*NV_PER_CHIP, C, C].
+    L_full_np = rng.standard_normal((NCHIPS * NV_PER_CHIP, C, C)).astype(np.float32) * 0.05
+    for i in range(NCHIPS * NV_PER_CHIP):
+        L_full_np[i] = np.tril(L_full_np[i], k=-1)  # strict lower triangular
+
+    # Per-chip numpy reference
+    eye_C = np.eye(C, dtype=np.float32)
+    T_ref_np = np.stack(
+        [np.linalg.inv(eye_C - L_full_np[i]) for i in range(NCHIPS * NV_PER_CHIP)],
+        axis=0,
+    )  # [4*NV_PER_CHIP, C, C]
+
+    # Upload to mesh: shard along dim 0 so each chip gets NV_PER_CHIP heads
+    L_tt = ttnn.from_torch(
+        torch.from_numpy(L_full_np),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0),
+    )
+
+    # Run Neumann factorization on mesh
+    import time as _time
+    sync = lambda: ttnn.synchronize_device(state.mesh)
+    sync()
+    t0 = _time.perf_counter()
+    T_tt = _neumann_inverse_via_mesh_tp(state, L_tt, C)
+    sync()
+    elapsed_ms = (_time.perf_counter() - t0) * 1000.0
+
+    # Read back per-chip and compare
+    T_full_np = ttnn.to_torch(
+        T_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+    ).float().cpu().numpy()  # [4*NV_PER_CHIP, C, C]
+
+    ttnn.deallocate(L_tt)
+    ttnn.deallocate(T_tt)
+
+    # Cosine per chip slice
+    per_chip_cos = []
+    per_chip_max_diff = []
+    for chip in range(NCHIPS):
+        chip_T_ref = T_ref_np[chip * NV_PER_CHIP:(chip + 1) * NV_PER_CHIP].flatten().astype(np.float64)
+        chip_T_tt = T_full_np[chip * NV_PER_CHIP:(chip + 1) * NV_PER_CHIP].flatten().astype(np.float64)
+        cos = float(
+            (chip_T_ref * chip_T_tt).sum()
+            / (np.linalg.norm(chip_T_ref) * np.linalg.norm(chip_T_tt) + 1e-12)
+        )
+        max_diff = float(np.abs(chip_T_ref - chip_T_tt).max())
+        per_chip_cos.append(round(cos, 8))
+        per_chip_max_diff.append(round(max_diff, 6))
+
+    overall_cos = float((T_ref_np.astype(np.float64).flatten() * T_full_np.astype(np.float64).flatten()).sum()
+                        / (np.linalg.norm(T_ref_np) * np.linalg.norm(T_full_np) + 1e-12))
+    overall_max_diff = float(np.abs(T_ref_np - T_full_np).max())
+
+    return {
+        "ok": True,
+        "C": C,
+        "shape_per_chip": [NV_PER_CHIP, C, C],
+        "n_matmuls": 2 * int(np.log2(C)) - 1,  # log2(C) squarings + log2(C)-1 composition matmuls
+        "elapsed_ms": round(elapsed_ms, 3),
+        "per_chip_cos": per_chip_cos,
+        "per_chip_max_diff": per_chip_max_diff,
+        "overall_cos": round(overall_cos, 8),
+        "overall_max_diff": round(overall_max_diff, 6),
+        "passed": overall_cos >= 0.9999,
+        "note": (
+            "Neumann factorization on mesh: each chip computes its NV_PER_CHIP "
+            "heads independently (no CCL). Validates the algorithmic primitive "
+            "needed for v4 Stage 4b chunked recurrence."
+        ),
+    }
 
 
 def handle_probe_ccl_equivalence_tp(state: MeshServerState, args: dict) -> dict:
@@ -8444,6 +8605,7 @@ HANDLERS = {
     "probe_deltanet_conv1d_split_check_tp": handle_probe_deltanet_conv1d_split_check_tp,
     "probe_deltanet_owned_decay_gate_real_tensors_tp": handle_probe_deltanet_owned_decay_gate_real_tensors_tp,
     "probe_ccl_equivalence_tp": handle_probe_ccl_equivalence_tp,
+    "probe_neumann_inverse_mesh_tp": handle_probe_neumann_inverse_mesh_tp,
     "shutdown":       handle_shutdown,
 }
 

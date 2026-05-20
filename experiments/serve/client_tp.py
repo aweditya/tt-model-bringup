@@ -182,6 +182,23 @@ def cmd_probe_multirow_construct_vs_per_position(args):
     print(f"\n{data['verdict']}")
 
 
+def cmd_probe_neumann_inverse_mesh_tp(args):
+    payload = {}
+    if args.C:
+        payload["C"] = args.C
+    data = _send("probe_neumann_inverse_mesh_tp", payload, timeout=300.0)
+    if data.get("error"):
+        print(f"ERROR: {data['error']}", file=sys.stderr); sys.exit(4)
+    print(f"C={data['C']}  shape_per_chip={data['shape_per_chip']}  n_matmuls={data['n_matmuls']}")
+    print(f"elapsed_ms={data['elapsed_ms']}")
+    print(f"\nper-chip cos:        {data['per_chip_cos']}")
+    print(f"per-chip max_diff:   {data['per_chip_max_diff']}")
+    print(f"\noverall cos:      {data['overall_cos']}")
+    print(f"overall max_diff: {data['overall_max_diff']}")
+    print(f"\nVerdict: {'PASS' if data['passed'] else 'FAIL'}")
+    print(f"\n{data.get('note', '')}")
+
+
 def cmd_probe_ccl_equivalence_tp(args):
     payload = {}
     if args.hidden:
@@ -733,6 +750,13 @@ def main():
                            "per-position internally — same math; will be replaced with "
                            "real Neumann chunked math in future sessions)")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
+    nim = sub.add_parser("probe_neumann_inverse_mesh_tp",
+                          help="v4 Stage 4b: validate Neumann (I-L)^{-1} factorization "
+                               "on mesh at production [NV_PER_CHIP, C, C] shape. Each chip "
+                               "processes heads independently (no CCL). Gate: cos ≥ 0.9999.")
+    nim.add_argument("--C", type=int, default=8,
+                      help="chunk size (must be power of 2). Default: 8.")
+    nim.set_defaults(fn=cmd_probe_neumann_inverse_mesh_tp)
     cle = sub.add_parser("probe_ccl_equivalence_tp",
                           help="B.2.2 CCL semantics: verify all_reduce vs composite "
                                "(RS+AG) vs custom (AG+reshape+sum) produce the SAME math "
