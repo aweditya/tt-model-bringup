@@ -625,6 +625,28 @@ def _tp_all_reduce(state: MeshServerState, partial):
                 print(f"[ar diag error] {_e!r}", flush=True)
             state._ccl_debug_count = _count + 1
 
+    # Local helper to print OUTPUT after each path's all_reduce.
+    def _diag_output(_result, _path_name: str):
+        if getattr(state, 'ccl_debug', False):
+            _olim = getattr(state, 'ccl_debug_limit', 8)
+            _oc = getattr(state, '_ccl_out_count', 0)
+            if _oc < _olim:
+                try:
+                    _of = ttnn.to_torch(
+                        _result, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+                    ).float()
+                    _OH = _of.shape[-1] // 4
+                    _ocv = [round(float(_of[..., 0, c*_OH]), 6) for c in range(4)]
+                    _ocm = [round(float(_of[..., 0, c*_OH:(c+1)*_OH].mean()), 6) for c in range(4)]
+                    _ocn = [round(float(_of[..., 0, c*_OH:(c+1)*_OH].norm()), 4) for c in range(4)]
+                    _otag = getattr(state, 'ccl_debug_tag', 'ar')
+                    print(f"[{_otag} OUT call={_oc} via={_path_name}] shape={list(_result.shape)} "
+                          f"chip_v0={_ocv} chip_means={_ocm} chip_norms={_ocn}", flush=True)
+                except Exception as _oe:
+                    print(f"[ar out diag err] {_oe!r}", flush=True)
+                state._ccl_out_count = _oc + 1
+        return _result
+
     # B.2.2 workaround: composite reduce_scatter + all_gather (instead of
     # all_reduce) — different op chain at API surface, but per the
     # all_reduce kernel audit it uses the SAME underlying kernels as
@@ -639,7 +661,7 @@ def _tp_all_reduce(state: MeshServerState, partial):
             num_links=2, topology=ttnn.Topology.Linear,
         )
         ttnn.deallocate(scattered)
-        return gathered
+        return _diag_output(gathered, "composite")
 
     # B.2.2 workaround #2: CUSTOM all_reduce via all_gather + local sum.
     # This is what ttnn.all_reduce's fallback path uses for edge cases
@@ -660,10 +682,10 @@ def _tp_all_reduce(state: MeshServerState, partial):
         summed = ttnn.sum(reshaped, dim=1)
         ttnn.deallocate(gathered)
         ttnn.deallocate(reshaped)
-        return summed
+        return _diag_output(summed, "custom_AG+sum")
 
     if state.collective_mode == "explicit_all_reduce":
-        return ttnn.all_reduce(
+        return _diag_output(ttnn.all_reduce(
             partial,
             cluster_axis=1,
             memory_config=partial.memory_config(),
@@ -672,12 +694,12 @@ def _tp_all_reduce(state: MeshServerState, partial):
             # P150x4 supports 2 eth links per axis.
             num_links=2,
             topology=ttnn.Topology.Linear,
-        )
+        ), "explicit_all_reduce")
     try:
-        return ttnn.all_reduce(partial)
+        return _diag_output(ttnn.all_reduce(partial), "default_all_reduce")
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
-        return ttnn.all_gather(scattered, dim=1)
+        return _diag_output(ttnn.all_gather(scattered, dim=1), "fallback_RS+AG")
 
 
 def deltanet_step_tp(state, x_tt, dn, cfg):
@@ -2800,6 +2822,7 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.ccl_debug = True
         state.ccl_debug_tag = "dec"
         state._ccl_debug_count = 0
+        state._ccl_out_count = 0
     if debug_state:
         # Layer-boundary print is inside forward_token_tp_inner — called by the
         # REFERENCE path. So set the flag BEFORE the reference loop.
@@ -2826,6 +2849,7 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     if debug_ccl:
         state.ccl_debug_tag = "pre"
         state._ccl_debug_count = 0
+        state._ccl_out_count = 0
     _orig_dn_mode = None
     if test_dn_mode is not None:
         _orig_dn_mode = state.deltanet_recurrence_mode
