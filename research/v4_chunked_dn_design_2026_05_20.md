@@ -135,8 +135,22 @@ on tt-metal — the daily-driver long-context goal.
 - Probe gains `--use-chunked-dn` for A/B testing.
 - Validated: stub gives cos identical to v3 (trivially — same math).
 
-API surface and harness locked in. Future stages just replace the stub
-body. Each stage gated by per-stage flag for incremental rollout.
+### v4 Stage 1 — batched pre-norm + in_proj (commits `8c9488c` + `cea8641`, 2026-05-20) ✅
+- Refactor: extracted `_deltanet_step_tp_from_inproj` helper (stages 3-11 of DN).
+- Chunked stub computes batched `h_seq = rms_norm(x_seq)` + `all_seq = linear(h_seq, w_in)` ONCE, then per-position loop slices `all_seq[pos]` and calls helper.
+- Cos validated **bit-identical** to v3 (top1 5/5 at seq=5, 27/32 at seq=32).
+- Perf trade-off discovered: **slower at short seq (slice overhead), faster at long seq (matmul batching).**
+
+```
+              seq=5            seq=32
+v3 baseline   1244 ms          6243 ms
+v3 + Stage 1  2427 ms (1.95×)  5841 ms (0.94×)
+              SLOWER           FASTER
+```
+
+**Lesson:** batching one op (matmul) while still slicing for the rest costs more in slice overhead than it saves at short seq. Real perf wins come when MULTIPLE downstream ops are also batched (Stages 2-6 cumulative) — slicing disappears entirely.
+
+API surface and harness locked in. Future stages just replace one piece at a time.
 
 ## Next steps when picking this up
 
