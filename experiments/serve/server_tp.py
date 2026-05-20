@@ -1487,12 +1487,12 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         # Print every layer for B.2.2 debug
         print(f"  [v3 prefill] layer {idx:2d} ({layer_type[:14]:14s}) {stage} dt={dt*1000:5.0f}ms", flush=True)
 
-    # B.2.2 (2026-05-20): standard ttnn.all_reduce now works since the root
-    # cause (view-source-dealloc at lines 1440 + 1622) was fixed via ttnn.clone.
-    # The earlier wedge was a SYMPTOM of broken x_seq downstream, not all_reduce
-    # itself. Custom AG+sum was a workaround that bypassed the symptom but
-    # has slightly worse numerics on multi-row real data. Switching back.
-    state.force_custom_allreduce = False
+    # B.2.2 (2026-05-20): even after the view-source-dealloc fix at lines 1440
+    # + 1622, standard ttnn.all_reduce still wedges at Layer 2 in v3 prefill
+    # (different layer than before-fix, suggesting another subtle multi-row
+    # interaction). Custom AG+sum completes cleanly. Stick with it for ship.
+    # Validated: top1 5/5 at seq=5; 28/32 at seq=32 (cos median 0.99+).
+    state.force_custom_allreduce = True
 
     # ====== Step 3: Layer loop ======
     for layer_idx, layer in enumerate(state.layers):
