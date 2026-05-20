@@ -1045,6 +1045,8 @@ def forward_token_tp(state, token_id, cur_pos):
     return forward_token_tp_inner(state)
 
 
+_PREFILL_DEBUG_LAYER_IDX = 0  # incremented per attn call; only first prints
+
 def gated_attn_step_prefill_tp(state, x_seq_tt, attn, cos_seq_tt, sin_seq_tt, cfg, seq_len):
     """B.2.2: prefill version of gated_attn_step_tp — parallel SDPA over all
     positions at once. Sister function to the existing single-position
@@ -1071,6 +1073,7 @@ def gated_attn_step_prefill_tp(state, x_seq_tt, attn, cos_seq_tt, sin_seq_tt, cf
     """
     import ttnn
     import math
+    import time as _time
     HIDDEN = cfg['hidden']
     HEAD_DIM = cfg['head_dim']
     NQ_PER_CHIP = cfg['n_q_heads'] // 4
@@ -1080,12 +1083,26 @@ def gated_attn_step_prefill_tp(state, x_seq_tt, attn, cos_seq_tt, sin_seq_tt, cf
     ROTARY_DIM = int(HEAD_DIM * cfg['partial_rotary_factor'])
     EPS = 1e-6
 
+    # First-call diagnostic prints to localize any wedge
+    global _PREFILL_DEBUG_LAYER_IDX
+    DBG = _PREFILL_DEBUG_LAYER_IDX == 0
+    _PREFILL_DEBUG_LAYER_IDX += 1
+    def _t():
+        ttnn.synchronize_device(state.mesh)
+        return _time.time()
+    if DBG:
+        t0 = _t()
+        print(f"  [prefill_attn dbg] enter, seq_len={seq_len}, NQ_PER_CHIP={NQ_PER_CHIP}, "
+              f"NKV_PER_CHIP={NKV_PER_CHIP}", flush=True)
+
     # 1. Pre-norm (broadcasts on seq_len leading dim)
     h_tt = _rms_norm_manual(x_seq_tt, attn['input_norm'], EPS, HIDDEN)
+    if DBG: print(f"  [prefill_attn dbg]  +{_t()-t0:.2f}s after pre_norm  shape={list(h_tt.shape)}", flush=True)
 
     # 2. QKV matmul (batched on seq_len)
     all_tt = ttnn.linear(h_tt, attn['w_qkv'])  # [seq_len, QG_DIM_CHIP + 2*KV_DIM_CHIP]
     ttnn.deallocate(h_tt)
+    if DBG: print(f"  [prefill_attn dbg]  +{_t()-t0:.2f}s after QKV matmul  shape={list(all_tt.shape)}", flush=True)
 
     # 3. Slice QG / K / V and reshape per-head
     qg = ttnn.slice(all_tt, [0, 0], [seq_len, QG_DIM_CHIP])
@@ -1131,17 +1148,20 @@ def gated_attn_step_prefill_tp(state, x_seq_tt, attn, cos_seq_tt, sin_seq_tt, cf
     k_tt = apply_rope_seq(k_tt, NKV_PER_CHIP)
     ttnn.deallocate(cos_b)
     ttnn.deallocate(sin_b)
+    if DBG: print(f"  [prefill_attn dbg]  +{_t()-t0:.2f}s after batched RoPE  q.shape={list(q_tt.shape)} k.shape={list(k_tt.shape)}", flush=True)
 
     # 6. Write K, V to paged cache for future decode tokens.
     # paged_fill_cache signature: (cache, input, page_table, batch_idx=0)
     # input shape: [1, N_KV, input_seq_len, HEAD_DIM]
     k_for_cache = ttnn.reshape(k_tt, [1, NKV_PER_CHIP, seq_len, HEAD_DIM])
     v_for_cache = ttnn.reshape(v_tt, [1, NKV_PER_CHIP, seq_len, HEAD_DIM])
+    if DBG: print(f"  [prefill_attn dbg]  +{_t()-t0:.2f}s before paged_fill_cache  k_for_cache.shape={list(k_for_cache.shape)}", flush=True)
     try:
         ttnn.experimental.paged_fill_cache(
             attn['kc'], k_for_cache, state.page_table_tt, batch_idx=0)
         ttnn.experimental.paged_fill_cache(
             attn['vc'], v_for_cache, state.page_table_tt, batch_idx=0)
+        if DBG: print(f"  [prefill_attn dbg]  +{_t()-t0:.2f}s after paged_fill_cache", flush=True)
     except Exception as e:
         # Non-fatal for prefill validation: SDPA below uses the fresh K/V
         # directly, not the cache. Cache write only matters for subsequent
@@ -1156,12 +1176,14 @@ def gated_attn_step_prefill_tp(state, x_seq_tt, attn, cos_seq_tt, sin_seq_tt, cf
     q_for_sdpa = ttnn.reshape(q_tt, [1, NQ_PER_CHIP, seq_len, HEAD_DIM])
     k_for_sdpa = ttnn.reshape(k_tt, [1, NKV_PER_CHIP, seq_len, HEAD_DIM])
     v_for_sdpa = ttnn.reshape(v_tt, [1, NKV_PER_CHIP, seq_len, HEAD_DIM])
+    if DBG: print(f"  [prefill_attn dbg]  +{_t()-t0:.2f}s before SDPA  q.shape={list(q_for_sdpa.shape)} k.shape={list(k_for_sdpa.shape)}", flush=True)
     attn_out = ttnn.transformer.scaled_dot_product_attention(
         q_for_sdpa, k_for_sdpa, v_for_sdpa,
         is_causal=True,
         scale=1.0 / math.sqrt(HEAD_DIM),
         compute_kernel_config=state.sdpa_compute_kernel_config,
     )
+    if DBG: print(f"  [prefill_attn dbg]  +{_t()-t0:.2f}s after SDPA  shape={list(attn_out.shape)}", flush=True)
     # attn_out: [1, NQ_PER_CHIP, seq_len, HEAD_DIM]
     attn_per_head = ttnn.reshape(attn_out, [seq_len, NQ_PER_CHIP, HEAD_DIM])
     ttnn.deallocate(q_for_sdpa)
@@ -1264,8 +1286,25 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
     ttnn.deallocate(cos_seq_raw)
     ttnn.deallocate(sin_seq_raw)
 
+    # Reset the per-call attention debug counter so first call this forward
+    # gets the prints (helps debugging fresh calls).
+    global _PREFILL_DEBUG_LAYER_IDX
+    _PREFILL_DEBUG_LAYER_IDX = 0
+
+    import time as _time
+    _last_t = _time.time()
+    def _layer_dbg(idx, layer_type):
+        nonlocal _last_t
+        ttnn.synchronize_device(state.mesh)
+        now = _time.time()
+        dt = now - _last_t
+        _last_t = now
+        # Only print every 8 layers to limit noise
+        if idx % 8 == 0 or layer_type == 'full_attention':
+            print(f"  [v3 prefill] layer {idx} ({layer_type}) done in {dt*1000:.0f} ms", flush=True)
+
     # ====== Step 3: Layer loop ======
-    for layer in state.layers:
+    for layer_idx, layer in enumerate(state.layers):
         if layer['type'] == 'linear_attention':
             # DeltaNet: sequential per-position with slice_write assembly
             # Pre-allocate ROW_MAJOR working buffer [1, 1, seq_len, HIDDEN]
@@ -1318,6 +1357,7 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         new_x_seq = mlp_step_tp(state, x_seq, layer['mlp'])
         ttnn.deallocate(x_seq)
         x_seq = new_x_seq
+        _layer_dbg(layer_idx, layer['type'])
 
     ttnn.deallocate(cos_seq_tt)
     ttnn.deallocate(sin_seq_tt)
