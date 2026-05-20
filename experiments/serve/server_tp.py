@@ -1487,12 +1487,12 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         # Print every layer for B.2.2 debug
         print(f"  [v3 prefill] layer {idx:2d} ({layer_type[:14]:14s}) {stage} dt={dt*1000:5.0f}ms", flush=True)
 
-    # B.2.2 fix attempt 10: CUSTOM all_reduce via all_gather + ttnn.sum.
-    # Composite path (fix 9, ttnn.reduce_scatter + ttnn.all_gather) ALSO
-    # wedged — per audit, it uses same kernels as all_reduce internally.
-    # This time use all_gather (no reduce_scatter) + compute-only sum.
-    # Different kernel set entirely, different semaphore lifecycle.
-    state.force_custom_allreduce = True
+    # B.2.2 (2026-05-20): standard ttnn.all_reduce now works since the root
+    # cause (view-source-dealloc at lines 1440 + 1622) was fixed via ttnn.clone.
+    # The earlier wedge was a SYMPTOM of broken x_seq downstream, not all_reduce
+    # itself. Custom AG+sum was a workaround that bypassed the symptom but
+    # has slightly worse numerics on multi-row real data. Switching back.
+    state.force_custom_allreduce = False
 
     # ====== Step 3: Layer loop ======
     for layer_idx, layer in enumerate(state.layers):
