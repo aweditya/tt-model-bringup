@@ -130,6 +130,12 @@ class MeshServerState:
         # reduce_scatter), different semaphore lifecycle. Mirrors the
         # ttnn.all_reduce fallback path for edge cases.
         self.force_custom_allreduce = False
+        # v4 (task #75): when True, v3 prefill's DN body calls
+        # deltanet_chunked_neumann_tp instead of per-position loop. Currently
+        # a STUB that just loops per-position internally — same math, allows
+        # iterative replacement of stub body with real Neumann chunked math.
+        # See research/v4_chunked_dn_design_2026_05_20.md.
+        self.use_chunked_dn = False
         self.rope_mode = "manual"
         self.deltanet_decay_mode = "manual"
         # 2026-05-18: defaulted to "owned_gdn" after Tier 3 long-context gate
@@ -891,6 +897,83 @@ def deltanet_step_tp(state, x_tt, dn, cfg):
     return x_out
 
 
+def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
+    """v4 (task #75): chunked-parallel DeltaNet across `seq_len` positions.
+
+    Replaces the per-position sequential DN loop in v3 prefill with a single
+    chunked call that exploits the Neumann factorization of (I - attn)^{-1}
+    to compute all positions' recurrence in parallel.
+
+    Inputs:
+      x_seq_tt: [seq_len, HIDDEN] bf16 TILE, replicated across mesh
+      dn:       per-layer DN weights dict (same as deltanet_step_tp)
+      cfg:      model config
+      seq_len:  number of positions to process
+
+    Returns:
+      x_out_seq_tt: [seq_len, HIDDEN] bf16 TILE, residual-added DN output
+                   (replicated, mirrors deltanet_step_tp's output contract per position)
+
+    STATUS (2026-05-20, v4 step 1): STUB. Internally loops per-position
+    calling deltanet_step_tp. Same math as v3 — gives cos = 1.0 vs v3
+    trivially. The point of this stub is to lock in the function signature
+    and probe harness so future sessions can replace the body with real
+    chunked Neumann math one stage at a time.
+
+    Design doc: research/v4_chunked_dn_design_2026_05_20.md
+    Reference impl plan: research/c5_chunked_prefill_plan.md
+    Validated primitives: feedback_c5_primitives_green (Neumann factorization
+    + ttnn.cumsum both confirmed at production shape on single-chip).
+
+    NEXT SESSION work: replace the per-position loop below with:
+      1. ttnn.cumsum(g) per-chunk → G
+      2. exp(G_a - G_b) lower-tri → D
+      3. Neumann factorization of -(K_β @ K^T) ⊙ D → T = (I - attn)^{-1}
+      4. T @ V_β, T @ (K_β ⊙ exp(G)) → chunk-rotated values
+      5. Standard chunked recurrence per chunk; carry SSM state across chunks
+    """
+    import ttnn
+    import torch
+
+    HIDDEN = cfg['hidden']
+
+    # STUB BODY: per-position loop, reassemble into [seq_len, HIDDEN].
+    # This mirrors the v3 DN inner loop EXACTLY so cos validation is trivial.
+    dn_buf_init = torch.zeros((1, 1, seq_len, HIDDEN), dtype=torch.bfloat16)
+    dn_out_buf = ttnn.from_torch(
+        dn_buf_init,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        dtype=ttnn.bfloat16,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    for pos in range(seq_len):
+        x_pos = ttnn.slice(x_seq_tt, [pos, 0], [pos + 1, HIDDEN])
+        x_pos_out = deltanet_step_tp(state, x_pos, dn, cfg)
+        # x_pos is a VIEW of x_seq_tt — DO NOT deallocate (per B.2.2 lesson)
+        x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
+        x_pos_rm = ttnn.to_layout(x_pos_4d, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.experimental.slice_write(
+            x_pos_rm, dn_out_buf,
+            [0, 0, pos, 0],
+            [1, 1, pos + 1, HIDDEN],
+            [1, 1, 1, 1],
+        )
+        ttnn.deallocate(x_pos_out)
+        ttnn.deallocate(x_pos_4d)
+        ttnn.deallocate(x_pos_rm)
+
+    # Reassemble into [seq_len, HIDDEN] TILE via clone (per B.2.2 fix).
+    dn_out_4d_tile = ttnn.to_layout(dn_out_buf, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(dn_out_buf)
+    _view = ttnn.reshape(dn_out_4d_tile, [seq_len, HIDDEN])
+    x_out_seq_tt = ttnn.clone(_view)
+    ttnn.deallocate(_view)
+    ttnn.deallocate(dn_out_4d_tile)
+    return x_out_seq_tt
+
+
 def mlp_step_tp(state, x_tt, mlp):
     """One SwiGLU MLP TP step on the mesh.
 
@@ -1531,6 +1614,20 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 print(f"  [v3 L{layer_idx} x_seq diag err] {e!r}", flush=True)
         _layer_dbg(layer_idx, layer['type'], stage="start")
         if layer['type'] == 'linear_attention':
+            # v4 (task #75): when state.use_chunked_dn=True, route DN body
+            # through deltanet_chunked_neumann_tp (currently STUB → per-pos).
+            # Future: stub body replaced with Neumann chunked math; same API.
+            if getattr(state, 'use_chunked_dn', False):
+                new_x_seq = deltanet_chunked_neumann_tp(
+                    state, x_seq, layer['dn'], cfg, seq_len)
+                ttnn.deallocate(x_seq)
+                x_seq = new_x_seq
+                _layer_dbg(layer_idx, layer['type'], stage="pre_mlp")
+                new_x_seq = mlp_step_tp(state, x_seq, layer['mlp'])
+                ttnn.deallocate(x_seq)
+                x_seq = new_x_seq
+                _layer_dbg(layer_idx, layer['type'], stage="end")
+                continue
             # DeltaNet: sequential per-position with slice_write assembly
             # Pre-allocate ROW_MAJOR working buffer [1, 1, seq_len, HIDDEN]
             dn_buf_init = torch.zeros((1, 1, seq_len, HIDDEN), dtype=torch.bfloat16)
@@ -2929,6 +3026,10 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     if force_sync:
         state.force_sync_per_position = True
         print(f"[probe] force_sync_per_position=True for test path", flush=True)
+    use_chunked_dn = bool(args.get("use_chunked_dn", False))
+    if use_chunked_dn:
+        state.use_chunked_dn = True
+        print(f"[probe] use_chunked_dn=True for test path (v4 step 1 STUB)", flush=True)
     t0 = _time.time()
     if mode == "stub":
         test_logits = forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)
@@ -2953,6 +3054,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.deltanet_decay_gate_mode = _orig_dg_mode
     if force_sync:
         state.force_sync_per_position = False
+    if use_chunked_dn:
+        state.use_chunked_dn = False
     if debug_state:
         state.debug_state = False
         state.debug_layer_boundary = False

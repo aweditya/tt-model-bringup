@@ -225,6 +225,8 @@ def cmd_probe_prefill_vs_decode_loop_tp(args):
         payload["force_sync_per_position"] = True
     if args.debug_state:
         payload["debug_state"] = True
+    if args.use_chunked_dn:
+        payload["use_chunked_dn"] = True
     data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
     if data.get("error"):
         print(f"ERROR: {data['error']}", file=sys.stderr)
@@ -725,6 +727,11 @@ def main():
                            "each position's DN call in both decode-loop reference (tag='dec') "
                            "and v3 prefill (tag='pre'). Use to find where state evolution "
                            "first diverges.")
+    pvd.add_argument("--use-chunked-dn", action="store_true",
+                      help="v4 (task #75): route v3 prefill DN body through "
+                           "deltanet_chunked_neumann_tp (currently a STUB that loops "
+                           "per-position internally — same math; will be replaced with "
+                           "real Neumann chunked math in future sessions)")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     cle = sub.add_parser("probe_ccl_equivalence_tp",
                           help="B.2.2 CCL semantics: verify all_reduce vs composite "
