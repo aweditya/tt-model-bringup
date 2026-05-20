@@ -1109,6 +1109,24 @@ def forward_token_tp_inner(state, return_logits: bool = False):
                                        state.cur_pos_buf,
                                        0,  # vestigial cur_pos int (paged path ignores it)
                                        cos_row_tt, sin_row_tt, cfg)
+        # B.2.2 Test 8: print x BEFORE MLP at L0 (single-shot, pos 0)
+        if _li == 0 and getattr(state, 'debug_layer_boundary', False):
+            _bm = getattr(state, '_pre_mlp_count', 0)
+            if _bm < 1:
+                try:
+                    _xpf = ttnn.to_torch(
+                        x_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+                    ).float()
+                    _Hpm = _xpf.shape[-1] // 4
+                    _pv = [round(float(_xpf[..., 0, c*_Hpm]), 6) for c in range(4)]
+                    _pm = [round(float(_xpf[..., 0, c*_Hpm:(c+1)*_Hpm].mean()), 6) for c in range(4)]
+                    _pn = [round(float(_xpf[..., 0, c*_Hpm:(c+1)*_Hpm].norm()), 4) for c in range(4)]
+                    _ptg = getattr(state, '_debug_state_tag', 'dec')
+                    print(f"  [{_ptg} L0 pre-MLP x[0,:]] chip_v0={_pv} chip_means={_pm} chip_norms={_pn}",
+                          flush=True)
+                    state._pre_mlp_count = _bm + 1
+                except Exception as _e:
+                    print(f"  [decode L0 pre-MLP diag err] {_e!r}", flush=True)
         x_tt = mlp_step_tp(state, x_tt, layer['mlp'])
         # B.2.2 Test 7: print x at layer-1 entry on first call only
         if _li == 0 and getattr(state, 'debug_layer_boundary', False):
@@ -1560,6 +1578,24 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
             x_seq = new_x_seq
 
         _layer_dbg(layer_idx, layer['type'], stage="pre_mlp")
+        # B.2.2 Test 8: print x_seq[0,:] BEFORE MLP at L0 in v3 (single-shot)
+        if layer_idx == 0 and getattr(state, 'debug_layer_boundary', False):
+            _v3bm = getattr(state, '_pre_mlp_count', 0)
+            if _v3bm < 2:  # allow both dec (in fwd_token) and pre (here) one print each
+                try:
+                    _v3xf = ttnn.to_torch(
+                        x_seq, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+                    ).float()
+                    _v3Hpm = _v3xf.shape[-1] // 4
+                    _v3pv = [round(float(_v3xf[0, c*_v3Hpm]), 6) for c in range(4)]
+                    _v3pm = [round(float(_v3xf[0, c*_v3Hpm:(c+1)*_v3Hpm].mean()), 6) for c in range(4)]
+                    _v3pn = [round(float(_v3xf[0, c*_v3Hpm:(c+1)*_v3Hpm].norm()), 4) for c in range(4)]
+                    _v3tg = getattr(state, '_debug_state_tag', 'pre')
+                    print(f"  [{_v3tg} L0 pre-MLP x_seq[0,:]] chip_v0={_v3pv} chip_means={_v3pm} chip_norms={_v3pn}",
+                          flush=True)
+                    state._pre_mlp_count = _v3bm + 1
+                except Exception as _v3e:
+                    print(f"  [v3 L0 pre-MLP diag err] {_v3e!r}", flush=True)
         # MLP: batched on [seq_len, HIDDEN] (broadcasts on leading dim)
         # Note: the B.2.2 wedge fix is now in _tp_all_reduce (clones the
         # result to escape DeallocatedTombStone state at the source), so we
@@ -2769,6 +2805,7 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         # REFERENCE path. So set the flag BEFORE the reference loop.
         state.debug_layer_boundary = True
         state._layer_bd_count = 0
+        state._pre_mlp_count = 0
         state._debug_state_tag = "dec"
     t0 = _time.time()
     ref_logits = np.empty((seq_len, VOCAB), dtype=np.float32)
@@ -2807,6 +2844,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         # _layer_bd_count reset so v3 also gets one print (it doesn't call
         # forward_token_tp_inner, but reset for safety/consistency).
         state._layer_bd_count = 0
+        # NOTE: do NOT reset _pre_mlp_count here — the limit is 2 (one for dec
+        # path which already happened, one for pre path which is about to).
     force_sync = bool(args.get("force_sync_per_position", False))
     if force_sync:
         state.force_sync_per_position = True
