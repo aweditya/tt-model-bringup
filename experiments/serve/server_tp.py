@@ -1146,6 +1146,216 @@ def _neumann_inverse_via_mesh_tp(state, L_tt, C):
     return T
 
 
+def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
+    """v4 Stage 4b-iii: FULLY chunked DeltaNet using _chunked_recurrence_tp.
+
+    Replaces the per-position recurrence loop with a single chunked Neumann
+    call. Per-position work is reduced to:
+      - PRE-recurrence: conv1d + QKV split + GQA + L2-norm  (collected into batched)
+      - POST-recurrence: output gate + w_out + all_reduce + residual add (per pos)
+
+    Requires seq_len to be a power of 2 (Neumann factorization constraint).
+
+    All math/primitives validated standalone:
+    - _chunked_recurrence_tp: probe_chunked_recurrence_tp cos 0.99996 @ C=8
+    - _neumann_inverse_via_mesh_tp: probe_neumann_inverse_mesh_tp cos 0.99999967 @ C=64
+    """
+    import ttnn
+    import torch
+    import numpy as np
+    from full_layer_tp_probe import (
+        IN_PROJ_OUT_CHIP, EPS, CONV_DIM_CHIP, VAL_DIM_CHIP, NV_PER_CHIP,
+        NK_PER_CHIP, K_DIM, V_DIM, KEY_DIM_CHIP, N_REP, NCHIPS,
+    )
+
+    HIDDEN = cfg['hidden']
+    C = seq_len
+
+    # === Stage 1: batched pre-norm + in_proj ===
+    h_seq = _rms_norm_manual(x_seq_tt, dn['input_norm'], EPS, HIDDEN)
+    all_seq = ttnn.linear(h_seq, dn['w_in'])  # [C, IN_PROJ_OUT_CHIP]
+    ttnn.deallocate(h_seq)
+
+    # === Stage 3: batched decay/gate (keep g_seq + beta_seq for chunked recurrence) ===
+    a_seq = ttnn.slice(all_seq, [0, CONV_DIM_CHIP + VAL_DIM_CHIP],
+                       [C, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP])
+    b_seq = ttnn.slice(all_seq, [0, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
+                       [C, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP])
+    a_biased = ttnn.add(a_seq, dn['dt_bias'])
+    softplus_a = ttnn.log(ttnn.add(ttnn.exp(a_biased), 1.0))
+    g_seq = ttnn.mul(ttnn.neg(ttnn.exp(dn['A_log'])), softplus_a)  # [C, NV_PER_CHIP]
+    beta_seq = ttnn.sigmoid(b_seq)                                   # [C, NV_PER_CHIP]
+    ttnn.deallocate(a_seq); ttnn.deallocate(b_seq)
+    ttnn.deallocate(a_biased); ttnn.deallocate(softplus_a)
+
+    # === PRE-RECURRENCE: per-pos conv1d + QKV split + L2-norm, collect into batched ===
+    total_NV = NCHIPS * NV_PER_CHIP
+    q_collected = ttnn.from_torch(
+        torch.zeros((total_NV, C, K_DIM), dtype=torch.bfloat16),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
+    k_collected = ttnn.from_torch(
+        torch.zeros((total_NV, C, K_DIM), dtype=torch.bfloat16),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
+    v_collected = ttnn.from_torch(
+        torch.zeros((total_NV, C, V_DIM), dtype=torch.bfloat16),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
+    z_collected = ttnn.from_torch(
+        torch.zeros((C, NCHIPS * VAL_DIM_CHIP), dtype=torch.bfloat16),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1))
+
+    def _gqa(t, n_kh, d):
+        t2 = ttnn.reshape(t, [n_kh, 1, d])
+        t3 = ttnn.repeat(t2, ttnn.Shape([1, N_REP, 1]))
+        return ttnn.reshape(t3, [n_kh * N_REP, d])
+
+    EPS_RMS = EPS / K_DIM
+
+    for pos in range(C):
+        all_pos = ttnn.slice(all_seq, [pos, 0], [pos + 1, IN_PROJ_OUT_CHIP])
+        mixed_qkv = ttnn.slice(all_pos, [0, 0], [1, CONV_DIM_CHIP])
+        z_tt_pos = ttnn.slice(all_pos, [0, CONV_DIM_CHIP],
+                               [1, CONV_DIM_CHIP + VAL_DIM_CHIP])
+        ttnn.deallocate(all_pos)
+
+        # Conv1d (mirrors helper's logic)
+        if state.deltanet_conv1d_mode == "owned_conv1d":
+            state0, state1, state2 = dn['conv_st_split']
+            w0, w1, w2, w3 = dn['w_conv_split']
+            mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
+            ttnn.deallocate(mixed_qkv)
+            _, _, _, conv_out_2d = ttnn.experimental.qwen36_conv1d_decode_owned(
+                mixed_col, state0, state1, state2, w0, w1, w2, w3)
+            ttnn.deallocate(mixed_col)
+            conv_out = ttnn.reshape(conv_out_2d, [CONV_DIM_CHIP])
+            ttnn.deallocate(conv_out_2d)
+        else:
+            mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
+            ttnn.deallocate(mixed_qkv)
+            conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
+            ttnn.deallocate(mixed_col)
+            conv_prod = ttnn.mul(conv_input, dn['w_conv'])
+            conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
+            ttnn.deallocate(conv_prod)
+            conv_state_new = ttnn.slice(conv_input, [0, 1],
+                                         [CONV_DIM_CHIP, cfg['conv_kernel']])
+            ttnn.deallocate(conv_input)
+            ttnn.copy(conv_state_new, dn['conv_st'])
+            ttnn.deallocate(conv_state_new)
+
+        q_flat = ttnn.slice(conv_out, [0], [KEY_DIM_CHIP])
+        k_flat = ttnn.slice(conv_out, [KEY_DIM_CHIP], [2 * KEY_DIM_CHIP])
+        v_flat = ttnn.slice(conv_out, [2 * KEY_DIM_CHIP], [CONV_DIM_CHIP])
+        ttnn.deallocate(conv_out)
+
+        q = _gqa(q_flat, NK_PER_CHIP, K_DIM)
+        k = _gqa(k_flat, NK_PER_CHIP, K_DIM)
+        v = ttnn.reshape(v_flat, [NV_PER_CHIP, V_DIM])
+        ttnn.deallocate(q_flat); ttnn.deallocate(k_flat); ttnn.deallocate(v_flat)
+
+        q = _rms_norm_manual(q, dn['q_l2_scale'], EPS_RMS, K_DIM)
+        k = _rms_norm_manual(k, dn['k_l2_scale'], EPS_RMS, K_DIM)
+
+        # Collect into batched buffers via slice_write
+        q_3d = ttnn.reshape(q, [NV_PER_CHIP, 1, K_DIM])
+        k_3d = ttnn.reshape(k, [NV_PER_CHIP, 1, K_DIM])
+        v_3d = ttnn.reshape(v, [NV_PER_CHIP, 1, V_DIM])
+        q_rm = ttnn.to_layout(q_3d, ttnn.ROW_MAJOR_LAYOUT)
+        k_rm = ttnn.to_layout(k_3d, ttnn.ROW_MAJOR_LAYOUT)
+        v_rm = ttnn.to_layout(v_3d, ttnn.ROW_MAJOR_LAYOUT)
+        z_rm = ttnn.to_layout(z_tt_pos, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.experimental.slice_write(q_rm, q_collected,
+            [0, pos, 0], [NV_PER_CHIP, pos + 1, K_DIM], [1, 1, 1])
+        ttnn.experimental.slice_write(k_rm, k_collected,
+            [0, pos, 0], [NV_PER_CHIP, pos + 1, K_DIM], [1, 1, 1])
+        ttnn.experimental.slice_write(v_rm, v_collected,
+            [0, pos, 0], [NV_PER_CHIP, pos + 1, V_DIM], [1, 1, 1])
+        ttnn.experimental.slice_write(z_rm, z_collected,
+            [pos, 0], [pos + 1, VAL_DIM_CHIP], [1, 1])
+
+        ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v); ttnn.deallocate(z_tt_pos)
+        ttnn.deallocate(q_3d); ttnn.deallocate(k_3d); ttnn.deallocate(v_3d)
+        ttnn.deallocate(q_rm); ttnn.deallocate(k_rm); ttnn.deallocate(v_rm); ttnn.deallocate(z_rm)
+
+    ttnn.deallocate(all_seq)
+
+    # Convert collected to TILE for matmul
+    q_seq_tile = ttnn.to_layout(q_collected, ttnn.TILE_LAYOUT)
+    k_seq_tile = ttnn.to_layout(k_collected, ttnn.TILE_LAYOUT)
+    v_seq_tile = ttnn.to_layout(v_collected, ttnn.TILE_LAYOUT)
+    z_seq_tile = ttnn.to_layout(z_collected, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(q_collected); ttnn.deallocate(k_collected)
+    ttnn.deallocate(v_collected); ttnn.deallocate(z_collected)
+
+    # Transpose g_seq, beta_seq from [C, NV_PER_CHIP] to [NV_PER_CHIP, C]
+    g_seq_NV = ttnn.transpose(g_seq, -2, -1)
+    beta_seq_NV = ttnn.transpose(beta_seq, -2, -1)
+    ttnn.deallocate(g_seq); ttnn.deallocate(beta_seq)
+
+    # === CHUNKED NEUMANN RECURRENCE ===
+    S_prev = ttnn.reshape(dn['ssm'], [NV_PER_CHIP, K_DIM, V_DIM])
+    O_seq, S_new = _chunked_recurrence_tp(
+        state, q_seq_tile, k_seq_tile, v_seq_tile, g_seq_NV, beta_seq_NV, S_prev, C)
+
+    # Update dn['ssm'] from S_new
+    S_new_4d = ttnn.reshape(S_new, [1, NV_PER_CHIP, K_DIM, V_DIM])
+    ttnn.copy(S_new_4d, dn['ssm'])
+
+    ttnn.deallocate(q_seq_tile); ttnn.deallocate(k_seq_tile); ttnn.deallocate(v_seq_tile)
+    ttnn.deallocate(g_seq_NV); ttnn.deallocate(beta_seq_NV)
+    ttnn.deallocate(S_new); ttnn.deallocate(S_new_4d)
+
+    # === POST-RECURRENCE: per-pos output gate + w_out + all_reduce + residual ===
+    dn_out_buf = ttnn.from_torch(
+        torch.zeros((1, 1, C, HIDDEN), dtype=torch.bfloat16),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    for pos in range(C):
+        x_pos = ttnn.slice(x_seq_tt, [pos, 0], [pos + 1, HIDDEN])
+        out_per_head_3d = ttnn.slice(O_seq, [0, pos, 0],
+                                     [NV_PER_CHIP, pos + 1, V_DIM])
+        out_per_head = ttnn.reshape(out_per_head_3d, [NV_PER_CHIP, V_DIM])
+        ttnn.deallocate(out_per_head_3d)
+        z_pos = ttnn.slice(z_seq_tile, [pos, 0], [pos + 1, VAL_DIM_CHIP])
+
+        # Output gate
+        out_normed = _rms_norm_manual(out_per_head, dn['linear_attn_norm'], EPS, V_DIM)
+        z_per_head = ttnn.reshape(z_pos, [NV_PER_CHIP, V_DIM])
+        silu_z = ttnn.silu(z_per_head)
+        out_gated = ttnn.reshape(ttnn.mul(out_normed, silu_z), [1, VAL_DIM_CHIP])
+        ttnn.deallocate(out_per_head); ttnn.deallocate(out_normed)
+        ttnn.deallocate(z_per_head); ttnn.deallocate(silu_z); ttnn.deallocate(z_pos)
+
+        # w_out + all_reduce + residual
+        partial = ttnn.linear(out_gated, dn['w_out'])
+        ttnn.deallocate(out_gated)
+        reduced = _tp_all_reduce(state, partial)
+        ttnn.deallocate(partial)
+        x_pos_out = ttnn.add(x_pos, reduced)
+        ttnn.deallocate(reduced)
+
+        x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
+        x_pos_rm = ttnn.to_layout(x_pos_4d, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.experimental.slice_write(x_pos_rm, dn_out_buf,
+            [0, 0, pos, 0], [1, 1, pos + 1, HIDDEN], [1, 1, 1, 1])
+        ttnn.deallocate(x_pos_out); ttnn.deallocate(x_pos_4d); ttnn.deallocate(x_pos_rm)
+
+    ttnn.deallocate(O_seq); ttnn.deallocate(z_seq_tile)
+
+    dn_out_4d_tile = ttnn.to_layout(dn_out_buf, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(dn_out_buf)
+    _view = ttnn.reshape(dn_out_4d_tile, [C, HIDDEN])
+    x_out_seq_tt = ttnn.clone(_view)
+    ttnn.deallocate(_view)
+    ttnn.deallocate(dn_out_4d_tile)
+    return x_out_seq_tt
+
+
 def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
     """v4 (task #75): chunked-parallel DeltaNet across `seq_len` positions.
 
@@ -1189,6 +1399,12 @@ def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
     from full_layer_tp_probe import (
         IN_PROJ_OUT_CHIP, EPS, CONV_DIM_CHIP, VAL_DIM_CHIP, NV_PER_CHIP,
     )
+
+    # === Stage 4b-iii dispatch: use FULLY chunked DN if seq_len is power of 2 and >= 4
+    # (Neumann factorization requires power-of-2 C). Otherwise fall back to
+    # Stage 1+3 per-pos path below.
+    if seq_len >= 4 and (seq_len & (seq_len - 1)) == 0:
+        return _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len)
 
     HIDDEN = cfg['hidden']
 
