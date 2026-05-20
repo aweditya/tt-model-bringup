@@ -1437,7 +1437,14 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         layout=ttnn.TILE_LAYOUT,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
-    x_seq = ttnn.reshape(embed_raw, [seq_len, HIDDEN])
+    # B.2.2 FIX (2026-05-20): ttnn.reshape returns a VIEW. Deallocating
+    # `embed_raw` (the source) frees the view's underlying buffer; subsequent
+    # MLP allocations reuse it and zero `x_seq` mid-execution. Clone first
+    # to materialize a fresh allocation BEFORE freeing the source. Same
+    # trap as feedback_owned_decay_gate_shipped.md, opposite direction.
+    _x_seq_view = ttnn.reshape(embed_raw, [seq_len, HIDDEN])
+    x_seq = ttnn.clone(_x_seq_view)
+    ttnn.deallocate(_x_seq_view)
     ttnn.deallocate(prompt_ids_idx)
     ttnn.deallocate(embed_raw)
 
@@ -1619,7 +1626,12 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
             ttnn.deallocate(x_seq)
             dn_out_4d_tile = ttnn.to_layout(dn_out_buf, ttnn.TILE_LAYOUT)
             ttnn.deallocate(dn_out_buf)
-            x_seq = ttnn.reshape(dn_out_4d_tile, [seq_len, HIDDEN])
+            # B.2.2 FIX (2026-05-20): same view-source-dealloc trap as above —
+            # MLP allocations reuse the freed buffer and zero x_seq mid-step.
+            # Clone to materialize fresh allocation.
+            _x_view = ttnn.reshape(dn_out_4d_tile, [seq_len, HIDDEN])
+            x_seq = ttnn.clone(_x_view)
+            ttnn.deallocate(_x_view)
             ttnn.deallocate(dn_out_4d_tile)
         else:
             # Gated Attention: parallel SDPA across all seq_len positions
