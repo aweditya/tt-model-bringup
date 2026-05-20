@@ -123,7 +123,13 @@ class MeshServerState:
         # reduce_scatter + all_gather instead of all_reduce. Different code
         # path → different output tensor lineage → may avoid the wedge in
         # downstream slice + DN. v3 prefill toggles this on per-call.
+        # (CONFIRMED to also wedge — same underlying kernels as all_reduce.)
         self.force_composite_ccl = False
+        # B.2.2 workaround #2: when True, _tp_all_reduce uses all_gather +
+        # ttnn.sum instead of all_reduce. Different kernel set (no
+        # reduce_scatter), different semaphore lifecycle. Mirrors the
+        # ttnn.all_reduce fallback path for edge cases.
+        self.force_custom_allreduce = False
         self.rope_mode = "manual"
         self.deltanet_decay_mode = "manual"
         # 2026-05-18: defaulted to "owned_gdn" after Tier 3 long-context gate
@@ -595,8 +601,9 @@ def _tp_all_reduce(state: MeshServerState, partial):
     import ttnn
 
     # B.2.2 workaround: composite reduce_scatter + all_gather (instead of
-    # all_reduce) — different op chain, possibly different output tensor
-    # lineage that downstream DN can consume. v3 prefill sets this flag.
+    # all_reduce) — different op chain at API surface, but per the
+    # all_reduce kernel audit it uses the SAME underlying kernels as
+    # all_reduce's internal implementation. Confirmed to also wedge.
     if getattr(state, 'force_composite_ccl', False):
         scattered = ttnn.reduce_scatter(
             partial, dim=1, cluster_axis=1,
@@ -608,6 +615,27 @@ def _tp_all_reduce(state: MeshServerState, partial):
         )
         ttnn.deallocate(scattered)
         return gathered
+
+    # B.2.2 workaround #2: CUSTOM all_reduce via all_gather + local sum.
+    # This is what ttnn.all_reduce's fallback path uses for edge cases
+    # (per audit: all_reduce_async.cpp:203-238) but avoiding reduce_scatter
+    # entirely. all_gather is a single collective; sum is pure compute (no
+    # fabric). Different kernel set, different semaphore lifecycle.
+    if getattr(state, 'force_custom_allreduce', False):
+        seq_len_local = partial.shape[-2]
+        hidden_local = partial.shape[-1]
+        # all_gather along dim=1 with cluster_axis=1 → [seq_len, NCHIPS*HIDDEN]
+        gathered = ttnn.all_gather(
+            partial, dim=1, cluster_axis=1,
+            num_links=2, topology=ttnn.Topology.Linear,
+        )
+        # Reshape [seq_len, 4*HIDDEN] → [seq_len, 4, HIDDEN]
+        reshaped = ttnn.reshape(gathered, [seq_len_local, 4, hidden_local])
+        # Sum across the chip axis → [seq_len, HIDDEN]
+        summed = ttnn.sum(reshaped, dim=1)
+        ttnn.deallocate(gathered)
+        ttnn.deallocate(reshaped)
+        return summed
 
     if state.collective_mode == "explicit_all_reduce":
         return ttnn.all_reduce(
@@ -1340,13 +1368,12 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         # Print every layer for B.2.2 debug
         print(f"  [v3 prefill] layer {idx:2d} ({layer_type[:14]:14s}) {stage} dt={dt*1000:5.0f}ms", flush=True)
 
-    # B.2.2 fix attempt 9: force composite CCL (reduce_scatter + all_gather)
-    # instead of all_reduce for the entire prefill forward. All_reduce
-    # output triggers a wedge when sliced + fed to DN (8 prior fix attempts
-    # all failed). User insight: the wedge is specific to TP-only ops. The
-    # composite path is a different op sequence — different output lineage —
-    # maybe avoids the wedge.
-    state.force_composite_ccl = True
+    # B.2.2 fix attempt 10: CUSTOM all_reduce via all_gather + ttnn.sum.
+    # Composite path (fix 9, ttnn.reduce_scatter + ttnn.all_gather) ALSO
+    # wedged — per audit, it uses same kernels as all_reduce internally.
+    # This time use all_gather (no reduce_scatter) + compute-only sum.
+    # Different kernel set entirely, different semaphore lifecycle.
+    state.force_custom_allreduce = True
 
     # ====== Step 3: Layer loop ======
     for layer_idx, layer in enumerate(state.layers):
@@ -1427,7 +1454,7 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
     ttnn.deallocate(sin_seq_tt)
 
     # Restore default CCL mode
-    state.force_composite_ccl = False
+    state.force_custom_allreduce = False
 
     # ====== Step 4: Final norm + LM head ======
     x_seq = _rms_norm_manual(x_seq, state.final_norm_tt, 1e-6, HIDDEN)
