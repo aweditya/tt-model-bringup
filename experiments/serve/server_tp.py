@@ -1337,55 +1337,38 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
     _toc(_t, "4_chunked_recurrence")
 
     _t = _tic()
-    # === POST-RECURRENCE: per-pos output gate + w_out + all_reduce + residual ===
-    dn_out_buf = ttnn.from_torch(
-        torch.zeros((1, 1, C, HIDDEN), dtype=torch.bfloat16),
-        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
-        device=state.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-        memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    # === STAGE 6: batched post-recurrence ===
+    # O_seq is [NV_PER_CHIP, C, V_DIM]; transpose to [C, NV_PER_CHIP, V_DIM]
+    O_C_first = ttnn.transpose(O_seq, 0, 1)
+    ttnn.deallocate(O_seq)
 
-    for pos in range(C):
-        x_pos = ttnn.slice(x_seq_tt, [pos, 0], [pos + 1, HIDDEN])
-        out_per_head_3d = ttnn.slice(O_seq, [0, pos, 0],
-                                     [NV_PER_CHIP, pos + 1, V_DIM])
-        out_per_head = ttnn.reshape(out_per_head_3d, [NV_PER_CHIP, V_DIM])
-        ttnn.deallocate(out_per_head_3d)
-        z_pos = ttnn.slice(z_seq_tile, [pos, 0], [pos + 1, VAL_DIM_CHIP])
+    # Batched rms_norm: reshape to 2D [C*NV_PER_CHIP, V_DIM], normalize, reshape back.
+    # rms_norm operates over last dim (V_DIM) → per-head per-position independently.
+    O_2d = ttnn.reshape(O_C_first, [C * NV_PER_CHIP, V_DIM])
+    ttnn.deallocate(O_C_first)
+    out_normed_2d = _rms_norm_manual(O_2d, dn['linear_attn_norm'], EPS, V_DIM)
+    ttnn.deallocate(O_2d)
+    out_normed_3d = ttnn.reshape(out_normed_2d, [C, NV_PER_CHIP, V_DIM])
+    ttnn.deallocate(out_normed_2d)
 
-        # Output gate
-        out_normed = _rms_norm_manual(out_per_head, dn['linear_attn_norm'], EPS, V_DIM)
-        z_per_head = ttnn.reshape(z_pos, [NV_PER_CHIP, V_DIM])
-        silu_z = ttnn.silu(z_per_head)
-        out_gated = ttnn.reshape(ttnn.mul(out_normed, silu_z), [1, VAL_DIM_CHIP])
-        ttnn.deallocate(out_per_head); ttnn.deallocate(out_normed)
-        ttnn.deallocate(z_per_head); ttnn.deallocate(silu_z); ttnn.deallocate(z_pos)
+    # Batched silu(z) * out_normed
+    z_3d = ttnn.reshape(z_seq_tile, [C, NV_PER_CHIP, V_DIM])
+    ttnn.deallocate(z_seq_tile)
+    silu_z_3d = ttnn.silu(z_3d)
+    ttnn.deallocate(z_3d)
+    out_gated_3d = ttnn.mul(out_normed_3d, silu_z_3d)
+    ttnn.deallocate(out_normed_3d); ttnn.deallocate(silu_z_3d)
+    out_gated_2d = ttnn.reshape(out_gated_3d, [C, VAL_DIM_CHIP])
+    ttnn.deallocate(out_gated_3d)
 
-        # w_out + all_reduce + residual
-        partial = ttnn.linear(out_gated, dn['w_out'])
-        ttnn.deallocate(out_gated)
-        reduced = _tp_all_reduce(state, partial)
-        ttnn.deallocate(partial)
-        x_pos_out = ttnn.add(x_pos, reduced)
-        ttnn.deallocate(reduced)
-
-        x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
-        x_pos_rm = ttnn.to_layout(x_pos_4d, ttnn.ROW_MAJOR_LAYOUT)
-        ttnn.experimental.slice_write(x_pos_rm, dn_out_buf,
-            [0, 0, pos, 0], [1, 1, pos + 1, HIDDEN], [1, 1, 1, 1])
-        ttnn.deallocate(x_pos_out); ttnn.deallocate(x_pos_4d); ttnn.deallocate(x_pos_rm)
-
-    ttnn.deallocate(O_seq); ttnn.deallocate(z_seq_tile)
-
-    _toc(_t, "5_post_recurrence")
-
-    _t = _tic()
-    dn_out_4d_tile = ttnn.to_layout(dn_out_buf, ttnn.TILE_LAYOUT)
-    ttnn.deallocate(dn_out_buf)
-    _view = ttnn.reshape(dn_out_4d_tile, [C, HIDDEN])
-    x_out_seq_tt = ttnn.clone(_view)
-    ttnn.deallocate(_view)
-    ttnn.deallocate(dn_out_4d_tile)
-    _toc(_t, "6_reassemble_clone")
+    # Batched w_out matmul (row-parallel) + all_reduce + residual add
+    partial = ttnn.linear(out_gated_2d, dn['w_out'])  # [C, HIDDEN] per-chip partial
+    ttnn.deallocate(out_gated_2d)
+    reduced = _tp_all_reduce(state, partial)  # [C, HIDDEN] replicated
+    ttnn.deallocate(partial)
+    x_out_seq_tt = ttnn.add(x_seq_tt, reduced)  # [C, HIDDEN] fresh allocation
+    ttnn.deallocate(reduced)
+    _toc(_t, "5_post_recurrence_batched")
     return x_out_seq_tt
 
 
