@@ -1408,6 +1408,23 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                   f"layout={x_seq.layout} mem={x_seq.memory_config()}", flush=True)
         except Exception as e:
             print(f"  [v3 layer {layer_idx:2d} entry] metadata read failed: {e}", flush=True)
+
+        # B.2.2 SLICE-CORRECTNESS DIAG (2026-05-20): at layer 1 entry (and 0 for
+        # control), dump x_seq row 0 contents per chip. Should be replicated.
+        # Compare layer 0 entry (embedding lineage, slice known to work) vs
+        # layer 1 entry (MLP lineage, slice suspected wrong).
+        if getattr(state, 'ccl_debug', False) and layer_idx <= 1:
+            try:
+                _full = ttnn.to_torch(
+                    x_seq, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+                ).float()
+                _Hc = _full.shape[-1] // 4
+                _chip_v = [round(float(_full[0, c*_Hc]), 6) for c in range(4)]
+                _chip_m = [round(float(_full[0, c*_Hc:(c+1)*_Hc].mean()), 6) for c in range(4)]
+                print(f"  [v3 L{layer_idx} x_seq[0,:]] chip_v0={_chip_v} chip_means={_chip_m}",
+                      flush=True)
+            except Exception as e:
+                print(f"  [v3 L{layer_idx} x_seq diag err] {e!r}", flush=True)
         _layer_dbg(layer_idx, layer['type'], stage="start")
         if layer['type'] == 'linear_attention':
             # DeltaNet: sequential per-position with slice_write assembly
@@ -1432,6 +1449,21 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 if _dbg_l:
                     ttnn.synchronize_device(state.mesh)
                     print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice shape={list(x_pos.shape)}", flush=True)
+                # B.2.2 SLICE-CORRECTNESS DIAG (2026-05-20): print x_pos[0,:]
+                # values per chip. Should match x_seq[pos,:] exactly. If not,
+                # slice is corrupting data on MLP-output TILE tensors.
+                if getattr(state, 'ccl_debug', False) and layer_idx <= 1 and pos == 0:
+                    try:
+                        _full = ttnn.to_torch(
+                            x_pos, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+                        ).float()
+                        _Hc = _full.shape[-1] // 4
+                        _chip_v = [round(float(_full[0, c*_Hc]), 6) for c in range(4)]
+                        _chip_m = [round(float(_full[0, c*_Hc:(c+1)*_Hc].mean()), 6) for c in range(4)]
+                        print(f"    [v3 L{layer_idx} x_pos[0,:] after slice] chip_v0={_chip_v} "
+                              f"chip_means={_chip_m}", flush=True)
+                    except Exception as e:
+                        print(f"    [v3 L{layer_idx} x_pos diag err] {e!r}", flush=True)
                 # Run DN step (existing per-position decode step)
                 x_pos_out = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
                 if _dbg_l:
