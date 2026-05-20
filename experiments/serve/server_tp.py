@@ -2351,6 +2351,172 @@ def handle_probe_multirow_construct_vs_per_position(state: MeshServerState, args
     }
 
 
+def handle_probe_slice_write_round_trip(state: MeshServerState, args: dict) -> dict:
+    """B.2.1.5b: probe ttnn.experimental.slice_write for pre-allocate + per-row write.
+
+    `slice_write` constraints (per ttnn help):
+      - rank == 4
+      - dtype bfloat16
+      - ROW_MAJOR layout (NOT TILE_LAYOUT)
+      - output interleaved
+      - last-dim slicing unsupported (we slice dim 2)
+
+    Test:
+      1. Pre-allocate dst = zeros([1, 1, seq_len, HIDDEN]) ROW_MAJOR bf16 on mesh
+      2. For each pos: src = full([1, 1, 1, HIDDEN], value=pos+1.0) ROW_MAJOR bf16
+      3. slice_write src into dst at [0,0,pos,0]→[1,1,pos+1,HIDDEN]
+      4. Read back each row via ttnn.slice, verify value
+      5. ALSO test: convert dst to TILE_LAYOUT, slice from there, verify
+
+    Gate: every row reads back its written value (allclose to expected scalar).
+
+    Verdict:
+      PASS → B.2.2 uses pre-alloc + slice_write (with ROW_MAJOR working buffer,
+             convert to TILE_LAYOUT for batched matmul)
+      FAIL → fall back to per-position list everywhere (no batched ops between
+             sequential layers), or build a custom ttnn op
+    """
+    import ttnn
+    import torch
+    import numpy as np
+
+    if state.mesh is None:
+        return {"error": "mesh not loaded"}
+
+    seq_len = int(args.get("seq_len", 5))
+    HIDDEN = int(args.get("hidden", state.cfg['hidden']))
+    if seq_len < 2:
+        return {"error": f"seq_len must be >= 2, got {seq_len}"}
+
+    # Step 1: pre-allocate dst [1, 1, seq_len, HIDDEN] ROW_MAJOR bf16 interleaved
+    dst_init = torch.zeros((1, 1, seq_len, HIDDEN), dtype=torch.bfloat16)
+    dst = ttnn.from_torch(
+        dst_init,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        dtype=ttnn.bfloat16,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+
+    write_results = []
+    write_error = None
+
+    for pos in range(seq_len):
+        # Step 2: src [1, 1, 1, HIDDEN] filled with (pos + 1.0)
+        src_value = float(pos + 1)
+        src_init = torch.full((1, 1, 1, HIDDEN), src_value, dtype=torch.bfloat16)
+        src = ttnn.from_torch(
+            src_init,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.bfloat16,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+        # Step 3: slice_write src into dst at row `pos`
+        try:
+            ttnn.experimental.slice_write(
+                src, dst,
+                [0, 0, pos, 0],
+                [1, 1, pos + 1, HIDDEN],
+            )
+            write_results.append({"pos": pos, "wrote_value": src_value, "ok": True})
+        except Exception as e:
+            write_error = f"slice_write failed at pos={pos}: {type(e).__name__}: {e}"
+            write_results.append({"pos": pos, "wrote_value": src_value,
+                                   "ok": False, "error": write_error})
+            ttnn.deallocate(src)
+            break
+        ttnn.deallocate(src)
+
+    if write_error:
+        ttnn.deallocate(dst)
+        return {
+            "error": write_error,
+            "write_results": write_results,
+            "verdict": "FAIL — slice_write doesn't work as expected; fall back",
+        }
+
+    # Step 4: read back each row via slice (ROW_MAJOR slice)
+    rowmajor_readback = []
+    for pos in range(seq_len):
+        try:
+            row_tt = ttnn.slice(dst, [0, 0, pos, 0], [1, 1, pos + 1, HIDDEN])
+            ttnn.synchronize_device(state.mesh)
+            arr = ttnn.to_torch(
+                row_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+            )[0].float().cpu().numpy().reshape(HIDDEN)
+            ttnn.deallocate(row_tt)
+            expected = float(pos + 1)
+            mean = float(arr.mean())
+            min_v = float(arr.min())
+            max_v = float(arr.max())
+            ok = bool(np.allclose(arr, expected, atol=0.1))
+            rowmajor_readback.append({
+                "pos": pos, "expected": expected,
+                "mean": mean, "min": min_v, "max": max_v, "ok": ok,
+            })
+        except Exception as e:
+            rowmajor_readback.append({"pos": pos, "expected": float(pos+1),
+                                       "error": f"{type(e).__name__}: {e}", "ok": False})
+
+    # Step 5: convert dst to TILE_LAYOUT, slice from there, verify
+    # (this is what we'd actually use in B.2.2 since matmul wants TILE)
+    tile_readback = []
+    tile_convert_error = None
+    try:
+        dst_tile = ttnn.to_layout(dst, ttnn.TILE_LAYOUT)
+        for pos in range(seq_len):
+            try:
+                row_tt = ttnn.slice(dst_tile, [0, 0, pos, 0], [1, 1, pos + 1, HIDDEN])
+                ttnn.synchronize_device(state.mesh)
+                arr = ttnn.to_torch(
+                    row_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+                )[0].float().cpu().numpy().reshape(HIDDEN)
+                ttnn.deallocate(row_tt)
+                expected = float(pos + 1)
+                ok = bool(np.allclose(arr, expected, atol=0.1))
+                tile_readback.append({
+                    "pos": pos, "expected": expected,
+                    "mean": float(arr.mean()),
+                    "min": float(arr.min()), "max": float(arr.max()),
+                    "ok": ok,
+                })
+            except Exception as e:
+                tile_readback.append({"pos": pos, "expected": float(pos+1),
+                                       "error": f"{type(e).__name__}: {e}", "ok": False})
+        ttnn.deallocate(dst_tile)
+    except Exception as e:
+        tile_convert_error = f"to_layout TILE failed: {type(e).__name__}: {e}"
+
+    ttnn.deallocate(dst)
+
+    rowmajor_pass = all(r.get("ok", False) for r in rowmajor_readback)
+    tile_pass = (tile_convert_error is None) and all(r.get("ok", False) for r in tile_readback)
+
+    return {
+        "ok": True,
+        "seq_len": seq_len,
+        "hidden": HIDDEN,
+        "write_results": write_results,
+        "rowmajor_readback": rowmajor_readback,
+        "tile_readback": tile_readback,
+        "tile_convert_error": tile_convert_error,
+        "rowmajor_pass": rowmajor_pass,
+        "tile_pass": tile_pass,
+        "verdict": (
+            "PASS — slice_write + ROW_MAJOR + to_layout(TILE) round-trip works. "
+            "B.2.2 path: use pre-alloc ROW_MAJOR working buffer; slice_write per "
+            "position; convert to TILE_LAYOUT for batched matmuls."
+            if (rowmajor_pass and tile_pass) else
+            f"PARTIAL: rowmajor_pass={rowmajor_pass} tile_pass={tile_pass}. "
+            "Investigate further."
+        ),
+    }
+
+
 def _read_argmax_id(state: MeshServerState, argmax_tt) -> int:
     import ttnn
     idx_concat = ttnn.to_torch(
@@ -6746,6 +6912,7 @@ HANDLERS = {
     "probe_async_ccl_components_tp": handle_probe_async_ccl_components_tp,
     "probe_prefill_vs_decode_loop_tp": handle_probe_prefill_vs_decode_loop_tp,
     "probe_multirow_construct_vs_per_position": handle_probe_multirow_construct_vs_per_position,
+    "probe_slice_write_round_trip": handle_probe_slice_write_round_trip,
     "probe_fused_paged_update_cache_tp": handle_probe_fused_paged_update_cache_tp,
     "probe_explicit_all_reduce_tp": handle_probe_explicit_all_reduce_tp,
     "probe_rope_fused_qk_tp": handle_probe_rope_fused_qk_tp,

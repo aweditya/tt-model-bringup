@@ -98,6 +98,40 @@ def cmd_probe_ccl_components_tp(args):
         print(f"\n[save] {args.out}")
 
 
+def cmd_probe_slice_write_round_trip(args):
+    payload = {}
+    if args.seq_len:
+        payload["seq_len"] = args.seq_len
+    if args.hidden:
+        payload["hidden"] = args.hidden
+    data = _send("probe_slice_write_round_trip", payload, timeout=120.0)
+    if data.get("error"):
+        print(f"ERROR: {data['error']}", file=sys.stderr)
+        if data.get("verdict"):
+            print(f"VERDICT: {data['verdict']}", file=sys.stderr)
+        sys.exit(4)
+    print(f"seq_len={data['seq_len']} hidden={data['hidden']}")
+    print(f"\nslice_write per-pos:")
+    for r in data["write_results"]:
+        status = "OK" if r["ok"] else f"FAIL ({r.get('error', '?')})"
+        print(f"  pos {r['pos']}: wrote {r['wrote_value']}  → {status}")
+    print(f"\nROW_MAJOR readback:")
+    for r in data["rowmajor_readback"]:
+        status = "OK" if r.get("ok") else f"FAIL"
+        print(f"  pos {r['pos']}: expected={r['expected']:.1f}  mean={r.get('mean', float('nan')):.4f}  "
+              f"min={r.get('min', float('nan')):.4f}  max={r.get('max', float('nan')):.4f}  {status}")
+    print(f"\nTILE_LAYOUT readback (after to_layout convert):")
+    if data.get("tile_convert_error"):
+        print(f"  to_layout failed: {data['tile_convert_error']}")
+    else:
+        for r in data["tile_readback"]:
+            status = "OK" if r.get("ok") else f"FAIL"
+            print(f"  pos {r['pos']}: expected={r['expected']:.1f}  mean={r.get('mean', float('nan')):.4f}  "
+                  f"min={r.get('min', float('nan')):.4f}  max={r.get('max', float('nan')):.4f}  {status}")
+    print(f"\nrowmajor_pass={data['rowmajor_pass']}  tile_pass={data['tile_pass']}")
+    print(f"\n{data['verdict']}")
+
+
 def cmd_probe_multirow_construct_vs_per_position(args):
     payload = {}
     if args.prompt:
@@ -562,6 +596,14 @@ def main():
     b.add_argument("--iters", type=int, default=20)
     b.add_argument("--warmup", type=int, default=3)
     b.set_defaults(fn=cmd_bench_decode_tp_components)
+    swr = sub.add_parser("probe_slice_write_round_trip",
+                          help="B.2.1.5b: probe pre-alloc + slice_write per-row write + readback. "
+                               "Tests ROW_MAJOR write and TILE_LAYOUT conversion. Decides whether "
+                               "B.2.2 can use this pattern.")
+    swr.add_argument("--seq-len", type=int, default=5)
+    swr.add_argument("--hidden", type=int, default=None,
+                      help="default: state.cfg['hidden'] = 5120")
+    swr.set_defaults(fn=cmd_probe_slice_write_round_trip)
     mrc = sub.add_parser("probe_multirow_construct_vs_per_position",
                           help="B.2.1.5: validate direct batched ttnn.embedding "
                                "→ [seq_len, HIDDEN] tensor supports correct row "
