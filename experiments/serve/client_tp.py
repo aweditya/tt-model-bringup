@@ -182,6 +182,32 @@ def cmd_probe_multirow_construct_vs_per_position(args):
     print(f"\n{data['verdict']}")
 
 
+def cmd_probe_ccl_equivalence_tp(args):
+    payload = {}
+    if args.hidden:
+        payload["hidden"] = args.hidden
+    if args.shapes:
+        payload["shapes"] = [[int(x) for x in s.split("x")] for s in args.shapes.split(",")]
+    data = _send("probe_ccl_equivalence_tp", payload, timeout=300.0)
+    if data.get("error"):
+        print(f"ERROR: {data['error']}", file=sys.stderr); sys.exit(4)
+    nchips = data.get("nchips", 4)
+    expected = data.get("expected_value")
+    print(f"nchips={nchips}  expected (all-reduced) value: {expected}")
+    print(f"\nResults per (shape, path):")
+    print(f"  {'shape':<12} {'path':<12} {'cos':<10} {'maxabs':<10} {'per_chip_means':<40} {'ms':<8} verdict")
+    for shape_key in sorted(data["results"].keys()):
+        for path, r in data["results"][shape_key].items():
+            if not r.get("ok"):
+                print(f"  {shape_key:<12} {path:<12} ERROR  {r.get('error', '?')}")
+                continue
+            means = "[" + ",".join(f"{m:.3f}" for m in r["per_chip_means"]) + "]"
+            verdict = "PASS" if r["passed"] else "FAIL"
+            print(f"  {shape_key:<12} {path:<12} {r['cosine_vs_expected']:.6f}  "
+                  f"{r['max_abs_diff']:<10.4f} {means:<40} {r['ms']:<8.1f} {verdict}")
+    print(f"\n{data.get('note', '')}")
+
+
 def cmd_probe_prefill_vs_decode_loop_tp(args):
     payload = {"mode": args.mode}
     if args.prompt:
@@ -667,6 +693,16 @@ def main():
                            "wrapper; cos=1.0 expected) or 'batched_mlp' (B.2.1 layer-outer "
                            "iteration with batched MLP per layer; gate cos>=0.999)")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
+    cle = sub.add_parser("probe_ccl_equivalence_tp",
+                          help="B.2.2 CCL semantics: verify all_reduce vs composite "
+                               "(RS+AG) vs custom (AG+reshape+sum) produce the SAME math "
+                               "on a known per-chip-different constant input. Tells us "
+                               "definitively why composite/custom give cos 0.57/0.70 in "
+                               "prefill instead of 0.999.")
+    cle.add_argument("--hidden", type=int, default=5120)
+    cle.add_argument("--shapes", default=None,
+                      help="comma-separated SxH shapes, e.g. '1x5120,5x5120' (default tests both)")
+    cle.set_defaults(fn=cmd_probe_ccl_equivalence_tp)
     ccl = sub.add_parser("probe_ccl_components_tp",
                           help="micro-bench CCL primitives (all_reduce, reduce_scatter, all_gather) "
                                "at production [1, HIDDEN] bf16 shape on (1,4) mesh; answers num_links "

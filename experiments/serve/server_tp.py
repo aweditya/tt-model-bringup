@@ -3607,6 +3607,169 @@ def handle_probe_fused_paged_update_cache_tp(state: MeshServerState, args: dict)
     return result
 
 
+def handle_probe_ccl_equivalence_tp(state: MeshServerState, args: dict) -> dict:
+    """B.2.2 CCL semantics probe: verify all_reduce ≟ composite ≟ custom on
+    a known per-chip-different constant input.
+
+    Builds per-chip constants via ShardTensorToMesh: chip i is filled with
+    value (i+1.0). Ground-truth all-reduced output: 10.0 (1+2+3+4) on every
+    element of every chip.
+
+    Tests 3 CCL paths × N shapes (1-row control + multi-row prefill-like):
+      R0: ttnn.all_reduce(partial, cluster_axis=1, num_links=2, Linear)
+      R1: composite — reduce_scatter(dim=1) → all_gather(dim=1)
+      R2: custom    — all_gather(dim=1) → reshape → sum(dim=1)
+
+    Reports per (shape, path):
+      - per-chip mean of result (should be 10.0 on every chip)
+      - cosine vs ground truth
+      - max_abs_diff vs ground truth (10.0)
+      - sample value at [chip 0, pos 0, dim 0]
+      - latency
+
+    Answers definitively:
+      - Does standalone all_reduce wedge on multi-row? (no downstream op)
+      - Does composite RS+AG produce the correct sum?
+      - Does custom AG+reshape+sum produce the correct sum?
+      - Does the math/wedge behavior depend on seq dim being > 1?
+
+    Order matters: composite + custom run BEFORE all_reduce per shape, so
+    that if all_reduce wedges we still get the other paths' results from
+    server-side prints. The whole request hangs on a wedge (no Python-level
+    op timeout), but server log preserves what we learned.
+    """
+    import ttnn
+    import torch
+    import numpy as np
+    import time as _time
+
+    if state.mesh is None:
+        return {"error": "mesh not loaded"}
+
+    NCHIPS = 4
+    H = int(args.get("hidden", 5120))
+    if H % NCHIPS != 0:
+        return {"error": f"H={H} must be divisible by NCHIPS={NCHIPS}"}
+    shapes = args.get("shapes", [[1, H], [5, H]])
+
+    def upload_per_chip_constant(seq, H_):
+        """Each chip i ends with [seq, H_] tensor filled with (i+1.0)."""
+        arr = np.zeros((seq, NCHIPS * H_), dtype=np.float32)
+        for i in range(NCHIPS):
+            arr[:, i * H_:(i + 1) * H_] = float(i + 1)
+        return ttnn.from_torch(
+            torch.from_numpy(arr),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def readback_per_chip(tensor):
+        """Returns torch [NCHIPS, seq, H_] = each chip's local data."""
+        full = ttnn.to_torch(
+            tensor, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+        ).float()
+        seq, total = full.shape[-2], full.shape[-1]
+        H_local = total // NCHIPS
+        return full.view(seq, NCHIPS, H_local).permute(1, 0, 2).contiguous()
+
+    def run_path(partial, path: str, seq: int, H_: int):
+        if path == "all_reduce":
+            return ttnn.all_reduce(
+                partial, cluster_axis=1,
+                memory_config=partial.memory_config(),
+                num_links=2, topology=ttnn.Topology.Linear,
+            )
+        if path == "composite":
+            scattered = ttnn.reduce_scatter(
+                partial, dim=1, cluster_axis=1,
+                num_links=2, topology=ttnn.Topology.Linear,
+            )
+            gathered = ttnn.all_gather(
+                scattered, dim=1, cluster_axis=1,
+                num_links=2, topology=ttnn.Topology.Linear,
+            )
+            ttnn.deallocate(scattered)
+            return gathered
+        if path == "custom":
+            gathered = ttnn.all_gather(
+                partial, dim=1, cluster_axis=1,
+                num_links=2, topology=ttnn.Topology.Linear,
+            )
+            reshaped = ttnn.reshape(gathered, [seq, NCHIPS, H_])
+            summed = ttnn.sum(reshaped, dim=1)
+            ttnn.deallocate(gathered)
+            ttnn.deallocate(reshaped)
+            return summed
+        raise ValueError(path)
+
+    expected_value = float(sum(range(1, NCHIPS + 1)))  # 1+2+3+4 = 10
+    results = {}
+    for shape in shapes:
+        seq, H_ = int(shape[0]), int(shape[1])
+        shape_key = f"{seq}x{H_}"
+        results[shape_key] = {}
+        for path in ("composite", "custom", "all_reduce"):
+            print(f"[ccl_eq] shape={shape_key} path={path} START", flush=True)
+            try:
+                partial = upload_per_chip_constant(seq, H_)
+                t0 = _time.perf_counter()
+                out = run_path(partial, path, seq, H_)
+                ttnn.synchronize_device(state.mesh)
+                ms = (_time.perf_counter() - t0) * 1000.0
+                per_chip = readback_per_chip(out)
+                expected = torch.full_like(per_chip, expected_value)
+                max_abs_diff = float((per_chip - expected).abs().max())
+                per_chip_means = [float(per_chip[c].mean()) for c in range(NCHIPS)]
+                sample_val = float(per_chip[0, 0, 0])
+                flat = per_chip.flatten()
+                exp_flat = expected.flatten()
+                cos = float(
+                    (flat * exp_flat).sum()
+                    / (flat.norm() * exp_flat.norm() + 1e-12)
+                )
+                ttnn.deallocate(partial)
+                ttnn.deallocate(out)
+                passed = max_abs_diff < 0.5
+                results[shape_key][path] = {
+                    "ok": True,
+                    "ms": ms,
+                    "expected_value": expected_value,
+                    "per_chip_means": per_chip_means,
+                    "sample_value_c0p0d0": sample_val,
+                    "max_abs_diff": max_abs_diff,
+                    "cosine_vs_expected": cos,
+                    "passed": passed,
+                }
+                print(f"[ccl_eq] shape={shape_key} path={path} DONE "
+                      f"means={per_chip_means} sample={sample_val:.4f} "
+                      f"cos={cos:.6f} maxabs={max_abs_diff:.4f} "
+                      f"{'PASS' if passed else 'FAIL'}", flush=True)
+            except Exception as e:
+                results[shape_key][path] = {
+                    "ok": False,
+                    "error": repr(e),
+                }
+                print(f"[ccl_eq] shape={shape_key} path={path} ERROR {e!r}",
+                      flush=True)
+
+    return {
+        "ok": True,
+        "expected_value": expected_value,
+        "nchips": NCHIPS,
+        "results": results,
+        "note": (
+            "Per-chip-constant probe: chip i = (i+1.0). Expected all-reduced "
+            "output is 10.0 everywhere on every chip. If per_chip_means == "
+            "[10,10,10,10], math is correct. If means == [2.5,2.5,2.5,2.5], "
+            "the op is averaging. If means differ across chips, op did not "
+            "fully reduce. Compare composite/custom against all_reduce as "
+            "ground truth (or against expected_value)."
+        ),
+    }
+
+
 def handle_probe_explicit_all_reduce_tp(state: MeshServerState, args: dict) -> dict:
     """Validate explicit axis/topology kwargs for row-parallel TP exits."""
     import ttnn
@@ -7736,6 +7899,7 @@ HANDLERS = {
     "cosine_ladder_tp": handle_cosine_ladder_tp,
     "probe_deltanet_conv1d_split_check_tp": handle_probe_deltanet_conv1d_split_check_tp,
     "probe_deltanet_owned_decay_gate_real_tensors_tp": handle_probe_deltanet_owned_decay_gate_real_tensors_tp,
+    "probe_ccl_equivalence_tp": handle_probe_ccl_equivalence_tp,
     "shutdown":       handle_shutdown,
 }
 
