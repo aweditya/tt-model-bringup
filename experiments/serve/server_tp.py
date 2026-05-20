@@ -2764,6 +2764,12 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.ccl_debug = True
         state.ccl_debug_tag = "dec"
         state._ccl_debug_count = 0
+    if debug_state:
+        # Layer-boundary print is inside forward_token_tp_inner — called by the
+        # REFERENCE path. So set the flag BEFORE the reference loop.
+        state.debug_layer_boundary = True
+        state._layer_bd_count = 0
+        state._debug_state_tag = "dec"
     t0 = _time.time()
     ref_logits = np.empty((seq_len, VOCAB), dtype=np.float32)
     for pos, tid in enumerate(prompt_ids):
@@ -2798,7 +2804,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     if debug_state:
         state.debug_state = True
         state._debug_state_tag = "pre"
-        state.debug_layer_boundary = True
+        # _layer_bd_count reset so v3 also gets one print (it doesn't call
+        # forward_token_tp_inner, but reset for safety/consistency).
         state._layer_bd_count = 0
     force_sync = bool(args.get("force_sync_per_position", False))
     if force_sync:
