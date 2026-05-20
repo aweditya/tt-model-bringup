@@ -1483,6 +1483,33 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 ttnn.deallocate(x_pos_out)
                 ttnn.deallocate(x_pos_4d)
                 ttnn.deallocate(x_pos_rm)
+                # B.2.2 STATE INSPECTION (2026-05-20): if debug_state set, print
+                # this layer's dn['ssm'] and conv_st_split summary AFTER this
+                # position's DN call. Compare to decode-loop reference.
+                if getattr(state, 'debug_state', False) and layer_idx == 0:
+                    try:
+                        _ssm_t = ttnn.to_torch(
+                            layer['dn']['ssm'],
+                            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+                        ).float()
+                        _ssm_mean = round(float(_ssm_t.mean()), 8)
+                        _ssm_norm = round(float(_ssm_t.norm()), 6)
+                        _ssm_v0 = round(float(_ssm_t.flatten()[0]), 8)
+                        _cs_summaries = []
+                        for k, _cs_tt in enumerate(layer['dn'].get('conv_st_split', [])):
+                            _cs = ttnn.to_torch(
+                                _cs_tt,
+                                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+                            ).float()
+                            _cs_summaries.append(
+                                f"cs{k}(mean={float(_cs.mean()):.6g} norm={float(_cs.norm()):.4g})"
+                            )
+                        _tag = getattr(state, '_debug_state_tag', 'pre')
+                        print(f"  [{_tag} L0 state after pos{pos}] "
+                              f"ssm(mean={_ssm_mean} v0={_ssm_v0} norm={_ssm_norm}) "
+                              f"{' '.join(_cs_summaries)}", flush=True)
+                    except Exception as _e:
+                        print(f"  [v3 state err] {_e!r}", flush=True)
                 # B.2.2 Test 2: optional sync between per-position DN calls
                 # to test the async-ordering hypothesis. Adds ~5 syncs per
                 # DN layer × 32 DN layers = 160 syncs per forward.
@@ -2640,6 +2667,38 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     VOCAB = state.vocab_size
 
     debug_ccl = bool(args.get("debug_ccl", False))
+    debug_state = bool(args.get("debug_state", False))
+
+    def _print_dn_state(tag: str, layer_idx: int, pos_label: str):
+        """Read back layer's dn['ssm'] and conv_st_split, print summary."""
+        if not debug_state:
+            return
+        layer = state.layers[layer_idx]
+        if layer['type'] != 'linear_attention':
+            return
+        try:
+            import ttnn as _t
+            ssm = _t.to_torch(
+                layer['dn']['ssm'],
+                mesh_composer=_t.ConcatMeshToTensor(state.mesh, dim=1)
+            ).float()
+            ssm_mean = round(float(ssm.mean()), 8)
+            ssm_norm = round(float(ssm.norm()), 6)
+            ssm_v0 = round(float(ssm.flatten()[0]), 8)
+            cs_summaries = []
+            for k, cs_tt in enumerate(layer['dn'].get('conv_st_split', [])):
+                cs = _t.to_torch(
+                    cs_tt, mesh_composer=_t.ConcatMeshToTensor(state.mesh, dim=0)
+                ).float()
+                cs_summaries.append(
+                    f"cs{k}(mean={float(cs.mean()):.6g} norm={float(cs.norm()):.4g})"
+                )
+            print(f"  [{tag} L{layer_idx} state after {pos_label}] "
+                  f"ssm(mean={ssm_mean} v0={ssm_v0} norm={ssm_norm}) "
+                  f"{' '.join(cs_summaries)}",
+                  flush=True)
+        except Exception as e:
+            print(f"  [{tag} L{layer_idx} state err] {e!r}", flush=True)
     # B.2.2 TEST: optionally override the recurrence mode for the test path.
     # Used to test the hypothesis that owned_gdn(_inplace) kernels have hidden
     # state that contaminates layer-1+ DN output in v3 prefill context.
@@ -2671,6 +2730,7 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         ref_logits[pos] = ttnn.to_torch(
             logits_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
         )[0].float().cpu().numpy().reshape(VOCAB)
+        _print_dn_state("dec", 0, f"pos{pos}")
     ref_ms = (_time.time() - t0) * 1000.0
 
     # Path B — test: forward_prefill_tp_inner.
@@ -2692,6 +2752,9 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.deltanet_decay_gate_mode = test_decay_gate_mode
         print(f"[probe] override deltanet_decay_gate_mode={test_decay_gate_mode} for test path "
               f"(was {_orig_dg_mode})", flush=True)
+    if debug_state:
+        state.debug_state = True
+        state._debug_state_tag = "pre"
     force_sync = bool(args.get("force_sync_per_position", False))
     if force_sync:
         state.force_sync_per_position = True
@@ -2720,6 +2783,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.deltanet_decay_gate_mode = _orig_dg_mode
     if force_sync:
         state.force_sync_per_position = False
+    if debug_state:
+        state.debug_state = False
 
     # Per-position comparison
     a64 = ref_logits.astype(np.float64)

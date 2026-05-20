@@ -223,6 +223,8 @@ def cmd_probe_prefill_vs_decode_loop_tp(args):
         payload["test_decay_gate_mode"] = args.test_decay_gate_mode
     if args.force_sync_per_position:
         payload["force_sync_per_position"] = True
+    if args.debug_state:
+        payload["debug_state"] = True
     data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
     if data.get("error"):
         print(f"ERROR: {data['error']}", file=sys.stderr)
@@ -718,6 +720,11 @@ def main():
                       choices=["manual", "owned_decay_gate"],
                       help="override deltanet_decay_gate_mode for the TEST path only. "
                            "Use 'manual' to test whether owned_decay_gate kernel is the culprit.")
+    pvd.add_argument("--debug-state", action="store_true",
+                      help="print layer 0 dn['ssm'] mean/norm/v0 and conv_st_split after "
+                           "each position's DN call in both decode-loop reference (tag='dec') "
+                           "and v3 prefill (tag='pre'). Use to find where state evolution "
+                           "first diverges.")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     cle = sub.add_parser("probe_ccl_equivalence_tp",
                           help="B.2.2 CCL semantics: verify all_reduce vs composite "
