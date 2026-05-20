@@ -182,6 +182,23 @@ def cmd_probe_multirow_construct_vs_per_position(args):
     print(f"\n{data['verdict']}")
 
 
+def cmd_probe_chunked_recurrence_tp(args):
+    payload = {}
+    if args.C:
+        payload["C"] = args.C
+    data = _send("probe_chunked_recurrence_tp", payload, timeout=300.0)
+    if data.get("error"):
+        print(f"ERROR: {data['error']}", file=sys.stderr); sys.exit(4)
+    print(f"C={data['C']}  q_shape_per_chip={data['q_shape_per_chip']}  S_shape_per_chip={data['S_shape_per_chip']}")
+    print(f"elapsed_ms={data['elapsed_ms']}")
+    print(f"\noutput:   cos={data['output_cos']:.8f}  max_diff={data['output_max_diff']:.6f}  "
+          f"{'PASS' if data['passed_output'] else 'FAIL'}")
+    print(f"state:    cos={data['state_cos']:.8f}  max_diff={data['state_max_diff']:.6f}  "
+          f"{'PASS' if data['passed_state'] else 'FAIL'}")
+    print(f"\nVerdict: {'PASS' if data['passed'] else 'FAIL'}")
+    print(f"\n{data.get('note', '')}")
+
+
 def cmd_probe_neumann_inverse_mesh_tp(args):
     payload = {}
     if args.C:
@@ -750,6 +767,12 @@ def main():
                            "per-position internally — same math; will be replaced with "
                            "real Neumann chunked math in future sessions)")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
+    chr_ = sub.add_parser("probe_chunked_recurrence_tp",
+                          help="v4 Stage 4b: validate _chunked_recurrence_tp on mesh vs "
+                               "numpy per-position reference. Gate: cos ≥ 0.99 at bf16.")
+    chr_.add_argument("--C", type=int, default=8,
+                      help="chunk size (must be power of 2). Default: 8.")
+    chr_.set_defaults(fn=cmd_probe_chunked_recurrence_tp)
     nim = sub.add_parser("probe_neumann_inverse_mesh_tp",
                           help="v4 Stage 4b: validate Neumann (I-L)^{-1} factorization "
                                "on mesh at production [NV_PER_CHIP, C, C] shape. Each chip "

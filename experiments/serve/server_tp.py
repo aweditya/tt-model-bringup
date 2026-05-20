@@ -937,6 +937,158 @@ def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg,
     return x_out
 
 
+def _chunked_recurrence_tp(state, q_seq, k_seq, v_seq, g_seq, beta_seq, S_prev, C):
+    """v4 Stage 4b: chunked Neumann recurrence on mesh.
+
+    Mirrors the validated numpy reference impl in
+    experiments/utils/chunked_recurrence_numpy_probe.py:chunked_recurrence.
+
+    Each chip processes its NV_PER_CHIP heads INDEPENDENTLY (no CCL).
+    All ops are per-chip batched matmuls / elementwise.
+
+    Inputs (per-chip shapes, mesh tensors):
+      q_seq, k_seq: [NV_PER_CHIP, C, K_DIM] bf16
+      v_seq:        [NV_PER_CHIP, C, V_DIM]
+      g_seq:        [NV_PER_CHIP, C]  (decay values g_t, NOT exp(g_t))
+      beta_seq:     [NV_PER_CHIP, C]
+      S_prev:       [NV_PER_CHIP, K_DIM, V_DIM]
+      C: chunk size (power of 2, default 8)
+
+    Returns:
+      O_seq:  [NV_PER_CHIP, C, V_DIM]
+      S_new:  [NV_PER_CHIP, K_DIM, V_DIM]
+    """
+    import ttnn
+    import torch
+    import numpy as np
+    from full_layer_tp_probe import NV_PER_CHIP
+
+    # --- Build the lower-triangular & strict-lower-tri masks (precomputed) ---
+    # tril (inclusive of diag): used in D, A
+    # strict_lower (diag zeroed): used to mask attn = -(K_β @ K^T) * D
+    tril_np = np.tril(np.ones((C, C), dtype=np.float32))
+    strict_lower_np = tril_np - np.eye(C, dtype=np.float32)
+    # Broadcast-friendly per-head shapes: [NV_PER_CHIP, C, C]
+    tril_per_chip = np.broadcast_to(tril_np, (NV_PER_CHIP, C, C)).copy()
+    strict_lower_per_chip = np.broadcast_to(strict_lower_np, (NV_PER_CHIP, C, C)).copy()
+    tril_mask = ttnn.from_torch(
+        torch.from_numpy(tril_per_chip),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    strict_lower_mask = ttnn.from_torch(
+        torch.from_numpy(strict_lower_per_chip),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+
+    # --- G = cumsum(g) along last dim ---
+    G = ttnn.cumsum(g_seq, dim=-1)  # [NV_PER_CHIP, C]
+
+    # --- D = exp(G_a - G_b) * tril_mask ---  shape [NV_PER_CHIP, C, C]
+    G_a = ttnn.reshape(G, [NV_PER_CHIP, C, 1])
+    G_b = ttnn.reshape(G, [NV_PER_CHIP, 1, C])
+    diff = ttnn.sub(G_a, G_b)            # broadcast → [NV_PER_CHIP, C, C]
+    D_raw = ttnn.exp(diff)
+    D = ttnn.mul(D_raw, tril_mask)
+    ttnn.deallocate(diff)
+    ttnn.deallocate(D_raw)
+
+    # --- k_beta = beta * k,  v_beta = beta * v ---
+    beta_3d = ttnn.reshape(beta_seq, [NV_PER_CHIP, C, 1])
+    k_beta = ttnn.mul(k_seq, beta_3d)    # [NV_PER_CHIP, C, K_DIM]
+    v_beta = ttnn.mul(v_seq, beta_3d)    # [NV_PER_CHIP, C, V_DIM]
+
+    # --- attn = -(k_beta @ k^T) * D, diagonal zeroed via strict_lower ---
+    k_T = ttnn.transpose(k_seq, -2, -1)  # [NV_PER_CHIP, K_DIM, C]
+    kkT = ttnn.matmul(k_beta, k_T)       # [NV_PER_CHIP, C, C]
+    attn = ttnn.mul(ttnn.neg(kkT), D)    # neg + mul D
+    attn = ttnn.mul(attn, strict_lower_mask)  # zero diagonal & upper
+    ttnn.deallocate(kkT)
+
+    # --- T = (I - attn)^{-1} via Neumann factorization ---
+    T = _neumann_inverse_via_mesh_tp(state, attn, C)
+    ttnn.deallocate(attn)
+
+    # --- V_prime = T @ v_beta ---
+    V_prime = ttnn.matmul(T, v_beta)     # [NV_PER_CHIP, C, V_DIM]
+
+    # --- K_prime = T @ (k_beta * exp(G)) ---
+    expG = ttnn.exp(G)                    # [NV_PER_CHIP, C]
+    expG_3d = ttnn.reshape(expG, [NV_PER_CHIP, C, 1])
+    k_beta_scaled = ttnn.mul(k_beta, expG_3d)
+    K_prime = ttnn.matmul(T, k_beta_scaled)  # [NV_PER_CHIP, C, K_DIM]
+    ttnn.deallocate(k_beta_scaled)
+    ttnn.deallocate(k_beta)
+    ttnn.deallocate(T)
+    ttnn.deallocate(v_beta)
+
+    # --- v_prime = K_prime @ S_prev ---
+    v_prime = ttnn.matmul(K_prime, S_prev)  # [NV_PER_CHIP, C, V_DIM]
+    ttnn.deallocate(K_prime)
+
+    # --- v_new = V_prime - v_prime ---
+    v_new = ttnn.sub(V_prime, v_prime)
+    ttnn.deallocate(V_prime)
+    ttnn.deallocate(v_prime)
+
+    # --- attn_int = (q * exp(G)) @ S_prev ---
+    q_scaled = ttnn.mul(q_seq, expG_3d)
+    attn_int = ttnn.matmul(q_scaled, S_prev)  # [NV_PER_CHIP, C, V_DIM]
+    ttnn.deallocate(q_scaled)
+
+    # --- A = (q @ k^T) * D ---
+    A_raw = ttnn.matmul(q_seq, k_T)
+    A = ttnn.mul(A_raw, D)
+    ttnn.deallocate(A_raw)
+    ttnn.deallocate(k_T)
+    ttnn.deallocate(D)
+
+    # --- O = attn_int + A @ v_new ---
+    Av_new = ttnn.matmul(A, v_new)
+    O = ttnn.add(attn_int, Av_new)        # [NV_PER_CHIP, C, V_DIM]
+    ttnn.deallocate(Av_new)
+    ttnn.deallocate(A)
+    ttnn.deallocate(attn_int)
+
+    # --- S_new = exp(G[-1]) * S_prev + (k * exp(G[-1] - G))^T @ v_new ---
+    # G_last = G[:, -1] of shape [NV_PER_CHIP] — reshape to [NV_PER_CHIP, 1] for broadcast
+    G_last_2d = ttnn.slice(G, [0, C - 1], [NV_PER_CHIP, C])  # [NV_PER_CHIP, 1]
+    expG_last = ttnn.exp(G_last_2d)  # [NV_PER_CHIP, 1]
+    # decay_factor = exp(G_last - G) of shape [NV_PER_CHIP, C]
+    decay_factor = ttnn.exp(ttnn.sub(G_last_2d, G))  # broadcast → [NV_PER_CHIP, C]
+    decay_factor_3d = ttnn.reshape(decay_factor, [NV_PER_CHIP, C, 1])
+    k_decayed = ttnn.mul(k_seq, decay_factor_3d)  # [NV_PER_CHIP, C, K_DIM]
+    k_decayed_T = ttnn.transpose(k_decayed, -2, -1)  # [NV_PER_CHIP, K_DIM, C]
+    rank1_update = ttnn.matmul(k_decayed_T, v_new)   # [NV_PER_CHIP, K_DIM, V_DIM]
+    # S_prev_scaled = expG_last (scalar per head) * S_prev
+    expG_last_3d = ttnn.reshape(expG_last, [NV_PER_CHIP, 1, 1])
+    S_prev_scaled = ttnn.mul(S_prev, expG_last_3d)
+    S_new = ttnn.add(S_prev_scaled, rank1_update)
+    ttnn.deallocate(v_new)
+    ttnn.deallocate(rank1_update)
+    ttnn.deallocate(S_prev_scaled)
+    ttnn.deallocate(k_decayed)
+    ttnn.deallocate(k_decayed_T)
+    ttnn.deallocate(decay_factor)
+    ttnn.deallocate(decay_factor_3d)
+    ttnn.deallocate(G_last_2d)
+    ttnn.deallocate(expG_last)
+    ttnn.deallocate(expG_last_3d)
+    ttnn.deallocate(G)
+    ttnn.deallocate(expG)
+    ttnn.deallocate(expG_3d)
+    ttnn.deallocate(G_a)
+    ttnn.deallocate(G_b)
+    ttnn.deallocate(beta_3d)
+    ttnn.deallocate(tril_mask)
+    ttnn.deallocate(strict_lower_mask)
+
+    return O, S_new
+
+
 def _neumann_inverse_via_mesh_tp(state, L_tt, C):
     """Compute (I - L)^{-1} for strict-lower-triangular L via Neumann
     factorization on the mesh. Each chip processes its slice independently.
@@ -4201,6 +4353,139 @@ def handle_probe_fused_paged_update_cache_tp(state: MeshServerState, args: dict)
         ),
     }
     return result
+
+
+def handle_probe_chunked_recurrence_tp(state: MeshServerState, args: dict) -> dict:
+    """v4 Stage 4b: validate _chunked_recurrence_tp on mesh vs numpy reference.
+
+    Generates synthetic q/k/v/g/beta on mesh at production per-chip shapes,
+    runs the ttnn chunked recurrence + a numpy per-position reference (same
+    math as validated in experiments/utils/chunked_recurrence_numpy_probe.py),
+    compares.
+
+    Gate: overall cos ≥ 0.99 (bf16 precision floor; numpy reference is fp64).
+    """
+    import ttnn
+    import torch
+    import numpy as np
+    from full_layer_tp_probe import NV_PER_CHIP, K_DIM, V_DIM, NCHIPS
+
+    if state.mesh is None:
+        return {"error": "mesh not loaded"}
+
+    C = int(args.get("C", 8))
+    if (C & (C - 1)) != 0:
+        return {"error": f"C must be a power of 2, got {C}"}
+
+    rng = np.random.default_rng(2026_05_20)
+
+    # Per-chip synthetic inputs. Each chip has its own NV_PER_CHIP heads.
+    # Across chips: total [NCHIPS * NV_PER_CHIP, C, ...] generated, sharded.
+    total_NV = NCHIPS * NV_PER_CHIP
+    q_full = rng.standard_normal((total_NV, C, K_DIM)).astype(np.float32) * 0.05
+    k_full = rng.standard_normal((total_NV, C, K_DIM)).astype(np.float32) * 0.05
+    v_full = rng.standard_normal((total_NV, C, V_DIM)).astype(np.float32) * 0.05
+    g_full = -np.abs(rng.standard_normal((total_NV, C)).astype(np.float32)) * 0.5
+    beta_full = 1.0 / (1.0 + np.exp(
+        -rng.standard_normal((total_NV, C)).astype(np.float32) * 0.5
+    ))
+    S_init_full = np.zeros((total_NV, K_DIM, V_DIM), dtype=np.float32)
+
+    # === Numpy per-position reference (validated bit-equivalent to chunked) ===
+    # Compute per-head per-pos: H[t+1] = decay*H + k_col * delta_row;  out = H[t+1] @ q
+    H_ref = S_init_full.astype(np.float64).copy()
+    out_ref = np.zeros((total_NV, C, V_DIM), dtype=np.float64)
+    for t in range(C):
+        q_t = q_full[:, t, :].astype(np.float64)         # (NV, K)
+        k_t = k_full[:, t, :].astype(np.float64)
+        v_t = v_full[:, t, :].astype(np.float64)
+        decay_t = np.exp(g_full[:, t]).astype(np.float64)  # (NV,)
+        beta_t = beta_full[:, t].astype(np.float64)
+        H_decayed = decay_t[:, None, None] * H_ref       # (NV, K, V)
+        k_col = k_t[:, :, None]
+        kv_mem = (H_decayed * k_col).sum(axis=1)         # (NV, V)
+        delta = (v_t - kv_mem) * beta_t[:, None]
+        H_new = H_decayed + k_col * delta[:, None, :]
+        q_col = q_t[:, :, None]
+        out_t = (H_new * q_col).sum(axis=1)              # (NV, V)
+        out_ref[:, t, :] = out_t
+        H_ref = H_new
+    S_ref = H_ref
+
+    # === Upload to mesh (shard NV dim across chips) ===
+    def upload_shard(arr_np, dtype=ttnn.bfloat16):
+        return ttnn.from_torch(
+            torch.from_numpy(arr_np),
+            dtype=dtype, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0),
+        )
+
+    q_seq = upload_shard(q_full)         # [NV_PER_CHIP, C, K_DIM] per chip
+    k_seq = upload_shard(k_full)
+    v_seq = upload_shard(v_full)
+    g_seq = upload_shard(g_full)         # [NV_PER_CHIP, C]
+    beta_seq = upload_shard(beta_full)
+    S_prev = upload_shard(S_init_full)   # [NV_PER_CHIP, K_DIM, V_DIM]
+
+    # === Run ttnn chunked recurrence ===
+    import time as _time
+    ttnn.synchronize_device(state.mesh)
+    t0 = _time.perf_counter()
+    try:
+        O_tt, S_new_tt = _chunked_recurrence_tp(
+            state, q_seq, k_seq, v_seq, g_seq, beta_seq, S_prev, C)
+        ttnn.synchronize_device(state.mesh)
+        elapsed_ms = (_time.perf_counter() - t0) * 1000.0
+    except Exception as e:
+        return {"error": f"_chunked_recurrence_tp raised: {type(e).__name__}: {e}"}
+
+    # === Read back per-chip and compare ===
+    O_full = ttnn.to_torch(
+        O_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+    ).float().cpu().numpy()  # [total_NV, C, V_DIM]
+    S_full = ttnn.to_torch(
+        S_new_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+    ).float().cpu().numpy()  # [total_NV, K_DIM, V_DIM]
+
+    ttnn.deallocate(q_seq)
+    ttnn.deallocate(k_seq)
+    ttnn.deallocate(v_seq)
+    ttnn.deallocate(g_seq)
+    ttnn.deallocate(beta_seq)
+    ttnn.deallocate(S_prev)
+    ttnn.deallocate(O_tt)
+    ttnn.deallocate(S_new_tt)
+
+    def cos(a, b):
+        a = a.astype(np.float64).flatten()
+        b = b.astype(np.float64).flatten()
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+
+    o_cos = cos(out_ref, O_full)
+    o_max_diff = float(np.abs(out_ref - O_full).max())
+    s_cos = cos(S_ref, S_full)
+    s_max_diff = float(np.abs(S_ref - S_full).max())
+
+    return {
+        "ok": True,
+        "C": C,
+        "q_shape_per_chip": [NV_PER_CHIP, C, K_DIM],
+        "S_shape_per_chip": [NV_PER_CHIP, K_DIM, V_DIM],
+        "elapsed_ms": round(elapsed_ms, 3),
+        "output_cos": round(o_cos, 8),
+        "output_max_diff": round(o_max_diff, 6),
+        "state_cos": round(s_cos, 8),
+        "state_max_diff": round(s_max_diff, 6),
+        "passed_output": o_cos >= 0.99,
+        "passed_state": s_cos >= 0.99,
+        "passed": o_cos >= 0.99 and s_cos >= 0.99,
+        "note": (
+            "Validates _chunked_recurrence_tp against numpy per-position reference. "
+            "Numpy ref is fp64; ttnn uses bf16. cos ≥ 0.99 is the bf16 precision "
+            "floor on this kind of multi-matmul accumulation."
+        ),
+    }
 
 
 def handle_probe_neumann_inverse_mesh_tp(state: MeshServerState, args: dict) -> dict:
@@ -8606,6 +8891,7 @@ HANDLERS = {
     "probe_deltanet_owned_decay_gate_real_tensors_tp": handle_probe_deltanet_owned_decay_gate_real_tensors_tp,
     "probe_ccl_equivalence_tp": handle_probe_ccl_equivalence_tp,
     "probe_neumann_inverse_mesh_tp": handle_probe_neumann_inverse_mesh_tp,
+    "probe_chunked_recurrence_tp": handle_probe_chunked_recurrence_tp,
     "shutdown":       handle_shutdown,
 }
 
