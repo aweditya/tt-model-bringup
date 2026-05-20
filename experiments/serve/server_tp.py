@@ -1171,11 +1171,33 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
     HIDDEN = cfg['hidden']
     C = seq_len
 
+    # Per-phase timing — gated on state.profile_chunked_dn. Only fires once
+    # per probe (counter capped). Writes accumulated phase ms to
+    # state._phase_times dict so probe can sum across layers.
+    _profile = getattr(state, 'profile_chunked_dn', False)
+    if _profile:
+        import time as _ptime
+        if not hasattr(state, '_phase_times'):
+            state._phase_times = {}
+        def _tic():
+            ttnn.synchronize_device(state.mesh)
+            return _ptime.perf_counter()
+        def _toc(t0, label):
+            ttnn.synchronize_device(state.mesh)
+            ms = (_ptime.perf_counter() - t0) * 1000.0
+            state._phase_times[label] = state._phase_times.get(label, 0.0) + ms
+    else:
+        _tic = lambda: 0
+        _toc = lambda t0, label: None
+
+    _t = _tic()
     # === Stage 1: batched pre-norm + in_proj ===
     h_seq = _rms_norm_manual(x_seq_tt, dn['input_norm'], EPS, HIDDEN)
     all_seq = ttnn.linear(h_seq, dn['w_in'])  # [C, IN_PROJ_OUT_CHIP]
     ttnn.deallocate(h_seq)
+    _toc(_t, "1_stage_1_prenorm_inproj")
 
+    _t = _tic()
     # === Stage 3: batched decay/gate (keep g_seq + beta_seq for chunked recurrence) ===
     a_seq = ttnn.slice(all_seq, [0, CONV_DIM_CHIP + VAL_DIM_CHIP],
                        [C, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP])
@@ -1187,7 +1209,9 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
     beta_seq = ttnn.sigmoid(b_seq)                                   # [C, NV_PER_CHIP]
     ttnn.deallocate(a_seq); ttnn.deallocate(b_seq)
     ttnn.deallocate(a_biased); ttnn.deallocate(softplus_a)
+    _toc(_t, "2_stage_3_decay_gate")
 
+    _t = _tic()
     # === PRE-RECURRENCE: per-pos conv1d + QKV split + L2-norm, collect into batched ===
     total_NV = NCHIPS * NV_PER_CHIP
     q_collected = ttnn.from_torch(
@@ -1290,6 +1314,9 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
     ttnn.deallocate(q_collected); ttnn.deallocate(k_collected)
     ttnn.deallocate(v_collected); ttnn.deallocate(z_collected)
 
+    _toc(_t, "3_pre_recurrence_collect")
+
+    _t = _tic()
     # Transpose g_seq, beta_seq from [C, NV_PER_CHIP] to [NV_PER_CHIP, C]
     g_seq_NV = ttnn.transpose(g_seq, -2, -1)
     beta_seq_NV = ttnn.transpose(beta_seq, -2, -1)
@@ -1307,7 +1334,9 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
     ttnn.deallocate(q_seq_tile); ttnn.deallocate(k_seq_tile); ttnn.deallocate(v_seq_tile)
     ttnn.deallocate(g_seq_NV); ttnn.deallocate(beta_seq_NV)
     ttnn.deallocate(S_new); ttnn.deallocate(S_new_4d)
+    _toc(_t, "4_chunked_recurrence")
 
+    _t = _tic()
     # === POST-RECURRENCE: per-pos output gate + w_out + all_reduce + residual ===
     dn_out_buf = ttnn.from_torch(
         torch.zeros((1, 1, C, HIDDEN), dtype=torch.bfloat16),
@@ -1347,12 +1376,16 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
 
     ttnn.deallocate(O_seq); ttnn.deallocate(z_seq_tile)
 
+    _toc(_t, "5_post_recurrence")
+
+    _t = _tic()
     dn_out_4d_tile = ttnn.to_layout(dn_out_buf, ttnn.TILE_LAYOUT)
     ttnn.deallocate(dn_out_buf)
     _view = ttnn.reshape(dn_out_4d_tile, [C, HIDDEN])
     x_out_seq_tt = ttnn.clone(_view)
     ttnn.deallocate(_view)
     ttnn.deallocate(dn_out_4d_tile)
+    _toc(_t, "6_reassemble_clone")
     return x_out_seq_tt
 
 
@@ -3544,6 +3577,11 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     if use_chunked_dn:
         state.use_chunked_dn = True
         print(f"[probe] use_chunked_dn=True for test path (v4 step 1 STUB)", flush=True)
+    profile_chunked_dn = bool(args.get("profile_chunked_dn", False))
+    if profile_chunked_dn:
+        state.profile_chunked_dn = True
+        state._phase_times = {}  # reset accumulator
+        print(f"[probe] profile_chunked_dn=True — per-phase timing on", flush=True)
     t0 = _time.time()
     if mode == "stub":
         test_logits = forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)
@@ -3570,6 +3608,18 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.force_sync_per_position = False
     if use_chunked_dn:
         state.use_chunked_dn = False
+    if profile_chunked_dn:
+        state.profile_chunked_dn = False
+        # Print accumulated phase times (summed across all DN layer calls)
+        if hasattr(state, '_phase_times') and state._phase_times:
+            print("[probe] chunked DN per-phase totals (ms summed across all DN layers):",
+                  flush=True)
+            total = sum(state._phase_times.values())
+            for k in sorted(state._phase_times.keys()):
+                v = state._phase_times[k]
+                pct = (v / total * 100.0) if total > 0 else 0
+                print(f"  {k:35s} {v:8.1f} ms  ({pct:5.1f}%)", flush=True)
+            print(f"  {'TOTAL chunked DN time':35s} {total:8.1f} ms", flush=True)
     if debug_state:
         state.debug_state = False
         state.debug_layer_boundary = False

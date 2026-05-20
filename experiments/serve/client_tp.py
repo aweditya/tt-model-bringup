@@ -261,6 +261,8 @@ def cmd_probe_prefill_vs_decode_loop_tp(args):
         payload["debug_state"] = True
     if args.use_chunked_dn:
         payload["use_chunked_dn"] = True
+    if args.profile_chunked_dn:
+        payload["profile_chunked_dn"] = True
     data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
     if data.get("error"):
         print(f"ERROR: {data['error']}", file=sys.stderr)
@@ -766,6 +768,10 @@ def main():
                            "deltanet_chunked_neumann_tp (currently a STUB that loops "
                            "per-position internally — same math; will be replaced with "
                            "real Neumann chunked math in future sessions)")
+    pvd.add_argument("--profile-chunked-dn", action="store_true",
+                      help="v4 Stage 4b-iii diag: per-phase walltime breakdown of "
+                           "_chunked_dn_with_chunked_recurrence_tp (6 phases). "
+                           "Requires --use-chunked-dn and seq_len being a power of 2.")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     chr_ = sub.add_parser("probe_chunked_recurrence_tp",
                           help="v4 Stage 4b: validate _chunked_recurrence_tp on mesh vs "
