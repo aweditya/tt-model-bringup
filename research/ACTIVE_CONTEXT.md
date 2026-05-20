@@ -3,7 +3,40 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
-## Current Status (2026-05-20 — end of day) — B.2.2 SHIPPED, Ring shipped, v4 designed
+## Current Status (2026-05-20 — final) — B.2.2 SHIPPED, Ring shipped, v4 Stages 1+3 win, 4b-iii regresses, next is TRACE
+
+### Production status (matters for daily-driver use)
+- **Decode**: 13.02 tok/s, unchanged from before this session
+- **Prefill**: per-token traced forward, ~77 ms/tok = ~13 tok/s ingest rate
+- **For a 30k-token prompt: prefill = ~38 min** (still the bottleneck — addressing this is the whole v4 project)
+
+### What this session shipped (47 commits, all on origin/main)
+- B.2.2 v3 parallel-attn prefill: ROOT CAUSE FOUND + FIXED via `ttnn.clone` after each reshape (commit `6fa1082`). Top1 5/5 at seq=5.
+- Ring topology in production CCL (commit `b6f0f28`). Neutral for traced production, +6-28% for eager paths.
+- Reshape-source-dealloc audit + defensive cos/sin clones (commit `7ec9cd6`).
+- **v4 Stages 1+3 (commits `cea8641` + `f4dbe06`): batched pre-norm + in_proj + decay/gate. REAL prefill perf win: +46% at seq=87 vs v3 alone.** Behind `--use-chunked-dn` flag, opt-in.
+- v4 Stage 4 algorithmic primitives validated (numpy, mesh Neumann, ttnn chunked recurrence): all correctness PASS.
+- **v4 Stage 4b-iii integration (commit `674a41b`): correctness PASS (top1 matches), perf REGRESSION (2-4× slower at C=8/32)**. Eager dispatch overhead > algorithmic savings at small C.
+
+### The honest gap to "fast prefill in production"
+1. Even v3+Stages 1+3 (the actual win this session) is SLOWER than production traced prefill at every length tested. v3 ingest at seq=87 = 5.7 tok/s vs production 13 tok/s.
+2. v3 is EAGER mode — pays per-op dispatch tax that production traced forward doesn't.
+3. **Path to production TTFT win: trace capture of v3+S1+S3** so chunked-batched ops also amortize dispatch.
+
+### Next session — task #83
+**Trace capture v3+S1+S3 + Tracy profile** to:
+- Eliminate the eager dispatch tax (the gravity well on TT-Metal)
+- Identify where wall time actually goes (collect step? Neumann matmuls? transpose?)
+- Then v3+S1+S3 traced should beat production traced — first real long-context TTFT win
+
+### Open backlog
+- Task #74: investigate residual standard `ttnn.all_reduce` wedge at Layer 2 post-fix (custom AG+sum workaround in v3; not urgent)
+- Task #75: v4 chunked DN per design doc (Stages 1+3 done, 4b-iii done-with-caveat, Stage 5/6 deferred)
+- Task #78: v4 Stage 2 (batched conv1d) — needed for Stage 4b-iii to remove collect overhead
+- Task #82: v4 Stage 4b-iii integration — committed, perf regression, next session investigates via trace
+- Task #83: trace capture + Tracy profile (THE next-session entry point)
+
+## Stale Status (2026-05-20 mid-day) — B.2.2 SHIPPED, Ring shipped, v4 designed
 
 ### Headline
 - **B.2.2 v3 parallel-attn prefill SHIPPED** (commit `6fa1082`). top1 5/5
