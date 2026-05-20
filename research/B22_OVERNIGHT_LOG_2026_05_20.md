@@ -231,5 +231,53 @@ each `reshape` site (2 sites: embedding line 1440, DN reassembly line 1622).
 - Targeted diag (Test 10: print x_tt + reduced + out inside mlp_step_tp) is sometimes the cheapest way to ground-truth a hypothesis. Should have done it earlier — 4+ tests in I was still speculating about kernel state.
 - Equivalence probes with constant inputs DON'T catch row-dependent issues. Vary the input data to catch row-dependent bugs.
 
+---
+
+## Post-morning session (still 2026-05-20)
+
+After the user woke up:
+
+### Ring topology shipped (task #59, commit `b6f0f28`)
+qb2's 4 P150s are physically a ring (validated). Adopted `Topology.Ring`
+in production `_tp_all_reduce`. Measured impact:
+- Production decode (traced): 13.05 → 13.02 tok/s (neutral, within noise —
+  trace amortizes the topology difference).
+- Eager paths: v3 prefill 6% faster, eager decode-loop reference 28% faster.
+
+Kept shipped — honest answer for the hardware, helps any future eager work.
+
+### Reshape-view audit (task #73, commit `7ec9cd6`)
+Audited all 20 `reshape(X)` → `deallocate(X)` sites in server_tp.py.
+- 2 v3 x_seq sites: already fixed during the night
+- 2 v3 cos/sin RoPE sites: defensive clone added (small tensors,
+  empirically wasn't corrupting, but consistent with the fix pattern)
+- 5 internal step-func sites: safe (view consumed before source dealloc)
+- 11 in non-production probe handlers: same trap class, no prod exposure
+
+Full triage + canonical fix + detection heuristic in
+`research/reshape_view_audit_2026_05_20.md`.
+
+### v3 wiring to production (task #72) — DELETED as a regression
+Analysis: v3 eager prefill at seq=5 = 1258 ms; current production traced
+prefill = ~385 ms (5 × 77 ms). v3 is ~3× SLOWER. Wiring it in is a net
+regression. v3's value is as a stepping stone for trace-batched-prefill
+or chunked-DN integration (next item).
+
+### v4 design doc (task #75 prep, commit `f6921d5`)
+Wrote `research/v4_chunked_dn_design_2026_05_20.md`. Plan: replace v3's
+per-position DN body with chunked-parallel via C'5 Neumann series.
+- C'5 math primitives already validated (`feedback_c5_primitives_green`)
+- v4 = v3 structure + `deltanet_step_tp_chunked` instead of per-position loop
+- Estimated 3-5 day-arcs to build
+- Expected speedup: 3× at seq=32, 10× at seq=500, 20× at seq=32k
+
+### Final ship metrics
+- B.2.2 v3 prefill: top1 5/5 at seq=5, cos median 1.00, wall 1235 ms
+- Production decode: 13.02 tok/s (essentially unchanged — Ring is neutral for traced)
+
+### Open items for next session
+- Task #74: investigate residual standard `ttnn.all_reduce` wedge at Layer 2 (deferred — rabbit hole risk; custom AG+sum is fine for now)
+- Task #75: build v4 chunked DN per the design doc (main next prefill prize)
+
 
 

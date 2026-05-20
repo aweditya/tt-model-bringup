@@ -3,7 +3,36 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
-## Current Status (2026-05-20) — B.2.2 prefill batched-attention bug isolated to slice or DN-of-MLP-input
+## Current Status (2026-05-20 — end of day) — B.2.2 SHIPPED, Ring shipped, v4 designed
+
+### Headline
+- **B.2.2 v3 parallel-attn prefill SHIPPED** (commit `6fa1082`). top1 5/5
+  at seq=5 vs decode-loop reference, cos median 1.00. Root cause was
+  `ttnn.reshape` returning a view + deallocating source clobbering x_seq
+  mid-MLP. Fix: `ttnn.clone` after each reshape that's held across
+  subsequent allocations. Full investigation in
+  `research/B22_OVERNIGHT_LOG_2026_05_20.md`.
+- **Ring topology adopted** (commit `b6f0f28`). qb2's 4 P150s are
+  physically a ring. Neutral for traced production decode (13.02 tok/s),
+  +6-28% for eager paths.
+- **Reshape audit** (commit `7ec9cd6`) and defensive cos/sin clones.
+  See `research/reshape_view_audit_2026_05_20.md`.
+- **v4 chunked DN design** (commit `f6921d5`) at
+  `research/v4_chunked_dn_design_2026_05_20.md`. Next big prefill prize.
+
+### Production state
+- Decode: 13.02 tok/s on qb2 4× P150 mesh (unchanged from pre-session
+  baseline; Ring topology is neutral for traced path).
+- Prefill: v3 NOT wired into `handle_generate_tp` (analysis showed it'd
+  be a regression — eager v3 is 3× slower than traced per-token prefill).
+
+### Open items
+- Task #74: investigate residual `ttnn.all_reduce` wedge at Layer 2 in
+  v3 (custom AG+sum workaround in use). Risk: rabbit hole.
+- Task #75: build v4 chunked DN per design doc. Expected: 3× (seq=32),
+  10× (seq=500), 20× (seq=32k) prefill speedup.
+
+## Stale Status (2026-05-20 mid-day) — B.2.2 prefill batched-attention bug isolated to slice or DN-of-MLP-input
 
 **Goal of current arc**: ship `forward_prefill_tp_inner_v3_parallel_attn`
 (batched attention + batched MLP + sequential DN) to reduce TTFT. Gate:
