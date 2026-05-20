@@ -654,11 +654,11 @@ def _tp_all_reduce(state: MeshServerState, partial):
     if getattr(state, 'force_composite_ccl', False):
         scattered = ttnn.reduce_scatter(
             partial, dim=1, cluster_axis=1,
-            num_links=2, topology=ttnn.Topology.Linear,
+            num_links=2, topology=ttnn.Topology.Ring,
         )
         gathered = ttnn.all_gather(
             scattered, dim=1, cluster_axis=1,
-            num_links=2, topology=ttnn.Topology.Linear,
+            num_links=2, topology=ttnn.Topology.Ring,
         )
         ttnn.deallocate(scattered)
         return _diag_output(gathered, "composite")
@@ -674,7 +674,7 @@ def _tp_all_reduce(state: MeshServerState, partial):
         # all_gather along dim=1 with cluster_axis=1 → [seq_len, NCHIPS*HIDDEN]
         gathered = ttnn.all_gather(
             partial, dim=1, cluster_axis=1,
-            num_links=2, topology=ttnn.Topology.Linear,
+            num_links=2, topology=ttnn.Topology.Ring,
         )
         # Reshape [seq_len, 4*HIDDEN] → [seq_len, 4, HIDDEN]
         reshaped = ttnn.reshape(gathered, [seq_len_local, 4, hidden_local])
@@ -692,8 +692,10 @@ def _tp_all_reduce(state: MeshServerState, partial):
             # P1 SHIPPED 2026-05-19: num_links=2 measured 11.2% faster than
             # num_links=1 at [1, 5120] bf16 (probe_ccl_components_tp). BH
             # P150x4 supports 2 eth links per axis.
+            # 2026-05-20: Topology.Ring on qb2 (validated via probe; 4 P150s
+            # physically wired as ring). Halves worst-case hop count for collectives.
             num_links=2,
-            topology=ttnn.Topology.Linear,
+            topology=ttnn.Topology.Ring,
         ), "explicit_all_reduce")
     try:
         return _diag_output(ttnn.all_reduce(partial), "default_all_reduce")
