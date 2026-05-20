@@ -119,15 +119,57 @@ NOT x_tt + reduced.
 
 ### Test 10 — diag inside mlp_step_tp around ttnn.add
 
-Status: bootstrapping (b1jn83t6l polling)
+Status: COMPLETE
+Result: **ROOT CAUSE FOUND. x_tt is being zeroed mid-MLP-execution.**
 
-Prints x_tt[0,0], reduced[0,0], and out[0,0] (with memory_config) around
-the residual add inside mlp_step_tp. Fires once per probe path.
+```
+[pre MLP RESID #0] x_tt[0,0]=0.000000  reduced[0,0]=0.019897  out[0,0]=0.019897
+                   ^^^^^^^^^^^^^^^^^^^^                       ← add is correct: 0 + 0.019897 = 0.019897
+                   ZEROED!  but pre-MLP diag showed -0.019531
+```
 
-Three candidate causes for the missing residual:
-1. ttnn.add bug on multi-row [5, 5120] — returns 2nd arg only
-2. x_tt silently zeroed by some upstream MLP op
-3. Mismatched memory_config between x_tt and reduced causing add to misbehave
+The residual add is mathematically correct (0 + reduced = reduced). But
+x_tt arrives as ZERO instead of its pre-MLP value -0.019531.
+
+**The bug: reshape view + dealloc source pattern.** At line 1622 in
+forward_prefill_tp_inner_v3_parallel_attn:
+
+```python
+x_seq = ttnn.reshape(dn_out_4d_tile, [seq_len, HIDDEN])  # VIEW
+ttnn.deallocate(dn_out_4d_tile)                          # frees view's backing!
+```
+
+x_seq becomes a view into freed memory. Pre-MLP diag reads it
+immediately → memory not yet reused → correct values returned. MLP starts
+allocating (rms_norm output, linear outputs, matmul scratch) → freed
+buffer gets reused → x_seq's underlying memory zeroed/clobbered → by the
+residual add, x_tt[0,0]=0.
+
+Same bug at line 1440 (embedding reshape).
+
+This was the candidate hypothesis I floated EARLY in the session and
+dismissed when Layer 0 state matched. Layer 0 state matches because the
+DN inner loop happens BEFORE the bad reshape — the bug strikes at the
+reassembly chain AFTER all DN per-position calls. Lesson: don't dismiss
+hypotheses based on indirect evidence.
+
+### FIX — commit 6fa1082, bootstrapping (bv5x397ta polling)
+
+Apply `ttnn.clone` after each `ttnn.reshape` that's followed by source
+deallocation. Two sites in v3 forward:
+1. Embedding reshape (line 1440)
+2. DN reassembly reshape (line 1622)
+
+Pattern:
+```python
+view = ttnn.reshape(source, target_shape)
+x_seq = ttnn.clone(view)  # fresh allocation
+ttnn.deallocate(view)
+ttnn.deallocate(source)
+```
+
+Expected: cos jumps from 0.65 → 0.999 if this is the only bug.
+Validation: probe_prefill_vs_decode_loop_tp --mode parallel_attn
 
 Result: [TBD]
 
