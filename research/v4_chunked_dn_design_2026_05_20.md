@@ -168,9 +168,34 @@ v3 + Stage 1+3            2808 ms (-122%)  5097 ms (+16%)   15162 ms (+46% vs v3
 | 1 (pre-norm + in_proj batched) | ✅ done | +6% vs v3 alone (extrapolated) |
 | 2 (conv1d batched) | ⏸️ deferred | TBD |
 | 3 (decay/gate batched) | ✅ done | +46% vs v3 cumulative |
-| 4 (Neumann (I-attn)⁻¹ chunked recurrence) | next | huge — eliminates per-pos loop entirely |
+| 4a (chunked Neumann math validated in numpy) | ✅ done | cos = 1.0 (fp64) bit-equivalent — algorithmic risk REMOVED |
+| 4b (ttnn integration of chunked recurrence) | next | huge — eliminates per-pos loop entirely |
 | 5 (multi-chunk loop + state thread) | future | enables 32k+ context |
 | 6 (batched output gate) | future | small cleanup |
+
+### v4 Stage 4a — math validation (commit `9770354`, 2026-05-20) ✅
+
+`experiments/utils/chunked_recurrence_numpy_probe.py` validates the C'5
+plan §1 chunked Neumann math against per-position recurrence at fp64:
+
+```
+output cos:   1.0000000000  (10-digit precision)
+state cos:    1.0000000000
+max|Δ|:       5×10⁻¹⁸       (fp64 noise floor)
+```
+
+Both zero-state (chunk 0) and non-zero-state (mid-prefill) cases pass.
+
+**Stage 4b next session: port the validated numpy impl to ttnn** on the mesh.
+Each chip processes its NV_PER_CHIP heads independently (no CCL until the
+output stage). Reference impl: `chunked_recurrence` in the numpy probe.
+Reference primitives: `experiments/utils/neumann_inverse_probe.py` for the
+Neumann factorization of `(I-attn)⁻¹`.
+
+Integration path: extend the chunked DN stub to collect per-pos q/k/v into
+batched tensors (since conv1d isn't batched yet), then run the chunked
+recurrence on them, then per-pos output gate + w_out + all_reduce + residual.
+Stage 2 (batched conv1d) can land later — Stage 4b doesn't require it.
 
 API surface and harness locked in. Future stages just replace one piece at a time.
 
