@@ -620,7 +620,7 @@ def main():
                       help="prompt to tokenize and validate (default: 'The capital of France is')")
     pvd.add_argument("--mode", default="stub",
                       choices=["stub", "batched_mlp", "sequential_via_slices",
-                               "per_position_list"],
+                               "per_position_list", "parallel_attn"],
                       help="prefill implementation under test: 'stub' (B.1 decode-loop "
                            "wrapper; cos=1.0 expected) or 'batched_mlp' (B.2.1 layer-outer "
                            "iteration with batched MLP per layer; gate cos>=0.999)")

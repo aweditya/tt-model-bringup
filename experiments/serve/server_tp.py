@@ -1045,6 +1045,319 @@ def forward_token_tp(state, token_id, cur_pos):
     return forward_token_tp_inner(state)
 
 
+def gated_attn_step_prefill_tp(state, x_seq_tt, attn, cos_seq_tt, sin_seq_tt, cfg, seq_len):
+    """B.2.2: prefill version of gated_attn_step_tp — parallel SDPA over all
+    positions at once. Sister function to the existing single-position
+    gated_attn_step_tp.
+
+    Inputs:
+      x_seq_tt: [seq_len, HIDDEN] bf16 TILE_LAYOUT replicated on mesh
+      cos_seq_tt, sin_seq_tt: [seq_len, ROTARY_DIM] per-position RoPE tables
+      cfg, seq_len: as usual
+
+    Returns: [seq_len, HIDDEN] post-residual (replicated).
+
+    Side effect: writes K, V to paged cache at positions [0, seq_len) via
+    paged_fill_cache.
+
+    Compared to gated_attn_step_tp (decode):
+      - Q/K/V matmul broadcasts on seq_len leading dim
+      - RoPE applied per-position (manual rotate-half with batched cos/sin)
+      - KV cache write via paged_fill_cache (multi-position) instead of
+        paged_update_cache (single-position)
+      - SDPA via ttnn.transformer.scaled_dot_product_attention with
+        is_causal=True (instead of paged_scaled_dot_product_attention_decode)
+      - out_proj + all_reduce + residual all broadcast on seq_len
+    """
+    import ttnn
+    import math
+    HIDDEN = cfg['hidden']
+    HEAD_DIM = cfg['head_dim']
+    NQ_PER_CHIP = cfg['n_q_heads'] // 4
+    NKV_PER_CHIP = cfg['n_kv_heads'] // 4
+    QG_DIM_CHIP = 2 * NQ_PER_CHIP * HEAD_DIM
+    KV_DIM_CHIP = NKV_PER_CHIP * HEAD_DIM
+    ROTARY_DIM = int(HEAD_DIM * cfg['partial_rotary_factor'])
+    EPS = 1e-6
+
+    # 1. Pre-norm (broadcasts on seq_len leading dim)
+    h_tt = _rms_norm_manual(x_seq_tt, attn['input_norm'], EPS, HIDDEN)
+
+    # 2. QKV matmul (batched on seq_len)
+    all_tt = ttnn.linear(h_tt, attn['w_qkv'])  # [seq_len, QG_DIM_CHIP + 2*KV_DIM_CHIP]
+    ttnn.deallocate(h_tt)
+
+    # 3. Slice QG / K / V and reshape per-head
+    qg = ttnn.slice(all_tt, [0, 0], [seq_len, QG_DIM_CHIP])
+    k_flat = ttnn.slice(all_tt, [0, QG_DIM_CHIP],
+                          [seq_len, QG_DIM_CHIP + KV_DIM_CHIP])
+    v_flat = ttnn.slice(all_tt, [0, QG_DIM_CHIP + KV_DIM_CHIP],
+                          [seq_len, QG_DIM_CHIP + 2 * KV_DIM_CHIP])
+    ttnn.deallocate(all_tt)
+
+    # qg → [seq_len, NQ_PER_CHIP, 2*HEAD_DIM]
+    qg = ttnn.reshape(qg, [seq_len, NQ_PER_CHIP, 2 * HEAD_DIM])
+    q_tt = ttnn.slice(qg, [0, 0, 0], [seq_len, NQ_PER_CHIP, HEAD_DIM])
+    gate_tt = ttnn.slice(qg, [0, 0, HEAD_DIM], [seq_len, NQ_PER_CHIP, 2 * HEAD_DIM])
+    ttnn.deallocate(qg)
+    k_tt = ttnn.reshape(k_flat, [seq_len, NKV_PER_CHIP, HEAD_DIM])
+    v_tt = ttnn.reshape(v_flat, [seq_len, NKV_PER_CHIP, HEAD_DIM])
+    ttnn.deallocate(k_flat)
+    ttnn.deallocate(v_flat)
+
+    # 4. QK normalize (broadcasts on seq_len, n_heads — applied per HEAD_DIM)
+    q_tt = _rms_norm_manual(q_tt, attn['q_norm'], EPS, HEAD_DIM)
+    k_tt = _rms_norm_manual(k_tt, attn['k_norm'], EPS, HEAD_DIM)
+
+    # 5. Batched Manual RoPE (rotate-half on first ROTARY_DIM cols).
+    # Per-position cos/sin via broadcasting [seq_len, 1, ROTARY_DIM] over heads dim.
+    half = ROTARY_DIM // 2
+    cos_b = ttnn.reshape(cos_seq_tt, [seq_len, 1, ROTARY_DIM])
+    sin_b = ttnn.reshape(sin_seq_tt, [seq_len, 1, ROTARY_DIM])
+
+    def apply_rope_seq(t, n_heads):
+        rot = ttnn.slice(t, [0, 0, 0], [seq_len, n_heads, ROTARY_DIM])
+        passthru = ttnn.slice(t, [0, 0, ROTARY_DIM], [seq_len, n_heads, HEAD_DIM])
+        x1 = ttnn.slice(rot, [0, 0, 0], [seq_len, n_heads, half])
+        x2 = ttnn.slice(rot, [0, 0, half], [seq_len, n_heads, ROTARY_DIM])
+        neg_x2 = ttnn.neg(x2)
+        rotated = ttnn.add(
+            ttnn.mul(rot, cos_b),
+            ttnn.mul(ttnn.concat([neg_x2, x1], dim=-1), sin_b),
+        )
+        return ttnn.concat([rotated, passthru], dim=-1)
+
+    q_tt = apply_rope_seq(q_tt, NQ_PER_CHIP)
+    k_tt = apply_rope_seq(k_tt, NKV_PER_CHIP)
+    ttnn.deallocate(cos_b)
+    ttnn.deallocate(sin_b)
+
+    # 6. Write K, V to paged cache for future decode tokens.
+    # paged_fill_cache signature: (cache, input, page_table, batch_idx=0)
+    # input shape: [1, N_KV, input_seq_len, HEAD_DIM]
+    k_for_cache = ttnn.reshape(k_tt, [1, NKV_PER_CHIP, seq_len, HEAD_DIM])
+    v_for_cache = ttnn.reshape(v_tt, [1, NKV_PER_CHIP, seq_len, HEAD_DIM])
+    try:
+        ttnn.experimental.paged_fill_cache(
+            attn['kc'], k_for_cache, state.page_table_tt, batch_idx=0)
+        ttnn.experimental.paged_fill_cache(
+            attn['vc'], v_for_cache, state.page_table_tt, batch_idx=0)
+    except Exception as e:
+        # Non-fatal for prefill validation: SDPA below uses the fresh K/V
+        # directly, not the cache. Cache write only matters for subsequent
+        # decode. Log + continue.
+        print(f"  [warn] paged_fill_cache failed (cache will be stale for decode): "
+              f"{type(e).__name__}: {e}", flush=True)
+
+    # 7. Parallel SDPA with causal mask.
+    # Q: [1, NQ_PER_CHIP, seq_len, HEAD_DIM] (1 batch, n_q heads, seq_len Q, head_dim)
+    # K, V: [1, NKV_PER_CHIP, seq_len, HEAD_DIM]
+    # SDPA handles GQA when N_KV < N_Q automatically.
+    q_for_sdpa = ttnn.reshape(q_tt, [1, NQ_PER_CHIP, seq_len, HEAD_DIM])
+    k_for_sdpa = ttnn.reshape(k_tt, [1, NKV_PER_CHIP, seq_len, HEAD_DIM])
+    v_for_sdpa = ttnn.reshape(v_tt, [1, NKV_PER_CHIP, seq_len, HEAD_DIM])
+    attn_out = ttnn.transformer.scaled_dot_product_attention(
+        q_for_sdpa, k_for_sdpa, v_for_sdpa,
+        is_causal=True,
+        scale=1.0 / math.sqrt(HEAD_DIM),
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+    )
+    # attn_out: [1, NQ_PER_CHIP, seq_len, HEAD_DIM]
+    attn_per_head = ttnn.reshape(attn_out, [seq_len, NQ_PER_CHIP, HEAD_DIM])
+    ttnn.deallocate(q_for_sdpa)
+    ttnn.deallocate(k_for_sdpa)
+    ttnn.deallocate(v_for_sdpa)
+    ttnn.deallocate(k_for_cache)
+    ttnn.deallocate(v_for_cache)
+    ttnn.deallocate(q_tt)
+    ttnn.deallocate(k_tt)
+    ttnn.deallocate(v_tt)
+
+    # 8. Sigmoid gate + multiply (broadcasts on seq_len)
+    attn_gated = ttnn.mul(attn_per_head, ttnn.sigmoid(gate_tt))
+    ttnn.deallocate(attn_per_head)
+    ttnn.deallocate(gate_tt)
+
+    # 9. out_proj row-parallel + all_reduce on [seq_len, HIDDEN]
+    attn_flat = ttnn.reshape(attn_gated, [seq_len, NQ_PER_CHIP * HEAD_DIM])
+    ttnn.deallocate(attn_gated)
+    partial = ttnn.linear(attn_flat, attn['w_o'])  # [seq_len, HIDDEN] partial
+    ttnn.deallocate(attn_flat)
+    reduced = _tp_all_reduce(state, partial)
+    ttnn.deallocate(partial)
+    out = ttnn.add(x_seq_tt, reduced)
+    ttnn.deallocate(reduced)
+    return out
+
+
+def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=False):
+    """B.2.2: parallel attention + batched MLP + sequential DeltaNet with slice_write.
+
+    Builds on validated primitives:
+      - Batched ttnn.embedding for input + RoPE table lookup (B.2.1.5a)
+      - Slice from directly-constructed multi-row TILE_LAYOUT works (B.2.1.5a)
+      - slice_write + to_layout(TILE) round-trip (B.2.1.5b)
+
+    Structure:
+      Step 1: Batched embed → x_seq_tt [seq_len, HIDDEN] TILE_LAYOUT
+      Step 2: Batched RoPE cos/sin lookup → cos_seq_tt, sin_seq_tt
+      Step 3: For each layer:
+        - DeltaNet (linear_attention): sequential per-position; slice from
+          x_seq, run decode-step, slice_write per-position output into a
+          ROW_MAJOR working buffer; convert to TILE.
+        - Gated Attention: gated_attn_step_prefill_tp (parallel SDPA)
+        - MLP: existing mlp_step_tp (broadcasts on leading dim)
+      Step 4: Final norm + LM head (slice last position for production;
+        batched LM head for capture_logits validation).
+    """
+    import ttnn
+    import torch
+    import numpy as np
+
+    cfg = state.cfg
+    HIDDEN = cfg['hidden']
+    ROTARY_DIM = state.rotary_dim
+    seq_len = len(prompt_ids)
+    VOCAB = state.vocab_size
+
+    if seq_len < 1:
+        raise ValueError(f"prompt_ids must have len >= 1, got {seq_len}")
+    if seq_len > MAX_POS:
+        raise ValueError(f"prompt_ids len {seq_len} > MAX_POS {MAX_POS}")
+
+    # ====== Step 1: Batched embed → x_seq_tt [seq_len, HIDDEN] ======
+    prompt_ids_idx = ttnn.from_torch(
+        torch.tensor([[int(t)] for t in prompt_ids], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    embed_raw = ttnn.embedding(
+        prompt_ids_idx, state.embed_tt,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    x_seq = ttnn.reshape(embed_raw, [seq_len, HIDDEN])
+    ttnn.deallocate(prompt_ids_idx)
+    ttnn.deallocate(embed_raw)
+
+    # ====== Step 2: Batched RoPE cos/sin lookup ======
+    positions_idx = ttnn.from_torch(
+        torch.tensor([[t] for t in range(seq_len)], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    cos_seq_raw = ttnn.embedding(
+        positions_idx, state.cos_table_tt,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    sin_seq_raw = ttnn.embedding(
+        positions_idx, state.sin_table_tt,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    cos_seq_tt = ttnn.reshape(cos_seq_raw, [seq_len, ROTARY_DIM])
+    sin_seq_tt = ttnn.reshape(sin_seq_raw, [seq_len, ROTARY_DIM])
+    ttnn.deallocate(positions_idx)
+    ttnn.deallocate(cos_seq_raw)
+    ttnn.deallocate(sin_seq_raw)
+
+    # ====== Step 3: Layer loop ======
+    for layer in state.layers:
+        if layer['type'] == 'linear_attention':
+            # DeltaNet: sequential per-position with slice_write assembly
+            # Pre-allocate ROW_MAJOR working buffer [1, 1, seq_len, HIDDEN]
+            dn_buf_init = torch.zeros((1, 1, seq_len, HIDDEN), dtype=torch.bfloat16)
+            dn_out_buf = ttnn.from_torch(
+                dn_buf_init,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                dtype=ttnn.bfloat16,
+                device=state.mesh,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+
+            for pos, tid in enumerate(prompt_ids):
+                # Set state.cur_pos_buf etc (DeltaNet itself doesn't use them,
+                # but harmless and keeps invariants consistent across modes).
+                update_input_buffers(state, tid, pos)
+                # Slice x_pos from x_seq (works on directly-constructed tensor)
+                x_pos = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
+                # Run DN step (existing per-position decode step)
+                x_pos_out = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
+                ttnn.deallocate(x_pos)
+                # Reshape to rank-4 + convert to ROW_MAJOR for slice_write
+                x_pos_4d = ttnn.reshape(x_pos_out, [1, 1, 1, HIDDEN])
+                x_pos_rm = ttnn.to_layout(x_pos_4d, ttnn.ROW_MAJOR_LAYOUT)
+                ttnn.experimental.slice_write(
+                    x_pos_rm, dn_out_buf,
+                    [0, 0, pos, 0],
+                    [1, 1, pos + 1, HIDDEN],
+                    [1, 1, 1, 1],
+                )
+                ttnn.deallocate(x_pos_out)
+                ttnn.deallocate(x_pos_4d)
+                ttnn.deallocate(x_pos_rm)
+
+            # Convert dn_out_buf to TILE_LAYOUT [seq_len, HIDDEN]
+            ttnn.deallocate(x_seq)
+            dn_out_4d_tile = ttnn.to_layout(dn_out_buf, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(dn_out_buf)
+            x_seq = ttnn.reshape(dn_out_4d_tile, [seq_len, HIDDEN])
+            ttnn.deallocate(dn_out_4d_tile)
+        else:
+            # Gated Attention: parallel SDPA across all seq_len positions
+            new_x_seq = gated_attn_step_prefill_tp(
+                state, x_seq, layer['attn'], cos_seq_tt, sin_seq_tt, cfg, seq_len)
+            ttnn.deallocate(x_seq)
+            x_seq = new_x_seq
+
+        # MLP: batched on [seq_len, HIDDEN] (broadcasts on leading dim)
+        new_x_seq = mlp_step_tp(state, x_seq, layer['mlp'])
+        ttnn.deallocate(x_seq)
+        x_seq = new_x_seq
+
+    ttnn.deallocate(cos_seq_tt)
+    ttnn.deallocate(sin_seq_tt)
+
+    # ====== Step 4: Final norm + LM head ======
+    x_seq = _rms_norm_manual(x_seq, state.final_norm_tt, 1e-6, HIDDEN)
+
+    if capture_logits:
+        # Batched LM head over all positions
+        sharded_logits_tt = ttnn.linear(x_seq, state.lm_head_tt)
+        gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+        sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [seq_len, VOCAB])
+        rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+        ttnn.deallocate(sharded_logits_tt)
+        ttnn.deallocate(gathered_logits_tt)
+        ttnn.deallocate(sliced_logits_tt)
+        ttnn.synchronize_device(state.mesh)
+        full_arr = ttnn.to_torch(
+            rm_logits_tt,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        )[:seq_len].float().cpu().numpy()
+        ttnn.deallocate(rm_logits_tt)
+        ttnn.deallocate(x_seq)
+        return full_arr
+
+    # Production: slice last position
+    x_last = ttnn.slice(x_seq, [seq_len - 1, 0], [seq_len, HIDDEN])
+    ttnn.deallocate(x_seq)
+    sharded_logits_tt = ttnn.linear(x_last, state.lm_head_tt)
+    gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+    sliced_logits_tt = ttnn.slice(gathered_logits_tt, [0, 0], [1, VOCAB])
+    rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+    ttnn.deallocate(sharded_logits_tt)
+    ttnn.deallocate(gathered_logits_tt)
+    ttnn.deallocate(sliced_logits_tt)
+    ttnn.deallocate(x_last)
+    ttnn.synchronize_device(state.mesh)
+    return rm_logits_tt
+
+
 def forward_prefill_tp_inner_v2_per_position_list(state, prompt_ids, capture_logits=False):
     """B.2.1 ISOLATION #2: layer-outer iter, keep per-position [1, HIDDEN]
     tensors in a Python list — NO slice, NO concat of multi-position tensors.
@@ -2117,7 +2430,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         prompt_ids = state.tok.encode(prompt)
 
     mode = str(args.get("mode", "stub"))
-    valid_modes = ("stub", "batched_mlp", "sequential_via_slices", "per_position_list")
+    valid_modes = ("stub", "batched_mlp", "sequential_via_slices",
+                   "per_position_list", "parallel_attn")
     if mode not in valid_modes:
         return {"error": f"mode must be one of {valid_modes}, got {mode}"}
 
@@ -2157,6 +2471,9 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
             state, prompt_ids, capture_logits=True)
     elif mode == "per_position_list":
         test_logits = forward_prefill_tp_inner_v2_per_position_list(
+            state, prompt_ids, capture_logits=True)
+    elif mode == "parallel_attn":
+        test_logits = forward_prefill_tp_inner_v3_parallel_attn(
             state, prompt_ids, capture_logits=True)
     test_ms = (_time.time() - t0) * 1000.0
 
