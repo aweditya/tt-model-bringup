@@ -217,6 +217,8 @@ def cmd_probe_prefill_vs_decode_loop_tp(args):
         payload["prompt"] = args.prompt
     if args.debug_ccl:
         payload["debug_ccl"] = True
+    if args.test_dn_mode:
+        payload["test_dn_mode"] = args.test_dn_mode
     data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
     if data.get("error"):
         print(f"ERROR: {data['error']}", file=sys.stderr)
@@ -700,6 +702,11 @@ def main():
     pvd.add_argument("--debug-ccl", action="store_true",
                       help="enable _tp_all_reduce shape+values diagnostic (first 8 calls "
                            "per path; tag 'dec' for decode-loop, 'pre' for prefill)")
+    pvd.add_argument("--test-dn-mode", default=None,
+                      choices=["manual", "owned_gdn", "owned_gdn_inplace"],
+                      help="override deltanet_recurrence_mode for the TEST path only "
+                           "(reference still uses production default). Use 'manual' to "
+                           "test whether owned_gdn kernel has hidden cross-call state.")
     pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     cle = sub.add_parser("probe_ccl_equivalence_tp",
                           help="B.2.2 CCL semantics: verify all_reduce vs composite "

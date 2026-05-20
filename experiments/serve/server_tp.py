@@ -2635,6 +2635,16 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     VOCAB = state.vocab_size
 
     debug_ccl = bool(args.get("debug_ccl", False))
+    # B.2.2 TEST: optionally override the recurrence mode for the test path.
+    # Used to test the hypothesis that owned_gdn(_inplace) kernels have hidden
+    # state that contaminates layer-1+ DN output in v3 prefill context.
+    # When None, uses the current production default. Modes: 'manual',
+    # 'owned_gdn', 'owned_gdn_inplace'.
+    test_dn_mode = args.get("test_dn_mode")
+    if test_dn_mode is not None and test_dn_mode not in (
+        "manual", "owned_gdn", "owned_gdn_inplace"
+    ):
+        return {"error": f"test_dn_mode must be manual/owned_gdn/owned_gdn_inplace, got {test_dn_mode!r}"}
 
     # Path A — reference: explicit sequential decode-loop, captured per-position.
     _reset_state_buffers(state)
@@ -2660,6 +2670,12 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     if debug_ccl:
         state.ccl_debug_tag = "pre"
         state._ccl_debug_count = 0
+    _orig_dn_mode = None
+    if test_dn_mode is not None:
+        _orig_dn_mode = state.deltanet_recurrence_mode
+        state.deltanet_recurrence_mode = test_dn_mode
+        print(f"[probe] override deltanet_recurrence_mode={test_dn_mode} for test path "
+              f"(was {_orig_dn_mode})", flush=True)
     t0 = _time.time()
     if mode == "stub":
         test_logits = forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)
@@ -2678,6 +2694,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     test_ms = (_time.time() - t0) * 1000.0
     if debug_ccl:
         state.ccl_debug = False
+    if _orig_dn_mode is not None:
+        state.deltanet_recurrence_mode = _orig_dn_mode
 
     # Per-position comparison
     a64 = ref_logits.astype(np.float64)
