@@ -2416,11 +2416,13 @@ def handle_probe_slice_write_round_trip(state: MeshServerState, args: dict) -> d
         )
 
         # Step 3: slice_write src into dst at row `pos`
+        # signature: slice_write(input, output, start, end, step) — step required
         try:
             ttnn.experimental.slice_write(
                 src, dst,
                 [0, 0, pos, 0],
                 [1, 1, pos + 1, HIDDEN],
+                [1, 1, 1, 1],
             )
             write_results.append({"pos": pos, "wrote_value": src_value, "ok": True})
         except Exception as e:
