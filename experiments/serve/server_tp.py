@@ -911,7 +911,36 @@ def mlp_step_tp(state, x_tt, mlp):
     ttnn.deallocate(h)
     reduced = _tp_all_reduce(state, partial)
     ttnn.deallocate(partial)
+    # B.2.2 Test 10: targeted residual-add diag — fires once per probe
+    _resid_dbg = getattr(state, 'debug_mlp_resid', False)
+    _resid_count = getattr(state, '_mlp_resid_count', 0)
+    if _resid_dbg and _resid_count < 2:
+        try:
+            _xt = ttnn.to_torch(
+                x_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+            ).float()
+            _rd = ttnn.to_torch(
+                reduced, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+            ).float()
+            _tg = getattr(state, '_debug_state_tag', 'dec')
+            print(f"  [{_tg} MLP RESID #{_resid_count}] x_tt.shape={list(x_tt.shape)} x_tt[0,0]={float(_xt[..., 0, 0]):.6f} x_tt.mc={x_tt.memory_config().memory_layout} "
+                  f"| reduced.shape={list(reduced.shape)} reduced[0,0]={float(_rd[..., 0, 0]):.6f} reduced.mc={reduced.memory_config().memory_layout}",
+                  flush=True)
+        except Exception as _re:
+            print(f"  [MLP resid diag pre err] {_re!r}", flush=True)
     out = ttnn.add(x_tt, reduced)
+    if _resid_dbg and _resid_count < 2:
+        try:
+            _ot = ttnn.to_torch(
+                out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
+            ).float()
+            _tg = getattr(state, '_debug_state_tag', 'dec')
+            print(f"  [{_tg} MLP RESID #{_resid_count}] out.shape={list(out.shape)} out[0,0]={float(_ot[..., 0, 0]):.6f} out.mc={out.memory_config().memory_layout} "
+                  f"(expected x_tt[0,0]+reduced[0,0])",
+                  flush=True)
+            state._mlp_resid_count = _resid_count + 1
+        except Exception as _re2:
+            print(f"  [MLP resid diag post err] {_re2!r}", flush=True)
     ttnn.deallocate(reduced)
     return out
 
@@ -2829,6 +2858,8 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
         state.debug_layer_boundary = True
         state._layer_bd_count = 0
         state._pre_mlp_count = 0
+        state.debug_mlp_resid = True
+        state._mlp_resid_count = 0
         state._debug_state_tag = "dec"
     t0 = _time.time()
     ref_logits = np.empty((seq_len, VOCAB), dtype=np.float32)
@@ -2901,6 +2932,7 @@ def handle_probe_prefill_vs_decode_loop_tp(state: MeshServerState, args: dict) -
     if debug_state:
         state.debug_state = False
         state.debug_layer_boundary = False
+        state.debug_mlp_resid = False
 
     # Per-position comparison
     a64 = ref_logits.astype(np.float64)
