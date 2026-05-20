@@ -1373,7 +1373,7 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
             ttnn.deallocate(x_seq)
             # Same fix as below (B.2.2 wedge) — attn output also ends with
             # all_reduce + add, has the same DeallocatedTombStone risk.
-            new_x_seq = ttnn.to_memory_config(new_x_seq, ttnn.DRAM_MEMORY_CONFIG)
+            new_x_seq = ttnn.clone(new_x_seq, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             x_seq = new_x_seq
 
         _layer_dbg(layer_idx, layer['type'], stage="pre_mlp")
@@ -1390,7 +1390,7 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
         # with an identical config — internally this triggers create_device_tensor
         # which severs the tombstone link. Cost: one memory copy per layer.
         # See research/b2_2_wedge_root_cause.md.
-        new_x_seq = ttnn.to_memory_config(new_x_seq, ttnn.DRAM_MEMORY_CONFIG)
+        new_x_seq = ttnn.clone(new_x_seq, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         x_seq = new_x_seq
         _layer_dbg(layer_idx, layer['type'], stage="end")
 
