@@ -1331,10 +1331,19 @@ def forward_prefill_tp_inner_v3_parallel_attn(state, prompt_ids, capture_logits=
                 _dbg_l = layer_idx <= 1  # DN debug only for layers 0 and 1
                 if _dbg_l: print(f"    [DN inner] layer={layer_idx} pos={pos} BEFORE slice", flush=True)
                 # Slice x_pos from x_seq (works on directly-constructed tensor)
-                x_pos = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
+                x_pos_view = ttnn.slice(x_seq, [pos, 0], [pos + 1, HIDDEN])
                 if _dbg_l:
                     ttnn.synchronize_device(state.mesh)
-                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice shape={list(x_pos.shape)}", flush=True)
+                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER slice shape={list(x_pos_view.shape)}", flush=True)
+                # Force a fresh allocation+copy via to_memory_config — slice may
+                # return a view with subtly different underlying state that
+                # deltanet_step_tp's internal ops can't handle (per layer 1
+                # wedge investigation B.2.2 debug).
+                x_pos = ttnn.to_memory_config(x_pos_view, ttnn.DRAM_MEMORY_CONFIG)
+                ttnn.deallocate(x_pos_view)
+                if _dbg_l:
+                    ttnn.synchronize_device(state.mesh)
+                    print(f"    [DN inner] layer={layer_idx} pos={pos} AFTER to_memory_config(DRAM) shape={list(x_pos.shape)}", flush=True)
                 # Run DN step (existing per-position decode step)
                 x_pos_out = deltanet_step_tp(state, x_pos, layer['dn'], cfg)
                 if _dbg_l:
