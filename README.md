@@ -231,24 +231,33 @@ with the qb1 single-chip baseline (5.19 tok/s in the QK-rms_norm-shipped
 memory note). Both servers had been bootstrapped before measurement, so
 the numbers reflect steady-state traced decode (not cold-start).
 
-### Legacy 8B-era demos (not re-runnable)
+### Legacy 8B-era demos (re-verified on qb1, 2026-05-21)
 
 `REPRODUCE.md` documents six experiments from the pre-pivot Llama /
-Qwen2.5 era. All six script files are still present in `experiments/`
-(filenames have evolved slightly — REPRODUCE refers to the older names):
+Qwen2.5 era. All six were authored on the now-deprecated `ssh tenstorrent`
+host (per `CLAUDE.md` non-negotiable #4) and were **re-verified on qb1**
+on 2026-05-21 against the current `~/tt-xla/.venv` install
+(`torch==2.11.0+cu130`, `ttnn==0.69.0`, firmware 19.6.0). All six PASS
+within 2-7% of the historical baselines:
 
-| Script (actual filename) | REPRODUCE.md alias |
-|--------------------------|--------------------|
-| `experiments/60_native_rope_decode.py` | `60_traced_native_rope.py` |
-| `experiments/64_llama32_1b_port.py` | `64_llama1b_port.py` |
-| `experiments/67_llama32_3b_port.py` | `67_llama3b_port.py` |
-| `experiments/73_llama8b_instruct.py` | `73_8b_port.py` |
-| `experiments/76b_8b_correctness_check.py` | (same) |
-| `experiments/80_8b_diverse_qa_demo.py` | (same) |
+| Script | Baseline | qb1 (2026-05-21) |
+|--------|----------|------------------|
+| `experiments/60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** |
+| `experiments/64_llama32_1b_port.py`    |  78 tok/s | **78.6 tok/s**  |
+| `experiments/67_llama32_3b_port.py`    |  34 tok/s | **33.7 tok/s**  |
+| `experiments/73_llama8b_instruct.py`   |  19 tok/s | **19 tok/s**    |
+| `experiments/76b_8b_correctness_check.py` | cos > 0.997, 8/8 | cos **0.997327**, **8/8** |
+| `experiments/80_8b_diverse_qa_demo.py` | 18 tok/s, 9/10 EOS | **18 tok/s, 9/10 EOS** |
 
-These targeted the now-deprecated `ssh tenstorrent` host (per `CLAUDE.md`
-non-negotiable #4, that host is no longer available). They have **not**
-been re-run from qb1/qb2 and are kept for historical reference only.
+See `REPRODUCE.md` for the run recipe (stop the prod `serve.sh` first
+so device 0 is free), and `~/tt-xla/.cache/legacy_demos_2026_05_21/`
+on qb1 for the captured stdout logs. The fresh public-clone setup
+recipe (Setup steps 3+4 above) was also re-verified the same day:
+anonymous `git clone` → `uv sync` →
+`uv pip install -e $TT_METAL_HOME --no-build-isolation` produces a
+working `.venv/` with `ttnn==0.69.0`, and the fresh-clone
+`experiments.serve.client generate` talks cleanly to the persistent
+qb1 prod server's Unix socket and decodes 16 tokens at 5.12 tok/s.
 
 ### Experienced-user shortcut
 
