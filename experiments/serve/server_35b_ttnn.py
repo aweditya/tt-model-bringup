@@ -706,9 +706,11 @@ def step_forward_ttnn(state, tok_id, pos):
     logits = ttnn.matmul(h_norm, state.lm_head_tt)  # [1, VOCAB] per chip (replicated)
     ttnn.deallocate(h_norm)
 
-    # On-device argmax (vocab is small enough to argmax directly)
-    argmax_tt = ttnn.argmax(logits, dim=-1, keepdim=True, use_multicore=True)
+    # On-device argmax requires ROW_MAJOR input (multicore argmax constraint).
+    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
     ttnn.deallocate(logits)
+    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
+    ttnn.deallocate(logits_rm)
 
     # 5. Single 8-byte readback of the argmax — ONLY host transfer per step.
     next_id_t = ttnn.to_torch(
