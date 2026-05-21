@@ -354,8 +354,12 @@ def bootstrap(state, log):
                     for k in key_to_shard
                     if k.startswith(f"model.language_model.layers.{L}.")}
         layer_tt = {}
-        layer_tt["input_layernorm"] = np_to_replicated(layer_sd["input_layernorm.weight"], state.mesh)
-        layer_tt["post_attention_layernorm"] = np_to_replicated(layer_sd["post_attention_layernorm.weight"], state.mesh)
+        # 91f loader convention: input_layernorm + post_attention_layernorm use
+        # `output * (1 + weight)`; q_norm, k_norm same convention. linear_attn.norm
+        # is standard `output * weight` (RMSNormGated). Pre-add 1.0 at upload so
+        # downstream rms_norm calls just multiply by the stored weight.
+        layer_tt["input_layernorm"] = np_to_replicated(layer_sd["input_layernorm.weight"] + 1.0, state.mesh)
+        layer_tt["post_attention_layernorm"] = np_to_replicated(layer_sd["post_attention_layernorm.weight"] + 1.0, state.mesh)
         if state.layer_types[L] == "linear_attention":
             layer_tt.update(upload_dn_layer(layer_sd, state.mesh))
         else:
