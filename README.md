@@ -38,9 +38,14 @@ for Blackhole. Once the build completes, export:
 
 ```bash
 export TT_METAL_HOME=$HOME/tenstorrent/tt-metal
-export TT_BUILD_DIR=$TT_METAL_HOME/build_tracy_gcc12_nodist   # or your variant
+export TT_BUILD_DIR=$TT_METAL_HOME/build_Release   # or your build variant (e.g. build_tracy_gcc12_nodist)
 export ARCH_NAME=blackhole
 ```
+
+The exact `TT_BUILD_DIR` name depends on which CMake preset you ran
+(`./build_metal.sh` defaults to `build_Release` on Blackhole; profiler
+builds produce `build_tracy_gcc12_nodist`). Both qb1 and qb2 currently
+use `build_Release`.
 
 > **TODO (follow-up PR):** pin a known-good `tt-metal` SHA here. Today's
 > `ttnn` build on qb2 is the reference; the SHA will be captured by a
@@ -76,6 +81,29 @@ uv sync
 This reads `pyproject.toml` + `uv.lock` and provisions `.venv/` with the
 pinned versions of `torch`, `transformers`, `huggingface_hub`,
 `safetensors`, and `numpy`.
+
+**You must then install `ttnn` (Tenstorrent's Python runtime) into the
+same venv** — `pyproject.toml` cannot pin it because it has no PyPI
+release. Use the editable install from your tt-metal checkout:
+
+```bash
+# build deps for ttnn's setup.py (one-time)
+uv pip install setuptools_scm
+
+# install ttnn + its runtime deps (loguru, pandas, seaborn, graphviz, ml-dtypes, tracy, …)
+uv pip install -e $TT_METAL_HOME --no-build-isolation
+```
+
+The `-e` install registers a `ttnn` package in `.venv/lib/.../site-packages/`
+that points at `$TT_METAL_HOME/ttnn/ttnn/`. A bare `sys.path.insert(...,
+$TT_METAL_HOME/ttnn)` is **not** sufficient — ttnn's `__init__.py` imports
+the bundled `tracy` profiler module, which only ships via the
+`uv pip install -e .` path.
+
+Verified 2026-05-21 on qb1: a fresh `uv sync` resolves to
+`torch==2.12.0+cu130` (qb1 prod runs `torch==2.11.0+cu130`); the prebuilt
+`ttnn==0.69.0` C extension imports cleanly against both — no torch ABI
+break across that minor bump.
 
 ### 4. Configure HuggingFace access (HF_TOKEN)
 
