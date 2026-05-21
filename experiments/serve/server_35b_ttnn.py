@@ -525,7 +525,8 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     return out, kv_cache  # kv_cache unchanged for placeholder
 
 
-def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_cache):
+def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_cache,
+                       sub_capture=None):
     """Full decoder layer forward on-device:
       residual = h
       h = input_layernorm(h)          # rms_norm with pre-(1+w) weight
@@ -536,9 +537,15 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
       moe = MoE(h)
       h = residual + moe
       return h, new_dn_state, new_kv_cache
+
+    sub_capture (debug only): dict to fill with intermediate hidden states
+    {"in_norm", "mixer_out", "after_mixer", "post_attn_norm", "moe_out"} as
+    numpy arrays (one chip's view).
     """
     residual_1 = h_tt
     h_norm_1 = ttnn.rms_norm(h_tt, weight=w["input_layernorm"], epsilon=EPS)
+    if sub_capture is not None:
+        sub_capture["in_norm"] = _ttnn_to_numpy_replicated(h_norm_1, mesh).reshape(-1)
     if layer_type == "linear_attention":
         mixer_out, new_conv, new_rec = dn_forward_ttnn(h_norm_1, w, mesh, dn_state)
         new_dn = (new_conv, new_rec)
@@ -546,14 +553,22 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     else:
         mixer_out, new_kv = attn_forward_ttnn(h_norm_1, w, mesh, cos_tt, sin_tt, kv_cache)
         new_dn = dn_state
+    if sub_capture is not None:
+        sub_capture["mixer_out"] = _ttnn_to_numpy_replicated(mixer_out, mesh).reshape(-1)
     ttnn.deallocate(h_norm_1)
     h_after_mixer = ttnn.add(residual_1, mixer_out)
     ttnn.deallocate(mixer_out)
+    if sub_capture is not None:
+        sub_capture["after_mixer"] = _ttnn_to_numpy_replicated(h_after_mixer, mesh).reshape(-1)
 
     residual_2 = h_after_mixer
     h_norm_2 = ttnn.rms_norm(h_after_mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
+    if sub_capture is not None:
+        sub_capture["post_attn_norm"] = _ttnn_to_numpy_replicated(h_norm_2, mesh).reshape(-1)
     moe_out = moe_forward_ttnn(h_norm_2, w, mesh)
     ttnn.deallocate(h_norm_2)
+    if sub_capture is not None:
+        sub_capture["moe_out"] = _ttnn_to_numpy_replicated(moe_out, mesh).reshape(-1)
     h_final = ttnn.add(residual_2, moe_out)
     ttnn.deallocate(residual_2); ttnn.deallocate(moe_out)
     return h_final, new_dn, new_kv
@@ -734,12 +749,17 @@ def step_forward_ttnn(state, tok_id, pos, capture=None):
 
     # 3. 40-layer chain.
     n = state.text_cfg.num_hidden_layers
+    sub_capture_layers = capture.get("sub_capture_layers", []) if capture is not None else []
     for L in range(n):
         lt = state.layer_types[L]
+        sc = {} if (capture is not None and L in sub_capture_layers) else None
         h_new, new_dn, new_kv = layer_forward_ttnn(
             h_tt, state.per_layer_tt[L], lt, state.mesh,
             cos_tt, sin_tt, state.dn_caches_tt[L], state.kv_caches_tt[L],
+            sub_capture=sc,
         )
+        if sc is not None:
+            capture[f"layer_{L}_sub"] = sc
         ttnn.deallocate(h_tt)
         h_tt = h_new
         if new_dn is not None:

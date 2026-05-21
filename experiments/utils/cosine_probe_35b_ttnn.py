@@ -86,10 +86,20 @@ def main():
     column_names = ["embed"] + [f"L{L}" for L in range(n_layers)] + ["final_norm", "logits"]
     on_device_argmax = np.zeros(seq, dtype=np.int32)
 
+    # L0 sub-captures available?
+    sub_keys = ["in_norm", "mixer_out", "post_attn_norm", "moe_out"]
+    hf_L0_sub = {}
+    for k in sub_keys:
+        path = ORACLE_DIR / f"L0_{k}.npy"
+        if path.exists():
+            hf_L0_sub[k] = np.load(path)
+    if hf_L0_sub:
+        log(f"oracle L0 sub-captures available: {sorted(hf_L0_sub.keys())}")
+
     log("forwarding prompt token-by-token with per-layer capture…")
     for p in range(seq):
         tok_id = int(prompt_ids[p])
-        capt = {}
+        capt = {"sub_capture_layers": [0]} if hf_L0_sub else {}
         t0 = time.time()
         next_id = srv.step_forward_ttnn(state, tok_id, p, capture=capt)
         dt = time.time() - t0
@@ -119,6 +129,14 @@ def main():
             f"final={cosines[p, n_layers+1]:.4f} logits={cosines[p, n_layers+2]:.4f}  "
             f"({dt*1000:.0f} ms)"
             + (f"  first_bad={first_bad}@{first_bad_cos:.4f}" if first_bad else ""))
+
+        if hf_L0_sub and "layer_0_sub" in capt:
+            sub = capt["layer_0_sub"]
+            sub_cos = {}
+            for k in sub_keys:
+                if k in sub and k in hf_L0_sub:
+                    sub_cos[k] = cosine(sub[k], hf_L0_sub[k][p])
+            log(f"    L0 sub: " + "  ".join(f"{k}={v:.4f}" for k, v in sub_cos.items()))
 
     # Save artifacts
     np.save(OUT_DIR / "cosines.npy", cosines)

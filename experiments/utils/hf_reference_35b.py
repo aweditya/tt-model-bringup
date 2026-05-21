@@ -73,16 +73,45 @@ def main():
     seq = prompt_ids.shape[1]
     log(f"  prompt_ids shape={list(prompt_ids.shape)} = {prompt_ids[0].tolist()}")
 
-    log("HF forward pass with output_hidden_states=True…")
+    # Register forward hooks on Layer 0 sub-modules so we can capture
+    # intra-layer activations (matching server_35b_ttnn's sub_capture points).
+    # Hook output is the module's OUTPUT tensor at the given submodule.
+    intra = {}
+    handles = []
+    L0 = model.model.layers[0]
+
+    def make_hook(name):
+        def hook(_module, _inp, output):
+            t = output[0] if isinstance(output, tuple) else output
+            intra[name] = t.detach().float().cpu().numpy()
+        return hook
+
+    # Match server_35b_ttnn's sub_capture names: in_norm, mixer_out, post_attn_norm, moe_out
+    handles.append(L0.input_layernorm.register_forward_hook(make_hook("in_norm")))
+    # Layer 0 is linear_attention; module is `linear_attn` (DN)
+    if layer_types[0] == "linear_attention":
+        handles.append(L0.linear_attn.register_forward_hook(make_hook("mixer_out")))
+    else:
+        handles.append(L0.self_attn.register_forward_hook(make_hook("mixer_out")))
+    handles.append(L0.post_attention_layernorm.register_forward_hook(make_hook("post_attn_norm")))
+    handles.append(L0.mlp.register_forward_hook(make_hook("moe_out")))
+
+    log("HF forward pass with output_hidden_states=True + L0 sub-hooks…")
     t0 = time.time()
-    with torch.no_grad():
-        out = model(
-            input_ids=prompt_ids,
-            output_hidden_states=True,
-            use_cache=False,  # we only need a single forward, no incremental
-            return_dict=True,
-        )
+    try:
+        with torch.no_grad():
+            out = model(
+                input_ids=prompt_ids,
+                output_hidden_states=True,
+                use_cache=False,  # we only need a single forward, no incremental
+                return_dict=True,
+            )
+    finally:
+        for h in handles:
+            h.remove()
     log(f"  forward took {time.time()-t0:.1f}s")
+    log(f"  L0 sub-captures: {sorted(intra.keys())} "
+        f"shapes: {{ {', '.join(f'{k}={list(v.shape)}' for k, v in intra.items())} }}")
 
     hidden_states = out.hidden_states  # tuple of (n_layers+1) tensors [1, seq, HIDDEN]
     logits = out.logits  # [1, seq, VOCAB]
@@ -111,6 +140,11 @@ def main():
     np.save(OUT_DIR / "logits.npy", logits_np)
     np.save(OUT_DIR / "final_norm.npy", final_norm_np)
     np.save(OUT_DIR / "argmax.npy", argmax_np)
+    # L0 intra-layer captures: each shape [1, seq, HIDDEN] → save as [seq, HIDDEN]
+    for k, v in intra.items():
+        if v.ndim == 3:
+            v = v[0]
+        np.save(OUT_DIR / f"L0_{k}.npy", v.astype(np.float32))
     meta = {
         "model_id": MODEL_ID,
         "prompt": PROMPT,
