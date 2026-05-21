@@ -86,14 +86,15 @@ download is rate-limited on the anonymous path.
 
 You have two equivalent options. Pick one.
 
-**Option A — `huggingface-cli login` (recommended).**
-The `huggingface-cli` binary ships as part of the `huggingface_hub`
-Python package, so it is installed automatically by `uv sync`. No extra
-install step is needed.
+**Option A — `hf auth login` (recommended).**
+The `hf` CLI ships as part of the `huggingface_hub` Python package, so
+it is installed automatically by `uv sync`. No extra install step is
+needed. (Note: `huggingface-cli` is the legacy name and is deprecated as
+of `huggingface_hub` ≥1.10 — `hf` is its drop-in replacement.)
 
 ```bash
 uv sync
-uv run huggingface-cli login    # writes ~/.cache/huggingface/token
+uv run hf auth login    # writes ~/.cache/huggingface/token
 ```
 
 `transformers` and `huggingface_hub` both auto-detect that token; no
