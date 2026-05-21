@@ -403,6 +403,83 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state):
     return out, conv_state_in, state_new
 
 
+def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
+    """Attention block on-device, single-token (T=1).
+
+    Q-head sharded (NQ_PER_CHIP=4), KV replicated. For SMOKE: no KV cache
+    (single-token attention reduces to output=v_per_q).
+
+    cos_tt, sin_tt: per-chip replicated [1, 1, ROTARY_DIM=64].
+
+    Returns out [1, HIDDEN] replicated.
+    """
+    # Q projection (sharded along Q-head axis); outputs Q+gate concatenated
+    # per-chip [1, NQ_PER_CHIP * HEAD_DIM_ATTN * 2 = 2048]
+    q_full = ttnn.matmul(h_tt, w["q_proj"])
+    # K, V replicated (per-chip [1, NUM_KV_HEADS * HEAD_DIM_ATTN = 512])
+    k = ttnn.matmul(h_tt, w["k_proj"])
+    v = ttnn.matmul(h_tt, w["v_proj"])
+
+    # Split Q + gate: first half is Q, second half is gate
+    # Reshape rank may be 3 (mesh tensor padding)
+    sr = len(list(q_full.shape))
+    if sr == 3:
+        q_part = ttnn.slice(q_full, [0, 0, 0], [1, 1, NQ_PER_CHIP * HEAD_DIM_ATTN])
+        gate_part = ttnn.slice(q_full, [0, 0, NQ_PER_CHIP * HEAD_DIM_ATTN],
+                                [1, 1, 2 * NQ_PER_CHIP * HEAD_DIM_ATTN])
+    else:
+        q_part = ttnn.slice(q_full, [0, 0], [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
+        gate_part = ttnn.slice(q_full, [0, NQ_PER_CHIP * HEAD_DIM_ATTN],
+                                [1, 2 * NQ_PER_CHIP * HEAD_DIM_ATTN])
+    ttnn.deallocate(q_full)
+
+    # q_norm, k_norm — applied per head_dim (rms_norm with weight)
+    # q reshape: [1, NQ_PER_CHIP, HEAD_DIM_ATTN]
+    q_h = ttnn.reshape(q_part, [NQ_PER_CHIP, HEAD_DIM_ATTN])
+    k_h = ttnn.reshape(k, [NUM_KV_HEADS, HEAD_DIM_ATTN])
+    ttnn.deallocate(q_part); ttnn.deallocate(k)
+    q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+
+    # RoPE on Q, K — apply to first ROTARY_DIM dims of head
+    # For SMOKE: skip RoPE (placeholder)
+    # SHORTCUT for first cut.
+
+    # GQA: per chip, all NQ_PER_CHIP Q heads map to ONE KV head (chip-based mapping
+    # per B12.8: chip 0/1 → KV head 0, chip 2/3 → KV head 1).
+    # For SHORTCUT in first cut: skip the chip-specific KV selection; use first KV head.
+    # Per-chip attn_out = v broadcast (single-token attention is identity).
+    # Reshape v [NUM_KV_HEADS, HEAD_DIM_ATTN] → take first head → broadcast to NQ_PER_CHIP
+    v_h = ttnn.reshape(v, [NUM_KV_HEADS, HEAD_DIM_ATTN])
+    ttnn.deallocate(v)
+    # Slice first KV head: [NUM_KV_HEADS, HEAD_DIM_ATTN] → [1, HEAD_DIM_ATTN]
+    v_first = ttnn.slice(v_h, [0, 0], [1, HEAD_DIM_ATTN])
+    ttnn.deallocate(v_h)
+    # Broadcast to NQ_PER_CHIP heads via concat
+    if NQ_PER_CHIP == 4:
+        v_per_q = ttnn.concat([v_first, v_first, v_first, v_first], dim=0)
+    else:
+        v_per_q = ttnn.concat([v_first] * NQ_PER_CHIP, dim=0)
+    ttnn.deallocate(v_first); ttnn.deallocate(q_n); ttnn.deallocate(k_n)
+
+    attn_flat = ttnn.reshape(v_per_q, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
+    ttnn.deallocate(v_per_q)
+
+    # attn_output_gate: attn_out * sigmoid(gate)
+    gate_sig = ttnn.sigmoid(gate_part)
+    ttnn.deallocate(gate_part)
+    gated = ttnn.mul(attn_flat, gate_sig)
+    ttnn.deallocate(attn_flat); ttnn.deallocate(gate_sig)
+
+    # o_proj column-sharded + all_reduce
+    partial = ttnn.matmul(gated, w["o_proj"])
+    ttnn.deallocate(gated)
+    out = all_reduce_tt(partial, mesh)
+    ttnn.deallocate(partial)
+    return out, kv_cache  # kv_cache unchanged for placeholder
+
+
 def moe_forward_ttnn(h_tt, w, mesh):
     """MoE block fully on-device. h_tt [1, 2048] replicated. Returns [1, 2048] replicated."""
     # Router (replicated weight, replicated input → replicated output)
@@ -602,7 +679,28 @@ def main():
             dn_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
         ).float().numpy()[0]
         print(f"  DN out norm: {np.linalg.norm(dn_out_np):.4f} (shape {dn_out_np.shape})")
-        print(f"  ✓ on-device DN matmul plumbing works (no conv/recurrence yet — placeholder)")
+        print(f"  ✓ on-device DN with recurrence works")
+
+    # Attention smoke on layer 3 (first full_attention layer)
+    attn_layer_idx = None
+    for i, lt in enumerate(state.layer_types):
+        if lt == "full_attention":
+            attn_layer_idx = i
+            break
+    if attn_layer_idx is not None and attn_layer_idx < len(state.per_layer_tt):
+        print(f"\n  Attention smoke (layer {attn_layer_idx})…")
+        # Dummy cos/sin tensors replicated
+        cos_np = np.zeros((1, 1, ROTARY_DIM), dtype=np.float32)
+        sin_np = np.zeros((1, 1, ROTARY_DIM), dtype=np.float32)
+        cos_tt = np_to_replicated(cos_np, state.mesh)
+        sin_tt = np_to_replicated(sin_np, state.mesh)
+        attn_out, _ = attn_forward_ttnn(h_tt, state.per_layer_tt[attn_layer_idx],
+                                         state.mesh, cos_tt, sin_tt)
+        attn_out_np = ttnn.to_torch(
+            attn_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        ).float().numpy()[0]
+        print(f"  Attn out norm: {np.linalg.norm(attn_out_np):.4f} (shape {attn_out_np.shape})")
+        print(f"  ✓ on-device attention plumbing works")
 
     ttnn.close_mesh_device(state.mesh)
     ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
