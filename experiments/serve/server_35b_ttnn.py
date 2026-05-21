@@ -480,6 +480,40 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     return out, kv_cache  # kv_cache unchanged for placeholder
 
 
+def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_cache):
+    """Full decoder layer forward on-device:
+      residual = h
+      h = input_layernorm(h)          # rms_norm with pre-(1+w) weight
+      mixer = DN(h) OR attn(h)
+      h = residual + mixer
+      residual = h
+      h = post_attention_layernorm(h)
+      moe = MoE(h)
+      h = residual + moe
+      return h, new_dn_state, new_kv_cache
+    """
+    residual_1 = h_tt
+    h_norm_1 = ttnn.rms_norm(h_tt, weight=w["input_layernorm"], epsilon=EPS)
+    if layer_type == "linear_attention":
+        mixer_out, new_conv, new_rec = dn_forward_ttnn(h_norm_1, w, mesh, dn_state)
+        new_dn = (new_conv, new_rec)
+        new_kv = kv_cache
+    else:
+        mixer_out, new_kv = attn_forward_ttnn(h_norm_1, w, mesh, cos_tt, sin_tt, kv_cache)
+        new_dn = dn_state
+    ttnn.deallocate(h_norm_1)
+    h_after_mixer = ttnn.add(residual_1, mixer_out)
+    ttnn.deallocate(mixer_out)
+
+    residual_2 = h_after_mixer
+    h_norm_2 = ttnn.rms_norm(h_after_mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
+    moe_out = moe_forward_ttnn(h_norm_2, w, mesh)
+    ttnn.deallocate(h_norm_2)
+    h_final = ttnn.add(residual_2, moe_out)
+    ttnn.deallocate(residual_2); ttnn.deallocate(moe_out)
+    return h_final, new_dn, new_kv
+
+
 def moe_forward_ttnn(h_tt, w, mesh):
     """MoE block fully on-device. h_tt [1, 2048] replicated. Returns [1, 2048] replicated."""
     # Router (replicated weight, replicated input → replicated output)
@@ -526,9 +560,14 @@ def moe_forward_ttnn(h_tt, w, mesh):
         gate_up_e_w = ttnn.reshape(gate_up_e, [HIDDEN, 2 * MOE_INTER_CHIP])
         gate_up = ttnn.matmul(h_tt, gate_up_e_w)  # [1, 2*INTER] per chip
         ttnn.deallocate(gate_up_e); ttnn.deallocate(gate_up_e_w)
-        # Split gate||up halves
-        gate_part = ttnn.slice(gate_up, [0, 0], [1, MOE_INTER_CHIP])
-        up_part = ttnn.slice(gate_up, [0, MOE_INTER_CHIP], [1, 2 * MOE_INTER_CHIP])
+        # Split gate||up halves — rank-aware (matmul output may be rank 3 with mesh padding)
+        gu_rank = len(list(gate_up.shape))
+        if gu_rank == 3:
+            gate_part = ttnn.slice(gate_up, [0, 0, 0], [1, 1, MOE_INTER_CHIP])
+            up_part = ttnn.slice(gate_up, [0, 0, MOE_INTER_CHIP], [1, 1, 2 * MOE_INTER_CHIP])
+        else:
+            gate_part = ttnn.slice(gate_up, [0, 0], [1, MOE_INTER_CHIP])
+            up_part = ttnn.slice(gate_up, [0, MOE_INTER_CHIP], [1, 2 * MOE_INTER_CHIP])
         ttnn.deallocate(gate_up)
         mid = ttnn.mul(ttnn.silu(gate_part), up_part)
         ttnn.deallocate(gate_part); ttnn.deallocate(up_part)
@@ -701,6 +740,30 @@ def main():
         ).float().numpy()[0]
         print(f"  Attn out norm: {np.linalg.norm(attn_out_np):.4f} (shape {attn_out_np.shape})")
         print(f"  ✓ on-device attention plumbing works")
+
+    # Full layer smoke (layer 0 = DN + MoE composed with residuals + layernorms)
+    print("\n  Layer 0 composed smoke (DN + MoE + residuals + layernorms)…")
+    conv_state_np2 = np.zeros((NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
+    rec_state_np2 = np.zeros((NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
+    conv_state_tt2 = ttnn.from_torch(
+        torch.from_numpy(conv_state_np2), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0),
+    )
+    rec_state_tt2 = ttnn.from_torch(
+        torch.from_numpy(rec_state_np2), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0),
+    )
+    cos_zero = np_to_replicated(np.zeros((1, 1, ROTARY_DIM), dtype=np.float32), state.mesh)
+    sin_zero = np_to_replicated(np.zeros((1, 1, ROTARY_DIM), dtype=np.float32), state.mesh)
+    layer_out, _, _ = layer_forward_ttnn(
+        h_tt, state.per_layer_tt[0], state.layer_types[0], state.mesh,
+        cos_zero, sin_zero, (conv_state_tt2, rec_state_tt2), None,
+    )
+    layer_out_np = ttnn.to_torch(
+        layer_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+    ).float().numpy()[0]
+    print(f"  Layer 0 out norm: {np.linalg.norm(layer_out_np):.4f}")
+    print(f"  ✓ on-device full layer (DN + MoE + residuals + 2 layernorms) works")
 
     ttnn.close_mesh_device(state.mesh)
     ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
