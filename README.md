@@ -161,6 +161,80 @@ Steady-state throughput on qb2 as of 2026-05-20: **12.93 tok/s** with
 
 ---
 
+## Verified demos
+
+End-to-end client runs against the persistent servers on 2026-05-21,
+prompt `"The capital of France is"`, `--max-tokens 32`. Both demos
+generate the literal token `Paris` and continue coherently into a
+`<think>...</think>` block followed by a short factual answer.
+
+| Demo | Host | Prefill | Decode | Total wall |
+|------|------|---------|--------|------------|
+| A — Qwen3.6-27B single P150 | qb1 | 1926 ms (5 prompt tokens) | 194.63 ms/tok = **5.14 tok/s** | 9.6 s |
+| B — Qwen3.6-27B 4× P150 TP | qb2 | 382 ms (5 prompt tokens) | 77.02 ms/tok = **12.98 tok/s** | 2.9 s |
+
+Demo A first 32 generated tokens (qb1):
+
+```
+ Paris.
+
+<think>
+
+</think>
+
+That is correct. Paris is the capital and most populous city of France. It is located in the north-central part of the
+```
+
+Demo B first 32 generated tokens (qb2):
+
+```
+ Paris.
+
+<think>
+
+</think>
+
+That is correct. **Paris** is the capital and most populous city of France. It is located in the north-central part
+```
+
+Demo B's measured 12.98 tok/s matches the 2026-05-20 steady-state
+12.93 tok/s within run-to-run variance. Demo A's 5.14 tok/s is consistent
+with the qb1 single-chip baseline (5.19 tok/s in the QK-rms_norm-shipped
+memory note). Both servers had been bootstrapped before measurement, so
+the numbers reflect steady-state traced decode (not cold-start).
+
+### Legacy 8B-era demos (not re-runnable)
+
+`REPRODUCE.md` documents six experiments from the pre-pivot Llama /
+Qwen2.5 era. All six script files are still present in `experiments/`
+(filenames have evolved slightly — REPRODUCE refers to the older names):
+
+| Script (actual filename) | REPRODUCE.md alias |
+|--------------------------|--------------------|
+| `experiments/60_native_rope_decode.py` | `60_traced_native_rope.py` |
+| `experiments/64_llama32_1b_port.py` | `64_llama1b_port.py` |
+| `experiments/67_llama32_3b_port.py` | `67_llama3b_port.py` |
+| `experiments/73_llama8b_instruct.py` | `73_8b_port.py` |
+| `experiments/76b_8b_correctness_check.py` | (same) |
+| `experiments/80_8b_diverse_qa_demo.py` | (same) |
+
+These targeted the now-deprecated `ssh tenstorrent` host (per `CLAUDE.md`
+non-negotiable #4, that host is no longer available). They have **not**
+been re-run from qb1/qb2 and are kept for historical reference only.
+
+### Experienced-user shortcut
+
+If you already have a working `.venv/` on qb1/qb2 with `torch`,
+`transformers`, `huggingface_hub`, `safetensors`, and `numpy` installed,
+you can skip the `uv sync` step in Setup. The serve scripts only need
+`$VENV_PY` to point at an executable Python interpreter (default
+`$PROJECT_ROOT/.venv/bin/python`); they do **not** invoke `uv`
+themselves. Both Demo A and Demo B above were measured on hosts whose
+`.venv/` pre-dates the new `pyproject.toml` and they ran without any
+`uv sync` step.
+
+---
+
 ## Long context
 
 As of 2026-05-21, the qb2 4-chip TP path is validated at **L=4000** with

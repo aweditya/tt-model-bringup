@@ -13,8 +13,9 @@ dependencies = [
     "numpy>=1.26.4,<2.0",
 
     # HuggingFace ecosystem.
-    # huggingface_hub ships the `huggingface-cli` binary that the README's
-    # `uv run huggingface-cli login` workflow depends on. Do NOT drop it.
+    # huggingface_hub ships the `hf` binary that the README's
+    # `uv run hf auth login` workflow depends on. Do NOT drop it.
+    # (`huggingface-cli` is the deprecated alias for the same binary.)
     "huggingface-hub>=1.10.0",
     "transformers>=5.5.0",
     "safetensors>=0.7.0",
