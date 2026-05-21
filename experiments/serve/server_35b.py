@@ -395,6 +395,7 @@ def handle_generate_35b(state, args):
 
     state.reset_caches()
     prompt_ids = state.tokenizer.encode(prompt)
+    stop_on_eos = bool(args.get("stop_on_eos", True))
 
     # Prefill
     t0 = time.time()
@@ -421,7 +422,7 @@ def handle_generate_35b(state, args):
         h = step_forward(state, h, pos)
         pos += 1
         decode_times.append(time.time() - t1)
-        if next_id == state.tokenizer.eos_token_id:
+        if stop_on_eos and next_id == state.tokenizer.eos_token_id:
             break
 
     generated_text = state.tokenizer.decode(generated_ids, skip_special_tokens=True)
