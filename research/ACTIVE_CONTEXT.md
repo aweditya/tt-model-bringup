@@ -3,7 +3,41 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
-## Current Status (2026-05-20 — final) — B.2.2 SHIPPED, Ring shipped, v4 Stages 1+3 win, 4b-iii regresses, next is TRACE
+## Current Status (2026-05-21 — final) — prefill chunked-DN SHIPPED at seq≤32, pivoting to long context
+
+**Prefill thread CLOSED.** v4 chunked-DN cap shipped (commit `dc41d6d`).
+
+What's in production:
+- `seq_len in {4,8,16,32}` → `_chunked_dn_with_chunked_recurrence_tp` (1.58× faster vs v3 at seq=32, top1 within noise)
+- `seq_len > 32` → v3 per-position path (unchanged production behavior)
+
+Why we capped at 32: real-text apples-to-apples sweep showed clean win at
+C=32, -22% top1 at C=64, -59% top1 at C=128. The chained bf16 matmuls in
+`_chunked_recurrence_tp` accumulate too much error at C≥64. **This is the
+same broader bf16 prefill drift cliff** that gated qb1 long context until
+B3 SDPA config killed it (`feedback_bf16_prefill_drift_cliff.md`,
+`feedback_fp32_sdpa_cliff_probe.md`). Fixing prefill at C≥64 IS the long
+context problem — pivot accordingly.
+
+Methodology note for future sessions: **always use real-text token IDs for
+chunked-DN precision sweeps** (`scripts/v4_precision_sweep.py` has
+precomputed IDs). Synthetic `range(100, N)` produces degenerate baselines
+that look like the change-under-test broke things when actually the
+baseline was already broken.
+
+Deferred (not blocking long context):
+- Task #78 (Stage 2 batched conv1d) — addresses 88% of remaining time in
+  chunked path; small lever now that cap is at 32. Revisit if extending cap.
+- Task #83 (trace capture v3+S1+S3 + Tracy profile) — orthogonal perf work.
+- Task #74 (residual standard all_reduce wedge at Layer 2) — separate bug.
+
+Next: long-context validation on qb2 TP. First probe is needle-haystack at
+L=500 with the qb1 password recipe to verify B3 SDPA is actually plumbed
+through qb2 prefill (memory says decode is on B3 via `gated_attn_step_tp`).
+
+---
+
+## Prior Status (2026-05-20) — B.2.2 SHIPPED, Ring shipped, v4 Stages 1+3 win, 4b-iii regresses, next is TRACE
 
 ### Production status (matters for daily-driver use)
 - **Decode**: 13.02 tok/s, unchanged from before this session
