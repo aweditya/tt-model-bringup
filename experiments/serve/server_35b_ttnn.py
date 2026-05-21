@@ -300,6 +300,27 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state):
     k_h = ttnn.reshape(k_flat, [1, NK_PER_CHIP, HEAD_K_DIM])
     v_h = ttnn.reshape(v_flat, [1, NV_PER_CHIP, HEAD_V_DIM])
 
+    # L2-normalize Q/K per-head: x / sqrt(sum(x*x, dim=-1, keepdim=True) + eps)
+    # Use ttnn.rsqrt to avoid a divide. eps matches HF GatedDeltaNet (1e-6).
+    q_sq = ttnn.mul(q_h, q_h)
+    q_sumsq = ttnn.sum(q_sq, dim=-1, keepdim=True)
+    ttnn.deallocate(q_sq)
+    q_inv = ttnn.rsqrt(ttnn.add(q_sumsq, EPS))
+    ttnn.deallocate(q_sumsq)
+    q_n = ttnn.mul(q_h, q_inv)
+    ttnn.deallocate(q_h); ttnn.deallocate(q_inv)
+
+    k_sq = ttnn.mul(k_h, k_h)
+    k_sumsq = ttnn.sum(k_sq, dim=-1, keepdim=True)
+    ttnn.deallocate(k_sq)
+    k_inv = ttnn.rsqrt(ttnn.add(k_sumsq, EPS))
+    ttnn.deallocate(k_sumsq)
+    k_n = ttnn.mul(k_h, k_inv)
+    ttnn.deallocate(k_h); ttnn.deallocate(k_inv)
+
+    q_h = q_n
+    k_h = k_n
+
     # === beta + g ===
     beta = ttnn.sigmoid(b)  # [1, 8] per chip
     ttnn.deallocate(b)
@@ -321,15 +342,19 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state):
     # g_decay per chip: [1, NV_PER_CHIP=8]
     # beta per chip: [1, NV_PER_CHIP=8]
 
-    # Q/K head broadcast: tile K dim 1 from 4 to 8 (V_HEADS / K_HEADS = 2× repeat).
-    # ttnn.repeat broadcasts; we want repeat_interleave but absent that, use
-    # concat ([q, q] along head dim) — only works if shapes allow.
-    # SHORTCUT for first cut: skip repeat, use first 4 heads of state.
-    # (Placeholder — won't be cosine-correct but exercises recurrence math.)
-    # Per-chip recurrence uses 8-head state; use repeat via concat along head dim.
-    q_rep = ttnn.concat([q_h, q_h], dim=1)  # [1, 8, 128]
-    k_rep = ttnn.concat([k_h, k_h], dim=1)
+    # Q/K head broadcast: V_HEADS / K_HEADS = 2× repeat_interleave.
+    # ttnn lacks repeat_interleave; emulate via reshape→repeat→reshape so
+    # heads come out [q0, q0, q1, q1, q2, q2, q3, q3] (NOT [q0, q1, q2, q3, q0, q1, ...]).
+    GQA_REPEAT = NV_PER_CHIP // NK_PER_CHIP  # = 2
+    q_4d = ttnn.reshape(q_h, [1, NK_PER_CHIP, 1, HEAD_K_DIM])
+    k_4d = ttnn.reshape(k_h, [1, NK_PER_CHIP, 1, HEAD_K_DIM])
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+    q_rep_4d = ttnn.repeat(q_4d, ttnn.Shape([1, 1, GQA_REPEAT, 1]))
+    k_rep_4d = ttnn.repeat(k_4d, ttnn.Shape([1, 1, GQA_REPEAT, 1]))
+    ttnn.deallocate(q_4d); ttnn.deallocate(k_4d)
+    q_rep = ttnn.reshape(q_rep_4d, [1, NV_PER_CHIP, HEAD_K_DIM])
+    k_rep = ttnn.reshape(k_rep_4d, [1, NV_PER_CHIP, HEAD_K_DIM])
+    ttnn.deallocate(q_rep_4d); ttnn.deallocate(k_rep_4d)
 
     # Reshape g_decay [1, 8] → [1, 8, 1, 1] for state broadcast
     g_b = ttnn.reshape(g_decay, [1, NV_PER_CHIP, 1, 1])
