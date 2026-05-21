@@ -47,10 +47,12 @@ from experiments.serve import protocol as P  # noqa: E402
 
 # Model constants — sourced from config.json at bootstrap, mirrors 91f
 MODEL_ID = "Qwen/Qwen3.6-27B"
-MAX_POS = 2048  # 2026-05-21: bumped from 512 → 2048 to validate qb2 TP long
-                # context past L=460. KV cost: bf16 5120·64·2·2·2048 / 4 chips
-                # = ~640 MB/chip extra, easy on P150 HBM. NUM_BLOCKS auto-scales
-                # to 64. Prior bumps: 256→512 on 2026-05-18 (qb1 needle-haystack).
+MAX_POS = 8192  # 2026-05-21: bumped from 2048 → 8192 to validate L=4000/8000.
+                # KV cost is small thanks to GQA: n_kv_heads=4 × head_dim=256 ×
+                # 2(K+V) × bf16 × 64 layers ÷ 4 chips = 64 KB/token/chip.
+                # MAX_POS=8192 → 512 MB/chip extra over MAX_POS=2048, trivial
+                # on P150 HBM. NUM_BLOCKS auto-scales to 256.
+                # History: 256 → 512 (qb1 needle) → 2048 → 8192.
 # Paged KV cache parameters — required for trace-compatible decode
 # (paged_update_cache supports update_idxs_tensor=, non-paged doesn't).
 # BLOCK_SIZE must be a multiple of TILE_HEIGHT=32. NUM_BLOCKS * BLOCK_SIZE = MAX_POS.
