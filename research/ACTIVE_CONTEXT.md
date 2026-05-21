@@ -3,21 +3,29 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
-## Current Status (2026-05-21 — late) — long context VALIDATED to L=1990, MAX_POS=2048 shipped, repro plan drafted
+## Current Status (2026-05-21 — VERY late) — long context to L=7312, BOTH demos verified, repro PR ready for review
 
-**Long context unlocked on qb2 TP.** Needle-haystack 18/18 verbatim across
-L=460/1024/1990. MAX_POS bumped 512 → 2048. See
-`memory/feedback_qb2_tp_long_context_works.md`. Per-token prefill ~76 ms
-(traced one-position-at-a-time). At L=1990 that's 152s prefill — fine for
-the cell, painful at L=4k+ (5 min). Fix is task #83 (trace the chunked-DN
-path).
+**Long context shipped on qb2 TP.** Needle-haystack 24/24 verbatim across
+L=460/1024/1990/4000/7312 (5 length octaves). MAX_POS bumped 512 → 2048 →
+8192. See `memory/feedback_qb2_tp_long_context_works.md`. Per-token
+prefill ~76 ms; L=7312 cell ~9.3 min wall. For L≥4k UX, batched prefill
+(task #83) is the lever.
 
-**Repro packaging plan drafted** at `research/repro_packaging_plan_2026_05_21.md`.
-First PR (~1-2hr): `uv init` + `README.md` skeleton + `.env.example`. Defer
-`scripts/setup.sh` and tt-metal build automation to follow-up.
+**Demo A + Demo B both verified end-to-end on 2026-05-21:**
+- Demo A (qb1, Qwen3.6-27B single P150): 5.14 tok/s, "The capital of France is" → "Paris" coherent.
+- Demo B (qb2, Qwen3.6-27B 4× P150 TP): 12.98 tok/s, same prompt → "Paris" coherent.
+Both numbers match prior baselines within run-to-run variance.
 
-**HF_TOKEN reminder:** qb1+qb2 are unauthenticated (rate-limited HF
-downloads). Run `huggingface-cli login` once per host to fix — see
+**Repro PR ready for review** on local branch
+`worktree-agent-aa634853a73747afd` (4 commits, rebased onto current main,
+NOT pushed). Includes `pyproject.toml` + `uv.lock` + `README.md` +
+`.env.example` + `.gitignore`. README has Setup + Demo A + Demo B + Long
+context + Verified demos + Legacy 8B audit + Troubleshooting. Use `hf
+auth login` (not deprecated `huggingface-cli login`).
+
+**HF_TOKEN reminder:** qb1+qb2 are unauthenticated. Run `hf auth login`
+once per host (the binary ships with `huggingface_hub`, installed by
+`uv sync` if you're using the new flow). See
 `memory/reference_hf_token_setup.md`.
 
 ---
