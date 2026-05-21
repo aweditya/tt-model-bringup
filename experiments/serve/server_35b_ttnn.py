@@ -314,23 +314,66 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state):
     g_decay = ttnn.exp(ttnn.mul(softplus_v, neg_exp_alog))  # [1, 8] per chip, or [8]
     ttnn.deallocate(softplus_v); ttnn.deallocate(neg_exp_alog)
 
-    # === l2_norm q, k per head_dim ===
-    # ttnn might have rms_norm — l2_norm is rsqrt(sum(x^2))
-    # For first cut use rms_norm with weight=1 (effective l2_norm * sqrt(d))
-    # then scale. Or just use rsqrt of sum.
-    # SHORTCUT: use ttnn.rms_norm with weight tensor of ones; gives x / sqrt(mean(x^2))
-    # That's normalized but not unit-l2. The recurrence math expects x / |x| = unit l2.
-    # For now: skip l2_norm (placeholder — won't be cosine-correct).
+    # === Recurrence (state update + output query) ===
+    # State per chip: [1, NV_PER_CHIP=8, HEAD_K_DIM=128, HEAD_V_DIM=128]
+    # q, k per chip: [1, NK_PER_CHIP=4, HEAD_K_DIM=128] — need to broadcast/repeat to 8 heads
+    # v per chip: [1, NV_PER_CHIP=8, HEAD_V_DIM=128]
+    # g_decay per chip: [1, NV_PER_CHIP=8]
+    # beta per chip: [1, NV_PER_CHIP=8]
 
-    # === repeat 4 K heads → 8 V heads (for GQA-style match) ===
-    # ttnn.repeat? Or manual concat of self.
-    # PLACEHOLDER: keep K as-is (4 heads); will need to broadcast in recurrence
+    # Q/K head broadcast: tile K dim 1 from 4 to 8 (V_HEADS / K_HEADS = 2× repeat).
+    # ttnn.repeat broadcasts; we want repeat_interleave but absent that, use
+    # concat ([q, q] along head dim) — only works if shapes allow.
+    # SHORTCUT for first cut: skip repeat, use first 4 heads of state.
+    # (Placeholder — won't be cosine-correct but exercises recurrence math.)
+    # Per-chip recurrence uses 8-head state; use repeat via concat along head dim.
+    q_rep = ttnn.concat([q_h, q_h], dim=1)  # [1, 8, 128]
+    k_rep = ttnn.concat([k_h, k_h], dim=1)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h)
 
-    # === Recurrence — PLACEHOLDER (TODO: full state update) ===
-    # state * g (broadcast); kv_mem = sum(state * k_col); ...
-    # For smoke: just use v_h as core_attn_out (skip recurrence math)
-    core_attn_out = v_h  # [1, 8, 128] per chip
-    ttnn.deallocate(q_h); ttnn.deallocate(k_h); ttnn.deallocate(beta); ttnn.deallocate(g_decay)
+    # Reshape g_decay [1, 8] → [1, 8, 1, 1] for state broadcast
+    g_b = ttnn.reshape(g_decay, [1, NV_PER_CHIP, 1, 1])
+    ttnn.deallocate(g_decay)
+
+    # state = state * g
+    state = ttnn.mul(recurrent_state_in, g_b)
+    ttnn.deallocate(g_b)
+
+    # k_col: [1, 8, 128] → [1, 8, 128, 1]
+    k_col = ttnn.reshape(k_rep, [1, NV_PER_CHIP, HEAD_K_DIM, 1])
+    # kv_mem = sum(state * k_col, dim=-2)
+    state_k = ttnn.mul(state, k_col)
+    kv_mem = ttnn.sum(state_k, dim=-2)  # [1, 8, 1, 128] or [1, 8, 128]
+    ttnn.deallocate(state_k)
+    # kv_mem might be [1, 8, 1, 128]; reshape to match v_h [1, 8, 128]
+    kv_mem_3d = ttnn.reshape(kv_mem, [1, NV_PER_CHIP, HEAD_V_DIM])
+    ttnn.deallocate(kv_mem)
+
+    # delta = (v - kv_mem) * beta
+    v_minus_kv = ttnn.sub(v_h, kv_mem_3d)
+    ttnn.deallocate(kv_mem_3d); ttnn.deallocate(v_h)
+    beta_b = ttnn.reshape(beta, [1, NV_PER_CHIP, 1])
+    ttnn.deallocate(beta)
+    delta = ttnn.mul(v_minus_kv, beta_b)
+    ttnn.deallocate(v_minus_kv); ttnn.deallocate(beta_b)
+
+    # state += k_col * delta.unsqueeze(-2)
+    delta_row = ttnn.reshape(delta, [1, NV_PER_CHIP, 1, HEAD_V_DIM])
+    ttnn.deallocate(delta)
+    k_delta = ttnn.mul(k_col, delta_row)
+    ttnn.deallocate(k_col); ttnn.deallocate(delta_row)
+    state_new = ttnn.add(state, k_delta)
+    ttnn.deallocate(state); ttnn.deallocate(k_delta)
+
+    # out = sum(state_new * q_col, dim=-2)
+    q_col = ttnn.reshape(q_rep, [1, NV_PER_CHIP, HEAD_K_DIM, 1])
+    ttnn.deallocate(q_rep)
+    state_q = ttnn.mul(state_new, q_col)
+    ttnn.deallocate(q_col)
+    core_attn_out_4d = ttnn.sum(state_q, dim=-2)  # [1, 8, 1, 128]
+    ttnn.deallocate(state_q)
+    core_attn_out = ttnn.reshape(core_attn_out_4d, [1, NV_PER_CHIP, HEAD_V_DIM])
+    ttnn.deallocate(core_attn_out_4d)
 
     # === RMSNormGated: (output / sqrt(mean(x^2)) * norm_weight) * silu(z) ===
     # per-head; norm_weight is [HEAD_V_DIM=128] replicated
@@ -356,7 +399,8 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state):
     out = all_reduce_tt(partial, mesh)
     ttnn.deallocate(partial)
 
-    return out, conv_state_in, recurrent_state_in
+    # Return out + NEW recurrent state (state_new). conv state still placeholder.
+    return out, conv_state_in, state_new
 
 
 def moe_forward_ttnn(h_tt, w, mesh):
