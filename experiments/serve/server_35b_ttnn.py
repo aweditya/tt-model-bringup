@@ -248,7 +248,7 @@ def all_reduce_tt(x_tt, mesh):
     return ttnn.all_reduce(x_tt, cluster_axis=1)
 
 
-def dn_forward_ttnn(h_tt, w, mesh, dn_state):
+def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
     """DN block fully on-device. h_tt [1, HIDDEN] replicated.
 
     Implements:
@@ -275,6 +275,19 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state):
     z = ttnn.matmul(h_tt, w["in_proj_z"])            # [1, V_DIM_CHIP=1024] per chip
     a = ttnn.matmul(h_tt, w["in_proj_a"])            # [1, NV_PER_CHIP=8] per chip
     b = ttnn.matmul(h_tt, w["in_proj_b"])            # [1, NV_PER_CHIP=8] per chip
+    if dn_sub_capture is not None:
+        # mixed_qkv per-chip [Q_CHIP | K_CHIP | V_CHIP]; reassemble to HF order
+        dn_sub_capture["dn_in_proj_qkv"] = _reassemble_qkv_chip_to_hf(
+            _ttnn_to_numpy_perchip(mixed_qkv, mesh),
+            KEY_DIM_CHIP, VALUE_DIM_CHIP,
+        )
+        # z/a/b are pure V-head shards → straight concat across chips
+        dn_sub_capture["dn_in_proj_z"] = _reassemble_heads_chip_to_hf(
+            _ttnn_to_numpy_perchip(z, mesh))
+        dn_sub_capture["dn_in_proj_a"] = _reassemble_heads_chip_to_hf(
+            _ttnn_to_numpy_perchip(a, mesh))
+        dn_sub_capture["dn_in_proj_b"] = _reassemble_heads_chip_to_hf(
+            _ttnn_to_numpy_perchip(b, mesh))
 
     # === Conv1d update + silu ===
     # GatedDeltaNet conv1d: depthwise conv over last `kernel_size=4` timesteps.
@@ -297,6 +310,12 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state):
         kw_b = ttnn.reshape(kw_last, [1, CONV_DIM_CHIP])
     weighted = ttnn.mul(mixed_qkv, kw_b)
     ttnn.deallocate(mixed_qkv); ttnn.deallocate(kw_last); ttnn.deallocate(kw_b)
+    if dn_sub_capture is not None:
+        # HF conv1d hook captures the pre-silu output. Reassemble to HF layout.
+        dn_sub_capture["dn_conv1d"] = _reassemble_qkv_chip_to_hf(
+            _ttnn_to_numpy_perchip(weighted, mesh),
+            KEY_DIM_CHIP, VALUE_DIM_CHIP,
+        )
     silu_out = ttnn.silu(weighted)
     ttnn.deallocate(weighted)
 
@@ -437,12 +456,21 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state):
     # Reshape back to [1, V_DIM_CHIP=1024]
     gated_1d = ttnn.reshape(gated, [1, VALUE_DIM_CHIP])
     ttnn.deallocate(gated)
+    if dn_sub_capture is not None:
+        # HF norm output: same head layout as z (V-head sharded)
+        dn_sub_capture["dn_norm"] = _reassemble_heads_chip_to_hf(
+            _ttnn_to_numpy_perchip(gated_1d, mesh))
 
     # === out_proj column-sharded ===
     partial = ttnn.matmul(gated_1d, w["out_proj"])  # [1, HIDDEN] per chip (partial)
     ttnn.deallocate(gated_1d)
     out = all_reduce_tt(partial, mesh)
     ttnn.deallocate(partial)
+    if dn_sub_capture is not None:
+        # HF out_proj hook fires on Linear OUTPUT — that's BEFORE any cross-chip
+        # reduction in TP. Our post-all_reduce out is the equivalent of HF's
+        # full out_proj output (which has no TP partitioning).
+        dn_sub_capture["dn_out_proj"] = _ttnn_to_numpy_replicated(out, mesh).reshape(-1)
 
     # Return out + NEW recurrent state (state_new). conv state still placeholder.
     return out, conv_state_in, state_new
@@ -547,7 +575,10 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     if sub_capture is not None:
         sub_capture["in_norm"] = _ttnn_to_numpy_replicated(h_norm_1, mesh).reshape(-1)
     if layer_type == "linear_attention":
-        mixer_out, new_conv, new_rec = dn_forward_ttnn(h_norm_1, w, mesh, dn_state)
+        dn_sc = sub_capture.setdefault("dn_sub", {}) if sub_capture is not None else None
+        mixer_out, new_conv, new_rec = dn_forward_ttnn(
+            h_norm_1, w, mesh, dn_state, dn_sub_capture=dn_sc,
+        )
         new_dn = (new_conv, new_rec)
         new_kv = kv_cache
     else:
@@ -714,6 +745,39 @@ def _ttnn_to_numpy_replicated(t, mesh):
     return ttnn.to_torch(
         t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
     ).float().numpy()[0]
+
+
+def _ttnn_to_numpy_perchip(t, mesh):
+    """Concat-mesh-to-tensor and return list of NCHIPS per-chip numpy arrays.
+
+    The leading dim after ConcatMeshToTensor is the mesh shard (NCHIPS).
+    """
+    arr = ttnn.to_torch(
+        t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
+    ).float().numpy()
+    return [arr[c] for c in range(NCHIPS)]
+
+
+def _reassemble_qkv_chip_to_hf(per_chip_list, key_dim_chip, value_dim_chip):
+    """Per-chip mixed_qkv layout [Q_chip | K_chip | V_chip] → HF layout
+    [Q_full | K_full | V_full] as a flat numpy vector.
+    """
+    qs, ks, vs = [], [], []
+    for chip_arr in per_chip_list:
+        flat = chip_arr.reshape(-1)
+        assert flat.shape[0] == 2 * key_dim_chip + value_dim_chip, \
+            f"unexpected chip dim {flat.shape}"
+        qs.append(flat[:key_dim_chip])
+        ks.append(flat[key_dim_chip:2 * key_dim_chip])
+        vs.append(flat[2 * key_dim_chip:])
+    return np.concatenate(qs + ks + vs, axis=0)
+
+
+def _reassemble_heads_chip_to_hf(per_chip_list):
+    """Per-chip head-sharded tensor (e.g. z/a/b with chip = NV_PER_CHIP heads)
+    → full HF layout via straight concat across the head axis.
+    """
+    return np.concatenate([c.reshape(-1) for c in per_chip_list], axis=0)
 
 
 def step_forward_ttnn(state, tok_id, pos, capture=None):

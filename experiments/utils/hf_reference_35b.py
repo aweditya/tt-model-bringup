@@ -91,6 +91,15 @@ def main():
     # Layer 0 is linear_attention; module is `linear_attn` (DN)
     if layer_types[0] == "linear_attention":
         handles.append(L0.linear_attn.register_forward_hook(make_hook("mixer_out")))
+        # DN sub-module hooks: 7 hookable points within DN
+        dn = L0.linear_attn
+        handles.append(dn.in_proj_qkv.register_forward_hook(make_hook("dn_in_proj_qkv")))
+        handles.append(dn.in_proj_z.register_forward_hook(make_hook("dn_in_proj_z")))
+        handles.append(dn.in_proj_a.register_forward_hook(make_hook("dn_in_proj_a")))
+        handles.append(dn.in_proj_b.register_forward_hook(make_hook("dn_in_proj_b")))
+        handles.append(dn.conv1d.register_forward_hook(make_hook("dn_conv1d")))
+        handles.append(dn.norm.register_forward_hook(make_hook("dn_norm")))
+        handles.append(dn.out_proj.register_forward_hook(make_hook("dn_out_proj")))
     else:
         handles.append(L0.self_attn.register_forward_hook(make_hook("mixer_out")))
     handles.append(L0.post_attention_layernorm.register_forward_hook(make_hook("post_attn_norm")))
@@ -140,10 +149,21 @@ def main():
     np.save(OUT_DIR / "logits.npy", logits_np)
     np.save(OUT_DIR / "final_norm.npy", final_norm_np)
     np.save(OUT_DIR / "argmax.npy", argmax_np)
-    # L0 intra-layer captures: each shape [1, seq, HIDDEN] → save as [seq, HIDDEN]
+    # L0 intra-layer captures: normalize all to shape [seq, D_flat] so the
+    # cosine probe can do a uniform `arr[p]` lookup per position.
+    seq_local = seq
     for k, v in intra.items():
-        if v.ndim == 3:
+        if v.ndim >= 2 and v.shape[0] == 1:
             v = v[0]
+        if k == "dn_conv1d":
+            # HF shape [CONV_DIM, S+pad] — take valid seq slots and transpose
+            v = v[:, :seq_local].T  # [seq, CONV_DIM]
+        elif k == "dn_norm":
+            # HF shape [B*S*NV_HEADS, head_v_dim] = [seq*NV_HEADS, head_v_dim]
+            # Reshape to [seq, NV_HEADS * head_v_dim] to match our reassembled
+            # per-chip→full V_DIM layout.
+            assert v.ndim == 2, f"unexpected dn_norm shape {v.shape}"
+            v = v.reshape(seq_local, -1)  # [seq, NV_HEADS * head_v_dim]
         np.save(OUT_DIR / f"L0_{k}.npy", v.astype(np.float32))
     meta = {
         "model_id": MODEL_ID,
