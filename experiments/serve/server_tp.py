@@ -1021,6 +1021,13 @@ def _chunked_recurrence_tp(state, q_seq, k_seq, v_seq, g_seq, beta_seq, S_prev, 
     T = ttnn.typecast(T_fp32, ttnn.bfloat16)
     ttnn.deallocate(T_fp32)
 
+    # 2026-05-21: production caps the chunked dispatcher at seq_len ≤ 32 (see
+    # deltanet_chunked_neumann_tp). At C=32 the chained bf16 matmuls are
+    # tolerable (chunked top1 within 1 of v3); at C=64/128 they accumulate
+    # too much error to ship. fp32_dest_acc compute_kernel_config experiment
+    # was inconclusive (test was confounded by synthetic prompts); if revisited,
+    # use real-text token IDs (see scripts/v4_precision_sweep.py).
+
     # --- V_prime = T @ v_beta ---
     V_prime = ttnn.matmul(T, v_beta)     # [NV_PER_CHIP, C, V_DIM]
 
@@ -1425,10 +1432,13 @@ def deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, seq_len):
         IN_PROJ_OUT_CHIP, EPS, CONV_DIM_CHIP, VAL_DIM_CHIP, NV_PER_CHIP,
     )
 
-    # === Stage 4b-iii dispatch: use FULLY chunked DN if seq_len is power of 2 and >= 4
-    # (Neumann factorization requires power-of-2 C). Otherwise fall back to
-    # Stage 1+3 per-pos path below.
-    if seq_len >= 4 and (seq_len & (seq_len - 1)) == 0:
+    # === Stage 4b-iii dispatch: chunked DN only for seq_len in {4, 8, 16, 32}.
+    # Precision sweep 2026-05-21 (feedback_v4_chunked_dn_seq32_shipped.md):
+    # at C=32 chunked is 1.58× faster with -1 top1 (within noise); at C=64
+    # top1 drops -22%, at C=128 top1 drops -59% — unshippable. The 7 chained
+    # bf16 matmuls in _chunked_recurrence_tp accumulate too much error at C≥64.
+    # Fall through to v3 per-position path for longer prefill.
+    if seq_len in (4, 8, 16, 32):
         return _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len)
 
     HIDDEN = cfg['hidden']
