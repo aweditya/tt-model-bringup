@@ -203,20 +203,24 @@ def upload_moe_layer(sd, mesh):
 
     # experts.gate_up_proj [256, 1024, 2048] = [E, gate||up, hidden]
     # Per-chip slice: each chip holds all 256 experts, but its 128-of-512 slice
-    # of BOTH gate and up. So per-chip shape [256, 256, 2048] (128 gate + 128 up).
+    # of BOTH gate and up. Per-chip shape: [256_E, 2048_H, 256_I] (TRANSPOSED
+    # to [hidden, intermediate] for matmul-friendly layout — h @ W → [1, 256]).
     egu = sd["mlp.experts.gate_up_proj"]
     per_chip_egu = []
     for chip in range(NCHIPS):
         gate_slice = egu[:, chip*MOE_INTER_CHIP:(chip+1)*MOE_INTER_CHIP, :]  # [256, 128, 2048]
         up_slice = egu[:, MOE_INTER + chip*MOE_INTER_CHIP:MOE_INTER + (chip+1)*MOE_INTER_CHIP, :]
-        per_chip_egu.append(np.concatenate([gate_slice, up_slice], axis=1))  # [256, 256, 2048]
+        stacked = np.concatenate([gate_slice, up_slice], axis=1)  # [256, 256, 2048]
+        per_chip_egu.append(stacked.transpose(0, 2, 1))  # [256, 2048, 256] — [E, H, I]
     out["experts_gate_up"] = np_stacked_to_sharded(per_chip_egu, mesh)
 
-    # experts.down_proj [256, 2048, 512]: shard along axis 2 (intermediate)
+    # experts.down_proj [256, 2048, 512]: shard along axis 2 (intermediate).
+    # Per-chip [256_E, 128_I, 2048_H] (TRANSPOSED) — mid [1, 128] @ W → [1, 2048].
     ed = sd["mlp.experts.down_proj"]
     per_chip_ed = []
     for chip in range(NCHIPS):
-        per_chip_ed.append(ed[:, :, chip*MOE_INTER_CHIP:(chip+1)*MOE_INTER_CHIP])  # [256, 2048, 128]
+        slab = ed[:, :, chip*MOE_INTER_CHIP:(chip+1)*MOE_INTER_CHIP]  # [256, 2048, 128]
+        per_chip_ed.append(slab.transpose(0, 2, 1))  # [256, 128, 2048] — [E, I, H]
     out["experts_down"] = np_stacked_to_sharded(per_chip_ed, mesh)
 
     # shared_expert.gate_proj / up_proj [512, 2048]: row-sharded
@@ -277,15 +281,36 @@ def moe_forward_ttnn(h_tt, w, mesh):
     for k_idx in range(TOP_K):
         e = int(top_idxs_host[k_idx])
         w_scalar = float(weights_host[k_idx])
-        # Slice expert e's gate_up [256, 2048] from [256, 256, 2048]
-        # ttnn doesn't easily slice along leading dim of [E, in, out] — use a
-        # workaround: build idx tensor [1] = e, use ttnn.embedding-style gather.
-        # Simpler: pre-build slabs at upload as a flat dict keyed by (chip, e)?
-        # Won't scale to 256 experts on each chip = 1024 entries. Need indexed read.
-        # PLACEHOLDER for first cut: skip the indexed routed compute, set routed=0.
-        # The shared expert dominates output magnitude anyway; this validates
-        # the on-device pipeline. Fix routed in next iteration.
-        pass
+        # Slice expert e's gate_up: per-chip [256_E, 2048_H, 256_I] → [1, 2048, 256] → [2048, 256]
+        gate_up_e = ttnn.slice(
+            w["experts_gate_up"], [e, 0, 0], [e + 1, HIDDEN, 2 * MOE_INTER_CHIP]
+        )
+        gate_up_e_2d = ttnn.reshape(gate_up_e, [HIDDEN, 2 * MOE_INTER_CHIP])
+        gate_up = ttnn.matmul(h_tt, gate_up_e_2d)  # [1, 256]
+        ttnn.deallocate(gate_up_e); ttnn.deallocate(gate_up_e_2d)
+        # Split gate||up halves: [1, 256] → [1, 128] gate + [1, 128] up
+        gate_part = ttnn.slice(gate_up, [0, 0], [1, MOE_INTER_CHIP])
+        up_part = ttnn.slice(gate_up, [0, MOE_INTER_CHIP], [1, 2 * MOE_INTER_CHIP])
+        ttnn.deallocate(gate_up)
+        mid = ttnn.mul(ttnn.silu(gate_part), up_part)  # [1, 128]
+        ttnn.deallocate(gate_part); ttnn.deallocate(up_part)
+        # Slice expert e's down: per-chip [256_E, 128_I, 2048_H] → [1, 128, 2048] → [128, 2048]
+        down_e = ttnn.slice(
+            w["experts_down"], [e, 0, 0], [e + 1, MOE_INTER_CHIP, HIDDEN]
+        )
+        down_e_2d = ttnn.reshape(down_e, [MOE_INTER_CHIP, HIDDEN])
+        expert_out = ttnn.matmul(mid, down_e_2d)  # [1, 2048] per chip
+        ttnn.deallocate(down_e); ttnn.deallocate(down_e_2d); ttnn.deallocate(mid)
+        # Weighted accumulate: scale by w_scalar then add
+        # ttnn.mul with scalar broadcast — pass float
+        weighted = ttnn.mul(expert_out, w_scalar)
+        ttnn.deallocate(expert_out)
+        if routed_partial is None:
+            routed_partial = weighted
+        else:
+            new_routed = ttnn.add(routed_partial, weighted)
+            ttnn.deallocate(routed_partial); ttnn.deallocate(weighted)
+            routed_partial = new_routed
 
     # SHARED EXPERT (sharded intermediate dim)
     s_gate = ttnn.matmul(h_tt, w["shared_gate"])  # [1, 128] per chip
