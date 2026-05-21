@@ -281,29 +281,36 @@ def moe_forward_ttnn(h_tt, w, mesh):
     for k_idx in range(TOP_K):
         e = int(top_idxs_host[k_idx])
         w_scalar = float(weights_host[k_idx])
-        # Slice expert e's gate_up: per-chip [256_E, 2048_H, 256_I] → [1, 2048, 256] → [2048, 256]
+        # Mesh sharded tensors carry their leading mesh-shard dim in the LOGICAL
+        # shape. experts_gate_up logical [NCHIPS, 256_E, 2048_H, 256_I];
+        # per-chip [256_E, 2048_H, 256_I]. Slice begins/ends must be rank-4.
+        # Mesh-sharded tensor padded to rank 4 with leading 1.
+        # Logical shape: [1, 256_E, 2048_H, 256_I] (per-chip view).
         gate_up_e = ttnn.slice(
-            w["experts_gate_up"], [e, 0, 0], [e + 1, HIDDEN, 2 * MOE_INTER_CHIP]
-        )
-        gate_up_e_2d = ttnn.reshape(gate_up_e, [HIDDEN, 2 * MOE_INTER_CHIP])
-        gate_up = ttnn.matmul(h_tt, gate_up_e_2d)  # [1, 256]
-        ttnn.deallocate(gate_up_e); ttnn.deallocate(gate_up_e_2d)
-        # Split gate||up halves: [1, 256] → [1, 128] gate + [1, 128] up
+            w["experts_gate_up"],
+            [0, e, 0, 0],
+            [1, e + 1, HIDDEN, 2 * MOE_INTER_CHIP],
+        )  # per-chip [1, 1, HIDDEN, 2*INTER]
+        gate_up_e_w = ttnn.reshape(gate_up_e, [HIDDEN, 2 * MOE_INTER_CHIP])
+        gate_up = ttnn.matmul(h_tt, gate_up_e_w)  # [1, 2*INTER] per chip
+        ttnn.deallocate(gate_up_e); ttnn.deallocate(gate_up_e_w)
+        # Split gate||up halves
         gate_part = ttnn.slice(gate_up, [0, 0], [1, MOE_INTER_CHIP])
         up_part = ttnn.slice(gate_up, [0, MOE_INTER_CHIP], [1, 2 * MOE_INTER_CHIP])
         ttnn.deallocate(gate_up)
-        mid = ttnn.mul(ttnn.silu(gate_part), up_part)  # [1, 128]
+        mid = ttnn.mul(ttnn.silu(gate_part), up_part)
         ttnn.deallocate(gate_part); ttnn.deallocate(up_part)
-        # Slice expert e's down: per-chip [256_E, 128_I, 2048_H] → [1, 128, 2048] → [128, 2048]
+        # Slice expert e's down: logical [NCHIPS, 256_E, 128_I, 2048_H] → [NCHIPS, 1, 128, 2048]
         down_e = ttnn.slice(
-            w["experts_down"], [e, 0, 0], [e + 1, MOE_INTER_CHIP, HIDDEN]
+            w["experts_down"],
+            [0, e, 0, 0],
+            [1, e + 1, MOE_INTER_CHIP, HIDDEN],
         )
-        down_e_2d = ttnn.reshape(down_e, [MOE_INTER_CHIP, HIDDEN])
-        expert_out = ttnn.matmul(mid, down_e_2d)  # [1, 2048] per chip
-        ttnn.deallocate(down_e); ttnn.deallocate(down_e_2d); ttnn.deallocate(mid)
-        # Weighted accumulate: scale by w_scalar then add
-        # ttnn.mul with scalar broadcast — pass float
-        weighted = ttnn.mul(expert_out, w_scalar)
+        down_e_w = ttnn.reshape(down_e, [MOE_INTER_CHIP, HIDDEN])
+        expert_out = ttnn.matmul(mid, down_e_w)  # [1, HIDDEN] per chip (partial)
+        ttnn.deallocate(down_e); ttnn.deallocate(down_e_w); ttnn.deallocate(mid)
+        # Weighted accumulate
+        weighted = ttnn.multiply(expert_out, w_scalar)  # scalar broadcast
         ttnn.deallocate(expert_out)
         if routed_partial is None:
             routed_partial = weighted
