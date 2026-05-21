@@ -75,7 +75,7 @@ uv sync
 
 This reads `pyproject.toml` + `uv.lock` and provisions `.venv/` with the
 pinned versions of `torch`, `transformers`, `huggingface_hub`,
-`safetensors`, `numpy`, `accelerate`, and `tqdm`.
+`safetensors`, and `numpy`.
 
 ### 4. Configure HuggingFace access (HF_TOKEN)
 
@@ -162,11 +162,12 @@ Steady-state throughput on qb2 as of 2026-05-20: **12.93 tok/s** with
 
 ## Long context
 
-As of 2026-05-21, the qb2 4-chip TP path is validated at **L=1990** with
-**18/18 needle-haystack** retrieval (B3 HiFi2 SDPA recipe). See the
-in-progress probe at
-`experiments/utils/needle_haystack_qb2_tp.py` (the predecessor qb1
-single-chip probe lives in
+As of 2026-05-21, the qb2 4-chip TP path is validated at **L=4000** with
+**verbatim 8-char needle-haystack retrieval** at all needle positions
+(0.25/0.5/0.75 frac), using the B3 HiFi2 SDPA recipe. Sweep history:
+L=460 (6/6), L=1024 (6/6), L=1990 (6/6), L=4000 (3/3), L=8000 (in
+flight). Probe: `experiments/utils/needle_haystack_qb2_tp.py` (the
+predecessor qb1 single-chip probe lives in
 `experiments/utils/needle_haystack_b3_probe.py`).
 
 ---
