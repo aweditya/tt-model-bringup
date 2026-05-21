@@ -3,7 +3,49 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
-## Current Status (2026-05-21 — VERY late) — long context to L=7312, BOTH demos verified, repro PR ready for review
+## Current Status (2026-05-21 — MoE bringup mid-stream) — B0→B11 green, qb1 has fabric, mesh TP validated on qb1
+
+**Qwen3.6-35B-A3B MoE bringup at half-mark.** G0 (HF reference capture) and
+G1 (single-chip ttnn) and most of G2 (mesh ttnn) blocks green:
+
+```
+G0 HF references:
+  B0 layer 0 DN          cos=1.0   (e44736a)
+  B1 layer 0 MoE         cos=1.0   (4c56298)
+  B2 layer 0 full        cos=1.0   (ca30561)
+  B3 layer 3 attn        cos=1.0   (a5712a7), MRoPE == standard partial RoPE
+  B4 4-layer chain       cos=1.0   (1fd7c57)
+  B5 full 40-layer       predicts ' Paris'  (cbb6f20)
+
+G1 single-chip ttnn (qb1):
+  B7 DN block            cos=0.999839  (00fdf02)
+  B8 MoE block           cos=0.999894  (69703a9)
+  B9 full layer 0        cos=0.999997  (325d188)
+
+G2 mesh ttnn (qb1 (1,4), fabric confirmed):
+  B10 DN on mesh         cos=0.999984  (fe88c5b)
+  B11 MoE on mesh        cos=0.999991  (this turn)
+
+Next: B12 (compose B10+B11+RMSNorms+residuals on mesh), B13 (cosine
+ladder), B14 (server integration → coherent ' Paris').
+```
+
+**Major project hygiene update:** CLAUDE.md non-negotiable #5 said qb1
+has NO fabric — that's stale as of 2026-05-21. Verified live via
+`experiments/utils/qb1_fabric_probe.py`. CLAUDE.md updated this turn.
+
+qb1 has fabric → MoE bringup proceeds on qb1 mesh, qb2 prod TP server
+(Qwen3.6-27B @ 12.93 tok/s) stays up the whole time.
+
+Owned kernels (`owned_gdn_decode_owned`, `owned_decay_gate_decode_owned`)
+are still qb2-only. B7/B10 use stock ttnn for the gated delta recurrence.
+B16 owned-kernel reuse defers to either (a) rebuilding qb1's ttnn with
+owned ops integrated, or (b) running the integration step at the same
+time as we re-bootstrap qb2's mesh.
+
+---
+
+## Prior Status (2026-05-21 — VERY late) — long context to L=7312, BOTH demos verified, repro PR ready for review
 
 **Long context shipped on qb2 TP.** Needle-haystack 24/24 verbatim across
 L=460/1024/1990/4000/7312 (5 length octaves). MAX_POS bumped 512 → 2048 →
