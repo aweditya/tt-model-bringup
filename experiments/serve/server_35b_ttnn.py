@@ -694,11 +694,20 @@ class State:
         self.kv_caches_tt = kv
 
 
-def step_forward_ttnn(state, tok_id, pos):
+def _ttnn_to_numpy_replicated(t, mesh):
+    """Concat-mesh-to-tensor of a replicated tensor, take chip 0 view as numpy."""
+    return ttnn.to_torch(
+        t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
+    ).float().numpy()[0]
+
+
+def step_forward_ttnn(state, tok_id, pos, capture=None):
     """ONE forward step fully on device: embed → 40 layers → final_norm → lm_head → argmax.
 
-    Returns next_id (int — single readback at end), no host data movement
-    during the layer chain.
+    Returns next_id (int — single readback at end). When capture is a dict
+    (debug-only), populates per-layer hidden states + final_norm + logits.
+    Capture adds host roundtrips and breaks the "all on device" property;
+    only pass capture during cosine-probe debugging.
     """
     # 1. Embed lookup on device.
     # ttnn.embedding expects uint32 idx tensor; torch.from_numpy doesn't
@@ -713,6 +722,8 @@ def step_forward_ttnn(state, tok_id, pos):
     ttnn.deallocate(tok_idx_tt)
     h_tt = ttnn.to_layout(embed_out, ttnn.TILE_LAYOUT)
     ttnn.deallocate(embed_out)
+    if capture is not None:
+        capture["embed"] = _ttnn_to_numpy_replicated(h_tt, state.mesh).reshape(-1)
 
     # 2. RoPE cos/sin for this position — host compute (small), upload replicated.
     # For first cut: zeros (placeholder, will fix later).
@@ -742,14 +753,20 @@ def step_forward_ttnn(state, tok_id, pos):
             state.dn_caches_tt[L] = new_dn
         if new_kv is not None:
             state.kv_caches_tt[L] = new_kv
+        if capture is not None:
+            capture[f"layer_{L}"] = _ttnn_to_numpy_replicated(h_tt, state.mesh).reshape(-1)
 
     ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
 
     # 4. Final norm + lm_head + argmax (all on device).
     h_norm = ttnn.rms_norm(h_tt, weight=state.final_norm_tt, epsilon=EPS)
     ttnn.deallocate(h_tt)
+    if capture is not None:
+        capture["final_norm"] = _ttnn_to_numpy_replicated(h_norm, state.mesh).reshape(-1)
     logits = ttnn.matmul(h_norm, state.lm_head_tt)  # [1, VOCAB] per chip (replicated)
     ttnn.deallocate(h_norm)
+    if capture is not None:
+        capture["logits"] = _ttnn_to_numpy_replicated(logits, state.mesh).reshape(-1)
 
     # On-device argmax requires ROW_MAJOR input (multicore argmax constraint).
     logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
