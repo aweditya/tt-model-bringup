@@ -47,9 +47,10 @@ from experiments.serve import protocol as P  # noqa: E402
 
 # Model constants — sourced from config.json at bootstrap, mirrors 91f
 MODEL_ID = "Qwen/Qwen3.6-27B"
-MAX_POS = 512  # 2026-05-18: bumped from 256 to clear the qb1 single-chip
-               # 500-position long-context bar (cf. feedback_fp32_sdpa_cliff_probe.md,
-               # feedback_needle_haystack_qb1.md) for the owned_gdn promotion gate.
+MAX_POS = 2048  # 2026-05-21: bumped from 512 → 2048 to validate qb2 TP long
+                # context past L=460. KV cost: bf16 5120·64·2·2·2048 / 4 chips
+                # = ~640 MB/chip extra, easy on P150 HBM. NUM_BLOCKS auto-scales
+                # to 64. Prior bumps: 256→512 on 2026-05-18 (qb1 needle-haystack).
 # Paged KV cache parameters — required for trace-compatible decode
 # (paged_update_cache supports update_idxs_tensor=, non-paged doesn't).
 # BLOCK_SIZE must be a multiple of TILE_HEIGHT=32. NUM_BLOCKS * BLOCK_SIZE = MAX_POS.

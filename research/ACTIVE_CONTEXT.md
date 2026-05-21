@@ -3,7 +3,26 @@
 Read this first after context compaction. Do not re-summarize the whole
 `HANDOFF.md` unless the user asks for a full audit.
 
-## Current Status (2026-05-21 — final) — prefill chunked-DN SHIPPED at seq≤32, pivoting to long context
+## Current Status (2026-05-21 — late) — long context VALIDATED to L=1990, MAX_POS=2048 shipped, repro plan drafted
+
+**Long context unlocked on qb2 TP.** Needle-haystack 18/18 verbatim across
+L=460/1024/1990. MAX_POS bumped 512 → 2048. See
+`memory/feedback_qb2_tp_long_context_works.md`. Per-token prefill ~76 ms
+(traced one-position-at-a-time). At L=1990 that's 152s prefill — fine for
+the cell, painful at L=4k+ (5 min). Fix is task #83 (trace the chunked-DN
+path).
+
+**Repro packaging plan drafted** at `research/repro_packaging_plan_2026_05_21.md`.
+First PR (~1-2hr): `uv init` + `README.md` skeleton + `.env.example`. Defer
+`scripts/setup.sh` and tt-metal build automation to follow-up.
+
+**HF_TOKEN reminder:** qb1+qb2 are unauthenticated (rate-limited HF
+downloads). Run `huggingface-cli login` once per host to fix — see
+`memory/reference_hf_token_setup.md`.
+
+---
+
+## Prior Status (2026-05-21 — final) — prefill chunked-DN SHIPPED at seq≤32, pivoting to long context
 
 **Prefill thread CLOSED.** v4 chunked-DN cap shipped (commit `dc41d6d`).
 
