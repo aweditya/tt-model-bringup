@@ -1,0 +1,26 @@
+[project]
+name = "tt-model-bringup"
+version = "0.1.0"
+description = "Tenstorrent Blackhole LLM bringup (Qwen3.6-family) — direct TT-Metal model bringup with custom owned_* compute kernels."
+readme = "README.md"
+requires-python = ">=3.10"
+
+# TT-NN (ttnn) is installed separately via Tenstorrent's tt-metal source build.
+# See README.md "Setup" section for the build flow; pin SHA TBD.
+dependencies = [
+    # Core ML stack — torch is CPU-only here; device tensors come from ttnn.
+    "torch>=2.11.0",
+    "numpy>=1.26.4,<2.0",
+
+    # HuggingFace ecosystem.
+    # huggingface_hub ships the `huggingface-cli` binary that the README's
+    # `uv run huggingface-cli login` workflow depends on. Do NOT drop it.
+    "huggingface-hub>=1.10.0",
+    "transformers>=5.5.0",
+    "safetensors>=0.7.0",
+    "accelerate>=1.0.0",
+    "tqdm>=4.66.0",
+]
+
+# uv-managed, no PyPI publishing.
+# `[build-system]` intentionally omitted (uv init --no-package).
