@@ -616,10 +616,107 @@ class State:
         self.tokenizer = None
         self.text_cfg = None
         self.layer_types = None
-        self.embed_w_np = None  # keep host copy for now; uploads per-token
+        self.embed_w_np = None
+        self.embed_tt = None     # ROW_MAJOR table for ttnn.embedding
         self.final_norm_tt = None
         self.lm_head_tt = None
         self.per_layer_tt = None
+        self.dn_caches_tt = None  # list per layer: (conv_state_tt, recurrent_state_tt) or None
+        self.kv_caches_tt = None  # list per layer: KV cache dict or None
+
+    def reset_caches_ttnn(self):
+        n = self.text_cfg.num_hidden_layers
+        dn = []
+        kv = []
+        for L in range(n):
+            if self.layer_types[L] == "linear_attention":
+                cs_np = np.zeros((NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
+                rs_np = np.zeros((NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
+                cs_tt = ttnn.from_torch(
+                    torch.from_numpy(cs_np), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
+                )
+                rs_tt = ttnn.from_torch(
+                    torch.from_numpy(rs_np), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
+                )
+                dn.append((cs_tt, rs_tt))
+                kv.append(None)
+            else:
+                dn.append(None)
+                kv.append(None)
+        self.dn_caches_tt = dn
+        self.kv_caches_tt = kv
+
+
+def step_forward_ttnn(state, tok_id, pos):
+    """ONE forward step fully on device: embed → 40 layers → final_norm → lm_head → argmax.
+
+    Returns next_id (int — single readback at end), no host data movement
+    during the layer chain.
+    """
+    # 1. Embed lookup on device.
+    # ttnn.embedding expects uint32 idx tensor; torch.from_numpy doesn't
+    # accept np.uint32 directly on older torch, so go through int32.
+    tok_idx_np = np.array([[tok_id]], dtype=np.int32)
+    tok_idx_tt = ttnn.from_torch(
+        torch.from_numpy(tok_idx_np),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    embed_out = ttnn.embedding(tok_idx_tt, state.embed_tt)  # [1, 1, HIDDEN] per chip
+    ttnn.deallocate(tok_idx_tt)
+    h_tt = ttnn.to_layout(embed_out, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(embed_out)
+
+    # 2. RoPE cos/sin for this position — host compute (small), upload replicated.
+    # For first cut: zeros (placeholder, will fix later).
+    cos_np = np.zeros((1, 1, ROTARY_DIM), dtype=np.float32)
+    sin_np = np.zeros((1, 1, ROTARY_DIM), dtype=np.float32)
+    cos_tt = np_to_replicated(cos_np, state.mesh)
+    sin_tt = np_to_replicated(sin_np, state.mesh)
+
+    # 3. 40-layer chain.
+    n = state.text_cfg.num_hidden_layers
+    for L in range(n):
+        lt = state.layer_types[L]
+        h_new, new_dn, new_kv = layer_forward_ttnn(
+            h_tt, state.per_layer_tt[L], lt, state.mesh,
+            cos_tt, sin_tt, state.dn_caches_tt[L], state.kv_caches_tt[L],
+        )
+        ttnn.deallocate(h_tt)
+        h_tt = h_new
+        if new_dn is not None:
+            # Deallocate old caches before overwriting
+            old_conv, old_rec = state.dn_caches_tt[L]
+            new_conv, new_rec = new_dn
+            if new_conv is not old_conv:
+                ttnn.deallocate(old_conv)
+            if new_rec is not old_rec:
+                ttnn.deallocate(old_rec)
+            state.dn_caches_tt[L] = new_dn
+        if new_kv is not None:
+            state.kv_caches_tt[L] = new_kv
+
+    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+
+    # 4. Final norm + lm_head + argmax (all on device).
+    h_norm = ttnn.rms_norm(h_tt, weight=state.final_norm_tt, epsilon=EPS)
+    ttnn.deallocate(h_tt)
+    logits = ttnn.matmul(h_norm, state.lm_head_tt)  # [1, VOCAB] per chip (replicated)
+    ttnn.deallocate(h_norm)
+
+    # On-device argmax (vocab is small enough to argmax directly)
+    argmax_tt = ttnn.argmax(logits, dim=-1, keepdim=True, use_multicore=True)
+    ttnn.deallocate(logits)
+
+    # 5. Single 8-byte readback of the argmax — ONLY host transfer per step.
+    next_id_t = ttnn.to_torch(
+        argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+    )
+    ttnn.deallocate(argmax_tt)
+    next_id = int(next_id_t.flatten()[0].item())
+    return next_id
 
 
 def bootstrap(state, log):
@@ -637,15 +734,20 @@ def bootstrap(state, log):
 
     log("[bootstrap] enumerate shards + load top-level weights to mesh…")
     key_to_shard = build_key_to_shard()
-    # Keep embed on host (per-token lookup is cheap); upload only what's used in
-    # per-token matmuls. lm_head + final_norm → mesh.
-    state.embed_w_np = load_t(key_to_shard, "model.language_model.embed_tokens.weight")
+    # Upload embed table to mesh (replicated; small enough at 248320*2048*2B = 1 GB).
+    # ttnn.embedding requires ROW_MAJOR layout for the table.
+    embed_w_np = load_t(key_to_shard, "model.language_model.embed_tokens.weight")
+    state.embed_tt = ttnn.from_torch(
+        torch.from_numpy(embed_w_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    state.embed_w_np = embed_w_np  # keep host copy too as fallback
+
     final_norm_w = load_t(key_to_shard, "model.language_model.norm.weight")
     lm_head_w = load_t(key_to_shard, "lm_head.weight")
-    # Pre-multiply final_norm by 1 + final_norm? Actually for the FINAL norm,
-    # the same Qwen3_5MoeRMSNorm convention applies — output * (1 + w).
-    # We'll handle the +1 inside the forward (it's just one extra add).
-    state.final_norm_tt = np_to_replicated(final_norm_w, state.mesh)
+    # final_norm uses (1+w) convention per Qwen3_5MoeRMSNorm — pre-add at upload
+    state.final_norm_tt = np_to_replicated(final_norm_w + 1.0, state.mesh)
     state.lm_head_tt = np_to_replicated(lm_head_w.T, state.mesh)  # [hidden, vocab] for matmul
 
     log("[bootstrap] uploading 40 layer weights to mesh (sharded per plan §3.2)…")
@@ -764,6 +866,29 @@ def main():
     ).float().numpy()[0]
     print(f"  Layer 0 out norm: {np.linalg.norm(layer_out_np):.4f}")
     print(f"  ✓ on-device full layer (DN + MoE + residuals + 2 layernorms) works")
+
+    # Deallocate single-layer smoke leftovers so step_forward_ttnn starts clean
+    ttnn.deallocate(h_tt)
+    ttnn.deallocate(out); ttnn.deallocate(h_norm); ttnn.deallocate(layer_out)
+    if state.layer_types[0] == "linear_attention":
+        ttnn.deallocate(dn_out)
+        ttnn.deallocate(conv_state_tt); ttnn.deallocate(recurrent_state_tt)
+    ttnn.deallocate(conv_state_tt2); ttnn.deallocate(rec_state_tt2)
+    ttnn.deallocate(cos_zero); ttnn.deallocate(sin_zero)
+    if attn_layer_idx is not None and attn_layer_idx < len(state.per_layer_tt):
+        ttnn.deallocate(attn_out); ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+
+    # ── FULL end-to-end on-device step_forward_ttnn smoke ──────────────
+    print("\n  step_forward_ttnn end-to-end smoke (embed → 40 layers → lm_head → argmax)…")
+    state.reset_caches_ttnn()
+    print(f"  caches reset: {sum(1 for x in state.dn_caches_tt if x is not None)} DN, "
+          f"{sum(1 for x in state.kv_caches_tt if x is None)} KV placeholders")
+    t0 = time.time()
+    next_id = step_forward_ttnn(state, tok_id, pos=0)
+    t1 = time.time()
+    tok_text = state.tokenizer.decode([next_id])
+    print(f"  next_id={next_id} text={tok_text!r}  (took {(t1-t0)*1000:.1f} ms)")
+    print(f"  ✓ FULL on-device step_forward_ttnn works end-to-end")
 
     ttnn.close_mesh_device(state.mesh)
     ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
