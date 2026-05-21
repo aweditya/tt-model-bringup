@@ -248,6 +248,72 @@ def all_reduce_tt(x_tt, mesh):
     return ttnn.all_reduce(x_tt, cluster_axis=1)
 
 
+def dn_forward_ttnn(h_tt, w, mesh, dn_state):
+    """DN block fully on-device. h_tt [1, HIDDEN] replicated.
+
+    dn_state: (conv_state_tt, recurrent_state_tt) per-chip-sharded.
+    For smoke: caller passes zeros uploaded fresh each call.
+
+    Returns (output_tt [1, HIDDEN] replicated, new_conv_state, new_recurrent_state).
+    """
+    conv_state_in, recurrent_state_in = dn_state
+
+    # Projections (sharded per-chip outputs)
+    mixed_qkv = ttnn.matmul(h_tt, w["in_proj_qkv"])  # [1, 2048] per chip
+    z = ttnn.matmul(h_tt, w["in_proj_z"])            # [1, 1024] per chip
+    a = ttnn.matmul(h_tt, w["in_proj_a"])            # [1, 8] per chip
+    b = ttnn.matmul(h_tt, w["in_proj_b"])            # [1, 8] per chip
+
+    # Conv1d update + silu (per-chip)
+    # conv_state_in per-chip: [1, CONV_DIM_CHIP=2048, CONV_KERNEL=4]
+    # Shift left by 1 and write new mixed_qkv at end via concat.
+    # Approach: slice cols 1:4 (last 3 cols), concat with mixed_qkv reshaped [1, 2048, 1]
+    # NOTE: ttnn.slice + concat on mesh tensors — TODO verify works.
+    # For now: do conv update via numpy round-trip (last host↔device step
+    # we'll eliminate later) — focus on validating projections + recurrence first.
+    # PLACEHOLDER: just compute conv_out as new_state's broadcast read.
+    # Simpler: skip conv, use mixed_qkv directly (will be wrong numerically
+    # for cosine comparison, but smoke-validates shapes).
+    silu_out = ttnn.silu(mixed_qkv)  # [1, 2048] per chip — placeholder for conv+silu
+    ttnn.deallocate(mixed_qkv)
+
+    # The above is a PLACEHOLDER — real conv1d update needs slice+concat or
+    # an owned kernel. For smoke we skip ahead to validate the recurrence
+    # plumbing works on device.
+
+    # For initial smoke, also skip recurrence and just project silu_out → out_proj
+    # to confirm matmul + all_reduce of DN's out_proj works.
+    # NOTE: this is NOT correct DN math — just a "does the pipeline run" check.
+
+    # Take the V part of silu_out (last V_DIM_CHIP=1024 elements) and project
+    # via out_proj.
+    # Slice rank 4 on mesh tensor: silu_out per-chip [1, 2048], logical [1, 1, 1, 2048]
+    # Slice last 1024 cols:
+    silu_out_4d_shape = list(silu_out.shape)  # could be [1, 2048] or padded
+    # Just use ttnn.slice with rank matching the logical shape
+    rank = len(silu_out_4d_shape)
+    if rank == 2:
+        v_part = ttnn.slice(silu_out, [0, KEY_DIM_CHIP * 2], [1, CONV_DIM_CHIP])
+    else:
+        # rank-4 padded form
+        zeros_pad = [0] * (rank - 1)
+        end_pad = list(silu_out_4d_shape[:-1])
+        v_part = ttnn.slice(silu_out, zeros_pad + [KEY_DIM_CHIP * 2], end_pad + [CONV_DIM_CHIP])
+    ttnn.deallocate(silu_out)
+    # Now v_part per-chip shape [1, V_DIM_CHIP=1024]
+    # out_proj per-chip [V_DIM_CHIP=1024, HIDDEN=2048]
+    partial = ttnn.matmul(v_part, w["out_proj"])  # [1, HIDDEN] per chip (partial)
+    ttnn.deallocate(v_part)
+    out = all_reduce_tt(partial, mesh)
+    ttnn.deallocate(partial)
+
+    # Also deallocate unused projections (placeholder)
+    ttnn.deallocate(z); ttnn.deallocate(a); ttnn.deallocate(b)
+
+    # Return out + unchanged state (placeholders — real impl evolves state)
+    return out, conv_state_in, recurrent_state_in
+
+
 def moe_forward_ttnn(h_tt, w, mesh):
     """MoE block fully on-device. h_tt [1, 2048] replicated. Returns [1, 2048] replicated."""
     # Router (replicated weight, replicated input → replicated output)
@@ -418,16 +484,36 @@ def main():
     print(f"  h_tt shape={list(h_tt.shape)} dtype={h_tt.dtype}")
 
     # Run MoE on layer 0 (forward through just one block to validate plumbing)
-    h_norm = ttnn.add(ttnn.rms_norm(h_tt, weight=state.per_layer_tt[0]["post_attention_layernorm"], epsilon=EPS), 0.0)
-    # NOTE: (1 + w) handling — for now using plain w * norm; correctness check
-    # for later. First just verify the plumbing.
+    h_norm = ttnn.rms_norm(h_tt, weight=state.per_layer_tt[0]["post_attention_layernorm"], epsilon=EPS)
     out = moe_forward_ttnn(h_norm, state.per_layer_tt[0], state.mesh)
     print(f"  MoE out shape={list(out.shape)}")
     out_np = ttnn.to_torch(
         out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
     ).float().numpy()[0]
     print(f"  out norm: {np.linalg.norm(out_np):.4f} (shape {out_np.shape})")
-    print(f"  ✓ on-device MoE shared-expert path works end-to-end on (1,4) mesh")
+    print(f"  ✓ on-device MoE block (routed + shared) works on (1,4) mesh")
+
+    # DN smoke (placeholder — projections + out_proj, no conv/recurrence yet)
+    if state.layer_types[0] == "linear_attention":
+        print("\n  DN smoke (layer 0)…")
+        # Build zero state tensors (sharded per chip)
+        conv_state_np = np.zeros((NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
+        recurrent_state_np = np.zeros((NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
+        conv_state_tt = ttnn.from_torch(
+            torch.from_numpy(conv_state_np), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0),
+        )
+        recurrent_state_tt = ttnn.from_torch(
+            torch.from_numpy(recurrent_state_np), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0),
+        )
+        dn_out, _, _ = dn_forward_ttnn(h_tt, state.per_layer_tt[0], state.mesh,
+                                        (conv_state_tt, recurrent_state_tt))
+        dn_out_np = ttnn.to_torch(
+            dn_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        ).float().numpy()[0]
+        print(f"  DN out norm: {np.linalg.norm(dn_out_np):.4f} (shape {dn_out_np.shape})")
+        print(f"  ✓ on-device DN matmul plumbing works (no conv/recurrence yet — placeholder)")
 
     ttnn.close_mesh_device(state.mesh)
     ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
