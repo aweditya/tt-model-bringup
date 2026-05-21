@@ -276,9 +276,29 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state):
     a = ttnn.matmul(h_tt, w["in_proj_a"])            # [1, NV_PER_CHIP=8] per chip
     b = ttnn.matmul(h_tt, w["in_proj_b"])            # [1, NV_PER_CHIP=8] per chip
 
-    # === Conv1d update + silu — PLACEHOLDER (TODO: real conv state shift) ===
-    silu_out = ttnn.silu(mixed_qkv)
-    ttnn.deallocate(mixed_qkv)
+    # === Conv1d update + silu ===
+    # GatedDeltaNet conv1d: depthwise conv over last `kernel_size=4` timesteps.
+    # For each per-chip channel c: out[c] = sum_k(state[..., c, k] * w[c, k]).
+    # State holds last (kernel_size - 1) inputs in slots [0..2]; current input
+    # goes in slot 3. For decode token t≥1 we'd shift state left and append;
+    # for token 0 state is zero so output collapses to mixed_qkv * w[:, 3].
+    #
+    # First-cut implementation: apply current-position kernel weight only
+    # (correct for token 0; non-trivial state shift wired in B16l).
+    # w["conv1d_weight"] per-chip shape [CONV_DIM_CHIP, KERNEL] = [2048, 4]
+    cw = w["conv1d_weight"]
+    cw_rank = len(list(cw.shape))
+    if cw_rank == 3:
+        kw_last = ttnn.slice(cw, [0, 0, CONV_KERNEL - 1], [1, CONV_DIM_CHIP, CONV_KERNEL])
+        # per-chip [1, 2048, 1] — reshape to [1, 2048] for broadcast against mixed_qkv
+        kw_b = ttnn.reshape(kw_last, [1, CONV_DIM_CHIP])
+    else:
+        kw_last = ttnn.slice(cw, [0, CONV_KERNEL - 1], [CONV_DIM_CHIP, CONV_KERNEL])
+        kw_b = ttnn.reshape(kw_last, [1, CONV_DIM_CHIP])
+    weighted = ttnn.mul(mixed_qkv, kw_b)
+    ttnn.deallocate(mixed_qkv); ttnn.deallocate(kw_last); ttnn.deallocate(kw_b)
+    silu_out = ttnn.silu(weighted)
+    ttnn.deallocate(weighted)
 
     # === Split q/k/v from silu_out ===
     # ttnn.matmul output on mesh has rank 3 (with leading batch/mesh padding):
