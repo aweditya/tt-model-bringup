@@ -68,6 +68,8 @@ TOP_K = 8
 MOE_INTER = 512
 EPS = 1e-6
 
+ROPE_THETA = 10_000_000.0  # Qwen3.6 rope_scaling.rope_theta (verified via inspector)
+
 NCHIPS = 4
 NV_PER_CHIP = NUM_V_HEADS // NCHIPS
 NK_PER_CHIP = NUM_K_HEADS // NCHIPS
@@ -534,6 +536,32 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
     return out, conv_state_new, state_new
 
 
+def _apply_partial_rope(x, cos_tt, sin_tt, n_heads):
+    """Apply Qwen3.6 partial RoPE to x [n_heads, HEAD_DIM_ATTN]:
+       only first ROTARY_DIM dims rotated, rest passthrough.
+
+       x_rot_embed = x_rot * cos + rotate_half(x_rot) * sin
+       rotate_half([a, b]) = [-b, a]   (a, b each half of ROTARY_DIM)
+    """
+    x_rot = ttnn.slice(x, [0, 0], [n_heads, ROTARY_DIM])
+    x_pass = ttnn.slice(x, [0, ROTARY_DIM], [n_heads, HEAD_DIM_ATTN])
+    half = ROTARY_DIM // 2
+    x1 = ttnn.slice(x_rot, [0, 0], [n_heads, half])
+    x2 = ttnn.slice(x_rot, [0, half], [n_heads, ROTARY_DIM])
+    neg_x2 = ttnn.neg(x2)
+    ttnn.deallocate(x2)
+    rotated = ttnn.concat([neg_x2, x1], dim=-1)
+    ttnn.deallocate(neg_x2); ttnn.deallocate(x1)
+    x_rot_cos = ttnn.mul(x_rot, cos_tt)  # broadcast cos [1, R] across [N, R]
+    rotated_sin = ttnn.mul(rotated, sin_tt)
+    ttnn.deallocate(x_rot); ttnn.deallocate(rotated)
+    x_rot_embed = ttnn.add(x_rot_cos, rotated_sin)
+    ttnn.deallocate(x_rot_cos); ttnn.deallocate(rotated_sin)
+    x_embed = ttnn.concat([x_rot_embed, x_pass], dim=-1)
+    ttnn.deallocate(x_rot_embed); ttnn.deallocate(x_pass)
+    return x_embed
+
+
 def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     """Attention block on-device, single-token decode (T=1).
 
@@ -573,9 +601,16 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
 
-    # RoPE skipped (placeholder). At pos 0 this is identity. At pos≥1, lack of
-    # RoPE means Q/K don't have positional rotation — attention still works
-    # approximately but loses fine position discrimination.
+    # TODO: re-enable partial RoPE once L39 cosine regression debugged. First
+    # naive enable showed pos≥1 L39 cos dropping 0.95→0.81 (with both bf16 and
+    # fp32 cos/sin upload). Suspect ttnn broadcast or slice-concat layout issue
+    # in _apply_partial_rope. Suppressed for now to preserve KV-cache gains.
+    # When fixed:
+    #   q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
+    #   ttnn.deallocate(q_n); q_n = q_n_rope
+    #   k_n_rope = _apply_partial_rope(k_n, cos_tt, sin_tt, 1)
+    #   ttnn.deallocate(k_n); k_n = k_n_rope
+    _ = cos_tt; _ = sin_tt  # silence unused until RoPE wired
 
     # === KV cache evolution ===
     # k_n shape per chip [1, HEAD_DIM]; v_h same.
@@ -890,12 +925,28 @@ def step_forward_ttnn(state, tok_id, pos, capture=None):
     if capture is not None:
         capture["embed"] = _ttnn_to_numpy_replicated(h_tt, state.mesh).reshape(-1)
 
-    # 2. RoPE cos/sin for this position — host compute (small), upload replicated.
-    # For first cut: zeros (placeholder, will fix later).
-    cos_np = np.zeros((1, 1, ROTARY_DIM), dtype=np.float32)
-    sin_np = np.zeros((1, 1, ROTARY_DIM), dtype=np.float32)
-    cos_tt = np_to_replicated(cos_np, state.mesh)
-    sin_tt = np_to_replicated(sin_np, state.mesh)
+    # 2. RoPE cos/sin for this position. Standard partial RoPE (MRoPE collapses
+    # to this for text-only). inv_freq[i] = theta^(-2i/ROTARY_DIM) for i in [0, R/2).
+    # cos_full = [cos(p*f), cos(p*f)]  and same for sin (so each pair shares angle).
+    # Compute in fp64 → cast to fp32, then upload to keep small-angle precision.
+    inv_freq = 1.0 / (ROPE_THETA ** (
+        np.arange(0, ROTARY_DIM, 2).astype(np.float64) / ROTARY_DIM))  # [R/2]
+    angle = float(pos) * inv_freq  # [R/2]
+    cos_half = np.cos(angle).astype(np.float32)
+    sin_half = np.sin(angle).astype(np.float32)
+    cos_np = np.concatenate([cos_half, cos_half]).reshape(1, ROTARY_DIM)  # [1, R]
+    sin_np = np.concatenate([sin_half, sin_half]).reshape(1, ROTARY_DIM)
+    # Upload as float32 to preserve precision on small angles (high-freq dims)
+    cos_tt = ttnn.from_torch(
+        torch.from_numpy(cos_np),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    sin_tt = ttnn.from_torch(
+        torch.from_numpy(sin_np),
+        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
 
     # 3. 40-layer chain.
     n = state.text_cfg.num_hidden_layers

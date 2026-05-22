@@ -41,6 +41,15 @@ def main():
         if depth <= 1 and n:
             print(f"  L0.{n}: {type(mod).__name__}")
 
+    # RoPE / attention config bits needed by server_35b_ttnn
+    print("\nRoPE / attention config:")
+    tc = m.config.get_text_config() if hasattr(m.config, "get_text_config") else m.config
+    for attr in ["rope_theta", "rope_scaling", "head_dim", "partial_rotary_factor",
+                 "max_position_embeddings", "num_attention_heads", "num_key_value_heads",
+                 "hidden_size", "attn_implementation"]:
+        val = getattr(tc, attr, "NOT_SET")
+        print(f"  {attr}: {val}")
+
 
 if __name__ == "__main__":
     main()
