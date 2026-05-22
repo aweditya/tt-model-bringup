@@ -601,17 +601,23 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
 
-    # RoPE temporarily disabled (commit b132002). _apply_partial_rope helper
-    # passes numpy oracle bit-exactly (rope_numpy_oracle.py cos 1.0 vs HF)
-    # and ttnn micro-probe at multi-row inputs (cos 0.999998). But integrated
-    # enable regresses cosine probe L39 pos≥1 from 0.95 → 0.81 — even with
-    # force_identity_rope=True (cos=1, sin=0). Root cause not yet found;
-    # suspect either (a) ttnn slice+concat round-trip on rms_norm output has
-    # subtle precision noise that compounds across 10 attn layers, or
-    # (b) HF parallel-prefill softmax vs my sequential softmax differs in a
-    # way that's papered over without RoPE. Helper + cos/sin compute stay
-    # in place for the future re-enable.
-    _ = cos_tt; _ = sin_tt  # used by RoPE when re-enabled
+    # RoPE deferred (see commit ab711e7). NOOP_ROPE=True confirmed to match
+    # the no-RoPE baseline pos 1 L39 cos exactly (0.9484); turning on
+    # _apply_partial_rope (even with cos=1, sin=0) regresses to 0.81. Bug
+    # is inside the slice/concat round-trip when integrated, even though
+    # the helper passes isolated micro-probes. Flip ENABLE_ROPE to True
+    # when the integration issue is fixed.
+    _ = cos_tt; _ = sin_tt
+    ENABLE_ROPE = False
+    if ENABLE_ROPE:
+        q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
+        ttnn.deallocate(q_n); q_n = q_n_rope
+        k_n_broadcast = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
+        ttnn.deallocate(k_n)
+        k_n_rope_broadcast = _apply_partial_rope(k_n_broadcast, cos_tt, sin_tt, NQ_PER_CHIP)
+        ttnn.deallocate(k_n_broadcast)
+        k_n = ttnn.slice(k_n_rope_broadcast, [0, 0], [1, HEAD_DIM_ATTN])
+        ttnn.deallocate(k_n_rope_broadcast)
 
     # === KV cache evolution ===
     # k_n shape per chip [1, HEAD_DIM]; v_h same.
