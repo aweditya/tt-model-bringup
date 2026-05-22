@@ -608,42 +608,40 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     # the helper passes isolated micro-probes. Flip ENABLE_ROPE to True
     # when the integration issue is fixed.
     _ = cos_tt; _ = sin_tt
-    # RoPE bisection results (commit TBD):
-    #   ENABLE_ROPE_Q=T, K=F: matches no-RoPE baseline cosines (L39 0.94-0.99). PASS.
-    #   ENABLE_ROPE_Q=F, K=T direct: pos 1 L39 0.92 (vs 0.94 baseline) — minor regression.
-    #   ENABLE_ROPE_Q=F, K=T broadcast/slice workaround: pos 1 L39 0.89 — WORSE.
-    #   ENABLE_ROPE_Q=T, K=T direct: pos 1 L39 0.81 — compound.
-    # Q-side is correct. K-side single-row [1, HEAD_DIM_ATTN] introduces noise
-    # that no micro-probe variant reproduces. Suspected: ttnn op behavior on
-    # rms_norm output at [1, HEAD_DIM_ATTN] differs subtly from fresh-upload
-    # bf16 tensors at the same shape, even though micro-probe with random
-    # values matches numpy bit-exactly.
-    #
-    # Workable next step: store K WITHOUT RoPE in cache; apply RoPE INSIDE
-    # attention computation (rotate Q_t and K_cache_t at each attention step
-    # with the relevant position's cos/sin). That avoids storing rotated K
-    # and lets us test if the K-rotation-output is what's bad, vs the
-    # K-rotation-then-store pipeline.
-    # For now: keep both off so baseline cosines are preserved.
-    ENABLE_ROPE_Q = False
-    ENABLE_ROPE_K = False
-    if ENABLE_ROPE_Q:
+    ENABLE_ROPE = True
+    BROADCAST_KV = True  # broadcast K and V both to [NQ_PER_CHIP, HEAD_DIM]
+    if ENABLE_ROPE:
+        # Q: direct rotation, works in micro-probe and integration
         q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
         ttnn.deallocate(q_n); q_n = q_n_rope
-    if ENABLE_ROPE_K:
-        k_n_rope_raw = _apply_partial_rope(k_n, cos_tt, sin_tt, 1)
-        ttnn.deallocate(k_n); k_n = k_n_rope_raw
+        # K: broadcast to NQ_PER_CHIP rows BEFORE rotation. Cache will also
+        # store [NQ_PER_CHIP, HEAD_DIM] per step. Attention math holds (each
+        # Q head attends to identical 4 K copies; softmax splits weight
+        # equally; V also broadcast so weighted sum recovers correct result).
+        if BROADCAST_KV:
+            k_n_b = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
+            ttnn.deallocate(k_n)
+            k_n_rope = _apply_partial_rope(k_n_b, cos_tt, sin_tt, NQ_PER_CHIP)
+            ttnn.deallocate(k_n_b)
+            k_n = k_n_rope
 
     # === KV cache evolution ===
-    # k_n shape per chip [1, HEAD_DIM]; v_h same.
+    # k_n: [NQ_PER_CHIP, HEAD_DIM] when ENABLE_ROPE+BROADCAST_KV is on,
+    #      else [1, HEAD_DIM]
+    # v: from matmul, [1, HEAD_DIM]
     v_h = ttnn.reshape(v, [1, HEAD_DIM_ATTN])
-    # NOTE: don't deallocate v here — v_h is a view of v and we need both alive
-    # until v_h is consumed (concat creates a new tensor, then we can drop v).
+    # When BROADCAST_KV is on, also broadcast V to match K's row count so
+    # K/V cache shapes stay consistent. Math: 4 identical V copies + 4
+    # identical K copies → softmax distributes evenly → weighted sum recovers
+    # the single-head attention result.
+    BROADCAST_V_LOCAL = (ENABLE_ROPE and BROADCAST_KV)
+    if BROADCAST_V_LOCAL:
+        v_h_broadcast = ttnn.concat([v_h] * NQ_PER_CHIP, dim=0)
+        ttnn.deallocate(v_h); v_h = v_h_broadcast
     if kv_cache is None:
         # pos 0: cache IS current K, V (no concat needed). Use direct refs.
         k_hist = k_n
         v_hist = v_h
-        # k_n / v_h are now returned as cache; don't deallocate them.
     else:
         # pos ≥ 1: concat current to existing history along position dim 0
         k_prev, v_prev = kv_cache
