@@ -608,16 +608,31 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     # the helper passes isolated micro-probes. Flip ENABLE_ROPE to True
     # when the integration issue is fixed.
     _ = cos_tt; _ = sin_tt
-    ENABLE_ROPE = False
-    if ENABLE_ROPE:
+    # RoPE bisection results (commit TBD):
+    #   ENABLE_ROPE_Q=T, K=F: matches no-RoPE baseline cosines (L39 0.94-0.99). PASS.
+    #   ENABLE_ROPE_Q=F, K=T direct: pos 1 L39 0.92 (vs 0.94 baseline) — minor regression.
+    #   ENABLE_ROPE_Q=F, K=T broadcast/slice workaround: pos 1 L39 0.89 — WORSE.
+    #   ENABLE_ROPE_Q=T, K=T direct: pos 1 L39 0.81 — compound.
+    # Q-side is correct. K-side single-row [1, HEAD_DIM_ATTN] introduces noise
+    # that no micro-probe variant reproduces. Suspected: ttnn op behavior on
+    # rms_norm output at [1, HEAD_DIM_ATTN] differs subtly from fresh-upload
+    # bf16 tensors at the same shape, even though micro-probe with random
+    # values matches numpy bit-exactly.
+    #
+    # Workable next step: store K WITHOUT RoPE in cache; apply RoPE INSIDE
+    # attention computation (rotate Q_t and K_cache_t at each attention step
+    # with the relevant position's cos/sin). That avoids storing rotated K
+    # and lets us test if the K-rotation-output is what's bad, vs the
+    # K-rotation-then-store pipeline.
+    # For now: keep both off so baseline cosines are preserved.
+    ENABLE_ROPE_Q = False
+    ENABLE_ROPE_K = False
+    if ENABLE_ROPE_Q:
         q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
         ttnn.deallocate(q_n); q_n = q_n_rope
-        k_n_broadcast = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
-        ttnn.deallocate(k_n)
-        k_n_rope_broadcast = _apply_partial_rope(k_n_broadcast, cos_tt, sin_tt, NQ_PER_CHIP)
-        ttnn.deallocate(k_n_broadcast)
-        k_n = ttnn.slice(k_n_rope_broadcast, [0, 0], [1, HEAD_DIM_ATTN])
-        ttnn.deallocate(k_n_rope_broadcast)
+    if ENABLE_ROPE_K:
+        k_n_rope_raw = _apply_partial_rope(k_n, cos_tt, sin_tt, 1)
+        ttnn.deallocate(k_n); k_n = k_n_rope_raw
 
     # === KV cache evolution ===
     # k_n shape per chip [1, HEAD_DIM]; v_h same.
@@ -951,15 +966,16 @@ def step_forward_ttnn(state, tok_id, pos, capture=None):
         sin_half = np.sin(angle).astype(np.float32)
         cos_np = np.concatenate([cos_half, cos_half]).reshape(1, ROTARY_DIM)  # [1, R]
         sin_np = np.concatenate([sin_half, sin_half]).reshape(1, ROTARY_DIM)
-    # Upload as float32 to preserve precision on small angles (high-freq dims)
+    # Upload as bf16 to match q_n/k_n dtype (avoids bf16*fp32→fp32 dtype
+    # promotion that would mismatch downstream bf16 consumers / KV cache).
     cos_tt = ttnn.from_torch(
         torch.from_numpy(cos_np),
-        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
     sin_tt = ttnn.from_torch(
         torch.from_numpy(sin_np),
-        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
 
