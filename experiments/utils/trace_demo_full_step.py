@@ -62,10 +62,12 @@ def main():
 
     # Reset caches before trace capture so state is clean
     state.reset_caches_ttnn()
-    log("attempting begin_trace_capture → step_forward_ttnn → end_trace_capture…")
+    # Update input buffers OUTSIDE trace capture (no host writes inside trace).
+    srv.update_input_buffers(state, tok_id, 0)
+    log("attempting begin_trace_capture → step_forward_inner → end_trace_capture…")
     try:
         trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
-        next_id_traced = srv.step_forward_ttnn(state, tok_id, 0)
+        next_id_traced = srv.step_forward_inner(state)
         ttnn.end_trace_capture(state.mesh, trace_id, cq_id=0)
         log(f"  ✓ trace capture succeeded; next_id during capture = {next_id_traced}")
         log(f"  trace_id = {trace_id}")
@@ -78,6 +80,7 @@ def main():
     log("attempting execute_trace…")
     try:
         state.reset_caches_ttnn()
+        srv.update_input_buffers(state, tok_id, 0)
         t0 = time.time()
         ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=True)
         elapsed = (time.time() - t0) * 1000.0

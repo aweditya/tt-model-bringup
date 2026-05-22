@@ -852,8 +852,14 @@ class State:
         self.final_norm_tt = None
         self.lm_head_tt = None
         self.per_layer_tt = None
-        self.dn_caches_tt = None  # list per layer: (conv_state_tt, recurrent_state_tt) or None
-        self.kv_caches_tt = None  # list per layer: KV cache dict or None
+        self.dn_caches_tt = None
+        self.kv_caches_tt = None
+        # B17 trace-capture input buffers (pre-allocated, written in-place
+        # OUTSIDE the trace via update_input_buffers).
+        self.tok_buf = None         # uint32 [1, 1] ROW_MAJOR — for ttnn.embedding(state.embed_tt)
+        self.rot_idxs_buf = None    # uint32 [1, 1] ROW_MAJOR — for cos/sin table lookup
+        self.cos_table_tt = None    # fp32 [MAX_KV, ROTARY_DIM] — pre-baked cos values for all positions
+        self.sin_table_tt = None    # fp32 [MAX_KV, ROTARY_DIM] — pre-baked sin values for all positions
 
     def reset_caches_ttnn(self):
         n = self.text_cfg.num_hidden_layers
@@ -921,61 +927,88 @@ def _reassemble_heads_chip_to_hf(per_chip_list):
     return np.concatenate([c.reshape(-1) for c in per_chip_list], axis=0)
 
 
-def step_forward_ttnn(state, tok_id, pos, capture=None):
-    """ONE forward step fully on device: embed → 40 layers → final_norm → lm_head → argmax.
+def update_input_buffers(state, token_id, cur_pos):
+    """Write new token id + rot_idxs into pre-allocated buffers in-place.
 
-    Returns next_id (int — single readback at end). When capture is a dict
-    (debug-only), populates per-layer hidden states + final_norm + logits.
-    Capture adds host roundtrips and breaks the "all on device" property;
-    only pass capture during cosine-probe debugging.
+    Must be called OUTSIDE trace capture. The trace then reads from these
+    buffers (no host-side from_torch inside captured region).
     """
-    # 1. Embed lookup on device.
-    # ttnn.embedding expects uint32 idx tensor; torch.from_numpy doesn't
-    # accept np.uint32 directly on older torch, so go through int32.
-    tok_idx_np = np.array([[tok_id]], dtype=np.int32)
-    tok_idx_tt = ttnn.from_torch(
-        torch.from_numpy(tok_idx_np),
-        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+    tok_host = ttnn.from_torch(
+        torch.tensor([[token_id]], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    embed_out = ttnn.embedding(tok_idx_tt, state.embed_tt)  # [1, 1, HIDDEN] per chip
-    ttnn.deallocate(tok_idx_tt)
+    ttnn.copy_host_to_device_tensor(tok_host, state.tok_buf)
+    rot_host = ttnn.from_torch(
+        torch.tensor([[cur_pos]], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(rot_host, state.rot_idxs_buf)
+
+
+def _precompute_cos_sin_table(mesh, max_pos):
+    """Precompute cos/sin tables for all positions [0, max_pos) of partial RoPE.
+
+    Returns (cos_table_tt, sin_table_tt) each shape [max_pos, ROTARY_DIM] fp32.
+    Used with ttnn.embedding(rot_idxs_buf, table) to look up the row for the
+    current position inside the trace (no host writes per step).
+    """
+    inv_freq = 1.0 / (ROPE_THETA ** (
+        np.arange(0, ROTARY_DIM, 2).astype(np.float64) / ROTARY_DIM))  # [R/2]
+    pos = np.arange(0, max_pos, dtype=np.float64)
+    angle = pos[:, None] * inv_freq[None, :]   # [max_pos, R/2]
+    cos_half = np.cos(angle).astype(np.float32)
+    sin_half = np.sin(angle).astype(np.float32)
+    cos = np.concatenate([cos_half, cos_half], axis=-1)  # [max_pos, R]
+    sin = np.concatenate([sin_half, sin_half], axis=-1)
+    cos_tt = ttnn.from_torch(
+        torch.from_numpy(cos),
+        dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
+    sin_tt = ttnn.from_torch(
+        torch.from_numpy(sin),
+        dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
+    return cos_tt, sin_tt
+
+
+def step_forward_ttnn(state, tok_id, pos, capture=None):
+    """Eager-mode public API: updates input buffers + runs step_forward_inner.
+
+    Caller-friendly: pass tok_id (int) and pos (int). For trace capture, call
+    update_input_buffers + step_forward_inner directly (so update writes happen
+    OUTSIDE the captured trace region).
+    """
+    update_input_buffers(state, tok_id, pos)
+    return step_forward_inner(state, capture=capture)
+
+
+def step_forward_inner(state, capture=None):
+    """Trace-friendly forward step: reads ONLY from pre-allocated buffers
+    (state.tok_buf, state.rot_idxs_buf) and per-layer weights. No host writes
+    inside. Returns next_id (int — one 8-byte readback at end).
+    """
+    embed_out = ttnn.embedding(state.tok_buf, state.embed_tt)  # [1, 1, HIDDEN] per chip
     h_tt = ttnn.to_layout(embed_out, ttnn.TILE_LAYOUT)
     ttnn.deallocate(embed_out)
     if capture is not None:
         capture["embed"] = _ttnn_to_numpy_replicated(h_tt, state.mesh).reshape(-1)
 
-    # 2. RoPE cos/sin for this position. Standard partial RoPE (MRoPE collapses
-    # to this for text-only). inv_freq[i] = theta^(-2i/ROTARY_DIM) for i in [0, R/2).
-    # cos_full = [cos(p*f), cos(p*f)]  and same for sin (so each pair shares angle).
-    # Compute in fp64 → cast to fp32, then upload to keep small-angle precision.
-    # ISOLATION: force_identity_rope=True forces cos=1 sin=0 to test the RoPE
-    # wrapper overhead. Should give same cosines as RoPE-disabled baseline if
-    # the apply_rope ops are bit-correct on identity inputs.
-    force_identity_rope = False
-    if force_identity_rope:
-        cos_np = np.ones((1, ROTARY_DIM), dtype=np.float32)
-        sin_np = np.zeros((1, ROTARY_DIM), dtype=np.float32)
-    else:
-        inv_freq = 1.0 / (ROPE_THETA ** (
-            np.arange(0, ROTARY_DIM, 2).astype(np.float64) / ROTARY_DIM))  # [R/2]
-        angle = float(pos) * inv_freq  # [R/2]
-        cos_half = np.cos(angle).astype(np.float32)
-        sin_half = np.sin(angle).astype(np.float32)
-        cos_np = np.concatenate([cos_half, cos_half]).reshape(1, ROTARY_DIM)  # [1, R]
-        sin_np = np.concatenate([sin_half, sin_half]).reshape(1, ROTARY_DIM)
-    # Upload as bf16 to match q_n/k_n dtype (avoids bf16*fp32→fp32 dtype
-    # promotion that would mismatch downstream bf16 consumers / KV cache).
-    cos_tt = ttnn.from_torch(
-        torch.from_numpy(cos_np),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
-    sin_tt = ttnn.from_torch(
-        torch.from_numpy(sin_np),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
+    # 2. RoPE cos/sin: look up the row for the current position from the
+    # pre-baked table via ttnn.embedding(rot_idxs_buf, cos_table_tt).
+    # Avoids per-step host writes (trace-friendly).
+    cos_row = ttnn.embedding(state.rot_idxs_buf, state.cos_table_tt)  # [1, 1, R]
+    sin_row = ttnn.embedding(state.rot_idxs_buf, state.sin_table_tt)
+    # Cast to TILE_LAYOUT for downstream ops (rms_norm, mul, etc.)
+    cos_tt = ttnn.to_layout(cos_row, ttnn.TILE_LAYOUT)
+    sin_tt = ttnn.to_layout(sin_row, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(cos_row); ttnn.deallocate(sin_row)
+    # Reshape from [1, 1, R] → [1, R] to match _apply_partial_rope broadcast expectation
+    cos_tt = ttnn.reshape(cos_tt, [1, ROTARY_DIM])
+    sin_tt = ttnn.reshape(sin_tt, [1, ROTARY_DIM])
 
     # 3. 40-layer chain.
     n = state.text_cfg.num_hidden_layers
@@ -1088,6 +1121,22 @@ def bootstrap(state, log):
         if (L + 1) % 10 == 0:
             log(f"  layer {L+1}/{state.text_cfg.num_hidden_layers} uploaded ({time.time()-t0:.1f}s)")
     log(f"  all weights uploaded in {time.time()-t0:.1f}s")
+
+    log("[bootstrap] pre-allocate trace input buffers + cos/sin table…")
+    # Pre-allocate tok_buf and rot_idxs_buf — written in-place via
+    # update_input_buffers() outside trace, read inside via ttnn.embedding.
+    state.tok_buf = ttnn.from_torch(
+        torch.zeros((1, 1), dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    state.rot_idxs_buf = ttnn.from_torch(
+        torch.zeros((1, 1), dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    state.cos_table_tt, state.sin_table_tt = _precompute_cos_sin_table(state.mesh, MAX_KV)
+    log(f"  tok_buf, rot_idxs_buf, cos/sin tables ({MAX_KV} positions) ready.")
     log("[bootstrap] ready.")
 
 
