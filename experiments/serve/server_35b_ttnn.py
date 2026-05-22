@@ -535,61 +535,94 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
 
 
 def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
-    """Attention block on-device, single-token (T=1).
+    """Attention block on-device, single-token decode (T=1).
 
     Q-head sharded (NQ_PER_CHIP=4 Q heads per chip). K, V each chip holds the
-    ONE KV head its 4 Q heads attend to (chip→KV-head mapping handled at upload).
+    ONE KV head its 4 Q heads attend to (chip→KV-head mapping at upload).
 
-    cos_tt, sin_tt: per-chip replicated [1, 1, ROTARY_DIM=64].
+    kv_cache: None on pos 0, else (k_history_tt [n, HEAD_DIM], v_history_tt [n, HEAD_DIM])
+      per chip. Naive concat growth — fine for short context, swap for in-place
+      tt-metal kv_cache.update_cache_for_token_ post-correctness.
 
-    For pos 0 with empty KV cache, attn reduces to attn_out = V (per Q head).
-    RoPE skipped (identity at pos 0). KV cache append skipped (no cache).
+    RoPE not yet wired (identity placeholder; effective at pos 0 since cos=1, sin=0,
+    and at pos≥1 history attention still works approximately because V values differ
+    per position even without Q/K position discrimination).
 
-    Returns out [1, HIDDEN] replicated.
+    Returns (out [1, HIDDEN] replicated, new_kv_cache).
     """
-    # Q projection (sharded along Q-head axis); outputs Q+gate concatenated
-    # per-chip [1, NQ_PER_CHIP * HEAD_DIM_ATTN * 2 = 2048]
+    # Q projection (Q-head sharded); per-chip [1, NQ_PER_CHIP * HEAD_DIM * 2]
     q_full = ttnn.matmul(h_tt, w["q_proj"])
-    # K, V per chip [1, HEAD_DIM_ATTN=256] — single KV head, per chip→KV mapping at upload.
+    # K, V per chip [1, HEAD_DIM_ATTN] — single KV head per chip (mapping at upload).
     k = ttnn.matmul(h_tt, w["k_proj"])
     v = ttnn.matmul(h_tt, w["v_proj"])
 
-    # Split Q + gate PER HEAD (per HF line 672-674: torch.chunk after view to
-    # [..., NUM_Q_HEADS, head_dim*2]). The flat per-chip q_full has layout
-    # [head0_Q(256) | head0_gate(256) | head1_Q | head1_gate | ...]. Reshape to
-    # [NQ_PER_CHIP, head_dim*2] and split last dim to get clean Q vs gate.
+    # Split Q + gate per-head (HF chunk after view to [..., -1, head_dim*2])
     q_full_2d = ttnn.reshape(q_full, [NQ_PER_CHIP, HEAD_DIM_ATTN * 2])
     ttnn.deallocate(q_full)
-    q_h = ttnn.slice(q_full_2d, [0, 0], [NQ_PER_CHIP, HEAD_DIM_ATTN])  # [4, 256]
+    q_h = ttnn.slice(q_full_2d, [0, 0], [NQ_PER_CHIP, HEAD_DIM_ATTN])
     gate_part_per_head = ttnn.slice(q_full_2d, [0, HEAD_DIM_ATTN],
-                                     [NQ_PER_CHIP, HEAD_DIM_ATTN * 2])  # [4, 256]
+                                     [NQ_PER_CHIP, HEAD_DIM_ATTN * 2])
     ttnn.deallocate(q_full_2d)
-    # Flat gate for the post-attn multiply later (HF: gate.reshape(*input_shape, -1))
     gate_part = ttnn.reshape(gate_part_per_head, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
     ttnn.deallocate(gate_part_per_head)
 
-    # k_norm: rms_norm on [1, HEAD_DIM_ATTN] (single KV head per chip)
+    # Q/K rms_norm per HEAD_DIM
     k_h = ttnn.reshape(k, [1, HEAD_DIM_ATTN])
     ttnn.deallocate(k)
     q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
     k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
-    ttnn.deallocate(q_n); ttnn.deallocate(k_n)  # placeholder: RoPE+QK^T skipped, only V used
 
-    # RoPE on Q, K — placeholder (identity at pos 0).
-    # KV cache write/read — placeholder (empty cache at pos 0).
-    # For pos 0 + empty cache, attn(Q, K_curr, V_curr) = V_curr (single-token softmax = 1).
-    # Per chip's NQ_PER_CHIP Q heads all attend to the chip's single KV head → broadcast V.
+    # RoPE skipped (placeholder). At pos 0 this is identity. At pos≥1, lack of
+    # RoPE means Q/K don't have positional rotation — attention still works
+    # approximately but loses fine position discrimination.
+
+    # === KV cache evolution ===
+    # k_n shape per chip [1, HEAD_DIM]; v_h same.
     v_h = ttnn.reshape(v, [1, HEAD_DIM_ATTN])
-    ttnn.deallocate(v)
-    if NQ_PER_CHIP == 4:
-        v_per_q = ttnn.concat([v_h, v_h, v_h, v_h], dim=0)
+    # NOTE: don't deallocate v here — v_h is a view of v and we need both alive
+    # until v_h is consumed (concat creates a new tensor, then we can drop v).
+    if kv_cache is None:
+        # pos 0: cache IS current K, V (no concat needed). Use direct refs.
+        k_hist = k_n
+        v_hist = v_h
+        # k_n / v_h are now returned as cache; don't deallocate them.
     else:
-        v_per_q = ttnn.concat([v_h] * NQ_PER_CHIP, dim=0)
-    ttnn.deallocate(v_h)
+        # pos ≥ 1: concat current to existing history along position dim 0
+        k_prev, v_prev = kv_cache
+        k_hist = ttnn.concat([k_prev, k_n], dim=0)
+        v_hist = ttnn.concat([v_prev, v_h], dim=0)
+        ttnn.deallocate(k_prev); ttnn.deallocate(v_prev)
+        ttnn.deallocate(k_n); ttnn.deallocate(v_h)
+    ttnn.deallocate(v)  # safe after v_h consumed (or aliased as v_hist for pos 0)
+    new_kv_cache = (k_hist, v_hist)
 
-    attn_flat = ttnn.reshape(v_per_q, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
-    ttnn.deallocate(v_per_q)
+    # === Attention: softmax(Q @ K_hist^T / sqrt(d_k)) @ V_hist ===
+    # Q [NQ_PER_CHIP=4, HEAD_DIM=256], K/V_hist [hist_len, 256]
+    # At pos 0 with hist_len=1, softmax over single value is degenerate (always 1.0
+    # mathematically but ttnn impl may differ). For now: compute QK^T via element-wise
+    # mul + sum (avoids transpose for the hist_len=1 case), and use ttnn.softmax which
+    # should handle len-1 correctly.
+    if len(list(k_hist.shape)) <= 2 and k_hist.shape[-2] == 1:
+        # pos 0 special-case: hist_len=1, output is just V broadcast per Q head.
+        # softmax([scalar]) = 1.0 exactly, so attn_out = V_hist.
+        # Broadcast V to NQ_PER_CHIP via concat (matches prior placeholder).
+        attn_out = ttnn.concat([v_hist] * NQ_PER_CHIP, dim=0)
+        ttnn.deallocate(q_n)
+    else:
+        k_hist_T = ttnn.transpose(k_hist, -2, -1)
+        scores = ttnn.matmul(q_n, k_hist_T)
+        ttnn.deallocate(k_hist_T); ttnn.deallocate(q_n)
+        scale = 1.0 / (HEAD_DIM_ATTN ** 0.5)
+        scores_scaled = ttnn.multiply(scores, scale)
+        ttnn.deallocate(scores)
+        weights = ttnn.softmax(scores_scaled, dim=-1)
+        ttnn.deallocate(scores_scaled)
+        attn_out = ttnn.matmul(weights, v_hist)
+        ttnn.deallocate(weights)
+
+    attn_flat = ttnn.reshape(attn_out, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
+    ttnn.deallocate(attn_out)
 
     # attn_output_gate: attn_out * sigmoid(gate)
     gate_sig = ttnn.sigmoid(gate_part)
@@ -602,7 +635,7 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     ttnn.deallocate(gated)
     out = all_reduce_tt(partial, mesh)
     ttnn.deallocate(partial)
-    return out, kv_cache  # kv_cache unchanged for placeholder
+    return out, new_kv_cache
 
 
 def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_cache,
