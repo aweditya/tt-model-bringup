@@ -308,35 +308,48 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
         dn_sub_capture["dn_in_proj_b"] = _reassemble_heads_chip_to_hf(
             _ttnn_to_numpy_perchip(b, mesh))
 
-    # === Conv1d update + silu ===
+    # === Conv1d update + silu — full causal_conv1d_update with state shift ===
     # GatedDeltaNet conv1d: depthwise conv over last `kernel_size=4` timesteps.
-    # For each per-chip channel c: out[c] = sum_k(state[..., c, k] * w[c, k]).
-    # State holds last (kernel_size - 1) inputs in slots [0..2]; current input
-    # goes in slot 3. For decode token t≥1 we'd shift state left and append;
-    # for token 0 state is zero so output collapses to mixed_qkv * w[:, 3].
-    #
-    # First-cut implementation: apply current-position kernel weight only
-    # (correct for token 0; non-trivial state shift wired in B16l).
-    # w["conv1d_weight"] per-chip shape [CONV_DIM_CHIP, KERNEL] = [2048, 4]
-    cw = w["conv1d_weight"]
-    cw_rank = len(list(cw.shape))
-    if cw_rank == 3:
-        kw_last = ttnn.slice(cw, [0, 0, CONV_KERNEL - 1], [1, CONV_DIM_CHIP, CONV_KERNEL])
-        # per-chip [1, 2048, 1] — reshape to [1, 2048] for broadcast against mixed_qkv
-        kw_b = ttnn.reshape(kw_last, [1, CONV_DIM_CHIP])
+    # Algorithm (matches HF's causal_conv1d_update fallback):
+    #   1. shift conv_state left by 1: new_state[..., :-1] = old_state[..., 1:]
+    #   2. append current input as last slot: new_state[..., -1] = mixed_qkv
+    #   3. conv_out = sum(new_state * w_conv, dim=-1)  (no bias for this layer)
+    #   4. silu(conv_out)
+    # conv_state shape per chip [1, CONV_DIM_CHIP, KERNEL=4]; w_conv same.
+    # mesh-aware shape: conv_state may be rank 4 with leading mesh-shard dim
+    cs_rank = len(list(conv_state_in.shape))
+    cur = ttnn.reshape(mixed_qkv, [1, CONV_DIM_CHIP, 1])
+    ttnn.deallocate(mixed_qkv)
+    # Slice last KERNEL-1 positions from old state: state[..., 1:KERNEL]
+    if cs_rank == 4:
+        prior = ttnn.slice(conv_state_in, [0, 0, 0, 1], [1, 1, CONV_DIM_CHIP, CONV_KERNEL])
+        prior = ttnn.reshape(prior, [1, CONV_DIM_CHIP, CONV_KERNEL - 1])
     else:
-        kw_last = ttnn.slice(cw, [0, CONV_KERNEL - 1], [CONV_DIM_CHIP, CONV_KERNEL])
-        kw_b = ttnn.reshape(kw_last, [1, CONV_DIM_CHIP])
-    weighted = ttnn.mul(mixed_qkv, kw_b)
-    ttnn.deallocate(mixed_qkv); ttnn.deallocate(kw_last); ttnn.deallocate(kw_b)
+        prior = ttnn.slice(conv_state_in, [0, 0, 1], [1, CONV_DIM_CHIP, CONV_KERNEL])
+    # Concat shifted state + current as new state (last slot = current)
+    conv_state_new = ttnn.concat([prior, cur], dim=-1)
+    ttnn.deallocate(prior); ttnn.deallocate(cur)
+    # Conv: pointwise mul with w_conv (handle weight rank like conv_state)
+    cw_rank_local = len(list(w["conv1d_weight"].shape))
+    if cw_rank_local == 4:
+        w_conv = ttnn.reshape(w["conv1d_weight"], [1, CONV_DIM_CHIP, CONV_KERNEL])
+    else:
+        w_conv = w["conv1d_weight"]
+    state_w = ttnn.mul(conv_state_new, w_conv)
+    if cw_rank_local == 4:
+        ttnn.deallocate(w_conv)
+    conv_out_3d = ttnn.sum(state_w, dim=-1, keepdim=True)  # [1, CONV_DIM_CHIP, 1]
+    ttnn.deallocate(state_w)
+    conv_out = ttnn.reshape(conv_out_3d, [1, CONV_DIM_CHIP])
+    ttnn.deallocate(conv_out_3d)
     if dn_sub_capture is not None:
-        # HF conv1d hook captures the pre-silu output. Reassemble to HF layout.
+        # HF conv1d hook captures pre-silu output. Reassemble to HF layout.
         dn_sub_capture["dn_conv1d"] = _reassemble_qkv_chip_to_hf(
-            _ttnn_to_numpy_perchip(weighted, mesh),
+            _ttnn_to_numpy_perchip(conv_out, mesh),
             KEY_DIM_CHIP, VALUE_DIM_CHIP,
         )
-    silu_out = ttnn.silu(weighted)
-    ttnn.deallocate(weighted)
+    silu_out = ttnn.silu(conv_out)
+    ttnn.deallocate(conv_out)
 
     # === Split q/k/v from silu_out ===
     # ttnn.matmul output on mesh has rank 3 (with leading batch/mesh padding):
@@ -517,8 +530,8 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
         # full out_proj output (which has no TP partitioning).
         dn_sub_capture["dn_out_proj"] = _ttnn_to_numpy_replicated(out, mesh).reshape(-1)
 
-    # Return out + NEW recurrent state (state_new). conv state still placeholder.
-    return out, conv_state_in, state_new
+    # Return out + new recurrent state + new conv state (both evolve per token).
+    return out, conv_state_new, state_new
 
 
 def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
