@@ -100,6 +100,16 @@ def main():
         handles.append(dn.conv1d.register_forward_hook(make_hook("dn_conv1d")))
         handles.append(dn.norm.register_forward_hook(make_hook("dn_norm")))
         handles.append(dn.out_proj.register_forward_hook(make_hook("dn_out_proj")))
+
+        # PRE-hook on norm captures the input: (core_attn_out, gate=z).
+        # core_attn_out shape [B*S*NV_HEADS, head_v_dim]; z same.
+        def pre_norm_hook(_module, inp):
+            args = inp if isinstance(inp, tuple) else (inp,)
+            if len(args) >= 1:
+                intra["dn_core_attn_out"] = args[0].detach().float().cpu().numpy()
+            if len(args) >= 2:
+                intra["dn_norm_gate_z"] = args[1].detach().float().cpu().numpy()
+        handles.append(dn.norm.register_forward_pre_hook(pre_norm_hook))
     else:
         handles.append(L0.self_attn.register_forward_hook(make_hook("mixer_out")))
     handles.append(L0.post_attention_layernorm.register_forward_hook(make_hook("post_attn_norm")))
@@ -158,11 +168,12 @@ def main():
         if k == "dn_conv1d":
             # HF shape [CONV_DIM, S+pad] — take valid seq slots and transpose
             v = v[:, :seq_local].T  # [seq, CONV_DIM]
-        elif k == "dn_norm":
+        elif k in ("dn_norm", "dn_core_attn_out", "dn_norm_gate_z"):
             # HF shape [B*S*NV_HEADS, head_v_dim] = [seq*NV_HEADS, head_v_dim]
             # Reshape to [seq, NV_HEADS * head_v_dim] to match our reassembled
-            # per-chip→full V_DIM layout.
-            assert v.ndim == 2, f"unexpected dn_norm shape {v.shape}"
+            # per-chip→full V_DIM layout. Note: pre-hook captures haven't had
+            # batch stripped yet so they're [seq*NV_HEADS, head_v_dim] directly.
+            assert v.ndim == 2, f"unexpected {k} shape {v.shape}"
             v = v.reshape(seq_local, -1)  # [seq, NV_HEADS * head_v_dim]
         np.save(OUT_DIR / f"L0_{k}.npy", v.astype(np.float32))
     meta = {

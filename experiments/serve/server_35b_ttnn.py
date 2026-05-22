@@ -357,6 +357,15 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
     k_n = ttnn.mul(k_h, k_inv)
     ttnn.deallocate(k_h); ttnn.deallocate(k_inv)
 
+    # HF Qwen3_5MoeGatedDeltaNet scales query by 1/sqrt(head_k_dim) before
+    # the recurrence (standard attention scaling), see torch_chunk_gated_delta_rule
+    # line ~264. Without it, our core_attn_out comes out sqrt(128)=11.31x larger
+    # than HF's, breaking RMSNormGated downstream.
+    q_scale = 1.0 / (HEAD_K_DIM ** 0.5)
+    q_n_scaled = ttnn.multiply(q_n, q_scale)
+    ttnn.deallocate(q_n)
+    q_n = q_n_scaled
+
     q_h = q_n
     k_h = k_n
 
@@ -444,12 +453,29 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
     # Reshape core_attn_out [1, 8, 128] → [8, 128] for batched per-head norm
     core_2d = ttnn.reshape(core_attn_out, [NV_PER_CHIP, HEAD_V_DIM])
     z_2d = ttnn.reshape(z, [NV_PER_CHIP, HEAD_V_DIM])
+    if dn_sub_capture is not None:
+        # core_attn_out per-chip [NV_PER_CHIP, HEAD_V_DIM] → reassemble heads
+        dn_sub_capture["dn_core_attn_out"] = _reassemble_heads_chip_to_hf(
+            _ttnn_to_numpy_perchip(core_2d, mesh))
+        dn_sub_capture["dn_norm_gate_z"] = _reassemble_heads_chip_to_hf(
+            _ttnn_to_numpy_perchip(z_2d, mesh))
+        dn_sub_capture["_debug_core_2d_shape"] = list(core_2d.shape)
+        dn_sub_capture["_debug_z_2d_shape"] = list(z_2d.shape)
+        dn_sub_capture["_debug_norm_weight_shape"] = list(w["norm_weight"].shape)
     ttnn.deallocate(z)
-    # rms_norm with norm_weight (linear_attn.norm.weight — standard w * norm)
-    normed = ttnn.rms_norm(core_2d, weight=w["norm_weight"], epsilon=EPS)
+    # Bug isolation: ttnn.rms_norm(x, weight=w) output cos 0.9582 vs numpy oracle.
+    # Try: call ttnn.rms_norm WITHOUT weight, then multiply explicitly.
+    normed_raw = ttnn.rms_norm(core_2d, epsilon=EPS)
     ttnn.deallocate(core_2d)
+    normed = ttnn.mul(normed_raw, w["norm_weight"])
+    ttnn.deallocate(normed_raw)
     silu_z = ttnn.silu(z_2d)
     ttnn.deallocate(z_2d)
+    if dn_sub_capture is not None:
+        dn_sub_capture["dn_norm_rms_only"] = _reassemble_heads_chip_to_hf(
+            _ttnn_to_numpy_perchip(normed, mesh))
+        dn_sub_capture["dn_norm_silu_z"] = _reassemble_heads_chip_to_hf(
+            _ttnn_to_numpy_perchip(silu_z, mesh))
     gated = ttnn.mul(normed, silu_z)
     ttnn.deallocate(normed); ttnn.deallocate(silu_z)
 
@@ -750,12 +776,13 @@ def _ttnn_to_numpy_replicated(t, mesh):
 def _ttnn_to_numpy_perchip(t, mesh):
     """Concat-mesh-to-tensor and return list of NCHIPS per-chip numpy arrays.
 
-    The leading dim after ConcatMeshToTensor is the mesh shard (NCHIPS).
+    Uses np.split along axis 0 so per-chip slabs of any dim-0 size work
+    (e.g. core_attn_out with NV_PER_CHIP rows per chip, not just 1).
     """
     arr = ttnn.to_torch(
         t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
     ).float().numpy()
-    return [arr[c] for c in range(NCHIPS)]
+    return list(np.split(arr, NCHIPS, axis=0))
 
 
 def _reassemble_qkv_chip_to_hf(per_chip_list, key_dim_chip, value_dim_chip):

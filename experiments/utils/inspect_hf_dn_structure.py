@@ -60,6 +60,10 @@ def main():
           f"groups={dn.conv1d.groups} padding={dn.conv1d.padding}")
     print(f"norm weight shape: {list(dn.norm.weight.shape)} "
           f"norm type: {type(dn.norm).__name__}")
+    print(f"norm variance_epsilon: {dn.norm.variance_epsilon}")
+    print(f"norm weight dtype: {dn.norm.weight.dtype}")
+    print(f"norm weight min/max/mean: {float(dn.norm.weight.min()):.4f}/"
+          f"{float(dn.norm.weight.max()):.4f}/{float(dn.norm.weight.mean()):.4f}")
     # Inline norm forward source for RMSNormGated
     print(f"\nnorm forward source:")
     nsrc = inspect.getsource(dn.norm.forward)

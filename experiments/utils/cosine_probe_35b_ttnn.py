@@ -89,7 +89,9 @@ def main():
     # L0 sub-captures available?
     sub_keys = ["in_norm", "mixer_out", "post_attn_norm", "moe_out"]
     dn_sub_keys = ["dn_in_proj_qkv", "dn_in_proj_z", "dn_in_proj_a", "dn_in_proj_b",
-                   "dn_conv1d", "dn_norm", "dn_out_proj"]
+                   "dn_conv1d", "dn_core_attn_out", "dn_norm_gate_z",
+                   "dn_norm_rms_only", "dn_norm_silu_z",
+                   "dn_norm", "dn_out_proj"]
     hf_L0_sub = {}
     for k in sub_keys + dn_sub_keys:
         path = ORACLE_DIR / f"L0_{k}.npy"
@@ -147,6 +149,11 @@ def main():
                     dn_cos[k] = cosine(dn_sub[k], hf_L0_sub[k][p])
             if dn_cos:
                 log(f"    L0 DN: " + "  ".join(f"{k}={v:.4f}" for k, v in dn_cos.items()))
+            # Debug: print recorded shapes once (only at p=0)
+            if p == 0:
+                debug_keys = [k for k in dn_sub.keys() if k.startswith("_debug_")]
+                if debug_keys:
+                    log(f"    L0 DN shapes: " + "  ".join(f"{k}={dn_sub[k]}" for k in debug_keys))
 
     # Save artifacts
     np.save(OUT_DIR / "cosines.npy", cosines)
