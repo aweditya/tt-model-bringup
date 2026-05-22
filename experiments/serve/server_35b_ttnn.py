@@ -171,27 +171,46 @@ def upload_dn_layer(sd, mesh):
 
 
 def upload_attn_layer(sd, mesh):
-    """Upload attention weights with Q-head sharding + KV replication."""
+    """Upload attention weights with Q-head sharding + KV-head-per-chip sharding.
+
+    GQA mapping: chip i → KV head (i // (NCHIPS // NUM_KV_HEADS)).
+    For NCHIPS=4, NUM_KV_HEADS=2: chip 0,1 → KV head 0; chip 2,3 → KV head 1.
+    Per-chip k_proj/v_proj outputs ONE KV head's K (or V) vector each,
+    matching the chip's 4 Q heads (which all attend to that one KV head).
+    """
     out = {}
-    q_proj = sd["self_attn.q_proj.weight"]  # [8192, 2048]
+    q_proj = sd["self_attn.q_proj.weight"]  # [Q_HEADS*HEAD_DIM*2=8192, HIDDEN=2048]
     q_proj_r = q_proj.reshape(NUM_Q_HEADS, HEAD_DIM_ATTN * 2, HIDDEN)
     per_chip_q = []
     for chip in range(NCHIPS):
         slc = q_proj_r[chip*NQ_PER_CHIP:(chip+1)*NQ_PER_CHIP].reshape(
             NQ_PER_CHIP * HEAD_DIM_ATTN * 2, HIDDEN
-        ).T  # [2048, 2048]
+        ).T  # [HIDDEN, NQ_PER_CHIP * HEAD_DIM * 2]
         per_chip_q.append(slc)
-    out["q_proj"] = np_stacked_to_sharded(per_chip_q, mesh)  # [4, 2048, 2048]
+    out["q_proj"] = np_stacked_to_sharded(per_chip_q, mesh)
 
-    # k_proj, v_proj replicated (only 2 KV heads, don't shard across 4 chips)
-    out["k_proj"] = np_to_replicated(sd["self_attn.k_proj.weight"].T, mesh)  # [2048, 512]
-    out["v_proj"] = np_to_replicated(sd["self_attn.v_proj.weight"].T, mesh)
+    # K, V projections: shard per chip→KV-head mapping.
+    # k_proj weight [NUM_KV_HEADS*HEAD_DIM=512, HIDDEN=2048]
+    k_proj = sd["self_attn.k_proj.weight"]
+    v_proj = sd["self_attn.v_proj.weight"]
+    per_chip_k = []
+    per_chip_v = []
+    chips_per_kv = NCHIPS // NUM_KV_HEADS  # 2
+    for chip in range(NCHIPS):
+        chip_kv = chip // chips_per_kv  # 0,0,1,1
+        # Take this chip's KV head's rows from W
+        k_slice = k_proj[chip_kv * HEAD_DIM_ATTN:(chip_kv + 1) * HEAD_DIM_ATTN, :].T  # [HIDDEN, HEAD_DIM]
+        v_slice = v_proj[chip_kv * HEAD_DIM_ATTN:(chip_kv + 1) * HEAD_DIM_ATTN, :].T
+        per_chip_k.append(k_slice)
+        per_chip_v.append(v_slice)
+    out["k_proj"] = np_stacked_to_sharded(per_chip_k, mesh)  # per-chip [HIDDEN, HEAD_DIM]
+    out["v_proj"] = np_stacked_to_sharded(per_chip_v, mesh)
     out["q_norm"] = np_to_replicated(sd["self_attn.q_norm.weight"], mesh)
     out["k_norm"] = np_to_replicated(sd["self_attn.k_norm.weight"], mesh)
 
-    # o_proj [2048, 4096]: column-sharded along input dim
+    # o_proj [HIDDEN=2048, NUM_Q_HEADS*HEAD_DIM=4096]: column-sharded along input dim.
     out["o_proj"] = np_stacked_to_sharded(
-        [shard_along(sd["self_attn.o_proj.weight"], 1)[c].T for c in range(NCHIPS)], mesh)  # [4, 1024, 2048]
+        [shard_along(sd["self_attn.o_proj.weight"], 1)[c].T for c in range(NCHIPS)], mesh)
     return out
 
 
@@ -505,62 +524,56 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
 def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     """Attention block on-device, single-token (T=1).
 
-    Q-head sharded (NQ_PER_CHIP=4), KV replicated. For SMOKE: no KV cache
-    (single-token attention reduces to output=v_per_q).
+    Q-head sharded (NQ_PER_CHIP=4 Q heads per chip). K, V each chip holds the
+    ONE KV head its 4 Q heads attend to (chip→KV-head mapping handled at upload).
 
     cos_tt, sin_tt: per-chip replicated [1, 1, ROTARY_DIM=64].
+
+    For pos 0 with empty KV cache, attn reduces to attn_out = V (per Q head).
+    RoPE skipped (identity at pos 0). KV cache append skipped (no cache).
 
     Returns out [1, HIDDEN] replicated.
     """
     # Q projection (sharded along Q-head axis); outputs Q+gate concatenated
     # per-chip [1, NQ_PER_CHIP * HEAD_DIM_ATTN * 2 = 2048]
     q_full = ttnn.matmul(h_tt, w["q_proj"])
-    # K, V replicated (per-chip [1, NUM_KV_HEADS * HEAD_DIM_ATTN = 512])
+    # K, V per chip [1, HEAD_DIM_ATTN=256] — single KV head, per chip→KV mapping at upload.
     k = ttnn.matmul(h_tt, w["k_proj"])
     v = ttnn.matmul(h_tt, w["v_proj"])
 
-    # Split Q + gate: first half is Q, second half is gate
-    # Reshape rank may be 3 (mesh tensor padding)
-    sr = len(list(q_full.shape))
-    if sr == 3:
-        q_part = ttnn.slice(q_full, [0, 0, 0], [1, 1, NQ_PER_CHIP * HEAD_DIM_ATTN])
-        gate_part = ttnn.slice(q_full, [0, 0, NQ_PER_CHIP * HEAD_DIM_ATTN],
-                                [1, 1, 2 * NQ_PER_CHIP * HEAD_DIM_ATTN])
-    else:
-        q_part = ttnn.slice(q_full, [0, 0], [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
-        gate_part = ttnn.slice(q_full, [0, NQ_PER_CHIP * HEAD_DIM_ATTN],
-                                [1, 2 * NQ_PER_CHIP * HEAD_DIM_ATTN])
+    # Split Q + gate PER HEAD (per HF line 672-674: torch.chunk after view to
+    # [..., NUM_Q_HEADS, head_dim*2]). The flat per-chip q_full has layout
+    # [head0_Q(256) | head0_gate(256) | head1_Q | head1_gate | ...]. Reshape to
+    # [NQ_PER_CHIP, head_dim*2] and split last dim to get clean Q vs gate.
+    q_full_2d = ttnn.reshape(q_full, [NQ_PER_CHIP, HEAD_DIM_ATTN * 2])
     ttnn.deallocate(q_full)
+    q_h = ttnn.slice(q_full_2d, [0, 0], [NQ_PER_CHIP, HEAD_DIM_ATTN])  # [4, 256]
+    gate_part_per_head = ttnn.slice(q_full_2d, [0, HEAD_DIM_ATTN],
+                                     [NQ_PER_CHIP, HEAD_DIM_ATTN * 2])  # [4, 256]
+    ttnn.deallocate(q_full_2d)
+    # Flat gate for the post-attn multiply later (HF: gate.reshape(*input_shape, -1))
+    gate_part = ttnn.reshape(gate_part_per_head, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
+    ttnn.deallocate(gate_part_per_head)
 
-    # q_norm, k_norm — applied per head_dim (rms_norm with weight)
-    # q reshape: [1, NQ_PER_CHIP, HEAD_DIM_ATTN]
-    q_h = ttnn.reshape(q_part, [NQ_PER_CHIP, HEAD_DIM_ATTN])
-    k_h = ttnn.reshape(k, [NUM_KV_HEADS, HEAD_DIM_ATTN])
-    ttnn.deallocate(q_part); ttnn.deallocate(k)
+    # k_norm: rms_norm on [1, HEAD_DIM_ATTN] (single KV head per chip)
+    k_h = ttnn.reshape(k, [1, HEAD_DIM_ATTN])
+    ttnn.deallocate(k)
     q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
     k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+    ttnn.deallocate(q_n); ttnn.deallocate(k_n)  # placeholder: RoPE+QK^T skipped, only V used
 
-    # RoPE on Q, K — apply to first ROTARY_DIM dims of head
-    # For SMOKE: skip RoPE (placeholder)
-    # SHORTCUT for first cut.
-
-    # GQA: per chip, all NQ_PER_CHIP Q heads map to ONE KV head (chip-based mapping
-    # per B12.8: chip 0/1 → KV head 0, chip 2/3 → KV head 1).
-    # For SHORTCUT in first cut: skip the chip-specific KV selection; use first KV head.
-    # Per-chip attn_out = v broadcast (single-token attention is identity).
-    # Reshape v [NUM_KV_HEADS, HEAD_DIM_ATTN] → take first head → broadcast to NQ_PER_CHIP
-    v_h = ttnn.reshape(v, [NUM_KV_HEADS, HEAD_DIM_ATTN])
+    # RoPE on Q, K — placeholder (identity at pos 0).
+    # KV cache write/read — placeholder (empty cache at pos 0).
+    # For pos 0 + empty cache, attn(Q, K_curr, V_curr) = V_curr (single-token softmax = 1).
+    # Per chip's NQ_PER_CHIP Q heads all attend to the chip's single KV head → broadcast V.
+    v_h = ttnn.reshape(v, [1, HEAD_DIM_ATTN])
     ttnn.deallocate(v)
-    # Slice first KV head: [NUM_KV_HEADS, HEAD_DIM_ATTN] → [1, HEAD_DIM_ATTN]
-    v_first = ttnn.slice(v_h, [0, 0], [1, HEAD_DIM_ATTN])
-    ttnn.deallocate(v_h)
-    # Broadcast to NQ_PER_CHIP heads via concat
     if NQ_PER_CHIP == 4:
-        v_per_q = ttnn.concat([v_first, v_first, v_first, v_first], dim=0)
+        v_per_q = ttnn.concat([v_h, v_h, v_h, v_h], dim=0)
     else:
-        v_per_q = ttnn.concat([v_first] * NQ_PER_CHIP, dim=0)
-    ttnn.deallocate(v_first); ttnn.deallocate(q_n); ttnn.deallocate(k_n)
+        v_per_q = ttnn.concat([v_h] * NQ_PER_CHIP, dim=0)
+    ttnn.deallocate(v_h)
 
     attn_flat = ttnn.reshape(v_per_q, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
     ttnn.deallocate(v_per_q)
