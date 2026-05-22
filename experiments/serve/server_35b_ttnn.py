@@ -601,16 +601,17 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
 
-    # TODO: re-enable partial RoPE once L39 cosine regression debugged. First
-    # naive enable showed pos≥1 L39 cos dropping 0.95→0.81 (with both bf16 and
-    # fp32 cos/sin upload). Suspect ttnn broadcast or slice-concat layout issue
-    # in _apply_partial_rope. Suppressed for now to preserve KV-cache gains.
-    # When fixed:
-    #   q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
-    #   ttnn.deallocate(q_n); q_n = q_n_rope
-    #   k_n_rope = _apply_partial_rope(k_n, cos_tt, sin_tt, 1)
-    #   ttnn.deallocate(k_n); k_n = k_n_rope
-    _ = cos_tt; _ = sin_tt  # silence unused until RoPE wired
+    # RoPE temporarily disabled (commit b132002). _apply_partial_rope helper
+    # passes numpy oracle bit-exactly (rope_numpy_oracle.py cos 1.0 vs HF)
+    # and ttnn micro-probe at multi-row inputs (cos 0.999998). But integrated
+    # enable regresses cosine probe L39 pos≥1 from 0.95 → 0.81 — even with
+    # force_identity_rope=True (cos=1, sin=0). Root cause not yet found;
+    # suspect either (a) ttnn slice+concat round-trip on rms_norm output has
+    # subtle precision noise that compounds across 10 attn layers, or
+    # (b) HF parallel-prefill softmax vs my sequential softmax differs in a
+    # way that's papered over without RoPE. Helper + cos/sin compute stay
+    # in place for the future re-enable.
+    _ = cos_tt; _ = sin_tt  # used by RoPE when re-enabled
 
     # === KV cache evolution ===
     # k_n shape per chip [1, HEAD_DIM]; v_h same.
@@ -929,13 +930,21 @@ def step_forward_ttnn(state, tok_id, pos, capture=None):
     # to this for text-only). inv_freq[i] = theta^(-2i/ROTARY_DIM) for i in [0, R/2).
     # cos_full = [cos(p*f), cos(p*f)]  and same for sin (so each pair shares angle).
     # Compute in fp64 → cast to fp32, then upload to keep small-angle precision.
-    inv_freq = 1.0 / (ROPE_THETA ** (
-        np.arange(0, ROTARY_DIM, 2).astype(np.float64) / ROTARY_DIM))  # [R/2]
-    angle = float(pos) * inv_freq  # [R/2]
-    cos_half = np.cos(angle).astype(np.float32)
-    sin_half = np.sin(angle).astype(np.float32)
-    cos_np = np.concatenate([cos_half, cos_half]).reshape(1, ROTARY_DIM)  # [1, R]
-    sin_np = np.concatenate([sin_half, sin_half]).reshape(1, ROTARY_DIM)
+    # ISOLATION: force_identity_rope=True forces cos=1 sin=0 to test the RoPE
+    # wrapper overhead. Should give same cosines as RoPE-disabled baseline if
+    # the apply_rope ops are bit-correct on identity inputs.
+    force_identity_rope = False
+    if force_identity_rope:
+        cos_np = np.ones((1, ROTARY_DIM), dtype=np.float32)
+        sin_np = np.zeros((1, ROTARY_DIM), dtype=np.float32)
+    else:
+        inv_freq = 1.0 / (ROPE_THETA ** (
+            np.arange(0, ROTARY_DIM, 2).astype(np.float64) / ROTARY_DIM))  # [R/2]
+        angle = float(pos) * inv_freq  # [R/2]
+        cos_half = np.cos(angle).astype(np.float32)
+        sin_half = np.sin(angle).astype(np.float32)
+        cos_np = np.concatenate([cos_half, cos_half]).reshape(1, ROTARY_DIM)  # [1, R]
+        sin_np = np.concatenate([sin_half, sin_half]).reshape(1, ROTARY_DIM)
     # Upload as float32 to preserve precision on small angles (high-freq dims)
     cos_tt = ttnn.from_torch(
         torch.from_numpy(cos_np),
