@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Teacher-forced cosine ladder for Qwen3.6-35B-A3B on (1,4) qb1 mesh.
+
+For each prompt position pos:
+  - feed prompt_ids[pos] to step_forward_ttnn with capture={}
+  - extract per-layer hidden states + final norm + logits
+  - cosine-compare to HF oracle at same pos (`.cache/hf_oracle_35b*/`)
+  - record cosine curve + top-1 match + layer-of-first-divergence
+
+This is the 35B-A3B analog of the 27B `cosine_ladder` endpoint that found
+the bf16 SDPA HiFi4 cliff at position 129 (see `feedback_fp32_sdpa_cliff_probe.md`).
+Standalone probe; promote to a `cosine_ladder` endpoint on
+`server_35b_ttnn.py` once the shape stabilizes.
+
+Run (qb1, ttnn env exported, server stopped):
+  cd ~/tt-xla
+  .venv/bin/python -u experiments/utils/cosine_ladder_35b.py \\
+    --oracle .cache/hf_oracle_35b_100tok \\
+    --output-json .cache/sanity_2026_05_22/cosine_ladder_35b.json \\
+    [--n-positions 10]   # smoke; omit for full prompt
+
+Output JSON schema documented in `research/35b_a3b_correctness_plan.md`.
+"""
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+sys.stdout.reconfigure(line_buffering=True)  # SSH pipes are block-buffered
+
+import server_35b_ttnn as srv  # noqa: E402
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def cos(a, b):
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--oracle", required=True,
+                    help="HF oracle dir (must contain hidden_states.npy, logits.npy, argmax.npy, prompt_ids.npy, meta.json)")
+    ap.add_argument("--output-json", required=True,
+                    help="path to write per-position results JSON")
+    ap.add_argument("--n-positions", type=int, default=0,
+                    help="cap at first N positions (0 = full prompt). Use small N for smoke runs.")
+    ap.add_argument("--drift-cos-threshold", type=float, default=0.99,
+                    help="layer cosine below this counts as divergence")
+    args = ap.parse_args()
+
+    oracle_dir = Path(args.oracle)
+    hf_hidden_states = np.load(oracle_dir / "hidden_states.npy")  # [41, seq, HIDDEN]
+    hf_logits = np.load(oracle_dir / "logits.npy")  # [seq, VOCAB]
+    hf_argmax = np.load(oracle_dir / "argmax.npy")  # [seq]
+    hf_prompt_ids = np.load(oracle_dir / "prompt_ids.npy")  # [seq]
+    meta = json.loads((oracle_dir / "meta.json").read_text())
+    n_layers_plus_1 = hf_hidden_states.shape[0]  # 41 for 40-layer model
+    n_layers = n_layers_plus_1 - 1
+    seq_len_full = hf_prompt_ids.shape[0]
+    n_positions = seq_len_full if args.n_positions == 0 else min(args.n_positions, seq_len_full)
+    log(f"oracle: {oracle_dir} | seq_len={seq_len_full} | layers={n_layers} | positions to test: {n_positions}")
+    log(f"prompt: {meta['prompt'][:80]!r}{'…' if len(meta['prompt']) > 80 else ''}")
+
+    out_path = Path(args.output_json)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Bootstrap (1,4) mesh + load all 40 layer weights. ~106 s on qb1 per
+    # B16 smoke timings.
+    log("bootstrapping (1,4) mesh + uploading weights…")
+    state = srv.State()
+    t0 = time.time()
+    srv.bootstrap(state, log)
+    state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders
+    log(f"bootstrap done in {time.time()-t0:.1f}s")
+
+    per_pos = []
+    first_div_pos = None
+    first_div_layer = None
+    for pos in range(n_positions):
+        tok_id = int(hf_prompt_ids[pos])
+        cap = {}
+        t0 = time.time()
+        tt_next_id = srv.step_forward_ttnn(state, tok_id, pos, capture=cap)
+        step_ms = (time.time() - t0) * 1e3
+
+        # Per-layer cosine: embed (oracle idx 0) + each layer (oracle idx L+1)
+        cos_per_layer = [cos(cap["embed"], hf_hidden_states[0, pos])]
+        for L in range(n_layers):
+            cos_per_layer.append(cos(cap[f"layer_{L}"], hf_hidden_states[L + 1, pos]))
+        cos_final = cos(cap["final_norm"], hf_hidden_states[-1, pos])
+        cos_logits = cos(cap["logits"], hf_logits[pos])
+
+        hf_arg = int(hf_argmax[pos])
+        top1 = (tt_next_id == hf_arg)
+
+        # Record layer-of-first-divergence (first layer where cos < threshold)
+        # for the EARLIEST position that diverges.
+        if first_div_pos is None:
+            for li, c in enumerate(cos_per_layer):
+                if c < args.drift_cos_threshold:
+                    first_div_pos = pos
+                    first_div_layer = li  # 0 = embed, 1..40 = decoder layers
+                    log(f"  ** first divergence at pos {pos} layer {li} (cos {c:.4f})")
+                    break
+
+        per_pos.append({
+            "pos": pos,
+            "tok_id": tok_id,
+            "hf_argmax": hf_arg,
+            "tt_argmax": tt_next_id,
+            "top1_match": bool(top1),
+            "cos_per_layer": [round(c, 6) for c in cos_per_layer],
+            "cos_final_norm": round(cos_final, 6),
+            "cos_logits": round(cos_logits, 6),
+            "step_ms": round(step_ms, 1),
+        })
+        log(f"  pos={pos:3d} tok={tok_id:6d} tt={tt_next_id:6d} hf={hf_arg:6d} "
+            f"match={'Y' if top1 else 'N'} cos_final={cos_final:.4f} "
+            f"cos_min_layer={min(cos_per_layer):.4f} step={step_ms:.0f}ms")
+
+    median_final = float(np.median([p["cos_final_norm"] for p in per_pos]))
+    median_logits = float(np.median([p["cos_logits"] for p in per_pos]))
+    top1_count = sum(1 for p in per_pos if p["top1_match"])
+
+    out = {
+        "oracle_dir": str(oracle_dir),
+        "n_positions_tested": n_positions,
+        "n_layers": n_layers,
+        "seq_len_full": seq_len_full,
+        "prompt": meta["prompt"],
+        "prompt_ids": [int(x) for x in hf_prompt_ids[:n_positions]],
+        "drift_cos_threshold": args.drift_cos_threshold,
+        "first_divergence_pos": first_div_pos,
+        "first_divergence_layer": first_div_layer,
+        "median_cos_final_norm": median_final,
+        "median_cos_logits": median_logits,
+        "top1_match_count": top1_count,
+        "top1_match_rate": top1_count / max(1, n_positions),
+        "per_pos": per_pos,
+    }
+    out_path.write_text(json.dumps(out, indent=2))
+    log(f"wrote {out_path}")
+    log(f"summary: top1 {top1_count}/{n_positions} ({100*top1_count/max(1,n_positions):.1f}%)  "
+        f"median cos_final {median_final:.4f}  median cos_logits {median_logits:.4f}  "
+        f"first_div: pos={first_div_pos} layer={first_div_layer}")
+
+
+if __name__ == "__main__":
+    main()
