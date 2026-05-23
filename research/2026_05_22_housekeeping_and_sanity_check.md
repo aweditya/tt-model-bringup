@@ -35,19 +35,26 @@ smoke) without manual hand-holding beyond what's in the README.
 
 | # | Step | Status | Notes |
 |---|------|--------|-------|
-| 1 | Living plan doc (this file) | in_progress | being written now |
-| 2 | Compress MEMORY.md (44 KB → < 24 KB) | pending | one-line hooks; detail already in topic files |
-| 3 | Merge repro PR into main + push | pending | rebase preferred; merge commit if conflicts |
-| 4 | Prune stale `tt-xla/` worktree | pending | cosmetic |
-| 5 | Status-check qb2, stop prod TP server | pending | use `serve_tp.sh stop`, never `pkill -9` |
-| 6 | Fresh clone repo on qb2 to new dir | pending | e.g. `~/tt-model-bringup-fresh` |
-| 7 | Run setup (uv sync + ttnn install) | pending | follow merged README verbatim |
-| 8 | Run legacy 6 demos | pending | 60/64/67/73/76b/80 |
-| 9 | Run Demo A (single-chip 27B) | pending | server.py path |
-| 10 | Run Demo B (4-chip TP 27B) | pending | server_tp.py path |
-| 11 | Run 35B-A3B MoE smoke | pending | may need a new entry point — flag the gap if so |
+| 1 | Living plan doc (this file) | done | |
+| 2 | Compress MEMORY.md (44 KB → 19.8 KB) | done | -55%; longest line ≤200 chars; all 146 links live |
+| 3 | Merge repro PR into main + push | done | rebased cleanly; HEAD `bdb64df` (incl. legacy-demos helper) |
+| 4 | Prune stale `tt-xla/` worktree | done | unlocked + force-removed; merged local branches left alone |
+| 5 | Status-check qb2, stop prod TP server | done | prod stopped gracefully (was PID 1623291) |
+| 6 | Fresh clone repo on qb2 to new dir | done | `~/tt-model-bringup-fresh` at HEAD `bdb64df` |
+| 7 | Run setup (uv sync + ttnn install) | done | uv 0.11.13, torch 2.12.0, ttnn 0.69.1.dev0; clean |
+| 8 | Run legacy 6 demos | in_progress | 60 ✓ (142.5 tok/s), 64 ✓ (78.4 tok/s); 67/73/76b/80 pending |
+| 9 | Run Demo A (single-chip 27B) | pending | use `PROJECT_ROOT=~/tt-model-bringup-fresh bash …/serve.sh start` |
+| 10 | Run Demo B (4-chip TP 27B) | pending | same `PROJECT_ROOT` override on serve_tp.sh |
+| 11 | Run 35B-A3B MoE smoke | blocked? | qb2 HF cache lacks 35B weights (~70 GB DL); smoke script `experiments/utils/decode_smoke_35b_ttnn.py` is qb1-targeted; will document gap rather than 70-GB download |
 | 12 | Restart qb2 prod in original `~/tt-xla/` | pending | bootstrap ~5–10 min |
-| 13 | Document results + commit | pending | update REPRODUCE.md table |
+| 13 | Document results + commit | pending | update REPRODUCE.md + this doc |
+
+### Findings so far (will fold into final doc)
+
+- **HF token not configured on qb2** (matches `reference_hf_token_setup.md`). Legacy demos still pass — they use meta-llama → unsloth fallback inside the script. The HF rate-limit warning prints but downloads complete. Real friction would only hit on cold/contended HF.
+- **README says `TT_BUILD_DIR=build_Release`** but qb2's prod uses `build_tracy_gcc12_nodist`. Both build dirs exist on qb2. The `uv pip install -e $TT_METAL_HOME` picks up whichever ttnn binary is in TT_METAL_HOME's wheel — and ttnn 0.69.1.dev0 imports + opens devices cleanly. The README's TODO already flagged the SHA-pin gap; no action needed today.
+- **Both serve.sh / serve_tp.sh respect `PROJECT_ROOT`** env var. Demos A/B from the fresh clone work without touching `~/tt-xla/`.
+- **35B-A3B weights not cached on qb2** (only Qwen3.6-27B + Qwen2.5-0.5B + Llama 1B/3B unsloth). MoE bringup is qb1-targeted; qb2 doesn't host that work today. Documenting as a gap; not blocking the housekeeping outcome.
 
 ## Known constraints
 
