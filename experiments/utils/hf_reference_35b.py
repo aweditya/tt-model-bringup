@@ -51,14 +51,23 @@ def log(msg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--prompt", default=DEFAULT_PROMPT,
-                    help="text to tokenize and pass through HF model")
+    ap.add_argument("--prompt", default=None,
+                    help="text to tokenize (overrides --prompt-file)")
+    ap.add_argument("--prompt-file", default=None,
+                    help="path to a UTF-8 file whose contents are the prompt")
     ap.add_argument("--output-dir", default=str(DEFAULT_OUT_DIR),
                     help="directory to save oracle artifacts")
     args = ap.parse_args()
 
+    if args.prompt is not None:
+        prompt_text = args.prompt
+    elif args.prompt_file is not None:
+        prompt_text = Path(args.prompt_file).read_text(encoding="utf-8").strip()
+    else:
+        prompt_text = DEFAULT_PROMPT
+
     global PROMPT, OUT_DIR
-    PROMPT = args.prompt
+    PROMPT = prompt_text
     OUT_DIR = Path(args.output_dir)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
