@@ -168,3 +168,48 @@ The venv ships TT-NN as a pip-installed package (no `LD_LIBRARY_PATH` or
 qb2 is an alternative single-chip substrate if qb1 is busy; same recipe but
 the server there is `server_tp.py` (4-chip TP) so chip 0 is also held — stop
 it via `serve_tp.sh stop` first if you need it.
+
+## Fresh-clone validated on qb2 (2026-05-22)
+
+End-to-end test of the "anyone can clone this repo and run it" path:
+`git clone https://github.com/aweditya/tt-model-bringup.git
+~/tt-model-bringup-fresh` on qb2, `uv sync`, `uv pip install -e
+$TT_METAL_HOME --no-build-isolation`, then ran the same 6 legacy demos +
+Demo A (single-chip 27B) + Demo B (4-chip TP 27B) + the qb1 MoE smoke as a
+parallel check.
+
+| Demo | qb1 baseline (2026-05-21) | qb2 fresh-clone (2026-05-22) | Notes |
+|------|----------------------------|------------------------------|-------|
+| `60_native_rope_decode.py` | 142.2 tok/s | **142.5 tok/s** | identical within run-to-run jitter |
+| `64_llama32_1b_port.py` | 78.6 tok/s | **78.4 tok/s** | |
+| `67_llama32_3b_port.py` | 33.7 tok/s | **34 tok/s** | |
+| `73_llama8b_instruct.py` | 19 tok/s | **19 tok/s** | |
+| `76b_8b_correctness_check.py` | cos 0.997327 | **cos 0.997327** | bit-identical |
+| `80_8b_diverse_qa_demo.py` | 18 tok/s | **16 tok/s (59% efficiency)** | within 2 tok/s; thermal/load variance |
+| Demo A — `server.py` + `client generate` | 5.14 tok/s (README) | 4.01 tok/s cold / 4.03 tok/s warm | first-run, fewer warm passes |
+| Demo B — `server_tp.py` + `client_tp generate_tp` | 12.98 tok/s (README) | **13.01 tok/s warm** | matched prod baseline 12.93 tok/s |
+| MoE smoke on qb1 (`decode_smoke_35b_ttnn.py`) | 480 ms/tok pre-trace (`feedback_b16_coherent_text_on_device.md`) | 522 ms/tok pre-trace, ` Paris` prediction + 24-tok coherent continuation | qb1 host since 35B weights cached there |
+
+Total wall: ~75 min of qb2 prod-downtime (legacy batch 23 min + Demo A
+bootstrap+smoke 14 min + Demo B bootstrap+smoke 13 min + prod
+cold-restart 17 min, plus tt-smi resets). Logs in
+`~/tt-model-bringup-fresh/.cache/sanity_2026_05_22/` on qb2 and
+`~/tt-xla/.cache/sanity_2026_05_22/` on qb1.
+
+### Fresh-clone bugs found and fixed
+
+- **`experiments/serve/protocol.py` + `experiments/serve/server_tp.py`
+  hardcoded PROJECT_ROOT to `~/tt-xla/`.** A fresh clone at any other path
+  wrote `server.sock` / `server.pid` / `server_tp.sock` to the legacy dir
+  while the client looked in the fresh dir → "No such file or directory".
+  Fixed by deriving PROJECT_ROOT from `__file__` (commit `b17d33e`). No
+  prod behavior change since `~/tt-xla/experiments/serve/...` still
+  resolves to `~/tt-xla/`.
+- **`serve.sh stop` / `serve_tp.sh stop` rely on a `.pid` file the python
+  server writes after bootstrap.** During the Demo A → Demo B transition,
+  this means `stop` may report "not running" before the server has
+  actually died. If you then start the next server, you race the TLB
+  cleanup of the prior one and crash with `tt_tlb_alloc failed -12`.
+  Recovery: `tt-smi -r 0,1,2,3`. Workaround until both bugs above are
+  cleaned up: SIGTERM by pgrep, wait, verify pgrep is empty, then start
+  the next server.

@@ -31,30 +31,36 @@ smoke) without manual hand-holding beyond what's in the README.
 - Scope of "all models": all four — legacy 6 demos, Demo A (single P150),
   Demo B (4× P150 TP), 35B-A3B MoE smoke.
 
-## Status
+## Status — ALL DONE
 
-| # | Step | Status | Notes |
-|---|------|--------|-------|
-| 1 | Living plan doc (this file) | done | |
-| 2 | Compress MEMORY.md (44 KB → 19.8 KB) | done | -55%; longest line ≤200 chars; all 146 links live |
-| 3 | Merge repro PR into main + push | done | rebased cleanly; HEAD `bdb64df` (incl. legacy-demos helper) |
-| 4 | Prune stale `tt-xla/` worktree | done | unlocked + force-removed; merged local branches left alone |
-| 5 | Status-check qb2, stop prod TP server | done | prod stopped gracefully (was PID 1623291) |
-| 6 | Fresh clone repo on qb2 to new dir | done | `~/tt-model-bringup-fresh` at HEAD `bdb64df` |
-| 7 | Run setup (uv sync + ttnn install) | done | uv 0.11.13, torch 2.12.0, ttnn 0.69.1.dev0; clean |
-| 8 | Run legacy 6 demos | in_progress | 60 ✓ (142.5 tok/s), 64 ✓ (78.4 tok/s); 67/73/76b/80 pending |
-| 9 | Run Demo A (single-chip 27B) | pending | use `PROJECT_ROOT=~/tt-model-bringup-fresh bash …/serve.sh start` |
-| 10 | Run Demo B (4-chip TP 27B) | pending | same `PROJECT_ROOT` override on serve_tp.sh |
-| 11 | Run 35B-A3B MoE smoke | blocked? | qb2 HF cache lacks 35B weights (~70 GB DL); smoke script `experiments/utils/decode_smoke_35b_ttnn.py` is qb1-targeted; will document gap rather than 70-GB download |
-| 12 | Restart qb2 prod in original `~/tt-xla/` | pending | bootstrap ~5–10 min |
-| 13 | Document results + commit | pending | update REPRODUCE.md + this doc |
+| # | Step | Result |
+|---|------|--------|
+| 1 | Living plan doc | done |
+| 2 | Compress MEMORY.md 44 KB → 19.8 KB | done; -55%; all 146 links live |
+| 3 | Merge repro PR into main + push | done; rebased clean; HEAD `bdb64df` |
+| 4 | Prune stale `tt-xla/` worktree | done |
+| 5 | Stop qb2 prod TP server | done |
+| 6 | Fresh clone repo on qb2 | done at `~/tt-model-bringup-fresh` |
+| 7 | Run setup (uv sync + ttnn install) | done; uv 0.11.13, torch 2.12.0, ttnn 0.69.1.dev0 |
+| 8 | Legacy 6 demos | all PASS — 60/64/67/73/76b ≤ baseline, 80 within 2 tok/s |
+| 9 | Demo A (single-chip 27B) | PASS — coherent "Paris." + `<think>` block, 4.01 tok/s cold |
+| 10 | Demo B (4-chip TP 27B) | PASS — 13.01 tok/s warm (≥ prod 12.93), required symlink workaround for socket bug |
+| 11 | 35B-A3B MoE smoke on qb1 | PASS — ` Paris` first token + 24-tok coherent decode at 522 ms/tok |
+| 12 | Restart qb2 prod in `~/tt-xla/` | done; 12.97 tok/s baseline restored |
+| 13 | Document + commit | this doc + REPRODUCE.md + protocol.py fix (commit `b17d33e`) |
 
 ### Findings so far (will fold into final doc)
 
-- **HF token not configured on qb2** (matches `reference_hf_token_setup.md`). Legacy demos still pass — they use meta-llama → unsloth fallback inside the script. The HF rate-limit warning prints but downloads complete. Real friction would only hit on cold/contended HF.
-- **README says `TT_BUILD_DIR=build_Release`** but qb2's prod uses `build_tracy_gcc12_nodist`. Both build dirs exist on qb2. The `uv pip install -e $TT_METAL_HOME` picks up whichever ttnn binary is in TT_METAL_HOME's wheel — and ttnn 0.69.1.dev0 imports + opens devices cleanly. The README's TODO already flagged the SHA-pin gap; no action needed today.
-- **Both serve.sh / serve_tp.sh respect `PROJECT_ROOT`** env var. Demos A/B from the fresh clone work without touching `~/tt-xla/`.
-- **35B-A3B weights not cached on qb2** (only Qwen3.6-27B + Qwen2.5-0.5B + Llama 1B/3B unsloth). MoE bringup is qb1-targeted; qb2 doesn't host that work today. Documenting as a gap; not blocking the housekeeping outcome.
+- **HF token not configured on qb2** (matches `reference_hf_token_setup.md`). Legacy demos still pass — meta-llama → unsloth fallback inside each script. Rate-limit warning prints but downloads complete.
+- **README says `TT_BUILD_DIR=build_Release`** but qb2's serve_tp.sh defaults to `build_tracy_gcc12_nodist`. Both build dirs exist; the `uv pip install -e $TT_METAL_HOME` picks the ttnn shipped in TT_METAL_HOME (0.69.1.dev0). Imports + device open cleanly.
+- **Both serve.sh / serve_tp.sh respect `PROJECT_ROOT`** for log/launch paths.
+- **35B-A3B weights not cached on qb2** — MoE smoke moves to qb1 (user-confirmed).
+- **REAL BUG — `experiments/serve/protocol.py:8-11` hardcodes `~/tt-xla/.cache/...`** for SOCKET_PATH / PID_PATH / CACHE_DIR. So a fresh-clone server writes its socket + pid to the LEGACY `~/tt-xla/.cache/` directory, NOT to its own `.cache/`. Visible consequences:
+  - `serve.sh stop` (which respects PROJECT_ROOT) can't find the pid file → reports "server not running" even when it is. We had to SIGTERM by pgrep.
+  - Two servers from different clones would clobber each other's socket + pid silently.
+  - The fresh-clone client still works only because *it* also reads the hardcoded path, so client + server agree by accident.
+  Fix: derive `CACHE_DIR` in `protocol.py` from `os.environ.get("PROJECT_ROOT", <__file__-based default>)`. ~10 lines, low-risk (default resolves to `~/tt-xla/.cache` for the prod checkout). Land as a follow-up after this sanity check; not blocking today.
+- **Demo A → Demo B transition gotcha.** Without an explicit chip-free check between Demo A teardown and Demo B start, server_tp.py boot can race server.py's TLB cleanup and crash with `tt_tlb_alloc failed with error code -12` (ENOMEM). Recovery: `tt-smi -r 0,1,2,3`. The pid-file bug above is the upstream cause — `serve.sh stop` thinks it succeeded, but the server is still running.
 
 ## Known constraints
 
@@ -67,16 +73,30 @@ smoke) without manual hand-holding beyond what's in the README.
   not have a one-shot entry script yet. If so, the smoke step documents the
   gap rather than fakes a pass.
 
-## Open questions / followups (update as they surface)
+## Followups (post-session)
 
-- Does the merged README's setup actually work on a host that doesn't already
-  have `~/tt-xla/` cached? The 2026-05-21 patch validated this on qb1; qb2
-  may have different `$TT_METAL_HOME` or firmware quirks.
-- Is `hf auth login` already wired on qb2? (Listed as "unauthenticated" in
-  `reference_hf_token_setup.md` from 2026-05-21.)
-- 35B-A3B is mid-bringup (B17 trace validated; long-context decode 100 toks
-  coherent). What's the canonical fresh-clone command for it? May need to
-  add one to README as a followup task.
+- **MEMORY.md edit:** add a `feedback_protocol_hardcoded_paths.md` topic
+  file referencing commit `b17d33e` if this bites us again. Right now the
+  history is captured in REPRODUCE.md and the commit message — that's
+  probably enough.
+- **README:** mention the `serve.sh stop` pid-file race (the bash wrapper
+  trusts the python server to write the pid file after bootstrap; if you
+  call `stop` before that's written, it reports "not running" and the
+  python is still alive). Either document the workaround (pgrep + SIGTERM)
+  or have the bash wrapper also write a `.pid.launch` *and* check it on
+  stop.
+- **35B-A3B repro:** the smoke `experiments/utils/decode_smoke_35b_ttnn.py`
+  is the right entry point but its docstring hardcodes `~/tt-xla` paths
+  and `build_Release`. After the next MoE milestone, fold it into a
+  README "Demo C" section with a clean fresh-clone recipe.
+- **qb1 is rsync-managed, not git-cloned.** The fresh-clone test on qb2
+  proves the cold-start story; qb1's `~/tt-xla/` doesn't have `.git/` so
+  it can't `git pull` updates. Possible cleanup: switch qb1 to a real git
+  clone if we want symmetric maintenance, or accept that qb2 is the
+  canonical "deployable" host.
+- **HF token still not configured on qb2 / qb1.** Demos work via the
+  unsloth fallback paths, but cold downloads are rate-limited. Lower
+  priority — would only bite a new host bring-up.
 
 ## Pointers (for context-recovery)
 
