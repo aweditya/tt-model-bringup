@@ -40,15 +40,41 @@ to 500 to replicate the 27B P21 bar.
 
 | # | Step | Status | Notes |
 |---|------|--------|-------|
-| 1 | Write this plan doc | in_progress | |
-| 2 | Pick + tokenize a 100-tok real-text prompt | pending | stable English passage; save in plan so reruns match |
-| 3 | Read server_35b_ttnn.py forward path | pending | find the per-step function + how to capture per-layer states |
-| 4 | Generate HF oracle for chosen prompt | pending | `experiments/utils/hf_reference_35b.py`; ~15 min, ~70 GB RAM on qb1 |
-| 5 | Write `experiments/utils/cosine_ladder_35b.py` | pending | permanent probe; teacher-forced loop; JSON output |
-| 6 | Smoke at 10 positions | pending | validates probe before 100-pos commit |
-| 7 | Full 100-position run | pending | ~30-50 min wall on qb1 |
-| 8 | Analyze cliff / layer-of-first-divergence | pending | feedback memory + plan doc update |
-| 9 | Decide next probe | pending | extend 500 / B3 SDPA variant / MoE router stability |
+| 1 | Write this plan doc | done | |
+| 2 | Pick + tokenize prompt | done | `experiments/utils/ladder_prompt.txt` — 85 Qwen tokens (Wikipedia "Mathematics" opening) |
+| 3 | Read server_35b_ttnn.py forward path | done | `step_forward_ttnn(state, tok, pos, capture=dict)` already exposes per-layer hidden states |
+| 4 | Generate HF oracle | done | `.cache/hf_oracle_35b_100tok/` on qb1; 13s wall (weights mmap-cached) |
+| 5 | Write probe | done | `experiments/utils/cosine_ladder_35b.py` |
+| 6 | 10-pos smoke | done | top-1 9/10; first divergence pos 0 L32 |
+| 7 | 85-pos full | done | **top-1 69/85 = 81.2%, median cos 0.94, drift concentrated in 10 AT layers** |
+| 8 | Analyze cliff / layer-of-first-divergence | done | no cliff; gradual layer-depth drift; L03=AT first to slip; L39 worst (cos 0.70 at pos 16); see `feedback_35b_a3b_attn_layer_drift.md` |
+| 9 | Decide next probe | done | **swap manual attention for paged SDPA + B3 compute_kernel_config** — same intervention as 27B P21 |
+
+## Findings (post 85-pos ladder)
+
+**The drift mechanism is not a cliff; it's monotonic per-AT-layer accumulation.** Embed + L00-L02 (all DN) are bit-perfect. From L03 onwards (the first AT layer), every full-attention block adds visible cosine drop. By L39 the worst-position cos is 0.70.
+
+**Root cause hypothesis (high confidence):** `server_35b_ttnn.py:attn_forward_ttnn` does manual `matmul → softmax → matmul` with no compute_kernel_config passed. ttnn's default fidelity on Blackhole is HiFi4 + fp32_dest_acc_en=True — exactly the config the 27B P21 probe identified as buggy for attention numerics (`feedback_fp32_sdpa_cliff_probe.md`). 27B's fix was paged SDPA + B3 (HiFi2, no fp32_dest_acc). Same intervention should apply here.
+
+## SDPA swap plan (in flight)
+
+Goal: replace manual attention with `ttnn.transformer.paged_scaled_dot_product_attention_decode` + B3 config. Implement behind a `state.attn_mode = "sdpa"` flag with `"manual"` as fallback so we can A/B without touching B17 trace prod.
+
+Sub-steps:
+1. Audit `attn_forward_ttnn` + `upload_attn_layer` + KV cache layout — map Q/K/V shapes, RoPE workaround interaction, current cache append pattern. (in-flight)
+2. Sketch SDPA call signature + config + KV layout (paged vs current) in a design memo. Get user check-in before refactor.
+3. Implement SDPA path behind flag.
+4. Smoke at 10 positions + ladder at 85 positions in SDPA mode.
+5. Compare per-layer cosines + top-1 vs manual baseline.
+6. Commit + flip default if SDPA wins, else revert + document.
+
+**Pre-swap baseline (the diff measures the swap, not noise):**
+- top-1 69/85 = 81.2%
+- median cos_final 0.9384, cos_logits 0.9424
+- L39 min cos 0.7000 at pos 16
+- L31 min cos 0.7742 at pos 80
+
+Success criterion for SDPA swap: top-1 ≥ 95%, median cos_final ≥ 0.99, L39 worst-case ≥ 0.90.
 
 ## Risks / things to track
 
