@@ -25,8 +25,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 import server_35b_ttnn as srv  # noqa: E402
 
+import argparse
+
 PROMPT = "The capital of France is"
-MAX_NEW = 24
+MAX_NEW = 24  # overridden via --max-new
 
 
 def log(msg):
@@ -34,7 +36,13 @@ def log(msg):
 
 
 def main():
-    log("bootstrap…")
+    global MAX_NEW
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max-new", type=int, default=MAX_NEW)
+    ap.add_argument("--prompt", default=PROMPT)
+    args = ap.parse_args()
+    MAX_NEW = args.max_new
+    log(f"bootstrap… (max_new={MAX_NEW}, prompt={args.prompt!r})")
     state = srv.State()
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()
