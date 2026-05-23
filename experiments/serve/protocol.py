@@ -5,10 +5,17 @@ import socket
 from dataclasses import dataclass, asdict
 from typing import Any, Optional
 
-SOCKET_PATH = os.path.expanduser("~/tt-xla/.cache/server.sock")
-PID_PATH = os.path.expanduser("~/tt-xla/.cache/server.pid")
-LOG_PATH = os.path.expanduser("~/tt-xla/.cache/server.log")
-CACHE_DIR = os.path.expanduser("~/tt-xla/.cache")
+# Resolve repo root from this file's location so a fresh clone at any path
+# works without hardcoding. Prod (~/tt-xla/) lands on ~/tt-xla/.cache/... —
+# unchanged from the prior hardcoded behavior. Override with TT_XLA_ROOT for
+# tests that want a custom cache location.
+_PROJECT_ROOT = os.environ.get("TT_XLA_ROOT") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
+CACHE_DIR = os.path.join(_PROJECT_ROOT, ".cache")
+SOCKET_PATH = os.path.join(CACHE_DIR, "server.sock")
+PID_PATH = os.path.join(CACHE_DIR, "server.pid")
+LOG_PATH = os.path.join(CACHE_DIR, "server.log")
 
 
 @dataclass

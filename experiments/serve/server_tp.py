@@ -35,7 +35,12 @@ import contextlib
 # Stage A: device init only. Bigger imports gated to bootstrap to keep cold startup fast.
 
 # --- Paths --------------------------------------------------------------------
-PROJECT_ROOT = os.path.expanduser("~/tt-xla")
+# Resolve repo root from this file's location so a fresh clone at any path
+# works without hardcoding. Prod (~/tt-xla/) is unchanged. Override with
+# TT_XLA_ROOT for tests that want a custom cache location.
+PROJECT_ROOT = os.environ.get("TT_XLA_ROOT") or os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..")
+)
 CACHE_DIR = os.path.join(PROJECT_ROOT, ".cache")
 SOCKET_PATH = os.path.join(CACHE_DIR, "server_tp.sock")
 PID_FILE = os.path.join(CACHE_DIR, "server_tp.pid")
