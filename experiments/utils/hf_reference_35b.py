@@ -27,6 +27,7 @@ Run (qb1):
 """
 import json
 import sys
+import argparse
 import time
 from pathlib import Path
 
@@ -36,11 +37,12 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
-OUT_DIR = PROJECT_ROOT / ".cache" / "hf_oracle_35b"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_OUT_DIR = PROJECT_ROOT / ".cache" / "hf_oracle_35b"
 
-# Same prompt server_35b_ttnn.py smoke uses
-PROMPT = "The capital of France is"
+# Same prompt server_35b_ttnn.py smoke uses (5 tokens). Override with --prompt
+# for longer ladders; --output-dir lets you keep parallel oracles without
+# clobbering this default B16 oracle.
+DEFAULT_PROMPT = "The capital of France is"
 
 
 def log(msg):
@@ -48,6 +50,18 @@ def log(msg):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt", default=DEFAULT_PROMPT,
+                    help="text to tokenize and pass through HF model")
+    ap.add_argument("--output-dir", default=str(DEFAULT_OUT_DIR),
+                    help="directory to save oracle artifacts")
+    args = ap.parse_args()
+
+    global PROMPT, OUT_DIR
+    PROMPT = args.prompt
+    OUT_DIR = Path(args.output_dir)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
     log(f"loading config + tokenizer ({MODEL_ID})…")
     cfg = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
