@@ -60,6 +60,8 @@ def main():
                     help="cap at first N positions (0 = full prompt). Use small N for smoke runs.")
     ap.add_argument("--drift-cos-threshold", type=float, default=0.99,
                     help="layer cosine below this counts as divergence")
+    ap.add_argument("--attn-mode", choices=["manual", "sdpa"], default="manual",
+                    help="attention path: 'manual' (B16/B17 default) or 'sdpa' (paged + B3 config)")
     args = ap.parse_args()
 
     oracle_dir = Path(args.oracle)
@@ -80,11 +82,12 @@ def main():
 
     # Bootstrap (1,4) mesh + load all 40 layer weights. ~106 s on qb1 per
     # B16 smoke timings.
-    log("bootstrapping (1,4) mesh + uploading weights…")
+    log(f"bootstrapping (1,4) mesh + uploading weights… (attn_mode={args.attn_mode})")
     state = srv.State()
+    state.attn_mode = args.attn_mode  # MUST be set before bootstrap; allocates paged plumbing if sdpa
     t0 = time.time()
     srv.bootstrap(state, log)
-    state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders
+    state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders (paged if sdpa)
     log(f"bootstrap done in {time.time()-t0:.1f}s")
 
     per_pos = []

@@ -226,21 +226,24 @@ def upload_moe_layer(sd, mesh):
     # Per-chip slice: each chip holds all 256 experts, but its 128-of-512 slice
     # of BOTH gate and up. Per-chip shape: [256_E, 2048_H, 256_I] (TRANSPOSED
     # to [hidden, intermediate] for matmul-friendly layout — h @ W → [1, 256]).
+    # experts.gate_up_proj per-chip [256_E, HIDDEN=2048, 2*INTER_CHIP=256] TILE.
+    # 3D shape preserves matmul-friendly dims so we can slice [0, e, 0..H, 0..2*I]
+    # and use the result directly without flat→reshape round-trip.
     egu = sd["mlp.experts.gate_up_proj"]
     per_chip_egu = []
     for chip in range(NCHIPS):
-        gate_slice = egu[:, chip*MOE_INTER_CHIP:(chip+1)*MOE_INTER_CHIP, :]  # [256, 128, 2048]
+        gate_slice = egu[:, chip*MOE_INTER_CHIP:(chip+1)*MOE_INTER_CHIP, :]
         up_slice = egu[:, MOE_INTER + chip*MOE_INTER_CHIP:MOE_INTER + (chip+1)*MOE_INTER_CHIP, :]
         stacked = np.concatenate([gate_slice, up_slice], axis=1)  # [256, 256, 2048]
         per_chip_egu.append(stacked.transpose(0, 2, 1))  # [256, 2048, 256] — [E, H, I]
     out["experts_gate_up"] = np_stacked_to_sharded(per_chip_egu, mesh)
 
     # experts.down_proj [256, 2048, 512]: shard along axis 2 (intermediate).
-    # Per-chip [256_E, 128_I, 2048_H] (TRANSPOSED) — mid [1, 128] @ W → [1, 2048].
+    # Per-chip [256_E, INTER_CHIP=128, HIDDEN=2048] TILE.
     ed = sd["mlp.experts.down_proj"]
     per_chip_ed = []
     for chip in range(NCHIPS):
-        slab = ed[:, :, chip*MOE_INTER_CHIP:(chip+1)*MOE_INTER_CHIP]  # [256, 2048, 128]
+        slab = ed[:, :, chip*MOE_INTER_CHIP:(chip+1)*MOE_INTER_CHIP]
         per_chip_ed.append(slab.transpose(0, 2, 1))  # [256, 128, 2048] — [E, I, H]
     out["experts_down"] = np_stacked_to_sharded(per_chip_ed, mesh)
 
@@ -562,7 +565,142 @@ def _apply_partial_rope(x, cos_tt, sin_tt, n_heads):
     return x_embed
 
 
-def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
+def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state):
+    """Attention block via ttnn paged_scaled_dot_product_attention_decode + B3 config.
+
+    Per-chip GQA layout: NQ_PER_CHIP=4 Q heads attend to 1 KV head (chip→KV-head
+    mapping at upload). Paged KV cache shape [NUM_BLOCKS, 1, BLOCK_SIZE, HEAD_DIM]
+    per chip; cur_pos selects the slot via state.cur_pos_buf (int32 [1] device).
+
+    RoPE: keeps the broadcast-to-NQ_PER_CHIP workaround for K from the manual
+    path (feedback_qwen36_attn_rope_single_row_ttnn_bug.md). After RoPE, all
+    NQ_PER_CHIP K rows are identical (cos/sin are scalar per step), so we slice
+    row 0 back to [1, HEAD_DIM] before paged_update_cache.
+
+    Returns (out [1, HIDDEN] replicated, kv_cache_tuple). The kv_cache_tuple is
+    the SAME (kc, vc) tensors that came in — paged_update_cache mutates them
+    in place, so callers can ignore the returned value.
+    """
+    L = None  # layer index unknown here; state holds caches per layer, attached at call site
+    # The caller (layer_forward_ttnn) passes the per-layer kv_cache via state's
+    # kv_caches_tt[L]. Here we receive the kc/vc as a paired tuple via state.
+    # By contract, attn_forward_ttnn (the dispatcher) sets state._current_kv_cache
+    # to (kc, vc) before calling this function.
+    kc, vc = state._current_kv_cache
+
+    # Q/K/V projections (Q-head sharded; K, V per chip = 1 KV head)
+    q_full = ttnn.matmul(h_tt, w["q_proj"])
+    k = ttnn.matmul(h_tt, w["k_proj"])
+    v = ttnn.matmul(h_tt, w["v_proj"])
+
+    # Split Q + gate per head (HF chunk after view to [..., -1, head_dim*2])
+    q_full_2d = ttnn.reshape(q_full, [NQ_PER_CHIP, HEAD_DIM_ATTN * 2])
+    ttnn.deallocate(q_full)
+    q_h = ttnn.slice(q_full_2d, [0, 0], [NQ_PER_CHIP, HEAD_DIM_ATTN])
+    gate_part_per_head = ttnn.slice(q_full_2d, [0, HEAD_DIM_ATTN],
+                                     [NQ_PER_CHIP, HEAD_DIM_ATTN * 2])
+    ttnn.deallocate(q_full_2d)
+    gate_part = ttnn.reshape(gate_part_per_head, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
+    ttnn.deallocate(gate_part_per_head)
+
+    # Q/K rms_norm per HEAD_DIM
+    k_h = ttnn.reshape(k, [1, HEAD_DIM_ATTN])
+    ttnn.deallocate(k)
+    q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+
+    # RoPE: Q rotation works on [4, HEAD_DIM] directly. K must be broadcast
+    # to [4, HEAD_DIM] before _apply_partial_rope (the [1, HEAD_DIM] ttnn
+    # slice/concat path is silently broken — see feedback_qwen36_attn_rope_*).
+    q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
+    ttnn.deallocate(q_n); q_n = q_n_rope
+    k_n_b = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
+    ttnn.deallocate(k_n)
+    k_n_rope = _apply_partial_rope(k_n_b, cos_tt, sin_tt, NQ_PER_CHIP)
+    ttnn.deallocate(k_n_b)
+    # Dedupe back to [1, HEAD_DIM]: all NQ_PER_CHIP rows are bit-identical
+    # post-RoPE because cos/sin are scalar per step. Take row 0.
+    k_n_single = ttnn.slice(k_n_rope, [0, 0], [1, HEAD_DIM_ATTN])
+    ttnn.deallocate(k_n_rope)
+    v_h = ttnn.reshape(v, [1, HEAD_DIM_ATTN])
+    ttnn.deallocate(v)
+
+    # Paged update_cache: write K, V at cur_pos. Input contract is
+    # [1, 1, NKV_PER_CHIP=1, HEAD_DIM] padded to TILE_HEIGHT=32 on dim -2,
+    # HEIGHT_SHARDED L1.
+    def _shard_for_paged_write(t_2d):
+        t4d = ttnn.reshape(t_2d, [1, 1, 1, HEAD_DIM_ATTN])
+        t_pad = ttnn.pad(t4d, [[0, 0], [0, 0], [0, state.sdpa_block_size - 1], [0, 0]],
+                         value=0.0)
+        return ttnn.to_memory_config(t_pad, state.paged_write_mem_cfg)
+    k_sharded = _shard_for_paged_write(k_n_single)
+    v_sharded = _shard_for_paged_write(v_h)
+    ttnn.deallocate(k_n_single); ttnn.deallocate(v_h)
+    ttnn.experimental.paged_update_cache(
+        kc, k_sharded,
+        update_idxs_tensor=state.cur_pos_buf,
+        page_table=state.page_table_tt,
+    )
+    ttnn.experimental.paged_update_cache(
+        vc, v_sharded,
+        update_idxs_tensor=state.cur_pos_buf,
+        page_table=state.page_table_tt,
+    )
+    ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
+
+    # SDPA decode (B3 config + CoreCoord(4,4) program config). Q shape
+    # [1, 1, NQ_PER_CHIP, HEAD_DIM] per chip.
+    q_for_sdpa = ttnn.reshape(q_n, [1, 1, NQ_PER_CHIP, HEAD_DIM_ATTN])
+    ttnn.deallocate(q_n)
+    attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+        q_for_sdpa, kc, vc,
+        cur_pos_tensor=state.cur_pos_buf,
+        page_table_tensor=state.page_table_tt,
+        scale=1.0 / (HEAD_DIM_ATTN ** 0.5),
+        program_config=state.paged_sdpa_progcfg,
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+    )  # [1, 1, NQ_PER_CHIP, HEAD_DIM] per chip
+    ttnn.deallocate(q_for_sdpa)
+    attn_flat = ttnn.reshape(attn_out, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
+    ttnn.deallocate(attn_out)
+
+    # attn_output_gate: attn_out * sigmoid(gate)
+    gate_sig = ttnn.sigmoid(gate_part)
+    ttnn.deallocate(gate_part)
+    gated = ttnn.mul(attn_flat, gate_sig)
+    ttnn.deallocate(attn_flat); ttnn.deallocate(gate_sig)
+
+    # o_proj column-sharded + all_reduce (same as manual path)
+    partial = ttnn.matmul(gated, w["o_proj"])
+    ttnn.deallocate(gated)
+    out = all_reduce_tt(partial, mesh)
+    ttnn.deallocate(partial)
+    return out, (kc, vc)
+
+
+def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None, *, state=None):
+    """Dispatcher between SDPA and manual attention paths.
+
+    When state is provided and state.attn_mode == "sdpa", routes to
+    attn_forward_ttnn_sdpa (with paged KV cache + B3 config). Otherwise
+    falls through to the historical manual matmul → softmax → matmul path
+    used through B16/B17.
+    """
+    if state is not None and state.attn_mode == "sdpa":
+        # kv_cache here is the (kc, vc) tuple from state.kv_caches_tt[L].
+        # paged_scaled_dot_product_attention_decode mutates the caches in place;
+        # the returned tuple == the input, so the caller's state.kv_caches_tt[L]
+        # assignment is a no-op (which is fine).
+        state._current_kv_cache = kv_cache
+        try:
+            return attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state)
+        finally:
+            state._current_kv_cache = None
+    return attn_forward_ttnn_manual(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=kv_cache)
+
+
+def attn_forward_ttnn_manual(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     """Attention block on-device, single-token decode (T=1).
 
     Q-head sharded (NQ_PER_CHIP=4 Q heads per chip). K, V each chip holds the
@@ -694,7 +832,7 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
 
 
 def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_cache,
-                       sub_capture=None):
+                       sub_capture=None, *, state=None):
     """Full decoder layer forward on-device:
       residual = h
       h = input_layernorm(h)          # rms_norm with pre-(1+w) weight
@@ -722,7 +860,8 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
         new_dn = (new_conv, new_rec)
         new_kv = kv_cache
     else:
-        mixer_out, new_kv = attn_forward_ttnn(h_norm_1, w, mesh, cos_tt, sin_tt, kv_cache)
+        mixer_out, new_kv = attn_forward_ttnn(h_norm_1, w, mesh, cos_tt, sin_tt, kv_cache,
+                                              state=state)
         new_dn = dn_state
     if sub_capture is not None:
         sub_capture["mixer_out"] = _ttnn_to_numpy_replicated(mixer_out, mesh).reshape(-1)
@@ -764,10 +903,11 @@ def moe_forward_ttnn(h_tt, w, mesh):
     # FIRST PASS: Python loop over K to avoid complex gather; each iter does
     # ttnn.embedding(single_idx, table) → [1, 256, 2048] then matmul.
 
-    routed_partial = None  # accumulator
-    # Read top_idxs and weights ONCE to host (1 readback for K indices + K weights
-    # is 16 scalars — minimal data; can be eliminated later via on-device gather).
-    # Use ConcatMeshToTensor to assemble the replicated mesh tensor, then take [0].
+    # B17-B v3: on-device expert dispatch. Don't FLATTEN experts (caused L1
+    # overflow). Instead: read top_idxs / weights via host readback (same as
+    # original) so trace doesn't apply here, but Python loop body uses the
+    # SAME slice pattern as before. This restores the original (working)
+    # MoE path. Trace support deferred — see research/b17_trace_handoff.
     top_idxs_host = ttnn.to_torch(
         top_idxs, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
     ).int().numpy()[0].reshape(-1)
@@ -775,23 +915,18 @@ def moe_forward_ttnn(h_tt, w, mesh):
         weights, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
     ).float().numpy()[0].reshape(-1)
 
+    routed_partial = None
     for k_idx in range(TOP_K):
         e = int(top_idxs_host[k_idx])
         w_scalar = float(weights_host[k_idx])
-        # Mesh sharded tensors carry their leading mesh-shard dim in the LOGICAL
-        # shape. experts_gate_up logical [NCHIPS, 256_E, 2048_H, 256_I];
-        # per-chip [256_E, 2048_H, 256_I]. Slice begins/ends must be rank-4.
-        # Mesh-sharded tensor padded to rank 4 with leading 1.
-        # Logical shape: [1, 256_E, 2048_H, 256_I] (per-chip view).
         gate_up_e = ttnn.slice(
             w["experts_gate_up"],
             [0, e, 0, 0],
             [1, e + 1, HIDDEN, 2 * MOE_INTER_CHIP],
-        )  # per-chip [1, 1, HIDDEN, 2*INTER]
+        )
         gate_up_e_w = ttnn.reshape(gate_up_e, [HIDDEN, 2 * MOE_INTER_CHIP])
-        gate_up = ttnn.matmul(h_tt, gate_up_e_w)  # [1, 2*INTER] per chip
+        gate_up = ttnn.matmul(h_tt, gate_up_e_w)
         ttnn.deallocate(gate_up_e); ttnn.deallocate(gate_up_e_w)
-        # Split gate||up halves — rank-aware (matmul output may be rank 3 with mesh padding)
         gu_rank = len(list(gate_up.shape))
         if gu_rank == 3:
             gate_part = ttnn.slice(gate_up, [0, 0, 0], [1, 1, MOE_INTER_CHIP])
@@ -802,17 +937,15 @@ def moe_forward_ttnn(h_tt, w, mesh):
         ttnn.deallocate(gate_up)
         mid = ttnn.mul(ttnn.silu(gate_part), up_part)
         ttnn.deallocate(gate_part); ttnn.deallocate(up_part)
-        # Slice expert e's down: logical [NCHIPS, 256_E, 128_I, 2048_H] → [NCHIPS, 1, 128, 2048]
         down_e = ttnn.slice(
             w["experts_down"],
             [0, e, 0, 0],
             [1, e + 1, MOE_INTER_CHIP, HIDDEN],
         )
         down_e_w = ttnn.reshape(down_e, [MOE_INTER_CHIP, HIDDEN])
-        expert_out = ttnn.matmul(mid, down_e_w)  # [1, HIDDEN] per chip (partial)
+        expert_out = ttnn.matmul(mid, down_e_w)
         ttnn.deallocate(down_e); ttnn.deallocate(down_e_w); ttnn.deallocate(mid)
-        # Weighted accumulate
-        weighted = ttnn.multiply(expert_out, w_scalar)  # scalar broadcast
+        weighted = ttnn.multiply(expert_out, w_scalar)
         ttnn.deallocate(expert_out)
         if routed_partial is None:
             routed_partial = weighted
@@ -860,6 +993,18 @@ class State:
         self.rot_idxs_buf = None    # uint32 [1, 1] ROW_MAJOR — for cos/sin table lookup
         self.cos_table_tt = None    # fp32 [MAX_KV, ROTARY_DIM] — pre-baked cos values for all positions
         self.sin_table_tt = None    # fp32 [MAX_KV, ROTARY_DIM] — pre-baked sin values for all positions
+        # Attention path selection. "manual" is the historical Q@K^T → softmax → @V
+        # path used through B16/B17. "sdpa" routes through ttnn paged_scaled_dot_product_attention_decode
+        # with the 27B B3 compute_kernel_config (HiFi2, no fp32_dest_acc). See
+        # research/35b_a3b_sdpa_swap_design.md + feedback_35b_a3b_attn_layer_drift.md.
+        # Set BEFORE bootstrap; the cache allocation + paged plumbing depends on this flag.
+        self.attn_mode = "manual"
+        # SDPA-mode plumbing — only populated when attn_mode == "sdpa".
+        self.cur_pos_buf = None             # int32 [1] device — replicated; consumed by paged_update_cache + paged SDPA
+        self.page_table_tt = None           # int32 [1, NUM_BLOCKS] — identity mapping for B=1
+        self.paged_write_mem_cfg = None     # HEIGHT_SHARDED L1 mem_cfg for the paged_update_cache input tile
+        self.paged_sdpa_progcfg = None      # SDPAProgramConfig (CoreCoord(4,4), exp_approx_mode=False)
+        self.sdpa_compute_kernel_config = None  # B3: HiFi2 + math_approx=False + fp32_dest_acc=False + packer_l1=False
 
     def reset_caches_ttnn(self):
         n = self.text_cfg.num_hidden_layers
@@ -881,7 +1026,25 @@ class State:
                 kv.append(None)
             else:
                 dn.append(None)
-                kv.append(None)
+                if self.attn_mode == "sdpa":
+                    # Pre-allocate paged K/V cache per attn layer.
+                    # Per chip: [NUM_BLOCKS, NKV_PER_CHIP=1, BLOCK_SIZE, HEAD_DIM] bf16.
+                    # Logical mesh tensor: [NCHIPS, NUM_BLOCKS, 1, BLOCK_SIZE, HEAD_DIM],
+                    # sharded dim=0 across chips.
+                    cache_shape = (NCHIPS, self.sdpa_num_blocks, 1,
+                                   self.sdpa_block_size, HEAD_DIM_ATTN)
+                    zeros = np.zeros(cache_shape, dtype=np.float32)
+                    kc = ttnn.from_torch(
+                        torch.from_numpy(zeros), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                        device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
+                    )
+                    vc = ttnn.from_torch(
+                        torch.from_numpy(zeros), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                        device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
+                    )
+                    kv.append((kc, vc))
+                else:
+                    kv.append(None)
         self.dn_caches_tt = dn
         self.kv_caches_tt = kv
 
@@ -928,7 +1091,8 @@ def _reassemble_heads_chip_to_hf(per_chip_list):
 
 
 def update_input_buffers(state, token_id, cur_pos):
-    """Write new token id + rot_idxs into pre-allocated buffers in-place.
+    """Write new token id + rot_idxs (+ cur_pos in sdpa mode) into pre-allocated
+    buffers in-place.
 
     Must be called OUTSIDE trace capture. The trace then reads from these
     buffers (no host-side from_torch inside captured region).
@@ -945,6 +1109,13 @@ def update_input_buffers(state, token_id, cur_pos):
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
     ttnn.copy_host_to_device_tensor(rot_host, state.rot_idxs_buf)
+    if state.attn_mode == "sdpa":
+        pos_host = ttnn.from_torch(
+            torch.tensor([cur_pos], dtype=torch.int32),
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        ttnn.copy_host_to_device_tensor(pos_host, state.cur_pos_buf)
 
 
 def _precompute_cos_sin_table(mesh, max_pos):
@@ -1019,7 +1190,7 @@ def step_forward_inner(state, capture=None):
         h_new, new_dn, new_kv = layer_forward_ttnn(
             h_tt, state.per_layer_tt[L], lt, state.mesh,
             cos_tt, sin_tt, state.dn_caches_tt[L], state.kv_caches_tt[L],
-            sub_capture=sc,
+            sub_capture=sc, state=state,
         )
         if sc is not None:
             capture[f"layer_{L}_sub"] = sc
@@ -1137,6 +1308,59 @@ def bootstrap(state, log):
     )
     state.cos_table_tt, state.sin_table_tt = _precompute_cos_sin_table(state.mesh, MAX_KV)
     log(f"  tok_buf, rot_idxs_buf, cos/sin tables ({MAX_KV} positions) ready.")
+
+    if state.attn_mode == "sdpa":
+        # Paged SDPA plumbing — mirrors 27B server_tp.py:468-525.
+        # NUM_BLOCKS*BLOCK_SIZE = MAX_KV; BLOCK_SIZE must be a multiple of
+        # TILE_HEIGHT=32. cur_pos_buf is a single int32 device tensor that
+        # paged_update_cache + paged SDPA consume; written each step via
+        # update_input_buffers OUTSIDE any captured trace.
+        SDPA_BLOCK_SIZE = 32
+        SDPA_NUM_BLOCKS = MAX_KV // SDPA_BLOCK_SIZE  # 128 at MAX_KV=4096
+        SDPA_TILE_HEIGHT = 32
+        state.sdpa_block_size = SDPA_BLOCK_SIZE
+        state.sdpa_num_blocks = SDPA_NUM_BLOCKS
+        state.cur_pos_buf = ttnn.from_torch(
+            torch.zeros((1,), dtype=torch.int32),
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        page_table_np = np.arange(SDPA_NUM_BLOCKS, dtype=np.int32).reshape(1, SDPA_NUM_BLOCKS)
+        state.page_table_tt = ttnn.from_torch(
+            torch.from_numpy(page_table_np),
+            device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        compute_grid = state.mesh.compute_with_storage_grid_size()
+        shard_grid = ttnn.num_cores_to_corerangeset(1, compute_grid, row_wise=True)
+        shard_spec = ttnn.ShardSpec(
+            shard_grid, [SDPA_TILE_HEIGHT, HEAD_DIM_ATTN],
+            ttnn.ShardOrientation.ROW_MAJOR,
+        )
+        state.paged_write_mem_cfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec,
+        )
+        # B3: HiFi2 + math_approx_mode=False + fp32_dest_acc_en=False + packer_l1_acc=False.
+        # CoreCoord(4,4) keeps SDPA in the per-chip slab (default grabs ~110 cores
+        # per head, which trips the tree-reduction error on (1,4) mesh).
+        state.paged_sdpa_progcfg = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
+            q_chunk_size=0,
+            k_chunk_size=0,
+            exp_approx_mode=False,
+        )
+        state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=False,
+        )
+        log(f"  SDPA paged plumbing: NUM_BLOCKS={SDPA_NUM_BLOCKS}, "
+            f"BLOCK_SIZE={SDPA_BLOCK_SIZE}, MAX_KV={MAX_KV}")
+        log(f"  SDPA compute_kernel_config: B3 (HiFi2 + no fp32_dest_acc + no packer_l1)")
+    else:
+        log("  attn_mode=manual; SDPA plumbing skipped")
+
     log("[bootstrap] ready.")
 
 
