@@ -83,17 +83,70 @@ The 27B P21 fix was specific to a buggy compute kernel config on SDPA decode. Th
 3. **GatedDeltaNet recurrent state drift**. 30 DN layers each carrying conv1d + recurrent state. State quantization compounds across positions. Has not been measured.
 4. **Smaller hidden dim** (2048 vs 27B's 5120). Less averaging means more bf16 noise per op. Architecture-level, can't fix in code.
 
-## Next probe (chosen)
+## Next probe (chosen) — superseded by SDPA investigation below
 
-**MoE router stability** is the cheapest novel signal and 35B-specific. Plan:
-- Extend `hf_reference_35b.py` to also save per-position per-MoE-layer top-k expert decisions + gate logits.
-- Extend `server_35b_ttnn.py:moe_forward_ttnn` to optionally capture top-k expert decisions + gate logits.
-- Write `experiments/utils/moe_router_stability_35b.py` probe: per position, compare TT top-k vs HF top-k; measure top-1 expert match rate, mean rank of HF's top expert in TT's ranking, fraction of positions where TT picks an expert NOT in HF's top-k.
-- Run on qb1, analyze, decide next.
+Originally planned MoE router stability probe. We pivoted to sub-step capture inside the SDPA path instead. That investigation concluded incorrectly (see below).
 
-Effort: ~1.5 hr probe code + ~5 min run. Should be quick to ship.
+## CORRECTNESS INVESTIGATION SUMMARY — 2026-05-22/23
 
-If MoE router is stable, pivot to DN recurrent state drift probe (per-layer recurrent state cosine vs HF).
+### Investigation timeline
+
+1. **Cosine ladder baseline** (manual + SDPA): top-1 81% / 80%, median cos 0.94 / 0.95, drift concentrated in 10 AT layers (especially L34-L39). Real signal.
+2. **Phase 1 drift attribution**: per-AT-layer drop is roughly flat vs position (H2 per-step noise dominant; H5/H6 accumulating noise rejected).
+3. **Phase 2 K-broadcast ablation**: broadcast workaround is bit-inert (HF/TT same numerics with or without). REJECTED H2 (RoPE-broadcast as noise source).
+4. **Needle-haystack at L=100**: HF retrieves verbatim, TT generates `"N/A\nassistant\n<think>..."`. **Confirmed: drift is user-facing.**
+5. **Per-layer ladder on the needle prompt**: identified pos 91 (chat boundary) + L34-L39 as catastrophic. Real signal.
+6. **Sub-step capture inside L31**: q_proj_full cos 0.99+ at all positions; post_gate cos drops to 0.66 at pos 91. CONCLUDED: "bf16 SDPA kernel is the noise source." Started scoping a custom fp32 SDPA kernel project.
+7. **fp32 KV cache test**: hard-rejected by paged SDPA decode kernel (same as 27B feedback note from months ago).
+8. **HF bf16-softmax monkey-patch test**: HF retrieves even with bf16 softmax. REJECTED the "fp32 softmax is the differentiator" hypothesis.
+9. **27B needle at L=500 regression**: **PASSES** (verdict Y, retrieved `7TTJ3PCK` in 39s on qb2 prod TP server). Same SDPA kernel, same B3, same bf16 KV. **INVALIDATES the "bf16 SDPA is the bottleneck" conclusion.**
+
+### What's actually true vs what we believed
+
+| Claim | Status |
+|---|---|
+| 35B-A3B TT fails needle retrieval at L=100 | TRUE — verified |
+| HF can retrieve the same needle | TRUE — verified |
+| Per-layer cos drops are real in TT's 35B path | TRUE — measurement is real, interpretation may be wrong |
+| Drift is concentrated in late layers at chat-boundary positions | TRUE — verified via ladder |
+| "bf16 SDPA precision is the bottleneck" | **FALSE** — 27B works at L=500 with same kernel |
+| "fp32 softmax is the differentiator vs HF" | **FALSE** — HF retrieves with bf16 softmax |
+| "Custom fp32 SDPA kernel project is the fix" | **NOT JUSTIFIED** — no evidence the kernel is the problem |
+
+### Open hypotheses (next session)
+
+- **H12 — 35B-specific TT plumbing bug**: per-chip GQA chip mapping (2 chips per KV head, different from 27B's 1:1), RoPE-broadcast interaction, or some other 35B integration mistake. The kernel is fine; our wiring of it may not be.
+- **H13 — Sub-step reassembly bug**: my per-chip → flat reassembly in the sub_capture code may not match HF's layout. The cosine 0.66 at pos 91 might be a SHAPE/ORDER comparison artifact rather than a precision delta.
+- **H14 — Chat-template token handling**: TT's failure mode (leaking `assistant\n<think>` tokens) is highly structural. Maybe TT mishandles specific chat-template token IDs (248045, 248046, 248068, etc.) in a way that breaks attention.
+- **H15 — HF baseline broken specifically for 35B**: less likely; HF retrieves cleanly.
+- **H16 — 35B intrinsically more precision-sensitive at chat-boundaries**: needs more investigation, but only if H12-H14 are ruled out.
+
+### Methodology lessons
+
+1. **27B is a free control** — for any future correctness work on 35B (or any other model), the first sanity check should be: does the sibling model exhibit the same symptom? If not, the bug is model-specific.
+2. **Verify sub-step capture reassembly with a known-correct ground truth** before trusting cosine numbers.
+3. **Don't propose big-bore fixes** (kernel projects, model rewrites) without first ruling out plumbing/integration bugs AND confirming the diagnosis against a sibling-model counterexample.
+4. **Per-layer cosine drops + sub-step localization are useful diagnostic tools but only relative to a verified baseline.** They don't independently prove a mechanism without cross-checks.
+
+### Cheap next-session probes (in order)
+
+1. **35B needle retrieval without chat template** (~15 min). Same haystack + needle + question but raw text continuation. If 35B retrieves raw but fails chat-rendered, the chat-template handling is the bug, not generic attention.
+2. **Audit `server_35b_ttnn.py:upload_attn_layer` and `attn_forward_ttnn_sdpa`** vs `server_tp.py:gated_attn_step_tp` line-by-line. Look for per-chip layout divergence, GQA chip mapping mismatches, RoPE-broadcast interactions.
+3. **Verify sub-step reassembly** with a tiny known-correct test (identity matrix in, check reassembled output matches expected). Confirms the cos 0.66 isn't a comparison artifact.
+
+### Artifacts (current state)
+
+All ladder JSONs + sub_capture npz + HF oracles are on qb1 under `.cache/sanity_2026_05_22/` and `.cache/hf_oracle_35b_needle100/`. Probe code is permanent at:
+- `experiments/utils/cosine_ladder_35b.py` (with --capture-attn-layer, --sdpa-variant, --kv-cache-dtype flags)
+- `experiments/utils/cosine_ladder_35b_analyze.py`
+- `experiments/utils/cosine_ladder_35b_drift_attribute.py`
+- `experiments/utils/cosine_ladder_35b_attn_sub_compare.py`
+- `experiments/utils/cosine_ladder_35b_diff.py`
+- `experiments/utils/needle_haystack_35b_ttnn.py`
+- `experiments/utils/needle_haystack_35b_hf.py`
+- `experiments/utils/needle_haystack_35b_hf_softmax_test.py`
+
+The SDPA path + B3 config + sub_capture infrastructure in `server_35b_ttnn.py` is net positive (structural alignment with 27B + reusable diagnostic infra) and stays as default. The K-broadcast workaround can be removed (proven bit-inert) but no urgency.
 
 ## Risks / things to track
 
