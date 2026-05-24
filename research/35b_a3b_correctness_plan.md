@@ -134,6 +134,36 @@ Originally planned MoE router stability probe. We pivoted to sub-step capture in
 2. **Audit `server_35b_ttnn.py:upload_attn_layer` and `attn_forward_ttnn_sdpa`** vs `server_tp.py:gated_attn_step_tp` line-by-line. Look for per-chip layout divergence, GQA chip mapping mismatches, RoPE-broadcast interactions.
 3. **Verify sub-step reassembly** with a tiny known-correct test (identity matrix in, check reassembled output matches expected). Confirms the cos 0.66 isn't a comparison artifact.
 
+## 2026-05-24 session update (long investigation, no final fix)
+
+**More work done, more hypotheses tested. Still no working fix.** Comprehensive wrap-up in
+`memory/feedback_35b_a3b_session_wrapup.md`. Quick highlights:
+
+- Sub-step capture at L31 then L39 inside the SDPA path. attn block sub-steps
+  are bit-clean at pos 0 (cos 0.9999); MoE output also bit-clean (cos 1.0000);
+  full layer output drops to 0.9809. Drift is post-MoE, in the residual ADD.
+- HF magnitude inspector revealed late-layer hidden states EXPLODE — L39 L2 = 117
+  vs L11 L2 = 10. bf16 quant noise scales with magnitude.
+- Audited 27B's `server_tp.py:gated_attn_step_tp` vs 35B's `attn_forward_ttnn_sdpa`.
+  Essentially identical — only difference is `ttnn.linear` vs `ttnn.matmul` (cosmetic)
+  and the K-broadcast workaround (proven bit-inert). 27B does NOT explicitly pass
+  `compute_kernel_config` to its linears.
+- Added HIFI4 + fp32_dest_acc to all 22 matmuls in 35B (matches 27B's `91f.py`
+  research recipe). Did NOT fix the needle test — TT still generates garbage.
+- Layer-by-layer drift onset: at pos 0, L31 and L39 specifically drop to cos 0.98
+  while L11/L15/L19/L23/L27 are bit-perfect. Layer-specific, magnitude-correlated,
+  NOT generic precision accumulation.
+
+**Top remaining hypothesis**: MoE router stability (H3). Rejected earlier on weak
+indirect evidence — needs a proper direct test (TT top-k vs HF top-k at L31/L39).
+TT's `moe_top_idxs` is already captured in the existing npz. Just need to compute
+HF's top-k from the router weights and compare.
+
+**Code state to clean up**: speculative flags added today
+(`attn_sdpa_no_broadcast`, `kv_cache_dtype`, `residual_add_dtype`) can be removed
+once the real fix lands. HIFI4 + sub_capture infra stays. User explicitly asked
+for a cleanup pass next session.
+
 ### Artifacts (current state)
 
 All ladder JSONs + sub_capture npz + HF oracles are on qb1 under `.cache/sanity_2026_05_22/` and `.cache/hf_oracle_35b_needle100/`. Probe code is permanent at:

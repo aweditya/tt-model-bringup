@@ -84,6 +84,21 @@ MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 MAX_KV = 4096  # max KV cache length; bump later for long context
 
 
+# 27B-style compute kernel config — HiFi4 + fp32_dest_acc_en=True. Passed to
+# every ttnn.matmul/ttnn.linear in the model forward to keep DEST register
+# accumulation in fp32 even when inputs/weights are bf16. Mirrors 91f.py's
+# discipline (every linear takes compute_kernel_config=hifi4) which is the
+# established 27B mixed-precision pattern. 35B's server was missing this
+# config on every matmul outside the SDPA call — the dominant cause of
+# accumulated bf16 quant noise at late layers (L31/L39).
+HIFI4 = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4,
+    math_approx_mode=False,
+    fp32_dest_acc_en=True,
+    packer_l1_acc=False,
+)
+
+
 # ── Tensor upload helpers ──────────────────────────────────────────────
 def np_to_replicated(arr, mesh, dtype=ttnn.bfloat16):
     """Upload a numpy array to mesh, replicated on every chip."""
@@ -295,10 +310,10 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
     conv_state_in, recurrent_state_in = dn_state
 
     # === Projections (sharded per-chip outputs) ===
-    mixed_qkv = ttnn.matmul(h_tt, w["in_proj_qkv"])  # [1, CONV_DIM_CHIP=2048] per chip
-    z = ttnn.matmul(h_tt, w["in_proj_z"])            # [1, V_DIM_CHIP=1024] per chip
-    a = ttnn.matmul(h_tt, w["in_proj_a"])            # [1, NV_PER_CHIP=8] per chip
-    b = ttnn.matmul(h_tt, w["in_proj_b"])            # [1, NV_PER_CHIP=8] per chip
+    mixed_qkv = ttnn.matmul(h_tt, w["in_proj_qkv"], compute_kernel_config=HIFI4)  # [1, CONV_DIM_CHIP=2048] per chip
+    z = ttnn.matmul(h_tt, w["in_proj_z"], compute_kernel_config=HIFI4)            # [1, V_DIM_CHIP=1024] per chip
+    a = ttnn.matmul(h_tt, w["in_proj_a"], compute_kernel_config=HIFI4)            # [1, NV_PER_CHIP=8] per chip
+    b = ttnn.matmul(h_tt, w["in_proj_b"], compute_kernel_config=HIFI4)            # [1, NV_PER_CHIP=8] per chip
     if dn_sub_capture is not None:
         # mixed_qkv per-chip [Q_CHIP | K_CHIP | V_CHIP]; reassemble to HF order
         dn_sub_capture["dn_in_proj_qkv"] = _reassemble_qkv_chip_to_hf(
@@ -525,7 +540,7 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
             _ttnn_to_numpy_perchip(gated_1d, mesh))
 
     # === out_proj column-sharded ===
-    partial = ttnn.matmul(gated_1d, w["out_proj"])  # [1, HIDDEN] per chip (partial)
+    partial = ttnn.matmul(gated_1d, w["out_proj"], compute_kernel_config=HIFI4)  # [1, HIDDEN] per chip (partial)
     ttnn.deallocate(gated_1d)
     out = all_reduce_tt(partial, mesh)
     ttnn.deallocate(partial)
@@ -589,9 +604,9 @@ def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state, sub_capture=Non
     kc, vc = state._current_kv_cache
 
     # Q/K/V projections (Q-head sharded; K, V per chip = 1 KV head)
-    q_full = ttnn.matmul(h_tt, w["q_proj"])
-    k = ttnn.matmul(h_tt, w["k_proj"])
-    v = ttnn.matmul(h_tt, w["v_proj"])
+    q_full = ttnn.matmul(h_tt, w["q_proj"], compute_kernel_config=HIFI4)
+    k = ttnn.matmul(h_tt, w["k_proj"], compute_kernel_config=HIFI4)
+    v = ttnn.matmul(h_tt, w["v_proj"], compute_kernel_config=HIFI4)
     if sub_capture is not None:
         # Per-chip q_full: [1, NQ_PER_CHIP * HEAD_DIM_ATTN * 2] = [1, 2048]
         # Reassemble across 4 chips along the Q-head axis (each chip holds 4 of
@@ -709,7 +724,7 @@ def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state, sub_capture=Non
         sub_capture["attn_post_gate"] = per_chip.reshape(-1)
 
     # o_proj column-sharded + all_reduce (same as manual path)
-    partial = ttnn.matmul(gated, w["o_proj"])
+    partial = ttnn.matmul(gated, w["o_proj"], compute_kernel_config=HIFI4)
     ttnn.deallocate(gated)
     if sub_capture is not None:
         # Per-chip o_proj partial — each chip outputs a partial sum of the same
@@ -770,10 +785,10 @@ def attn_forward_ttnn_manual(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     Returns (out [1, HIDDEN] replicated, new_kv_cache).
     """
     # Q projection (Q-head sharded); per-chip [1, NQ_PER_CHIP * HEAD_DIM * 2]
-    q_full = ttnn.matmul(h_tt, w["q_proj"])
+    q_full = ttnn.matmul(h_tt, w["q_proj"], compute_kernel_config=HIFI4)
     # K, V per chip [1, HEAD_DIM_ATTN] — single KV head per chip (mapping at upload).
-    k = ttnn.matmul(h_tt, w["k_proj"])
-    v = ttnn.matmul(h_tt, w["v_proj"])
+    k = ttnn.matmul(h_tt, w["k_proj"], compute_kernel_config=HIFI4)
+    v = ttnn.matmul(h_tt, w["v_proj"], compute_kernel_config=HIFI4)
 
     # Split Q + gate per-head (HF chunk after view to [..., -1, head_dim*2])
     q_full_2d = ttnn.reshape(q_full, [NQ_PER_CHIP, HEAD_DIM_ATTN * 2])
@@ -857,14 +872,14 @@ def attn_forward_ttnn_manual(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
         ttnn.deallocate(q_n)
     else:
         k_hist_T = ttnn.transpose(k_hist, -2, -1)
-        scores = ttnn.matmul(q_n, k_hist_T)
+        scores = ttnn.matmul(q_n, k_hist_T, compute_kernel_config=HIFI4)
         ttnn.deallocate(k_hist_T); ttnn.deallocate(q_n)
         scale = 1.0 / (HEAD_DIM_ATTN ** 0.5)
         scores_scaled = ttnn.multiply(scores, scale)
         ttnn.deallocate(scores)
         weights = ttnn.softmax(scores_scaled, dim=-1)
         ttnn.deallocate(scores_scaled)
-        attn_out = ttnn.matmul(weights, v_hist)
+        attn_out = ttnn.matmul(weights, v_hist, compute_kernel_config=HIFI4)
         ttnn.deallocate(weights)
 
     attn_flat = ttnn.reshape(attn_out, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
@@ -877,7 +892,7 @@ def attn_forward_ttnn_manual(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     ttnn.deallocate(attn_flat); ttnn.deallocate(gate_sig)
 
     # o_proj column-sharded + all_reduce
-    partial = ttnn.matmul(gated, w["o_proj"])
+    partial = ttnn.matmul(gated, w["o_proj"], compute_kernel_config=HIFI4)
     ttnn.deallocate(gated)
     out = all_reduce_tt(partial, mesh)
     ttnn.deallocate(partial)
@@ -920,7 +935,18 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     if sub_capture is not None:
         sub_capture["mixer_out"] = _ttnn_to_numpy_replicated(mixer_out, mesh).reshape(-1)
     ttnn.deallocate(h_norm_1)
-    h_after_mixer = ttnn.add(residual_1, mixer_out)
+    # Residual-add 1. Optionally upcast to fp32 to avoid bf16 quantization
+    # noise at large magnitudes (see feedback_35b_a3b_drift_is_user_facing.md).
+    use_fp32_add = state is not None and getattr(state, "residual_add_dtype", "bf16") == "fp32"
+    if use_fp32_add:
+        r1_fp32 = ttnn.typecast(residual_1, ttnn.float32)
+        m_fp32 = ttnn.typecast(mixer_out, ttnn.float32)
+        h_after_mixer_fp32 = ttnn.add(r1_fp32, m_fp32)
+        ttnn.deallocate(r1_fp32); ttnn.deallocate(m_fp32)
+        h_after_mixer = ttnn.typecast(h_after_mixer_fp32, ttnn.bfloat16)
+        ttnn.deallocate(h_after_mixer_fp32)
+    else:
+        h_after_mixer = ttnn.add(residual_1, mixer_out)
     ttnn.deallocate(mixer_out)
     if sub_capture is not None:
         sub_capture["after_mixer"] = _ttnn_to_numpy_replicated(h_after_mixer, mesh).reshape(-1)
@@ -934,7 +960,16 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     ttnn.deallocate(h_norm_2)
     if sub_capture is not None:
         sub_capture["moe_out"] = _ttnn_to_numpy_replicated(moe_out, mesh).reshape(-1)
-    h_final = ttnn.add(residual_2, moe_out)
+    # Residual-add 2. Same fp32-upcast option as residual-add 1.
+    if use_fp32_add:
+        r2_fp32 = ttnn.typecast(residual_2, ttnn.float32)
+        mo_fp32 = ttnn.typecast(moe_out, ttnn.float32)
+        h_final_fp32 = ttnn.add(r2_fp32, mo_fp32)
+        ttnn.deallocate(r2_fp32); ttnn.deallocate(mo_fp32)
+        h_final = ttnn.typecast(h_final_fp32, ttnn.bfloat16)
+        ttnn.deallocate(h_final_fp32)
+    else:
+        h_final = ttnn.add(residual_2, moe_out)
     ttnn.deallocate(residual_2); ttnn.deallocate(moe_out)
     return h_final, new_dn, new_kv
 
@@ -947,7 +982,7 @@ def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
     routed_full, shared_full, final.
     """
     # Router (replicated weight, replicated input → replicated output)
-    logits = ttnn.matmul(h_tt, w["router_weight"])  # [1, 256]
+    logits = ttnn.matmul(h_tt, w["router_weight"], compute_kernel_config=HIFI4)  # [1, 256]
     probs = ttnn.softmax(logits, dim=-1)
     # topk
     top_vals, top_idxs = ttnn.topk(probs, k=TOP_K, dim=-1)
@@ -988,7 +1023,7 @@ def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
             [1, e + 1, HIDDEN, 2 * MOE_INTER_CHIP],
         )
         gate_up_e_w = ttnn.reshape(gate_up_e, [HIDDEN, 2 * MOE_INTER_CHIP])
-        gate_up = ttnn.matmul(h_tt, gate_up_e_w)
+        gate_up = ttnn.matmul(h_tt, gate_up_e_w, compute_kernel_config=HIFI4)
         ttnn.deallocate(gate_up_e); ttnn.deallocate(gate_up_e_w)
         gu_rank = len(list(gate_up.shape))
         if gu_rank == 3:
@@ -1006,7 +1041,7 @@ def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
             [1, e + 1, MOE_INTER_CHIP, HIDDEN],
         )
         down_e_w = ttnn.reshape(down_e, [MOE_INTER_CHIP, HIDDEN])
-        expert_out = ttnn.matmul(mid, down_e_w)
+        expert_out = ttnn.matmul(mid, down_e_w, compute_kernel_config=HIFI4)
         ttnn.deallocate(down_e); ttnn.deallocate(down_e_w); ttnn.deallocate(mid)
         weighted = ttnn.multiply(expert_out, w_scalar)
         ttnn.deallocate(expert_out)
@@ -1018,14 +1053,14 @@ def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
             routed_partial = new_routed
 
     # SHARED EXPERT (sharded intermediate dim)
-    s_gate = ttnn.matmul(h_tt, w["shared_gate"])  # [1, 128] per chip
-    s_up = ttnn.matmul(h_tt, w["shared_up"])      # [1, 128] per chip
+    s_gate = ttnn.matmul(h_tt, w["shared_gate"], compute_kernel_config=HIFI4)  # [1, 128] per chip
+    s_up = ttnn.matmul(h_tt, w["shared_up"], compute_kernel_config=HIFI4)      # [1, 128] per chip
     s_mid = ttnn.mul(ttnn.silu(s_gate), s_up)
-    shared_partial = ttnn.matmul(s_mid, w["shared_down"])  # [1, 2048] per chip (partial)
+    shared_partial = ttnn.matmul(s_mid, w["shared_down"], compute_kernel_config=HIFI4)  # [1, 2048] per chip (partial)
     shared_full = all_reduce_tt(shared_partial, mesh)      # [1, 2048] replicated
 
     # Scalar gate (replicated weight; output [1, 1] replicated)
-    gate_logit = ttnn.matmul(h_tt, w["shared_expert_gate"])  # [1, 1]
+    gate_logit = ttnn.matmul(h_tt, w["shared_expert_gate"], compute_kernel_config=HIFI4)  # [1, 1]
     gate_sig = ttnn.sigmoid(gate_logit)
     gated_shared = ttnn.mul(shared_full, gate_sig)  # broadcast
 
@@ -1091,6 +1126,14 @@ class State:
         # made this variant buggy may not apply at 35B-A3B's GQA shapes.
         # See feedback_35b_a3b_drift_is_user_facing.md.
         self.sdpa_compute_variant = "B3"
+        # Residual-add dtype. "bf16" = current behavior (ttnn.add stays bf16).
+        # "fp32" = upcast operands to fp32 before each residual ADD in
+        # layer_forward_ttnn, then cast back to bf16. The bf16 ADD of large-
+        # magnitude tensors at late layers (L39 has L2~117) loses ~0.014
+        # cos to bf16 quantization on the sum. fp32 add removes that noise.
+        # ttnn.add's Python binding doesn't expose compute_kernel_config,
+        # so explicit casts are how we plumb fp32 accumulation here.
+        self.residual_add_dtype = "bf16"
         # SDPA-mode plumbing — only populated when attn_mode == "sdpa".
         self.cur_pos_buf = None             # int32 [1] device — replicated; consumed by paged_update_cache + paged SDPA
         self.page_table_tt = None           # int32 [1, NUM_BLOCKS] — identity mapping for B=1
@@ -1318,7 +1361,7 @@ def step_forward_inner(state, capture=None):
     ttnn.deallocate(h_tt)
     if capture is not None:
         capture["final_norm"] = _ttnn_to_numpy_replicated(h_norm, state.mesh).reshape(-1)
-    logits = ttnn.matmul(h_norm, state.lm_head_tt)  # [1, VOCAB] per chip (replicated)
+    logits = ttnn.matmul(h_norm, state.lm_head_tt, compute_kernel_config=HIFI4)  # [1, VOCAB] per chip (replicated)
     ttnn.deallocate(h_norm)
     if capture is not None:
         capture["logits"] = _ttnn_to_numpy_replicated(logits, state.mesh).reshape(-1)
@@ -1353,7 +1396,12 @@ def bootstrap(state, log):
 
     log("[bootstrap] enumerate shards + load top-level weights to mesh…")
     key_to_shard = build_key_to_shard()
-    # Upload embed table to mesh (replicated; small enough at 248320*2048*2B = 1 GB).
+    # Upload embed table to mesh (replicated). bf16 because the ttnn.embedding
+    # kernel hard-rejects fp32 weights ("Weights tensor must have BFLOAT16
+    # dtype"). We cast the embedding OUTPUT to fp32 in step_forward_inner to
+    # get fp32 propagation through the residual stream — matches 27B's 91l
+    # recipe in spirit (fp32 residual stream avoids bf16 quantization noise
+    # on the residual ADDs at late layers).
     # ttnn.embedding requires ROW_MAJOR layout for the table.
     embed_w_np = load_t(key_to_shard, "model.language_model.embed_tokens.weight")
     state.embed_tt = ttnn.from_torch(

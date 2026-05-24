@@ -74,6 +74,10 @@ def main():
     ap.add_argument("--kv-cache-dtype", choices=["bf16", "fp32"], default="bf16",
                     help="(sdpa mode only) KV cache storage dtype. fp32 was hard-rejected by "
                          "paged SDPA decode in 27B's ttnn build — may have been fixed since.")
+    ap.add_argument("--residual-add-dtype", choices=["bf16", "fp32"], default="bf16",
+                    help="dtype for the residual ADDs in layer_forward_ttnn. fp32 = upcast "
+                         "before each ttnn.add, cast back to bf16 after — mitigates bf16 "
+                         "quantization noise on large-magnitude tensors at late layers.")
     args = ap.parse_args()
 
     oracle_dir = Path(args.oracle)
@@ -101,6 +105,7 @@ def main():
     state.attn_sdpa_no_broadcast = args.no_rope_broadcast
     state.sdpa_compute_variant = args.sdpa_variant
     state.kv_cache_dtype = args.kv_cache_dtype
+    state.residual_add_dtype = args.residual_add_dtype
     t0 = time.time()
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders (paged if sdpa)
