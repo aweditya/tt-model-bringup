@@ -71,6 +71,9 @@ def main():
     ap.add_argument("--sdpa-variant", choices=["B3", "hifi4_fp32"], default="B3",
                     help="(sdpa mode only) compute_kernel_config variant for paged SDPA. "
                          "B3 = 27B-validated recipe; hifi4_fp32 = HiFi4 + fp32_dest_acc.")
+    ap.add_argument("--kv-cache-dtype", choices=["bf16", "fp32"], default="bf16",
+                    help="(sdpa mode only) KV cache storage dtype. fp32 was hard-rejected by "
+                         "paged SDPA decode in 27B's ttnn build — may have been fixed since.")
     args = ap.parse_args()
 
     oracle_dir = Path(args.oracle)
@@ -97,6 +100,7 @@ def main():
     state.attn_mode = args.attn_mode  # MUST be set before bootstrap; allocates paged plumbing if sdpa
     state.attn_sdpa_no_broadcast = args.no_rope_broadcast
     state.sdpa_compute_variant = args.sdpa_variant
+    state.kv_cache_dtype = args.kv_cache_dtype
     t0 = time.time()
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders (paged if sdpa)

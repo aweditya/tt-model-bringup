@@ -1105,22 +1105,24 @@ class State:
                     # Match 27B server_tp.py:354-358 layout: logical 4D shape
                     # (NUM_BLOCKS, NCHIPS, BLOCK_SIZE, HEAD_DIM) sharded along dim=1
                     # gives per-chip rank-4 view (NUM_BLOCKS, 1, BLOCK_SIZE, HEAD_DIM).
-                    # The "NCHIPS" axis here doubles as the kv-head-per-chip axis
-                    # (each chip stores its own K/V for its mapped KV head, with
-                    # NUM_KV_HEADS=2 replicated to NCHIPS=4 via chip→KV mapping).
+                    # The "NCHIPS" axis here doubles as the kv-head-per-chip axis.
                     cache_shape = (self.sdpa_num_blocks, NCHIPS,
                                    self.sdpa_block_size, HEAD_DIM_ATTN)
-                    # Separate numpy allocations for kc and vc — torch.from_numpy
-                    # shares memory with the source array; using one source for
-                    # both could let ttnn lazy-eval back to the same device buffer.
                     kc_init = np.zeros(cache_shape, dtype=np.float32)
                     vc_init = np.zeros(cache_shape, dtype=np.float32)
+                    # state.kv_cache_dtype controls KV storage precision.
+                    # bf16 is default + 27B-validated. fp32 was hard-rejected by
+                    # paged SDPA decode in 27B's ttnn build (feedback_fp32_kv_cache.md);
+                    # may have been fixed or may still apply. Try via flag for the
+                    # 35B drift-mitigation probe.
+                    kv_dtype = getattr(self, "kv_cache_dtype", "bf16")
+                    kv_tt_dtype = ttnn.float32 if kv_dtype == "fp32" else ttnn.bfloat16
                     kc = ttnn.from_torch(
-                        torch.from_numpy(kc_init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                        torch.from_numpy(kc_init), dtype=kv_tt_dtype, layout=ttnn.TILE_LAYOUT,
                         device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=1),
                     )
                     vc = ttnn.from_torch(
-                        torch.from_numpy(vc_init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                        torch.from_numpy(vc_init), dtype=kv_tt_dtype, layout=ttnn.TILE_LAYOUT,
                         device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=1),
                     )
                     kv.append((kc, vc))
