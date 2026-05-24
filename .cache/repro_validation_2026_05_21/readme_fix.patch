@@ -1,0 +1,81 @@
+From 5b60afe7f1d60f6d95d5ee4b06cf37d6ccf1b2bf Mon Sep 17 00:00:00 2001
+From: Aditya Sriram <aweditya@gmail.com>
+Date: Thu, 21 May 2026 01:15:26 -0700
+Subject: [PATCH] =?UTF-8?q?README=20=E2=80=94=20legacy=20demos=20re-verifi?=
+ =?UTF-8?q?ed=20(not=20stale)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Legacy 8B-era demos section is now stale: prior agent re-ran all six
+on qb1 against the current TT-NN install on 2026-05-21 and pushed the
+results to REPRODUCE.md (commit d14a547). README still claimed they had
+not been re-run from qb1/qb2 and were kept for historical reference only.
+
+Replace that section with a re-verified table mirroring REPRODUCE.md
+numbers, drop the old vs new filename alias table (REPRODUCE.md now uses
+the actual filenames so there is no alias to document).
+
+Also validated as part of this commit: anonymous git clone of the public
+repo on qb1 + the README setup steps 3+4 (uv sync then
+uv pip install -e TT_METAL_HOME --no-build-isolation) end with a working
+ttnn import in .venv/, and a fresh-clone experiments.serve.client
+generate talks cleanly to the prod server.py socket and decodes 16
+tokens at 5.12 tok/s.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ README.md | 35 +++++++++++++++++++----------------
+ 1 file changed, 19 insertions(+), 16 deletions(-)
+
+diff --git a/README.md b/README.md
+index fcdf70c..c77ddca 100644
+--- a/README.md
++++ b/README.md
+@@ -231,24 +231,27 @@ with the qb1 single-chip baseline (5.19 tok/s in the QK-rms_norm-shipped
+ memory note). Both servers had been bootstrapped before measurement, so
+ the numbers reflect steady-state traced decode (not cold-start).
+ 
+-### Legacy 8B-era demos (not re-runnable)
++### Legacy 8B-era demos (re-verified on qb1, 2026-05-21)
+ 
+ `REPRODUCE.md` documents six experiments from the pre-pivot Llama /
+-Qwen2.5 era. All six script files are still present in `experiments/`
+-(filenames have evolved slightly — REPRODUCE refers to the older names):
+-
+-| Script (actual filename) | REPRODUCE.md alias |
+-|--------------------------|--------------------|
+-| `experiments/60_native_rope_decode.py` | `60_traced_native_rope.py` |
+-| `experiments/64_llama32_1b_port.py` | `64_llama1b_port.py` |
+-| `experiments/67_llama32_3b_port.py` | `67_llama3b_port.py` |
+-| `experiments/73_llama8b_instruct.py` | `73_8b_port.py` |
+-| `experiments/76b_8b_correctness_check.py` | (same) |
+-| `experiments/80_8b_diverse_qa_demo.py` | (same) |
+-
+-These targeted the now-deprecated `ssh tenstorrent` host (per `CLAUDE.md`
+-non-negotiable #4, that host is no longer available). They have **not**
+-been re-run from qb1/qb2 and are kept for historical reference only.
++Qwen2.5 era. All six were authored on the now-deprecated `ssh tenstorrent`
++host (per `CLAUDE.md` non-negotiable #4) and were **re-verified on qb1**
++on 2026-05-21 against the current `~/tt-xla/.venv` install
++(`torch==2.11.0+cu130`, `ttnn==0.69.0`, firmware 19.6.0). All six PASS
++within 2-7% of the historical baselines:
++
++| Script | Baseline | qb1 (2026-05-21) |
++|--------|----------|------------------|
++| `experiments/60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** |
++| `experiments/64_llama32_1b_port.py`    |  78 tok/s | **78.6 tok/s**  |
++| `experiments/67_llama32_3b_port.py`    |  34 tok/s | **33.7 tok/s**  |
++| `experiments/73_llama8b_instruct.py`   |  19 tok/s | **19 tok/s**    |
++| `experiments/76b_8b_correctness_check.py` | cos > 0.997, 8/8 | cos **0.997327**, **8/8** |
++| `experiments/80_8b_diverse_qa_demo.py` | 18 tok/s, 9/10 EOS | **18 tok/s, 9/10 EOS** |
++
++See `REPRODUCE.md` for the run recipe (stop the prod `serve.sh` first
++so device 0 is free), and `~/tt-xla/.cache/legacy_demos_2026_05_21/`
++on qb1 for the captured stdout logs.
+ 
+ ### Experienced-user shortcut
+ 
+-- 
+2.34.1
+
