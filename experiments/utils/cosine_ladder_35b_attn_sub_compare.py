@@ -47,6 +47,12 @@ TT_TO_HF = {
     "attn_out_post_ar":       "o_proj",          # both: [seq, HIDDEN] — TT post-AR vs HF o_proj output
 }
 
+# MoE-side mapping. HF saves as L0_moe_L{N}_out.npy (the mlp output is the
+# full MoE-block output). For TT, "moe_final" is the corresponding value.
+TT_TO_HF_MOE = {
+    "moe_final":     ("moe", "out"),   # both: [seq, HIDDEN]
+}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -89,6 +95,85 @@ def main():
             c = cos(tt_vec, hf_vec)
             row += f"  {c:>6.4f}"
         print(row)
+    # MoE side
+    print()
+    print("--- MoE block ---")
+    for tt_key, (hf_prefix, hf_suffix) in TT_TO_HF_MOE.items():
+        hf_path = hf_dir / f"L0_{hf_prefix}_L{N}_{hf_suffix}.npy"
+        if not hf_path.exists():
+            print(f"{tt_key:>22}  HF file missing: {hf_path}")
+            continue
+        hf_arr = np.load(hf_path)
+        row = f"{tt_key:>22}  "
+        for p in positions:
+            tt_npz_key = f"pos{p:03d}_{tt_key}"
+            if tt_npz_key not in tt_data:
+                row += "    miss  "
+                continue
+            tt_vec = tt_data[tt_npz_key]
+            hf_vec = hf_arr[p]
+            c = cos(tt_vec, hf_vec)
+            row += f"  {c:>6.4f}"
+        print(row)
+    # Layer-level intermediates (in_norm, mixer_out, after_mixer, post_attn_norm,
+    # moe_out). Compute HF equivalents from oracle + report cos.
+    print()
+    print("--- Layer-level intermediates (computed HF reference) ---")
+    hf_hidden = hf_dir / "hidden_states.npy"
+    hf_attn_o = hf_dir / f"L0_attn_L{N}_o_proj.npy"
+    hf_moe_out = hf_dir / f"L0_moe_L{N}_out.npy"
+    if hf_hidden.exists() and hf_attn_o.exists() and hf_moe_out.exists():
+        hs = np.load(hf_hidden)  # [n_layers+1, seq, HIDDEN]
+        ao = np.load(hf_attn_o)  # [seq, HIDDEN]
+        mo = np.load(hf_moe_out)  # [seq, HIDDEN]
+        # HF after_mixer at layer N = hidden_states[N, pos] + ao[pos]
+        # HF final at layer N = hidden_states[N+1, pos] (= after_mixer + moe_out)
+        def hf_after_mixer(p): return hs[N, p] + ao[p]
+        def hf_layer_out(p):   return hs[N + 1, p]
+        def hf_moe_block(p):   return mo[p]
+
+        for tt_key, hf_fn in [
+            ("layer_after_mixer", hf_after_mixer),
+            ("layer_moe_out",     hf_moe_block),
+        ]:
+            row = f"{tt_key:>22}  "
+            for p in positions:
+                k = f"pos{p:03d}_{tt_key}"
+                if k not in tt_data:
+                    row += "    miss  "
+                    continue
+                c = cos(tt_data[k], hf_fn(p))
+                row += f"  {c:>6.4f}"
+            print(row)
+        # Reconstruct TT layer output = after_mixer + moe_out and compare
+        row = f"{'layer_out (TT recon)':>22}  "
+        for p in positions:
+            ka = f"pos{p:03d}_layer_after_mixer"
+            km = f"pos{p:03d}_layer_moe_out"
+            if ka in tt_data and km in tt_data:
+                tt_out = tt_data[ka] + tt_data[km]
+                c = cos(tt_out, hf_layer_out(p))
+                row += f"  {c:>6.4f}"
+            else:
+                row += "    miss  "
+        print(row)
+    else:
+        print(f"  layer-level HF references missing (hidden_states.npy + attn_L{N}_o_proj.npy + moe_L{N}_out.npy)")
+    print()
+    # Also report top_idxs match per position (not a cosine comparison —
+    # an exact set match, since router decisions are discrete).
+    print()
+    print(f"{'sub_op':>22}  " + "  ".join(f"pos{p:>3}" for p in positions))
+    print("--- MoE router decisions (TT only; HF top-k not currently saved) ---")
+    row = f"{'moe_top_idxs (TT)':>22}  "
+    for p in positions:
+        k = f"pos{p:03d}_moe_top_idxs"
+        if k in tt_data:
+            idxs = tt_data[k].tolist()
+            row += "  " + ",".join(str(x) for x in idxs[:4]) + (".." if len(idxs) > 4 else "") + " "
+        else:
+            row += "    miss "
+    print(row)
     print()
     print("Interpretation:")
     print("  - High cos (>=0.99) at all positions → this sub-op is precision-clean")

@@ -1,0 +1,319 @@
+{
+  "host": "tt-qb-ac-01",
+  "timestamp_utc": "2026-05-24T17:01:10.303528+00:00",
+  "published_specs": {
+    "dram_peak_gb_s": 512.0,
+    "dram_capacity_gb_nominal": 32.0,
+    "tensix_cores_pre_fw19_5": 140,
+    "tensix_cores_post_fw19_5": 120
+  },
+  "size_sweep_bytes": [
+    1048576,
+    16777216,
+    268435456,
+    1073741824
+  ],
+  "device_info": {
+    "compute_with_storage_grid_x": 11,
+    "compute_with_storage_grid_y": 10,
+    "compute_with_storage_cores": 110,
+    "dram_grid_size": "(x=8,y=1)",
+    "arch": "Arch.BLACKHOLE"
+  },
+  "dram_write": [
+    {
+      "requested_bytes": 1048576,
+      "bytes": 1048576,
+      "shape": [
+        128,
+        4096
+      ],
+      "median_ms": 0.20128674805164337,
+      "min_ms": 0.20099710673093796,
+      "p95_ms": 0.22318405099213123,
+      "n_measure": 3,
+      "samples_ms": [
+        0.22561708465218544,
+        0.20128674805164337,
+        0.20099710673093796
+      ],
+      "bandwidth_gb_s": 5.209364303163023,
+      "pct_of_dram_peak": 1.0174539654615278
+    },
+    {
+      "requested_bytes": 16777216,
+      "bytes": 16777216,
+      "shape": [
+        2048,
+        4096
+      ],
+      "median_ms": 2.983346115797758,
+      "min_ms": 2.9701660387218,
+      "p95_ms": 9.787463722750545,
+      "n_measure": 3,
+      "samples_ms": [
+        10.543476790189743,
+        2.9701660387218,
+        2.983346115797758
+      ],
+      "bandwidth_gb_s": 5.623623726110542,
+      "pct_of_dram_peak": 1.0983640090059652
+    },
+    {
+      "requested_bytes": 268435456,
+      "bytes": 268435456,
+      "shape": [
+        32768,
+        4096
+      ],
+      "median_ms": 197.0816389657557,
+      "min_ms": 197.0586203970015,
+      "p95_ms": 197.45949893258512,
+      "n_measure": 3,
+      "samples_ms": [
+        197.0586203970015,
+        197.0816389657557,
+        197.50148337334394
+      ],
+      "bandwidth_gb_s": 1.3620520785634553,
+      "pct_of_dram_peak": 0.2660257965944249
+    },
+    {
+      "requested_bytes": 1073741824,
+      "bytes": 1073741824,
+      "shape": [
+        131072,
+        4096
+      ],
+      "median_ms": 776.7049269750714,
+      "min_ms": 776.1178049258888,
+      "p95_ms": 778.7181071471423,
+      "n_measure": 3,
+      "samples_ms": [
+        776.1178049258888,
+        776.7049269750714,
+        778.9417938329279
+      ],
+      "bandwidth_gb_s": 1.382432100928931,
+      "pct_of_dram_peak": 0.2700062697126819
+    }
+  ],
+  "dram_read": [
+    {
+      "requested_bytes": 1048576,
+      "bytes": 1048576,
+      "shape": [
+        128,
+        4096
+      ],
+      "median_ms": 0.3823838196694851,
+      "min_ms": 0.36302488297224045,
+      "p95_ms": 0.8294255007058382,
+      "n_measure": 3,
+      "samples_ms": [
+        0.8790967985987663,
+        0.3823838196694851,
+        0.36302488297224045
+      ],
+      "bandwidth_gb_s": 2.7422080801074187,
+      "pct_of_dram_peak": 0.5355875156459802
+    },
+    {
+      "requested_bytes": 16777216,
+      "bytes": 16777216,
+      "shape": [
+        2048,
+        4096
+      ],
+      "median_ms": 23.689805064350367,
+      "min_ms": 23.68412632495165,
+      "p95_ms": 23.9606193266809,
+      "n_measure": 3,
+      "samples_ms": [
+        23.99070980027318,
+        23.689805064350367,
+        23.68412632495165
+      ],
+      "bandwidth_gb_s": 0.708204054631383,
+      "pct_of_dram_peak": 0.138321104420192
+    },
+    {
+      "requested_bytes": 268435456,
+      "bytes": 268435456,
+      "shape": [
+        32768,
+        4096
+      ],
+      "median_ms": 396.4636158198118,
+      "min_ms": 395.4489813186228,
+      "p95_ms": 396.79669169709086,
+      "n_measure": 3,
+      "samples_ms": [
+        395.4489813186228,
+        396.83370012789965,
+        396.4636158198118
+      ],
+      "bandwidth_gb_s": 0.6770746300260775,
+      "pct_of_dram_peak": 0.13224113867696827
+    },
+    {
+      "requested_bytes": 1073741824,
+      "bytes": 1073741824,
+      "shape": [
+        131072,
+        4096
+      ],
+      "median_ms": 1568.6403629370034,
+      "min_ms": 1567.9456130601466,
+      "p95_ms": 1572.0260244328529,
+      "n_measure": 3,
+      "samples_ms": [
+        1572.4022090435028,
+        1567.9456130601466,
+        1568.6403629370034
+      ],
+      "bandwidth_gb_s": 0.6845047783863009,
+      "pct_of_dram_peak": 0.1336923395285744
+    }
+  ],
+  "dram_copy": [
+    {
+      "requested_bytes": 1048576,
+      "bytes_logical": 1048576,
+      "bytes_moved_streaming": 2097152,
+      "shape": [
+        128,
+        4096
+      ],
+      "median_ms": 0.049919821321964264,
+      "min_ms": 0.04485016688704491,
+      "p95_ms": 0.06900792941451073,
+      "n_measure": 3,
+      "samples_ms": [
+        0.07112883031368256,
+        0.049919821321964264,
+        0.04485016688704491
+      ],
+      "bandwidth_gb_s_streaming": 42.010406777583405,
+      "bandwidth_gb_s_oneway": 21.005203388791703,
+      "pct_of_dram_peak_streaming": 8.205157573746758
+    },
+    {
+      "requested_bytes": 16777216,
+      "bytes_logical": 16777216,
+      "bytes_moved_streaming": 33554432,
+      "shape": [
+        2048,
+        4096
+      ],
+      "median_ms": 0.1264079473912716,
+      "min_ms": 0.11941837146878242,
+      "p95_ms": 0.14678309671580791,
+      "n_measure": 3,
+      "samples_ms": [
+        0.14904700219631195,
+        0.1264079473912716,
+        0.11941837146878242
+      ],
+      "bandwidth_gb_s_streaming": 265.445588607959,
+      "bandwidth_gb_s_oneway": 132.7227943039795,
+      "pct_of_dram_peak_streaming": 51.84484152499199
+    },
+    {
+      "requested_bytes": 268435456,
+      "bytes_logical": 268435456,
+      "bytes_moved_streaming": 536870912,
+      "shape": [
+        32768,
+        4096
+      ],
+      "median_ms": 1.3646697625517845,
+      "min_ms": 1.3640699908137321,
+      "p95_ms": 1.3827331829816103,
+      "n_measure": 3,
+      "samples_ms": [
+        1.3847402296960354,
+        1.3640699908137321,
+        1.3646697625517845
+      ],
+      "bandwidth_gb_s_streaming": 393.40720131155365,
+      "bandwidth_gb_s_oneway": 196.70360065577682,
+      "pct_of_dram_peak_streaming": 76.83734400616282
+    },
+    {
+      "requested_bytes": 1073741824,
+      "bytes_logical": 1073741824,
+      "bytes_moved_streaming": 2147483648,
+      "shape": [
+        131072,
+        4096
+      ],
+      "median_ms": 5.318962968885899,
+      "min_ms": 5.3169019520282745,
+      "p95_ms": 5.338555248454213,
+      "n_measure": 3,
+      "samples_ms": [
+        5.340732168406248,
+        5.3169019520282745,
+        5.318962968885899
+      ],
+      "bandwidth_gb_s_streaming": 403.7410413575052,
+      "bandwidth_gb_s_oneway": 201.8705206787526,
+      "pct_of_dram_peak_streaming": 78.85567214013773
+    }
+  ],
+  "dram_capacity": {
+    "largest_alloc_gb": 30.0,
+    "first_fail_gb": null,
+    "trace": [
+      {
+        "size_gb": 8.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 10.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 12.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 14.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 16.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 18.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 20.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 22.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 24.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 26.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 28.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 30.0,
+        "outcome": "ok"
+      }
+    ]
+  }
+}

@@ -1,0 +1,127 @@
+2026-05-24 10:01:10.211 | DEBUG    | ttnn:<module>:79 - Initial ttnn.CONFIG:
+Config{cache_path=/home/aditya/.cache/ttnn,model_cache_path=/home/aditya/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=true,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=false,comparison_mode_should_raise_exception=false,comparison_mode_pcc=0.9999,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
+========================================================================
+P150 memory bandwidth probe (host=tt-qb-ac-01, time=2026-05-24T17:01:10.303528+00:00)
+========================================================================
+2026-05-24 10:01:10.304 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-24 10:01:10.307 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-24 10:01:10.307 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-24 10:01:10.324 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:224)
+2026-05-24 10:01:10.324 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-24 10:01:10.327 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-24 10:01:10.327 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-24 10:01:10.343 | info     |             UMD | Harvesting masks for Chip 3: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-24 10:01:10.371 | info     |             UMD | Harvesting masks for Chip 0: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-24 10:01:10.375 | info     |             UMD | Harvesting masks for Chip 1: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-24 10:01:10.378 | info     |             UMD | Harvesting masks for Chip 2: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:283)
+2026-05-24 10:01:10.382 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1, 2, 3}/[1, 2, 3, 0] and remote chip ids {} (cluster.cpp:183)
+2026-05-24 10:01:10.382 | info     |             UMD | IOMMU: disabled (cluster.cpp:157)
+2026-05-24 10:01:10.382 | info     |             UMD | KMD version: 2.8.0 (cluster.cpp:160)
+2026-05-24 10:01:10.385 | info     |             UMD | Starting devices in cluster (cluster.cpp:949)
+2026-05-24 10:01:10.386 | info     |             UMD | Mapped hugepage 0x180000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-24 10:01:10.387 | info     |             UMD | Mapped hugepage 0x1c0000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-24 10:01:10.388 | info     |             UMD | Mapped hugepage 0x200000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-24 10:01:10.389 | info     |             UMD | Mapped hugepage 0x140000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-05-24 10:01:10.991 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:332)
+2026-05-24 10:01:10.991 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:394)
+2026-05-24 10:01:10.992 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-05-24 10:01:10.993 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-05-24 10:01:10.993 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:500)
+2026-05-24 10:01:11.002 | info     |          Fabric | TopologyMapper: Logical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1474)
+2026-05-24 10:01:11.002 | info     |          Fabric | 
+=== Logical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-05-24 10:01:11.002 | info     |          Fabric | 
+=== Logical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-05-24 10:01:11.002 | info     |          Fabric | TopologyMapper: Physical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1485)
+2026-05-24 10:01:11.002 | info     |          Fabric | 
+=== Physical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-05-24 10:01:11.002 | info     |          Fabric | 
+=== Physical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-05-24 10:01:11.002 | info     |          Fabric | Starting multi-mesh mapping: 1 logical mesh(es) to 1 physical mesh(es) (topology_mapper_utils.cpp:1469)
+2026-05-24 10:01:11.002 | info     |          Fabric | Multi-mesh mapping attempt 1/2: Trying inter-mesh mapping (topology_mapper_utils.cpp:1510)
+2026-05-24 10:01:11.002 | info     |          Fabric | Attempt 1: Inter-mesh mapping succeeded, found 1 mesh pair(s) (topology_mapper_utils.cpp:1539)
+2026-05-24 10:01:11.002 | info     |          Fabric | Attempt 1: Mapping 1 mesh pair(s) (topology_mapper_utils.cpp:1547)
+2026-05-24 10:01:11.002 | info     |          Fabric | Attempt 1: Mapping mesh 0 -> 0 (topology_mapper_utils.cpp:1554)
+2026-05-24 10:01:11.002 | info     |          Fabric | Multi-mesh mapping succeeded after 1 attempt(s): 1 mesh pair(s) mapped (topology_mapper_utils.cpp:1686)
+2026-05-24 10:01:11.020 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tenstorrent/tt-metal/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:259)
+2026-05-24 10:01:11.020 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tenstorrent/tt-metal/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:259)
+2026-05-24 10:01:11.020 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tenstorrent/tt-metal/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:259)
+2026-05-24 10:01:11.020 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tenstorrent/tt-metal/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:259)
+2026-05-24 10:01:11.099 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:261)
+opened device_id=0
+
+--- L1 / grid / device info ---
+  compute_with_storage_grid_x: 11
+  compute_with_storage_grid_y: 10
+  compute_with_storage_cores: 110
+  dram_grid_size: (x=8,y=1)
+  arch: Arch.BLACKHOLE
+
+--- DRAM WRITE (host -> device) ---
+  size = 1 MiB (0.001 GB): median=0.20 ms  BW=5.2 GB/s  (1.0% of 512 peak)
+  size = 16 MiB (0.017 GB): median=2.98 ms  BW=5.6 GB/s  (1.1% of 512 peak)
+  size = 256 MiB (0.268 GB): median=197.08 ms  BW=1.4 GB/s  (0.3% of 512 peak)
+  size = 1024 MiB (1.074 GB): median=776.70 ms  BW=1.4 GB/s  (0.3% of 512 peak)
+
+--- DRAM READ (device -> host) ---
+  size = 1 MiB (0.001 GB): median=0.38 ms  BW=2.7 GB/s  (0.5% of 512 peak)
+  size = 16 MiB (0.017 GB): median=23.69 ms  BW=0.7 GB/s  (0.1% of 512 peak)
+  size = 256 MiB (0.268 GB): median=396.46 ms  BW=0.7 GB/s  (0.1% of 512 peak)
+  size = 1024 MiB (1.074 GB): median=1568.64 ms  BW=0.7 GB/s  (0.1% of 512 peak)
+
+--- DRAM STREAMING (on-device DRAM -> DRAM via ttnn.clone) ---
+  size = 1 MiB (0.001 GB): median=0.05 ms  streaming BW (R+W)=42.0 GB/s  (8.2% of 512 peak)  one-way=21.0 GB/s
+  size = 16 MiB (0.017 GB): median=0.13 ms  streaming BW (R+W)=265.4 GB/s  (51.8% of 512 peak)  one-way=132.7 GB/s
+  size = 256 MiB (0.268 GB): median=1.36 ms  streaming BW (R+W)=393.4 GB/s  (76.8% of 512 peak)  one-way=196.7 GB/s
+  size = 1024 MiB (1.074 GB): median=5.32 ms  streaming BW (R+W)=403.7 GB/s  (78.9% of 512 peak)  one-way=201.9 GB/s
+
+--- DRAM CAPACITY (bracketed) ---
+
+[capacity] Bracketing DRAM capacity from 8.0 GB up to 30.0 GB...
+  trying 8.00 GB (actual 8.000 GB, shape (1048576, 4096))... OK
+  trying 10.00 GB (actual 10.000 GB, shape (1310720, 4096))... OK
+  trying 12.00 GB (actual 12.000 GB, shape (1572864, 4096))... OK
+  trying 14.00 GB (actual 14.000 GB, shape (1835008, 4096))... OK
+  trying 16.00 GB (actual 16.000 GB, shape (2097152, 4096))... OK
+  trying 18.00 GB (actual 18.000 GB, shape (2359296, 4096))... OK
+  trying 20.00 GB (actual 20.000 GB, shape (2621440, 4096))... OK
+  trying 22.00 GB (actual 22.000 GB, shape (2883584, 4096))... OK
+  trying 24.00 GB (actual 24.000 GB, shape (3145728, 4096))... OK
+  trying 26.00 GB (actual 26.000 GB, shape (3407872, 4096))... OK
+  trying 28.00 GB (actual 28.000 GB, shape (3670016, 4096))... OK
+  trying 30.00 GB (actual 30.000 GB, shape (3932160, 4096))... OK
+  largest allocatable: 30.000 GB
+
+closed device cleanly
+
+results JSON: /home/aditya/tt-xla/.cache/p150_memory_bandwidth/results.json
+
+========================================================================
+SUMMARY
+========================================================================
+  DRAM write (host->dev) best      5.6 GB/s @ 0.02 GB       (PCIe-bound)
+  DRAM read  (dev->host) best      2.7 GB/s @ 0.00 GB       (PCIe-bound)
+  DRAM streaming (R+W)             403.7 GB/s @ 1.07 GB     (78.9% of 512 peak)
+  DRAM streaming (one-way)         201.9 GB/s               (comparable to MLP weight-read accounting)
+  DRAM capacity (largest alloc)    30.00 GB                 (nominal 32.0 GB)
+  Compute-with-storage cores       110 (11x10)              (theoretical full grid 140 pre-fw19.5 / 120 post)
+========================================================================
+2026-05-24 10:05:34.166 | info     |    BuildKernels | JIT cache stats: 5/5 hits (100.0%) [5 cached, 6 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-05-24 10:05:34.166 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-05-24 10:05:34.166 | info     |    BuildKernels | JIT telemetry [dependencies_up_to_date]: count=10, total=13.045ms, min=0.029ms, max=3.837ms, mean=1.304ms (build_cache_telemetry.cpp:246)
+2026-05-24 10:05:34.166 | info     |    BuildKernels | JIT telemetry [JitBuildState::build]: count=5, total=13.346ms, min=0.818ms, max=4.096ms, mean=2.669ms (build_cache_telemetry.cpp:246)
+2026-05-24 10:05:34.166 | info     |    BuildKernels | JIT telemetry [jit_build]: count=5, total=13.493ms, min=0.838ms, max=4.122ms, mean=2.699ms (build_cache_telemetry.cpp:246)
+2026-05-24 10:05:34.191 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:490)
+2026-05-24 10:05:34.191 | info     |             UMD | Closing devices in cluster (cluster.cpp:961)

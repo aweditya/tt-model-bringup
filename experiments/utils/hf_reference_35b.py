@@ -163,7 +163,11 @@ def main():
             t = inp[0] if isinstance(inp, tuple) else inp
             intra[f"attn_L{N}_o_proj_input"] = t.detach().float().cpu().numpy()
         handles.append(attn_L.o_proj.register_forward_pre_hook(attn_o_proj_pre_hook))
-        log(f"  hooking attn submodules on layer {N}")
+        # Also hook L<N>.mlp output (the MoE block's full output) so we can
+        # localize drift within the MoE compute.
+        mlp_LN = model.model.layers[N].mlp
+        handles.append(mlp_LN.register_forward_hook(make_hook(f"moe_L{N}_out")))
+        log(f"  hooking attn + mlp submodules on layer {N}")
 
     log("HF forward pass with output_hidden_states=True + L0 sub-hooks…")
     t0 = time.time()

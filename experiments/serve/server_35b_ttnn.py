@@ -929,7 +929,8 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     h_norm_2 = ttnn.rms_norm(h_after_mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
     if sub_capture is not None:
         sub_capture["post_attn_norm"] = _ttnn_to_numpy_replicated(h_norm_2, mesh).reshape(-1)
-    moe_out = moe_forward_ttnn(h_norm_2, w, mesh)
+    moe_sc = sub_capture.setdefault("moe_sub", {}) if sub_capture is not None else None
+    moe_out = moe_forward_ttnn(h_norm_2, w, mesh, sub_capture=moe_sc)
     ttnn.deallocate(h_norm_2)
     if sub_capture is not None:
         sub_capture["moe_out"] = _ttnn_to_numpy_replicated(moe_out, mesh).reshape(-1)
@@ -938,8 +939,13 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     return h_final, new_dn, new_kv
 
 
-def moe_forward_ttnn(h_tt, w, mesh):
-    """MoE block fully on-device. h_tt [1, 2048] replicated. Returns [1, 2048] replicated."""
+def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
+    """MoE block fully on-device. h_tt [1, 2048] replicated. Returns [1, 2048] replicated.
+
+    sub_capture (optional dict): when set, populates with key MoE intermediates
+    for drift-attribution comparison vs HF. Keys: top_idxs, top_weights,
+    routed_full, shared_full, final.
+    """
     # Router (replicated weight, replicated input → replicated output)
     logits = ttnn.matmul(h_tt, w["router_weight"])  # [1, 256]
     probs = ttnn.softmax(logits, dim=-1)
@@ -968,6 +974,9 @@ def moe_forward_ttnn(h_tt, w, mesh):
     weights_host = ttnn.to_torch(
         weights, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
     ).float().numpy()[0].reshape(-1)
+    if sub_capture is not None:
+        sub_capture["moe_top_idxs"] = top_idxs_host.astype(np.int32).copy()
+        sub_capture["moe_top_weights"] = weights_host.astype(np.float32).copy()
 
     routed_partial = None
     for k_idx in range(TOP_K):
@@ -1022,9 +1031,18 @@ def moe_forward_ttnn(h_tt, w, mesh):
 
     # Routed sum + shared (routed is 0 for first cut)
     if routed_partial is None:
+        if sub_capture is not None:
+            sub_capture["moe_final"] = _ttnn_to_numpy_replicated(gated_shared, mesh).reshape(-1)
+            sub_capture["moe_gated_shared"] = sub_capture["moe_final"].copy()
         return gated_shared
     routed_full = all_reduce_tt(routed_partial, mesh)
-    return ttnn.add(routed_full, gated_shared)
+    if sub_capture is not None:
+        sub_capture["moe_routed_full"] = _ttnn_to_numpy_replicated(routed_full, mesh).reshape(-1)
+        sub_capture["moe_gated_shared"] = _ttnn_to_numpy_replicated(gated_shared, mesh).reshape(-1)
+    final = ttnn.add(routed_full, gated_shared)
+    if sub_capture is not None:
+        sub_capture["moe_final"] = _ttnn_to_numpy_replicated(final, mesh).reshape(-1)
+    return final
 
 
 # ── Persistent state + bootstrap ───────────────────────────────────────

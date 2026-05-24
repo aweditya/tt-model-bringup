@@ -133,9 +133,16 @@ def main():
         step_ms = (time.time() - t0) * 1e3
         if args.capture_attn_layer is not None:
             L_sub = cap.get(f"layer_{args.capture_attn_layer}_sub", {})
-            attn_sub = L_sub.get("attn_sub", {})
-            for k, v in attn_sub.items():
-                attn_sub_by_pos[f"pos{pos:03d}_{k}"] = v
+            # Top-level layer captures: in_norm, mixer_out, after_mixer, post_attn_norm, moe_out
+            # (saved by layer_forward_ttnn as direct keys in sub_capture dict).
+            for k, v in L_sub.items():
+                if isinstance(v, dict):
+                    continue  # attn_sub / moe_sub handled below
+                attn_sub_by_pos[f"pos{pos:03d}_layer_{k}"] = v
+            for sub_dict_name in ("attn_sub", "moe_sub"):
+                sd = L_sub.get(sub_dict_name, {})
+                for k, v in sd.items():
+                    attn_sub_by_pos[f"pos{pos:03d}_{k}"] = v
 
         # Per-layer cosine: embed (oracle idx 0) + each layer (oracle idx L+1)
         cos_per_layer = [cos(cap["embed"], hf_hidden_states[0, pos])]

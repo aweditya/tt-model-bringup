@@ -1,0 +1,240 @@
+{
+  "host": "tt-qb-ac-01",
+  "timestamp_utc": "2026-05-24T17:07:15.982496+00:00",
+  "dram_capacity": {
+    "largest_alloc_gb": 31.0,
+    "first_fail_gb": 32.0,
+    "trace": [
+      {
+        "size_gb": 28.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 29.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 30.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 31.0,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 32.0,
+        "outcome": "fail",
+        "error": "RuntimeError: TT_FATAL @ /home/aditya/tenstorrent/tt-metal/tt_metal/impl/allocator/bank_manager.cpp:462: false\ninfo:\nOut of Memory: Not enough space to allocate 34359738368 B DRAM buffer across 8 banks, where each "
+      },
+      {
+        "size_gb": 31.5,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 31.75,
+        "outcome": "ok"
+      },
+      {
+        "size_gb": 31.875,
+        "outcome": "fail",
+        "error": "RuntimeError: TT_FATAL @ /home/aditya/tenstorrent/tt-metal/tt_metal/impl/allocator/bank_manager.cpp:462: false\ninfo:\nOut of Memory: Not enough space to allocate 34225520640 B DRAM buffer across 8 banks, where each "
+      },
+      {
+        "size_gb": 31.8125,
+        "outcome": "ok"
+      }
+    ]
+  },
+  "l1_capacity": {
+    "largest_ok_kb_per_core": 1408.0,
+    "first_fail_kb_per_core": 1472.0,
+    "compute_with_storage_cores": 110,
+    "trace": [
+      {
+        "kb_per_core": 64.0,
+        "shape": [
+          112640,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 128.0,
+        "shape": [
+          225280,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 192.0,
+        "shape": [
+          337920,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 256.0,
+        "shape": [
+          450560,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 320.0,
+        "shape": [
+          563200,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 384.0,
+        "shape": [
+          675840,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 448.0,
+        "shape": [
+          788480,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 512.0,
+        "shape": [
+          901120,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 576.0,
+        "shape": [
+          1013760,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 640.0,
+        "shape": [
+          1126400,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 704.0,
+        "shape": [
+          1239040,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 768.0,
+        "shape": [
+          1351680,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 832.0,
+        "shape": [
+          1464320,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 896.0,
+        "shape": [
+          1576960,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 960.0,
+        "shape": [
+          1689600,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 1024.0,
+        "shape": [
+          1802240,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 1088.0,
+        "shape": [
+          1914880,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 1152.0,
+        "shape": [
+          2027520,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 1216.0,
+        "shape": [
+          2140160,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 1280.0,
+        "shape": [
+          2252800,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 1344.0,
+        "shape": [
+          2365440,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 1408.0,
+        "shape": [
+          2478080,
+          32
+        ],
+        "outcome": "ok"
+      },
+      {
+        "kb_per_core": 1472.0,
+        "shape": [
+          2590720,
+          32
+        ],
+        "outcome": "fail",
+        "error": "RuntimeError: TT_FATAL @ /home/aditya/tenstorrent/tt-metal/tt_metal/impl/allocator/bank_manager.cpp:462: false\ninfo:\nOut of Memory: Not enough space to allocate 165806080 B L1 buffer across 110 banks, where each ba"
+      }
+    ]
+  }
+}
