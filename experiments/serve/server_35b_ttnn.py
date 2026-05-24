@@ -998,7 +998,12 @@ class State:
         # with the 27B B3 compute_kernel_config (HiFi2, no fp32_dest_acc). See
         # research/35b_a3b_sdpa_swap_design.md + feedback_35b_a3b_attn_layer_drift.md.
         # Set BEFORE bootstrap; the cache allocation + paged plumbing depends on this flag.
-        self.attn_mode = "manual"
+        # Default flipped to "sdpa" 2026-05-22: 85-pos ladder showed pos-0 bit-perfect,
+        # median cos_final 0.94 → 0.95, structural cleanup. Top-1 81% vs 80% is within
+        # noise; the dominant 35B drift mechanism is NOT the SDPA bug (it's something
+        # else — see feedback_35b_a3b_sdpa_swap_result.md). Override with "manual"
+        # before bootstrap for A/B comparisons.
+        self.attn_mode = "sdpa"
         # SDPA-mode plumbing — only populated when attn_mode == "sdpa".
         self.cur_pos_buf = None             # int32 [1] device — replicated; consumed by paged_update_cache + paged SDPA
         self.page_table_tt = None           # int32 [1, NUM_BLOCKS] — identity mapping for B=1

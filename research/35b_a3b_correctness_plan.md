@@ -56,25 +56,44 @@ to 500 to replicate the 27B P21 bar.
 
 **Root cause hypothesis (high confidence):** `server_35b_ttnn.py:attn_forward_ttnn` does manual `matmul → softmax → matmul` with no compute_kernel_config passed. ttnn's default fidelity on Blackhole is HiFi4 + fp32_dest_acc_en=True — exactly the config the 27B P21 probe identified as buggy for attention numerics (`feedback_fp32_sdpa_cliff_probe.md`). 27B's fix was paged SDPA + B3 (HiFi2, no fp32_dest_acc). Same intervention should apply here.
 
-## SDPA swap plan (in flight)
+## SDPA swap — LANDED 2026-05-22 (default flipped to sdpa)
 
-Goal: replace manual attention with `ttnn.transformer.paged_scaled_dot_product_attention_decode` + B3 config. Implement behind a `state.attn_mode = "sdpa"` flag with `"manual"` as fallback so we can A/B without touching B17 trace prod.
+Goal was: replace manual attention with `ttnn.transformer.paged_scaled_dot_product_attention_decode` + B3 config. Done. Implementation behind `state.attn_mode` flag; default flipped to `"sdpa"` on 2026-05-22.
 
-Sub-steps:
-1. Audit `attn_forward_ttnn` + `upload_attn_layer` + KV cache layout — map Q/K/V shapes, RoPE workaround interaction, current cache append pattern. (in-flight)
-2. Sketch SDPA call signature + config + KV layout (paged vs current) in a design memo. Get user check-in before refactor.
-3. Implement SDPA path behind flag.
-4. Smoke at 10 positions + ladder at 85 positions in SDPA mode.
-5. Compare per-layer cosines + top-1 vs manual baseline.
-6. Commit + flip default if SDPA wins, else revert + document.
+**Result vs success criterion:**
 
-**Pre-swap baseline (the diff measures the swap, not noise):**
-- top-1 69/85 = 81.2%
-- median cos_final 0.9384, cos_logits 0.9424
-- L39 min cos 0.7000 at pos 16
-- L31 min cos 0.7742 at pos 80
+| metric | manual baseline | SDPA warmed | success criterion |
+|---|---|---|---|
+| top-1 match (85 pos) | 81.2% | 80.0% | ≥ 95% — **MISSED** |
+| median cos_final | 0.9384 | 0.9531 | ≥ 0.99 — **MISSED** |
+| L39 min cos | 0.7000 | 0.7808 | ≥ 0.90 — **MISSED** |
+| pos 0 cos_final | 0.9922 | **0.9999** | — **bit-perfect, win** |
+| first divergence layer | L32 | **L40** | — drift starts later, win |
 
-Success criterion for SDPA swap: top-1 ≥ 95%, median cos_final ≥ 0.99, L39 worst-case ≥ 0.90.
+Modest improvement, but the criterion was set assuming SDPA would close the gap. It didn't. SDPA is still net-positive (per-step precision + structural cleanup + well-trodden 27B path) so it stays as default.
+
+**Gotcha:** first SDPA-mode forward call has a JIT-compile race that corrupts pos 0 (DN layers L00-L05 cos 0.55-0.81, L10-L30 all uniform 0.9991). Warmup + `ttnn.synchronize_device` fixes it. Implemented in `cosine_ladder_35b.py`; same warmup likely needed for any new server lifetime exercising SDPA for the first time. See `feedback_35b_a3b_sdpa_swap_result.md`.
+
+## Conclusion: 35B drift is NOT the 27B mechanism
+
+The 27B P21 fix was specific to a buggy compute kernel config on SDPA decode. The 35B never used that kernel, so swapping in the well-configured SDPA only nibbles at the edges. The dominant drift mechanism for 35B is something else. Candidates:
+
+1. **Bf16 noise via the K-broadcast workaround**. RoPE-broadcast still required even in SDPA mode (the `[1, HEAD_DIM]` ttnn slice/concat bug from `feedback_qwen36_attn_rope_single_row_ttnn_bug.md` stands). 4× redundant bf16 ops in the RoPE step per AT layer × 10 AT layers = lots of compounded quantization.
+2. **MoE router instability**. 35B-A3B uses top-k expert routing. A single ULP at the gate logits can flip experts, cascading to very different outputs. Has not been measured yet.
+3. **GatedDeltaNet recurrent state drift**. 30 DN layers each carrying conv1d + recurrent state. State quantization compounds across positions. Has not been measured.
+4. **Smaller hidden dim** (2048 vs 27B's 5120). Less averaging means more bf16 noise per op. Architecture-level, can't fix in code.
+
+## Next probe (chosen)
+
+**MoE router stability** is the cheapest novel signal and 35B-specific. Plan:
+- Extend `hf_reference_35b.py` to also save per-position per-MoE-layer top-k expert decisions + gate logits.
+- Extend `server_35b_ttnn.py:moe_forward_ttnn` to optionally capture top-k expert decisions + gate logits.
+- Write `experiments/utils/moe_router_stability_35b.py` probe: per position, compare TT top-k vs HF top-k; measure top-1 expert match rate, mean rank of HF's top expert in TT's ranking, fraction of positions where TT picks an expert NOT in HF's top-k.
+- Run on qb1, analyze, decide next.
+
+Effort: ~1.5 hr probe code + ~5 min run. Should be quick to ship.
+
+If MoE router is stable, pivot to DN recurrent state drift probe (per-layer recurrent state cosine vs HF).
 
 ## Risks / things to track
 
