@@ -90,6 +90,17 @@ def main():
     state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders (paged if sdpa)
     log(f"bootstrap done in {time.time()-t0:.1f}s")
 
+    # Warmup step + sync before the actual ladder. Suspicion: SDPA mode shows
+    # pos-0-only corruption that may be a JIT-compile race on first call.
+    # Run a single forward + sync + reset caches to populate JIT caches.
+    import ttnn as _ttnn  # local import — keep probe top clean
+    log("warmup: 1 forward call to populate JIT caches, then sync + reset…")
+    warm_t0 = time.time()
+    _ = srv.step_forward_ttnn(state, int(hf_prompt_ids[0]), 0)
+    _ttnn.synchronize_device(state.mesh)
+    state.reset_caches_ttnn()  # reset KV/DN caches after warmup
+    log(f"warmup + sync + reset done in {time.time()-warm_t0:.1f}s")
+
     per_pos = []
     first_div_pos = None
     first_div_layer = None
