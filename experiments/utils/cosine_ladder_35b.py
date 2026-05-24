@@ -65,6 +65,12 @@ def main():
     ap.add_argument("--no-rope-broadcast", action="store_true",
                     help="(sdpa mode only) skip the K-broadcast workaround; apply RoPE directly on [1, HEAD_DIM]. "
                          "Phase 2 ablation — if ttnn [1, HEAD_DIM] slice bug is still live, K will be corrupted.")
+    ap.add_argument("--capture-attn-layer", type=int, default=None,
+                    help="(sdpa mode only) capture attn sub-step intermediates at this decoder layer "
+                         "index (0..n_layers-1). Must be a full_attention layer. Saves npz alongside JSON.")
+    ap.add_argument("--sdpa-variant", choices=["B3", "hifi4_fp32"], default="B3",
+                    help="(sdpa mode only) compute_kernel_config variant for paged SDPA. "
+                         "B3 = 27B-validated recipe; hifi4_fp32 = HiFi4 + fp32_dest_acc.")
     args = ap.parse_args()
 
     oracle_dir = Path(args.oracle)
@@ -90,6 +96,7 @@ def main():
     state = srv.State()
     state.attn_mode = args.attn_mode  # MUST be set before bootstrap; allocates paged plumbing if sdpa
     state.attn_sdpa_no_broadcast = args.no_rope_broadcast
+    state.sdpa_compute_variant = args.sdpa_variant
     t0 = time.time()
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders (paged if sdpa)
@@ -109,12 +116,22 @@ def main():
     per_pos = []
     first_div_pos = None
     first_div_layer = None
+    # When --capture-attn-layer is set, request sub_capture for that layer;
+    # store the per-position attn sub-step arrays in a dict to npz-dump after.
+    attn_sub_by_pos = {}
     for pos in range(n_positions):
         tok_id = int(hf_prompt_ids[pos])
         cap = {}
+        if args.capture_attn_layer is not None:
+            cap["sub_capture_layers"] = [args.capture_attn_layer]
         t0 = time.time()
         tt_next_id = srv.step_forward_ttnn(state, tok_id, pos, capture=cap)
         step_ms = (time.time() - t0) * 1e3
+        if args.capture_attn_layer is not None:
+            L_sub = cap.get(f"layer_{args.capture_attn_layer}_sub", {})
+            attn_sub = L_sub.get("attn_sub", {})
+            for k, v in attn_sub.items():
+                attn_sub_by_pos[f"pos{pos:03d}_{k}"] = v
 
         # Per-layer cosine: embed (oracle idx 0) + each layer (oracle idx L+1)
         cos_per_layer = [cos(cap["embed"], hf_hidden_states[0, pos])]
@@ -173,6 +190,10 @@ def main():
     }
     out_path.write_text(json.dumps(out, indent=2))
     log(f"wrote {out_path}")
+    if attn_sub_by_pos:
+        npz_path = out_path.with_suffix(".attn_sub.npz")
+        np.savez(npz_path, **attn_sub_by_pos)
+        log(f"wrote {npz_path} ({len(attn_sub_by_pos)} arrays for layer {args.capture_attn_layer})")
     log(f"summary: top1 {top1_count}/{n_positions} ({100*top1_count/max(1,n_positions):.1f}%)  "
         f"median cos_final {median_final:.4f}  median cos_logits {median_logits:.4f}  "
         f"first_div: pos={first_div_pos} layer={first_div_layer}")

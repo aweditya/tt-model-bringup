@@ -565,7 +565,7 @@ def _apply_partial_rope(x, cos_tt, sin_tt, n_heads):
     return x_embed
 
 
-def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state):
+def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state, sub_capture=None):
     """Attention block via ttnn paged_scaled_dot_product_attention_decode + B3 config.
 
     Per-chip GQA layout: NQ_PER_CHIP=4 Q heads attend to 1 KV head (chip→KV-head
@@ -592,6 +592,17 @@ def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state):
     q_full = ttnn.matmul(h_tt, w["q_proj"])
     k = ttnn.matmul(h_tt, w["k_proj"])
     v = ttnn.matmul(h_tt, w["v_proj"])
+    if sub_capture is not None:
+        # Per-chip q_full: [1, NQ_PER_CHIP * HEAD_DIM_ATTN * 2] = [1, 2048]
+        # Reassemble across 4 chips along the Q-head axis (each chip holds 4 of
+        # 16 Q heads, with gate-doubled). Full Q+gate shape: [1, NUM_Q_HEADS *
+        # HEAD_DIM_ATTN * 2] = [1, 8192] to match HF q_proj output.
+        per_chip = ttnn.to_torch(
+            q_full, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
+        ).float().numpy()  # [NCHIPS, 1, NQ_PER_CHIP * HEAD_DIM_ATTN * 2]
+        sub_capture["attn_q_proj_full"] = per_chip.reshape(
+            NCHIPS, NQ_PER_CHIP, HEAD_DIM_ATTN * 2
+        ).reshape(NUM_Q_HEADS, HEAD_DIM_ATTN * 2).reshape(-1)
 
     # Split Q + gate per head (HF chunk after view to [..., -1, head_dim*2])
     q_full_2d = ttnn.reshape(q_full, [NQ_PER_CHIP, HEAD_DIM_ATTN * 2])
@@ -675,28 +686,58 @@ def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state):
     ttnn.deallocate(q_for_sdpa)
     attn_flat = ttnn.reshape(attn_out, [1, NQ_PER_CHIP * HEAD_DIM_ATTN])
     ttnn.deallocate(attn_out)
+    if sub_capture is not None:
+        # Per-chip attn_flat: [1, NQ_PER_CHIP * HEAD_DIM] (pre-gate, post-SDPA).
+        # Reassemble across 4 chips along Q-head axis to match HF o_proj_input
+        # shape [seq, NUM_Q_HEADS * HEAD_DIM] = [seq, 4096].
+        per_chip = ttnn.to_torch(
+            attn_flat, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
+        ).float().numpy()  # [NCHIPS, 1, NQ_PER_CHIP * HEAD_DIM]
+        sub_capture["attn_sdpa_out"] = per_chip.reshape(-1)  # [NUM_Q_HEADS * HEAD_DIM]
 
     # attn_output_gate: attn_out * sigmoid(gate)
     gate_sig = ttnn.sigmoid(gate_part)
     ttnn.deallocate(gate_part)
     gated = ttnn.mul(attn_flat, gate_sig)
     ttnn.deallocate(attn_flat); ttnn.deallocate(gate_sig)
+    if sub_capture is not None:
+        # Post-gate (= HF o_proj_input). Per-chip [1, NQ_PER_CHIP * HEAD_DIM];
+        # reassemble across Q-head axis.
+        per_chip = ttnn.to_torch(
+            gated, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
+        ).float().numpy()
+        sub_capture["attn_post_gate"] = per_chip.reshape(-1)
 
     # o_proj column-sharded + all_reduce (same as manual path)
     partial = ttnn.matmul(gated, w["o_proj"])
     ttnn.deallocate(gated)
+    if sub_capture is not None:
+        # Per-chip o_proj partial — each chip outputs a partial sum of the same
+        # [1, HIDDEN] shape; full = sum across chips. Capture the sum to match
+        # the all_reduce final result; then compare to HF o_proj output.
+        per_chip = ttnn.to_torch(
+            partial, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
+        ).float().numpy()  # [NCHIPS, 1, HIDDEN]
+        sub_capture["attn_o_proj_summed"] = per_chip.sum(axis=0).reshape(-1)
     out = all_reduce_tt(partial, mesh)
     ttnn.deallocate(partial)
+    if sub_capture is not None:
+        sub_capture["attn_out_post_ar"] = _ttnn_to_numpy_replicated(out, mesh).reshape(-1)
     return out, (kc, vc)
 
 
-def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None, *, state=None):
+def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None, *, state=None,
+                      sub_capture=None):
     """Dispatcher between SDPA and manual attention paths.
 
     When state is provided and state.attn_mode == "sdpa", routes to
     attn_forward_ttnn_sdpa (with paged KV cache + B3 config). Otherwise
     falls through to the historical manual matmul → softmax → matmul path
     used through B16/B17.
+
+    sub_capture (optional dict): when set AND running SDPA path, the SDPA
+    function populates it with reassembled-to-HF-layout numpy arrays for
+    diagnostic comparison against HF forward hooks. Manual path ignores it.
     """
     if state is not None and state.attn_mode == "sdpa":
         # kv_cache here is the (kc, vc) tuple from state.kv_caches_tt[L].
@@ -705,7 +746,8 @@ def attn_forward_ttnn(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None, *, state=Non
         # assignment is a no-op (which is fine).
         state._current_kv_cache = kv_cache
         try:
-            return attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state)
+            return attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state,
+                                          sub_capture=sub_capture)
         finally:
             state._current_kv_cache = None
     return attn_forward_ttnn_manual(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=kv_cache)
@@ -871,8 +913,9 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
         new_dn = (new_conv, new_rec)
         new_kv = kv_cache
     else:
+        attn_sc = sub_capture.setdefault("attn_sub", {}) if sub_capture is not None else None
         mixer_out, new_kv = attn_forward_ttnn(h_norm_1, w, mesh, cos_tt, sin_tt, kv_cache,
-                                              state=state)
+                                              state=state, sub_capture=attn_sc)
         new_dn = dn_state
     if sub_capture is not None:
         sub_capture["mixer_out"] = _ttnn_to_numpy_replicated(mixer_out, mesh).reshape(-1)
@@ -1024,6 +1067,12 @@ class State:
         # in the current build — if K is silently corrupted, drift will collapse;
         # if drift is unchanged or improves, broadcast workaround can be removed.
         self.attn_sdpa_no_broadcast = False
+        # SDPA compute kernel config variant. "B3" = 27B-validated recipe
+        # (HiFi2, no fp32_dest_acc) — currently default. "hifi4_fp32" =
+        # HiFi4 + fp32_dest_acc_en=True for max precision. The 27B bug that
+        # made this variant buggy may not apply at 35B-A3B's GQA shapes.
+        # See feedback_35b_a3b_drift_is_user_facing.md.
+        self.sdpa_compute_variant = "B3"
         # SDPA-mode plumbing — only populated when attn_mode == "sdpa".
         self.cur_pos_buf = None             # int32 [1] device — replicated; consumed by paged_update_cache + paged SDPA
         self.page_table_tt = None           # int32 [1, NUM_BLOCKS] — identity mapping for B=1
@@ -1381,15 +1430,25 @@ def bootstrap(state, log):
             k_chunk_size=0,
             exp_approx_mode=False,
         )
-        state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.HiFi2,
-            math_approx_mode=False,
-            fp32_dest_acc_en=False,
-            packer_l1_acc=False,
-        )
+        if state.sdpa_compute_variant == "hifi4_fp32":
+            state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                packer_l1_acc=False,
+            )
+            variant_label = "hifi4_fp32 (HiFi4 + fp32_dest_acc + no packer_l1)"
+        else:  # "B3" default
+            state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+                math_fidelity=ttnn.MathFidelity.HiFi2,
+                math_approx_mode=False,
+                fp32_dest_acc_en=False,
+                packer_l1_acc=False,
+            )
+            variant_label = "B3 (HiFi2 + no fp32_dest_acc + no packer_l1)"
         log(f"  SDPA paged plumbing: NUM_BLOCKS={SDPA_NUM_BLOCKS}, "
             f"BLOCK_SIZE={SDPA_BLOCK_SIZE}, MAX_KV={MAX_KV}")
-        log(f"  SDPA compute_kernel_config: B3 (HiFi2 + no fp32_dest_acc + no packer_l1)")
+        log(f"  SDPA compute_kernel_config: {variant_label}")
     else:
         log("  attn_mode=manual; SDPA plumbing skipped")
 

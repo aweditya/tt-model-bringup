@@ -61,6 +61,9 @@ def main():
                     help="pass add_special_tokens=False to the tokenizer. Use when the prompt is "
                          "already chat-template-rendered (contains <|im_start|> etc.) — otherwise "
                          "tokenizer double-adds BOS-like prefix tokens.")
+    ap.add_argument("--hook-attn-layer", type=int, default=None,
+                    help="ALSO hook q_proj/k_proj/v_proj/q_norm/k_norm/o_proj outputs on this "
+                         "decoder layer (must be a full_attention layer). Saves as L<N>_attn_<sub>.npy.")
     args = ap.parse_args()
 
     if args.prompt is not None:
@@ -143,6 +146,24 @@ def main():
         handles.append(L0.self_attn.register_forward_hook(make_hook("mixer_out")))
     handles.append(L0.post_attention_layernorm.register_forward_hook(make_hook("post_attn_norm")))
     handles.append(L0.mlp.register_forward_hook(make_hook("moe_out")))
+
+    # Optional: hook q_proj/k_proj/v_proj/q_norm/k_norm/o_proj outputs on an
+    # arbitrary full_attention layer (used by the sub-step drift-attribution
+    # probe). Keys: attn_L<N>_<sub>.
+    if args.hook_attn_layer is not None:
+        N = args.hook_attn_layer
+        if layer_types[N] != "full_attention":
+            raise ValueError(f"--hook-attn-layer {N} is type {layer_types[N]!r}, not full_attention")
+        attn_L = model.model.layers[N].self_attn
+        for sub_name in ("q_proj", "k_proj", "v_proj", "q_norm", "k_norm", "o_proj"):
+            sub_mod = getattr(attn_L, sub_name)
+            handles.append(sub_mod.register_forward_hook(make_hook(f"attn_L{N}_{sub_name}")))
+        # Pre-hook on o_proj captures the INPUT (post-attention, pre-projection).
+        def attn_o_proj_pre_hook(_module, inp):
+            t = inp[0] if isinstance(inp, tuple) else inp
+            intra[f"attn_L{N}_o_proj_input"] = t.detach().float().cpu().numpy()
+        handles.append(attn_L.o_proj.register_forward_pre_hook(attn_o_proj_pre_hook))
+        log(f"  hooking attn submodules on layer {N}")
 
     log("HF forward pass with output_hidden_states=True + L0 sub-hooks…")
     t0 = time.time()
