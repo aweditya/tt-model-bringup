@@ -57,6 +57,10 @@ def main():
                     help="path to a UTF-8 file whose contents are the prompt")
     ap.add_argument("--output-dir", default=str(DEFAULT_OUT_DIR),
                     help="directory to save oracle artifacts")
+    ap.add_argument("--no-special-tokens", action="store_true",
+                    help="pass add_special_tokens=False to the tokenizer. Use when the prompt is "
+                         "already chat-template-rendered (contains <|im_start|> etc.) — otherwise "
+                         "tokenizer double-adds BOS-like prefix tokens.")
     args = ap.parse_args()
 
     if args.prompt is not None:
@@ -91,8 +95,10 @@ def main():
     model.eval()
     log(f"  model loaded in {time.time()-t0:.0f}s")
 
-    log(f"tokenize prompt: {PROMPT!r}")
-    prompt_ids = tok.encode(PROMPT, return_tensors="pt")  # [1, seq]
+    log(f"tokenize prompt ({'no special tokens' if args.no_special_tokens else 'add special tokens'}): "
+        f"{PROMPT[:80]!r}{'…' if len(PROMPT) > 80 else ''}")
+    prompt_ids = tok.encode(PROMPT, return_tensors="pt",
+                            add_special_tokens=not args.no_special_tokens)  # [1, seq]
     seq = prompt_ids.shape[1]
     log(f"  prompt_ids shape={list(prompt_ids.shape)} = {prompt_ids[0].tolist()}")
 
