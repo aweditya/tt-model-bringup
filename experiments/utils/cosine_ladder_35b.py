@@ -62,6 +62,9 @@ def main():
                     help="layer cosine below this counts as divergence")
     ap.add_argument("--attn-mode", choices=["manual", "sdpa"], default="manual",
                     help="attention path: 'manual' (B16/B17 default) or 'sdpa' (paged + B3 config)")
+    ap.add_argument("--no-rope-broadcast", action="store_true",
+                    help="(sdpa mode only) skip the K-broadcast workaround; apply RoPE directly on [1, HEAD_DIM]. "
+                         "Phase 2 ablation — if ttnn [1, HEAD_DIM] slice bug is still live, K will be corrupted.")
     args = ap.parse_args()
 
     oracle_dir = Path(args.oracle)
@@ -82,9 +85,11 @@ def main():
 
     # Bootstrap (1,4) mesh + load all 40 layer weights. ~106 s on qb1 per
     # B16 smoke timings.
-    log(f"bootstrapping (1,4) mesh + uploading weights… (attn_mode={args.attn_mode})")
+    log(f"bootstrapping (1,4) mesh + uploading weights… "
+        f"(attn_mode={args.attn_mode}, no_rope_broadcast={args.no_rope_broadcast})")
     state = srv.State()
     state.attn_mode = args.attn_mode  # MUST be set before bootstrap; allocates paged plumbing if sdpa
+    state.attn_sdpa_no_broadcast = args.no_rope_broadcast
     t0 = time.time()
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders (paged if sdpa)

@@ -610,19 +610,30 @@ def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state):
     k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
 
-    # RoPE: Q rotation works on [4, HEAD_DIM] directly. K must be broadcast
-    # to [4, HEAD_DIM] before _apply_partial_rope (the [1, HEAD_DIM] ttnn
-    # slice/concat path is silently broken — see feedback_qwen36_attn_rope_*).
+    # RoPE: Q rotation works on [4, HEAD_DIM] directly. K's path depends on
+    # state.attn_sdpa_no_broadcast — Phase 2 ablation flag for the
+    # broadcast workaround.
     q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
     ttnn.deallocate(q_n); q_n = q_n_rope
-    k_n_b = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
-    ttnn.deallocate(k_n)
-    k_n_rope = _apply_partial_rope(k_n_b, cos_tt, sin_tt, NQ_PER_CHIP)
-    ttnn.deallocate(k_n_b)
-    # Dedupe back to [1, HEAD_DIM]: all NQ_PER_CHIP rows are bit-identical
-    # post-RoPE because cos/sin are scalar per step. Take row 0.
-    k_n_single = ttnn.slice(k_n_rope, [0, 0], [1, HEAD_DIM_ATTN])
-    ttnn.deallocate(k_n_rope)
+    if state.attn_sdpa_no_broadcast:
+        # H2 ablation: apply RoPE directly on [1, HEAD_DIM] K. If the ttnn
+        # [1, HEAD_DIM] slice/concat bug is still live this will silently
+        # corrupt K — drift will collapse, telling us the workaround is
+        # still necessary. If clean, broadcast workaround can be removed.
+        k_n_single = _apply_partial_rope(k_n, cos_tt, sin_tt, 1)
+        ttnn.deallocate(k_n)
+    else:
+        # Broadcast workaround (commit c5b0012, feedback_qwen36_attn_rope_*).
+        # Broadcast K to NQ_PER_CHIP rows so _apply_partial_rope operates on
+        # [4, HEAD_DIM] (Q-side path that is known to work). Then dedupe
+        # row 0 — all rows are bit-identical post-RoPE because cos/sin are
+        # scalar per step.
+        k_n_b = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
+        ttnn.deallocate(k_n)
+        k_n_rope = _apply_partial_rope(k_n_b, cos_tt, sin_tt, NQ_PER_CHIP)
+        ttnn.deallocate(k_n_b)
+        k_n_single = ttnn.slice(k_n_rope, [0, 0], [1, HEAD_DIM_ATTN])
+        ttnn.deallocate(k_n_rope)
     v_h = ttnn.reshape(v, [1, HEAD_DIM_ATTN])
     ttnn.deallocate(v)
 
@@ -1004,6 +1015,15 @@ class State:
         # else — see feedback_35b_a3b_sdpa_swap_result.md). Override with "manual"
         # before bootstrap for A/B comparisons.
         self.attn_mode = "sdpa"
+        # Phase 2 ablation flag: skip the K-broadcast workaround in the SDPA path
+        # and apply RoPE directly on [1, HEAD_DIM] K. The broadcast was added in
+        # commit c5b0012 to work around a ttnn [1, HEAD_DIM] slice/concat bug
+        # (feedback_qwen36_attn_rope_single_row_ttnn_bug.md). Phase 1 drift
+        # attribution identified the 4x redundant bf16 ops as the prime
+        # per-step-noise suspect. Set True to test whether the ttnn bug is fixed
+        # in the current build — if K is silently corrupted, drift will collapse;
+        # if drift is unchanged or improves, broadcast workaround can be removed.
+        self.attn_sdpa_no_broadcast = False
         # SDPA-mode plumbing — only populated when attn_mode == "sdpa".
         self.cur_pos_buf = None             # int32 [1] device — replicated; consumed by paged_update_cache + paged SDPA
         self.page_table_tt = None           # int32 [1, NUM_BLOCKS] — identity mapping for B=1
