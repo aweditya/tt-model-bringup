@@ -1018,9 +1018,12 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     if sub_capture is not None:
         sub_capture["post_attn_norm"] = _ttnn_to_numpy_replicated(h_norm_2, mesh).reshape(-1)
     moe_sc = sub_capture.setdefault("moe_sub", {}) if sub_capture is not None else None
-    moe_fn = (moe_forward_ttnn_pattern_a
-              if (state is not None and state.moe_mode == "pattern_a")
-              else moe_forward_ttnn)
+    if state is not None and state.moe_mode == "pattern_a_batched":
+        moe_fn = moe_forward_ttnn_pattern_a_batched
+    elif state is not None and state.moe_mode == "pattern_a":
+        moe_fn = moe_forward_ttnn_pattern_a
+    else:
+        moe_fn = moe_forward_ttnn
     moe_out = moe_fn(h_norm_2, w, mesh, sub_capture=moe_sc)
     ttnn.deallocate(h_norm_2)
     if sub_capture is not None:
@@ -1292,6 +1295,116 @@ def moe_forward_ttnn_pattern_a(h_tt, w, mesh, sub_capture=None):
     return final
 
 
+def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
+    """Pattern A MoE with BATCHED expert matmul.
+
+    Algorithmically identical to moe_forward_ttnn_pattern_a — the only change
+    is the 64-iteration Python loop is collapsed into a single batched
+    ttnn.matmul over the stacked expert weights `[E_LOCAL, HIDDEN, 2*MOE_INTER]`.
+
+    This cuts the per-step matmul count from 5120 (40 layers × 64 experts × 2
+    matmuls) to ~80 (40 layers × 2 batched matmuls + DN + attn etc), so the
+    kernel-launch overhead that bounded the looped variant at ~308 ms/tok
+    should shrink dramatically. DeepSeek-V3 uses this pattern in production:
+    experiments/.refs/tt-metal/models/demos/deepseek_v3/tt/experts.py:255-267.
+    """
+    # Router (identical to topk path).
+    logits = ttnn.matmul(h_tt, w["router_weight"], compute_kernel_config=HIFI4)
+    probs = ttnn.softmax(logits, dim=-1)
+    ttnn.deallocate(logits)
+    top_vals, top_idxs = ttnn.topk(probs, k=TOP_K, dim=-1)
+    ttnn.deallocate(probs)
+    sum_v = ttnn.sum(top_vals, dim=-1, keepdim=True)
+    weights = ttnn.div(top_vals, sum_v)
+    ttnn.deallocate(top_vals); ttnn.deallocate(sum_v)
+
+    # On-device routing weight per local expert (identical to looped variant).
+    mask = ttnn.eq(w["local_expert_ids"], top_idxs)
+    ttnn.deallocate(top_idxs)
+    mask_f = ttnn.typecast(mask, ttnn.bfloat16)
+    ttnn.deallocate(mask)
+    weights_2d = ttnn.reshape(weights, [1, TOP_K])
+    ttnn.deallocate(weights)
+    weighted_mask = ttnn.mul(mask_f, weights_2d)
+    ttnn.deallocate(mask_f); ttnn.deallocate(weights_2d)
+    weighted_mask = ttnn.reshape(weighted_mask, [E_LOCAL, TOP_K])
+    routing_weight = ttnn.sum(weighted_mask, dim=-1, keepdim=True)  # [E_LOCAL, 1]
+    ttnn.deallocate(weighted_mask)
+    # Reshape for broadcast against [E_LOCAL, 1, HIDDEN] expert outputs.
+    routing_weight_3d = ttnn.reshape(routing_weight, [E_LOCAL, 1, 1])
+    ttnn.deallocate(routing_weight)
+
+    # BATCHED expert FFN: one matmul over all 64 local experts.
+    # Strategy: explicitly repeat h across E_LOCAL to match the weights' batch
+    # dim, then do a plain rank-4 batched matmul with NO broadcast.
+    #   h_tt [1, HIDDEN] → reshape [1, 1, 1, HIDDEN] → repeat [1, E_LOCAL, 1, 1]
+    #     → [1, E_LOCAL, 1, HIDDEN] per chip
+    #   weights logical [NCHIPS, E_LOCAL, HIDDEN, 2*MOE_INTER]; per-chip view
+    #     [1, E_LOCAL, HIDDEN, 2*MOE_INTER]
+    #   matmul → [1, E_LOCAL, 1, 2*MOE_INTER]
+    h_4d = ttnn.reshape(h_tt, [1, 1, 1, HIDDEN])
+    h_4d_repeat = ttnn.repeat(h_4d, [1, E_LOCAL, 1, 1])  # [1, E_LOCAL, 1, HIDDEN]
+    ttnn.deallocate(h_4d)
+    gate_up_batched = ttnn.matmul(
+        h_4d_repeat, w["experts_gate_up_local"], compute_kernel_config=HIFI4
+    )  # → [1, E_LOCAL, 1, 2*MOE_INTER]
+    ttnn.deallocate(h_4d_repeat)
+    # Split into gate / up halves along last dim. Slice with rank-4 coords.
+    gate_batched = ttnn.slice(
+        gate_up_batched, [0, 0, 0, 0], [1, E_LOCAL, 1, MOE_INTER]
+    )
+    up_batched = ttnn.slice(
+        gate_up_batched, [0, 0, 0, MOE_INTER], [1, E_LOCAL, 1, 2 * MOE_INTER]
+    )
+    ttnn.deallocate(gate_up_batched)
+    mid_batched = ttnn.mul(ttnn.silu(gate_batched), up_batched)
+    ttnn.deallocate(gate_batched); ttnn.deallocate(up_batched)
+
+    expert_out_batched = ttnn.matmul(
+        mid_batched, w["experts_down_local"], compute_kernel_config=HIFI4
+    )  # [1, E_LOCAL, 1, HIDDEN]
+    ttnn.deallocate(mid_batched)
+
+    # Apply routing weights + reduce over expert dim. routing_weight_3d was
+    # [E_LOCAL, 1, 1] — reshape to rank 4 [1, E_LOCAL, 1, 1] to match.
+    routing_weight_4d = ttnn.reshape(routing_weight_3d, [1, E_LOCAL, 1, 1])
+    ttnn.deallocate(routing_weight_3d)
+    weighted_batched = ttnn.mul(expert_out_batched, routing_weight_4d)
+    ttnn.deallocate(expert_out_batched); ttnn.deallocate(routing_weight_4d)
+    routed_local_4d = ttnn.sum(weighted_batched, dim=1, keepdim=True)  # [1, 1, 1, HIDDEN]
+    ttnn.deallocate(weighted_batched)
+    routed_local = ttnn.reshape(routed_local_4d, [1, HIDDEN])
+    ttnn.deallocate(routed_local_4d)
+
+    # All-reduce + shared expert path are identical to the looped variant.
+    routed_full = all_reduce_tt(routed_local, mesh)
+    ttnn.deallocate(routed_local)
+    if sub_capture is not None:
+        sub_capture["moe_routed_full"] = _ttnn_to_numpy_replicated(routed_full, mesh).reshape(-1)
+
+    s_gate = ttnn.matmul(h_tt, w["shared_gate"], compute_kernel_config=HIFI4)
+    s_up = ttnn.matmul(h_tt, w["shared_up"], compute_kernel_config=HIFI4)
+    s_mid = ttnn.mul(ttnn.silu(s_gate), s_up)
+    ttnn.deallocate(s_gate); ttnn.deallocate(s_up)
+    shared_partial = ttnn.matmul(s_mid, w["shared_down"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(s_mid)
+    shared_full = all_reduce_tt(shared_partial, mesh)
+    ttnn.deallocate(shared_partial)
+    gate_logit = ttnn.matmul(h_tt, w["shared_expert_gate"], compute_kernel_config=HIFI4)
+    gate_sig = ttnn.sigmoid(gate_logit)
+    ttnn.deallocate(gate_logit)
+    gated_shared = ttnn.mul(shared_full, gate_sig)
+    ttnn.deallocate(shared_full); ttnn.deallocate(gate_sig)
+    if sub_capture is not None:
+        sub_capture["moe_gated_shared"] = _ttnn_to_numpy_replicated(gated_shared, mesh).reshape(-1)
+
+    final = ttnn.add(routed_full, gated_shared)
+    ttnn.deallocate(routed_full); ttnn.deallocate(gated_shared)
+    if sub_capture is not None:
+        sub_capture["moe_final"] = _ttnn_to_numpy_replicated(final, mesh).reshape(-1)
+    return final
+
+
 # ── Persistent state + bootstrap ───────────────────────────────────────
 class State:
     def __init__(self):
@@ -1306,11 +1419,14 @@ class State:
         self.per_layer_tt = None
         self.dn_caches_tt = None
         self.kv_caches_tt = None
-        # MoE dispatch mode: "topk" (default; host-readback expert selection,
-        # trace-incompatible) or "pattern_a" (Mixtral-style; run all 64 local
-        # experts and mask by top-k on device, trace-clean but 8× more compute).
+        # MoE dispatch mode:
+        #   "topk"             — host-readback expert selection (trace-incompatible)
+        #   "pattern_a"        — Mixtral-style 64-iter loop, mask on device (trace-clean)
+        #   "pattern_a_batched"— DeepSeek-style batched matmul over stacked experts
+        #                        (trace-clean + much fewer kernel launches)
         # Must be set BEFORE bootstrap — upload format and forward function
-        # both depend on it.
+        # both depend on it. "pattern_a" and "pattern_a_batched" share the
+        # same upload format (upload_moe_layer_pattern_a).
         self.moe_mode = "topk"
         # B17 trace-capture input buffers (pre-allocated, written in-place
         # OUTSIDE the trace via update_input_buffers).
@@ -1624,7 +1740,7 @@ def bootstrap(state, log):
             layer_tt.update(upload_dn_layer(layer_sd, state.mesh))
         else:
             layer_tt.update(upload_attn_layer(layer_sd, state.mesh))
-        if state.moe_mode == "pattern_a":
+        if state.moe_mode in ("pattern_a", "pattern_a_batched"):
             layer_tt.update(upload_moe_layer_pattern_a(layer_sd, state.mesh))
         else:
             layer_tt.update(upload_moe_layer(layer_sd, state.mesh))
@@ -1722,7 +1838,12 @@ def main():
 
     # Run MoE on layer 0 (forward through just one block to validate plumbing)
     h_norm = ttnn.rms_norm(h_tt, weight=state.per_layer_tt[0]["post_attention_layernorm"], epsilon=EPS)
-    moe_fn = moe_forward_ttnn_pattern_a if state.moe_mode == "pattern_a" else moe_forward_ttnn
+    if state.moe_mode == "pattern_a_batched":
+        moe_fn = moe_forward_ttnn_pattern_a_batched
+    elif state.moe_mode == "pattern_a":
+        moe_fn = moe_forward_ttnn_pattern_a
+    else:
+        moe_fn = moe_forward_ttnn
     out = moe_fn(h_norm, state.per_layer_tt[0], state.mesh)
     print(f"  MoE out shape={list(out.shape)}")
     out_np = ttnn.to_torch(

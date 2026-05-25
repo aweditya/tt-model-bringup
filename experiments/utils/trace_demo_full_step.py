@@ -44,9 +44,17 @@ def log(msg):
 
 
 def main():
-    log("bootstrap (moe_mode=pattern_a so MoE has no host readback)…")
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--moe-mode", choices=["pattern_a", "pattern_a_batched"],
+                    default="pattern_a",
+                    help="Trace requires no host readback in step; pattern_a (looped, "
+                         "validated, 308 ms/tok) is the default. pattern_a_batched is "
+                         "WIP — ttnn matmul rank/broadcast plumbing not yet resolved.")
+    args = ap.parse_args()
+    log(f"bootstrap (moe_mode={args.moe_mode} — both are trace-clean)…")
     state = srv.State()
-    state.moe_mode = "pattern_a"  # required: topk mode has from_device inside step
+    state.moe_mode = args.moe_mode
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()
 
