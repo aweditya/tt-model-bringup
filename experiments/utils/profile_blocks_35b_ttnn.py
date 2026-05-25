@@ -56,27 +56,29 @@ def install_block_timers(mesh):
     orig_attn = srv.attn_forward_ttnn
     orig_moe = srv.moe_forward_ttnn
 
-    def timed_dn(h_tt, w, mesh_, dn_state, dn_sub_capture=None):
-        _sync(mesh_)
+    # Pass through **kwargs so additions like sub_capture / state /
+    # kv_cache don't break the wrapper when block signatures evolve.
+    def timed_dn(*args, **kwargs):
+        _sync(mesh)
         t0 = time.time()
-        out = orig_dn(h_tt, w, mesh_, dn_state, dn_sub_capture=dn_sub_capture)
-        _sync(mesh_)
+        out = orig_dn(*args, **kwargs)
+        _sync(mesh)
         _step_times_ms["dn"].append((time.time() - t0) * 1000.0)
         return out
 
-    def timed_attn(h_tt, w, mesh_, cos_tt, sin_tt, kv_cache=None):
-        _sync(mesh_)
+    def timed_attn(*args, **kwargs):
+        _sync(mesh)
         t0 = time.time()
-        out = orig_attn(h_tt, w, mesh_, cos_tt, sin_tt, kv_cache=kv_cache)
-        _sync(mesh_)
+        out = orig_attn(*args, **kwargs)
+        _sync(mesh)
         _step_times_ms["attn"].append((time.time() - t0) * 1000.0)
         return out
 
-    def timed_moe(h_tt, w, mesh_):
-        _sync(mesh_)
+    def timed_moe(*args, **kwargs):
+        _sync(mesh)
         t0 = time.time()
-        out = orig_moe(h_tt, w, mesh_)
-        _sync(mesh_)
+        out = orig_moe(*args, **kwargs)
+        _sync(mesh)
         _step_times_ms["moe"].append((time.time() - t0) * 1000.0)
         return out
 
