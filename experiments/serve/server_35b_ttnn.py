@@ -325,12 +325,17 @@ def upload_moe_layer_pattern_a(sd, mesh):
     out["experts_gate_up_local"] = np_stacked_to_sharded(per_chip_egu, mesh)
     out["experts_down_local"] = np_stacked_to_sharded(per_chip_ed, mesh)
 
-    # local_expert_ids per chip: [E_LOCAL, 1] uint32 ROW_MAJOR. Sharded along
-    # dim 0 of the [NCHIPS, E_LOCAL, 1] stacked tensor → per-chip [E_LOCAL, 1].
-    local_ids_stacked = np.stack([ids[:, None] for ids in per_chip_local_ids], axis=0)  # [NCHIPS, E_LOCAL, 1]
+    # local_expert_ids per chip: [E_LOCAL, 1] UINT16 ROW_MAJOR. Matches the
+    # dtype of ttnn.topk's output indices, so ttnn.eq can compare without a
+    # typecast (typecast to bf16 needs last-dim multiple of 32, which neither
+    # [E_LOCAL, 1] nor [1, TOP_K=8] satisfy).
+    # Expert IDs fit easily in UINT16 (max 255 vs 65535).
+    local_ids_stacked = np.stack(
+        [ids[:, None].astype(np.int16) for ids in per_chip_local_ids], axis=0
+    )  # [NCHIPS, E_LOCAL, 1] int16 (uint16 storage)
     out["local_expert_ids"] = ttnn.from_torch(
         torch.from_numpy(local_ids_stacked),
-        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh,
+        dtype=ttnn.uint16, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh,
         mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
     )
 
@@ -1142,17 +1147,54 @@ def moe_forward_ttnn_pattern_a(h_tt, w, mesh, sub_capture=None):
     # On-device routing weight per local expert.
     # local_expert_ids: [E_LOCAL, 1] uint32 per chip (different per chip)
     # top_idxs:         [1, TOP_K]   uint32 replicated
-    # mask = (local_expert_ids == top_idxs) broadcasts to [E_LOCAL, TOP_K] per chip
-    mask = ttnn.eq(w["local_expert_ids"], top_idxs)  # bf16 / int
+    # mask = (local_expert_ids == top_idxs) broadcasts. ttnn broadcasting may
+    # produce extra singleton dims — reshape to canonical [E_LOCAL, TOP_K]
+    # after each step to keep slicing/sum semantics predictable.
+    _DBG = sub_capture is not None and sub_capture.get("__debug_shapes", False)
+    if _DBG:
+        print(f"  [pa] local_expert_ids shape={list(w['local_expert_ids'].shape)} dtype={w['local_expert_ids'].dtype}", flush=True)
+        print(f"  [pa] top_idxs shape={list(top_idxs.shape)} dtype={top_idxs.dtype}", flush=True)
+        print(f"  [pa] weights shape={list(weights.shape)} dtype={weights.dtype}", flush=True)
+
+    # Both inputs UINT16 → ttnn.eq compares natively, no typecast needed.
+    # Output is some int type; we typecast the *result* (which is in TILE
+    # after the broadcast op, so the last-dim-32 restriction doesn't apply).
+    mask = ttnn.eq(w["local_expert_ids"], top_idxs)
     ttnn.deallocate(top_idxs)
+    if _DBG:
+        print(f"  [pa] mask (post-eq) shape={list(mask.shape)} dtype={mask.dtype}", flush=True)
     mask_f = ttnn.typecast(mask, ttnn.bfloat16)
     ttnn.deallocate(mask)
+    if _DBG:
+        print(f"  [pa] mask_f raw shape={list(mask_f.shape)} dtype={mask_f.dtype}", flush=True)
+    mask_f = ttnn.reshape(mask_f, [E_LOCAL, TOP_K])
+    if _DBG:
+        print(f"  [pa] mask_f reshaped shape={list(mask_f.shape)} sample chip0={_ttnn_to_numpy_perchip(mask_f, mesh)[0][:3, :]}", flush=True)
 
     # routing_weight[e] = sum_k(mask[e, k] * weights[k])
-    weighted_mask = ttnn.mul(mask_f, weights)  # broadcast [E_LOCAL, TOP_K] × [1, TOP_K] → [E_LOCAL, TOP_K]
-    ttnn.deallocate(mask_f); ttnn.deallocate(weights)
-    routing_weight = ttnn.sum(weighted_mask, dim=-1, keepdim=True)  # [E_LOCAL, 1] per chip
+    weights_2d = ttnn.reshape(weights, [1, TOP_K])
+    ttnn.deallocate(weights)
+    weighted_mask = ttnn.mul(mask_f, weights_2d)
+    ttnn.deallocate(mask_f); ttnn.deallocate(weights_2d)
+    weighted_mask = ttnn.reshape(weighted_mask, [E_LOCAL, TOP_K])
+    if _DBG:
+        print(f"  [pa] weighted_mask shape={list(weighted_mask.shape)} sample chip0={_ttnn_to_numpy_perchip(weighted_mask, mesh)[0][:3, :]}", flush=True)
+    routing_weight = ttnn.sum(weighted_mask, dim=-1, keepdim=True)  # → [E_LOCAL, 1]
     ttnn.deallocate(weighted_mask)
+    routing_weight = ttnn.reshape(routing_weight, [E_LOCAL, 1])
+    if _DBG:
+        rw_np = _ttnn_to_numpy_perchip(routing_weight, mesh)
+        print(f"  [pa] routing_weight shape={list(routing_weight.shape)} per-chip nonzero counts: {[int((c != 0).sum()) for c in rw_np]}", flush=True)
+        for c in range(NCHIPS):
+            flat = rw_np[c].flatten()
+            nz_idx = np.flatnonzero(flat).tolist()
+            nz_vals = flat[nz_idx].tolist()
+            print(f"  [pa] chip{c} routing_weight nonzero idx→val: {list(zip(nz_idx, [float(f'{v:.4f}') for v in nz_vals]))}", flush=True)
+        # Sanity: total nonzero across all chips should equal TOP_K=8, and the
+        # nonzero values should approximate top_vals/sum(top_vals).
+        total_nz = sum(int((c != 0).sum()) for c in rw_np)
+        total_sum = sum(float(c.sum()) for c in rw_np)
+        print(f"  [pa] total nonzero (all chips) = {total_nz} (expect {TOP_K}); sum = {total_sum:.6f} (expect 1.0)", flush=True)
 
     if sub_capture is not None:
         sub_capture["moe_top_idxs"] = None  # not captured in pattern_a path (top_idxs deallocated already)
