@@ -299,8 +299,15 @@ def upload_moe_layer_pattern_a(sd, mesh):
     Per-chip output tensors:
       experts_gate_up_local: [E_LOCAL=64, HIDDEN=2048, 2*MOE_INTER=1024] TILE bf16
       experts_down_local:    [E_LOCAL=64, MOE_INTER=512, HIDDEN=2048]    TILE bf16
-      local_expert_ids:      [E_LOCAL=64, 1]                              ROW_MAJOR uint32
+      local_expert_ids:      [E_LOCAL=64, 1]                              ROW_MAJOR uint16
     Shared-expert weights are identical to the topk-mode upload.
+
+    Layout note: we np.CONCATENATE the per-chip slabs along dim 0 (giving
+    [NCHIPS*E_LOCAL=256, …]) rather than np.STACK (which would give
+    [NCHIPS, E_LOCAL, …]). After ShardTensorToMesh(dim=0), per-chip view is
+    [E_LOCAL, …] rank 3 — NOT rank 4 with a leading chip dim. The rank-3
+    layout is what the batched expert matmul (variant H from the isolated
+    test suite) requires; the looped variant works with either layout.
     """
     out = {}
     out["router_weight"] = np_to_replicated(sd["mlp.gate.weight"].T, mesh)  # [HIDDEN, NUM_EXPERTS]
@@ -322,8 +329,20 @@ def upload_moe_layer_pattern_a(sd, mesh):
         per_chip_ed.append(ed[e_start:e_end].transpose(0, 2, 1).copy())
         per_chip_local_ids.append(np.arange(e_start, e_end, dtype=np.int32))
 
-    out["experts_gate_up_local"] = np_stacked_to_sharded(per_chip_egu, mesh)
-    out["experts_down_local"] = np_stacked_to_sharded(per_chip_ed, mesh)
+    # CONCATENATE along dim 0 (not stack) so the logical sharded shape is
+    # [NCHIPS*E_LOCAL=256, HIDDEN, 2*MOE_INTER] rank 3, per-chip [E_LOCAL, H, 2I].
+    egu_flat = np.concatenate(per_chip_egu, axis=0)  # [256, HIDDEN, 2*MOE_INTER]
+    ed_flat = np.concatenate(per_chip_ed, axis=0)    # [256, MOE_INTER, HIDDEN]
+    out["experts_gate_up_local"] = ttnn.from_torch(
+        torch.from_numpy(egu_flat.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
+    )
+    out["experts_down_local"] = ttnn.from_torch(
+        torch.from_numpy(ed_flat.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
+    )
 
     # local_expert_ids per chip: [E_LOCAL, 1] UINT16 ROW_MAJOR. Matches the
     # dtype of ttnn.topk's output indices, so ttnn.eq can compare without a
@@ -1216,16 +1235,18 @@ def moe_forward_ttnn_pattern_a(h_tt, w, mesh, sub_capture=None):
         sub_capture["moe_routing_weight"] = _ttnn_to_numpy_replicated(routing_weight, mesh).reshape(-1)
 
     # Run all E_LOCAL experts, accumulate weighted outputs locally.
+    # Weights are now logically rank 3 per chip [E_LOCAL, HIDDEN, 2*MOE_INTER]
+    # (post upload-layout change), so the per-expert slice uses 3D coords.
     routed_local = None
     for k in range(E_LOCAL):
-        # Slice expert k's weights from the per-chip stacked tensors.
-        gate_up_w_4d = ttnn.slice(
+        # Slice expert k's weights from the per-chip [E_LOCAL, H, 2I] tensor.
+        gate_up_w_3d = ttnn.slice(
             w["experts_gate_up_local"],
-            [0, k, 0, 0],
-            [1, k + 1, HIDDEN, 2 * MOE_INTER],
+            [k, 0, 0],
+            [k + 1, HIDDEN, 2 * MOE_INTER],
         )
-        gate_up_w = ttnn.reshape(gate_up_w_4d, [HIDDEN, 2 * MOE_INTER])
-        ttnn.deallocate(gate_up_w_4d)
+        gate_up_w = ttnn.reshape(gate_up_w_3d, [HIDDEN, 2 * MOE_INTER])
+        ttnn.deallocate(gate_up_w_3d)
         gate_up = ttnn.matmul(h_tt, gate_up_w, compute_kernel_config=HIFI4)
         ttnn.deallocate(gate_up_w)
         # Split into gate / up halves
@@ -1240,13 +1261,13 @@ def moe_forward_ttnn_pattern_a(h_tt, w, mesh, sub_capture=None):
         mid = ttnn.mul(ttnn.silu(gate_part), up_part)
         ttnn.deallocate(gate_part); ttnn.deallocate(up_part)
 
-        down_w_4d = ttnn.slice(
+        down_w_3d = ttnn.slice(
             w["experts_down_local"],
-            [0, k, 0, 0],
-            [1, k + 1, MOE_INTER, HIDDEN],
+            [k, 0, 0],
+            [k + 1, MOE_INTER, HIDDEN],
         )
-        down_w = ttnn.reshape(down_w_4d, [MOE_INTER, HIDDEN])
-        ttnn.deallocate(down_w_4d)
+        down_w = ttnn.reshape(down_w_3d, [MOE_INTER, HIDDEN])
+        ttnn.deallocate(down_w_3d)
         expert_out = ttnn.matmul(mid, down_w, compute_kernel_config=HIFI4)
         ttnn.deallocate(mid); ttnn.deallocate(down_w)
 
@@ -1331,50 +1352,52 @@ def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
     routing_weight = ttnn.sum(weighted_mask, dim=-1, keepdim=True)  # [E_LOCAL, 1]
     ttnn.deallocate(weighted_mask)
     # Reshape for broadcast against [E_LOCAL, 1, HIDDEN] expert outputs.
+    # NOTE: ttnn.reshape returns a VIEW that shares the underlying buffer.
+    # Do NOT deallocate the original routing_weight — that would invalidate
+    # the view and any later op on routing_weight_3d fails with
+    # "Tensor is not allocated". The buffer is reclaimed when the function
+    # returns (after the last user of routing_weight_3d, the .mul below).
     routing_weight_3d = ttnn.reshape(routing_weight, [E_LOCAL, 1, 1])
-    ttnn.deallocate(routing_weight)
 
-    # BATCHED expert FFN: one matmul over all 64 local experts.
-    # Strategy: explicitly repeat h across E_LOCAL to match the weights' batch
-    # dim, then do a plain rank-4 batched matmul with NO broadcast.
-    #   h_tt [1, HIDDEN] → reshape [1, 1, 1, HIDDEN] → repeat [1, E_LOCAL, 1, 1]
-    #     → [1, E_LOCAL, 1, HIDDEN] per chip
-    #   weights logical [NCHIPS, E_LOCAL, HIDDEN, 2*MOE_INTER]; per-chip view
-    #     [1, E_LOCAL, HIDDEN, 2*MOE_INTER]
-    #   matmul → [1, E_LOCAL, 1, 2*MOE_INTER]
-    h_4d = ttnn.reshape(h_tt, [1, 1, 1, HIDDEN])
-    h_4d_repeat = ttnn.repeat(h_4d, [1, E_LOCAL, 1, 1])  # [1, E_LOCAL, 1, HIDDEN]
-    ttnn.deallocate(h_4d)
+    # BATCHED expert FFN — variant H from the isolated test suite:
+    #   weights per-chip: [E_LOCAL, HIDDEN, 2*MOE_INTER] rank 3 (sharded along
+    #     dim 0 of the [NCHIPS*E_LOCAL, …] logical tensor)
+    #   h_tt: [1, HIDDEN] → reshape [1, 1, HIDDEN] → ttnn.repeat([E_LOCAL,1,1])
+    #     → [E_LOCAL, 1, HIDDEN] (each expert sees same h)
+    #   matmul: [E_LOCAL, 1, H] @ [E_LOCAL, H, 2I] → [E_LOCAL, 1, 2I]
+    # ttnn.matmul does NOT support dim-0 broadcast; the ttnn.repeat at rank 3
+    # works (rank-4 repeat failed with "Tensor is not allocated" in earlier
+    # attempts). See test_batched_expert_matmul_isolated.py for the full
+    # variant matrix.
+    h_3d = ttnn.reshape(h_tt, [1, 1, HIDDEN])
+    h_3d_repeat = ttnn.concat([h_3d] * E_LOCAL, dim=0)
+    ttnn.deallocate(h_3d)
     gate_up_batched = ttnn.matmul(
-        h_4d_repeat, w["experts_gate_up_local"], compute_kernel_config=HIFI4
-    )  # → [1, E_LOCAL, 1, 2*MOE_INTER]
-    ttnn.deallocate(h_4d_repeat)
-    # Split into gate / up halves along last dim. Slice with rank-4 coords.
-    gate_batched = ttnn.slice(
-        gate_up_batched, [0, 0, 0, 0], [1, E_LOCAL, 1, MOE_INTER]
-    )
-    up_batched = ttnn.slice(
-        gate_up_batched, [0, 0, 0, MOE_INTER], [1, E_LOCAL, 1, 2 * MOE_INTER]
-    )
+        h_3d_repeat, w["experts_gate_up_local"], compute_kernel_config=HIFI4
+    )  # → [E_LOCAL, 1, 2*MOE_INTER]
+    ttnn.deallocate(h_3d_repeat)
+    gate_batched = ttnn.slice(gate_up_batched, [0, 0, 0], [E_LOCAL, 1, MOE_INTER])
+    up_batched = ttnn.slice(gate_up_batched, [0, 0, MOE_INTER], [E_LOCAL, 1, 2 * MOE_INTER])
     ttnn.deallocate(gate_up_batched)
-    mid_batched = ttnn.mul(ttnn.silu(gate_batched), up_batched)
-    ttnn.deallocate(gate_batched); ttnn.deallocate(up_batched)
+    silu_gate = ttnn.silu(gate_batched)
+    mid_batched = ttnn.mul(silu_gate, up_batched)
+    ttnn.deallocate(gate_batched); ttnn.deallocate(up_batched); ttnn.deallocate(silu_gate)
 
     expert_out_batched = ttnn.matmul(
         mid_batched, w["experts_down_local"], compute_kernel_config=HIFI4
-    )  # [1, E_LOCAL, 1, HIDDEN]
+    )  # [E_LOCAL, 1, HIDDEN]
     ttnn.deallocate(mid_batched)
+    routing_weight_broadcast = ttnn.repeat(routing_weight_3d, [1, 1, HIDDEN])
 
-    # Apply routing weights + reduce over expert dim. routing_weight_3d was
-    # [E_LOCAL, 1, 1] — reshape to rank 4 [1, E_LOCAL, 1, 1] to match.
-    routing_weight_4d = ttnn.reshape(routing_weight_3d, [1, E_LOCAL, 1, 1])
-    ttnn.deallocate(routing_weight_3d)
-    weighted_batched = ttnn.mul(expert_out_batched, routing_weight_4d)
-    ttnn.deallocate(expert_out_batched); ttnn.deallocate(routing_weight_4d)
-    routed_local_4d = ttnn.sum(weighted_batched, dim=1, keepdim=True)  # [1, 1, 1, HIDDEN]
+    # Apply routing weights + reduce over expert dim 0. routing_weight_3d was
+    # [E_LOCAL, 1, 1] which is exactly what we need to broadcast against
+    # [E_LOCAL, 1, HIDDEN].
+    weighted_batched = ttnn.mul(expert_out_batched, routing_weight_broadcast)
+    ttnn.deallocate(expert_out_batched); ttnn.deallocate(routing_weight_broadcast)
+    routed_local_3d = ttnn.sum(weighted_batched, dim=0, keepdim=True)  # [1, 1, HIDDEN]
     ttnn.deallocate(weighted_batched)
-    routed_local = ttnn.reshape(routed_local_4d, [1, HIDDEN])
-    ttnn.deallocate(routed_local_4d)
+    routed_local = ttnn.reshape(routed_local_3d, [1, HIDDEN])
+    ttnn.deallocate(routed_local_3d)
 
     # All-reduce + shared expert path are identical to the looped variant.
     routed_full = all_reduce_tt(routed_local, mesh)
