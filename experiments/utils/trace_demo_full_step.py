@@ -44,16 +44,19 @@ def log(msg):
 
 
 def main():
-    log("bootstrap…")
+    log("bootstrap (moe_mode=pattern_a so MoE has no host readback)…")
     state = srv.State()
+    state.moe_mode = "pattern_a"  # required: topk mode has from_device inside step
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()
 
     prompt_ids = state.tokenizer.encode("The capital of France is")
     tok_id = prompt_ids[0]
 
+    # Eager warmup: 2 forwards. JIT-during-capture hangs on Blackhole
+    # (feedback_c4v4_validated), so we MUST run eager calls first to populate
+    # the kernel cache.
     log("eager warmup 2 forwards…")
-    state.reset_caches_ttnn()
     next_id = srv.step_forward_ttnn(state, tok_id, 0)
     log(f"  warmup 1 → next_id={next_id}")
     state.reset_caches_ttnn()
@@ -67,24 +70,46 @@ def main():
     log("attempting begin_trace_capture → step_forward_inner → end_trace_capture…")
     try:
         trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
-        next_id_traced = srv.step_forward_inner(state)
+        argmax_tt = srv.step_forward_inner(state)
         ttnn.end_trace_capture(state.mesh, trace_id, cq_id=0)
-        log(f"  ✓ trace capture succeeded; next_id during capture = {next_id_traced}")
-        log(f"  trace_id = {trace_id}")
+        log(f"  ✓ trace capture succeeded; trace_id = {trace_id}")
+        log(f"  argmax_tt shape={list(argmax_tt.shape)} dtype={argmax_tt.dtype}")
     except Exception as e:
         log(f"  ✗ trace capture FAILED: {type(e).__name__}: {e}")
         traceback.print_exc()
         return
 
-    # Try to replay
+    # Try to replay: reset state, fill input buffers, execute_trace, read argmax.
     log("attempting execute_trace…")
     try:
         state.reset_caches_ttnn()
         srv.update_input_buffers(state, tok_id, 0)
+        # Time the synchronous execute_trace.
+        ttnn.synchronize_device(state.mesh)
         t0 = time.time()
-        ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=True)
+        ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+        ttnn.synchronize_device(state.mesh)
         elapsed = (time.time() - t0) * 1000.0
-        log(f"  ✓ execute_trace succeeded in {elapsed:.1f} ms")
+        # Read argmax outside the trace.
+        next_id_t = ttnn.to_torch(
+            argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        )
+        next_id_traced = int(next_id_t.flatten()[0].item())
+        log(f"  ✓ execute_trace succeeded in {elapsed:.1f} ms; next_id_traced={next_id_traced}")
+        # Compare to eager argmax (from warmup 2 above which used reset state):
+        log(f"  eager next_id={next_id}  traced next_id={next_id_traced}  match={'Y' if next_id == next_id_traced else 'N'}")
+        # Run a few more executions to measure steady-state time.
+        timings_ms = []
+        for _ in range(10):
+            state.reset_caches_ttnn()
+            srv.update_input_buffers(state, tok_id, 0)
+            ttnn.synchronize_device(state.mesh)
+            t0 = time.time()
+            ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+            ttnn.synchronize_device(state.mesh)
+            timings_ms.append((time.time() - t0) * 1000.0)
+        import numpy as _np
+        log(f"  execute_trace 10× iters: min {min(timings_ms):.1f} med {_np.median(timings_ms):.1f} max {max(timings_ms):.1f} ms")
     except Exception as e:
         log(f"  ✗ execute_trace FAILED: {type(e).__name__}: {e}")
         traceback.print_exc()
