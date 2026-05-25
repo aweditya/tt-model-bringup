@@ -178,7 +178,11 @@ def upload_dn_layer(sd, mesh):
     out["dt_bias"] = np_stacked_to_sharded(
         [shard_along(sd["linear_attn.dt_bias"], 0)[c] for c in range(NCHIPS)], mesh)
 
-    # norm_weight [128]: replicated (per-head_dim)
+    # norm_weight [128]: replicated (per-head_dim). DN's fused norm uses the
+    # standard RMSNorm formula (y = x/rms(x) * γ), unlike the residual-stream
+    # norms (input_layernorm / post_attention_layernorm / final_norm) which
+    # use zero-centered (1+γ). Empirically verified via output-magnitude probe
+    # (_check_norm_formula.py).
     out["norm_weight"] = np_to_replicated(sd["linear_attn.norm.weight"], mesh)
 
     # out_proj [2048, 4096]: column-sharded along input dim
@@ -222,8 +226,10 @@ def upload_attn_layer(sd, mesh):
         per_chip_v.append(v_slice)
     out["k_proj"] = np_stacked_to_sharded(per_chip_k, mesh)  # per-chip [HIDDEN, HEAD_DIM]
     out["v_proj"] = np_stacked_to_sharded(per_chip_v, mesh)
-    out["q_norm"] = np_to_replicated(sd["self_attn.q_norm.weight"], mesh)
-    out["k_norm"] = np_to_replicated(sd["self_attn.k_norm.weight"], mesh)
+    # Qwen3.6 zero-centered RMSNorm: y = x/rms(x) * (1 + γ). Same pattern as
+    # input_layernorm / post_attention_layernorm / final_norm.
+    out["q_norm"] = np_to_replicated(sd["self_attn.q_norm.weight"] + 1.0, mesh)
+    out["k_norm"] = np_to_replicated(sd["self_attn.k_norm.weight"] + 1.0, mesh)
 
     # o_proj [HIDDEN=2048, NUM_Q_HEADS*HEAD_DIM=4096]: column-sharded along input dim.
     out["o_proj"] = np_stacked_to_sharded(
@@ -636,30 +642,18 @@ def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state, sub_capture=Non
     k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
 
-    # RoPE: Q rotation works on [4, HEAD_DIM] directly. K's path depends on
-    # state.attn_sdpa_no_broadcast — Phase 2 ablation flag for the
-    # broadcast workaround.
+    # RoPE: Q rotation works on [4, HEAD_DIM] directly. For K, the broadcast
+    # workaround (commit c5b0012, feedback_qwen36_attn_rope_*) routes through
+    # the [4, HEAD_DIM] Q-side path because applying RoPE directly on
+    # [1, HEAD_DIM] hits a ttnn slice/concat bug at single-row tile width.
     q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
     ttnn.deallocate(q_n); q_n = q_n_rope
-    if state.attn_sdpa_no_broadcast:
-        # H2 ablation: apply RoPE directly on [1, HEAD_DIM] K. If the ttnn
-        # [1, HEAD_DIM] slice/concat bug is still live this will silently
-        # corrupt K — drift will collapse, telling us the workaround is
-        # still necessary. If clean, broadcast workaround can be removed.
-        k_n_single = _apply_partial_rope(k_n, cos_tt, sin_tt, 1)
-        ttnn.deallocate(k_n)
-    else:
-        # Broadcast workaround (commit c5b0012, feedback_qwen36_attn_rope_*).
-        # Broadcast K to NQ_PER_CHIP rows so _apply_partial_rope operates on
-        # [4, HEAD_DIM] (Q-side path that is known to work). Then dedupe
-        # row 0 — all rows are bit-identical post-RoPE because cos/sin are
-        # scalar per step.
-        k_n_b = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
-        ttnn.deallocate(k_n)
-        k_n_rope = _apply_partial_rope(k_n_b, cos_tt, sin_tt, NQ_PER_CHIP)
-        ttnn.deallocate(k_n_b)
-        k_n_single = ttnn.slice(k_n_rope, [0, 0], [1, HEAD_DIM_ATTN])
-        ttnn.deallocate(k_n_rope)
+    k_n_b = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
+    ttnn.deallocate(k_n)
+    k_n_rope = _apply_partial_rope(k_n_b, cos_tt, sin_tt, NQ_PER_CHIP)
+    ttnn.deallocate(k_n_b)
+    k_n_single = ttnn.slice(k_n_rope, [0, 0], [1, HEAD_DIM_ATTN])
+    ttnn.deallocate(k_n_rope)
     v_h = ttnn.reshape(v, [1, HEAD_DIM_ATTN])
     ttnn.deallocate(v)
 
@@ -935,18 +929,7 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     if sub_capture is not None:
         sub_capture["mixer_out"] = _ttnn_to_numpy_replicated(mixer_out, mesh).reshape(-1)
     ttnn.deallocate(h_norm_1)
-    # Residual-add 1. Optionally upcast to fp32 to avoid bf16 quantization
-    # noise at large magnitudes (see feedback_35b_a3b_drift_is_user_facing.md).
-    use_fp32_add = state is not None and getattr(state, "residual_add_dtype", "bf16") == "fp32"
-    if use_fp32_add:
-        r1_fp32 = ttnn.typecast(residual_1, ttnn.float32)
-        m_fp32 = ttnn.typecast(mixer_out, ttnn.float32)
-        h_after_mixer_fp32 = ttnn.add(r1_fp32, m_fp32)
-        ttnn.deallocate(r1_fp32); ttnn.deallocate(m_fp32)
-        h_after_mixer = ttnn.typecast(h_after_mixer_fp32, ttnn.bfloat16)
-        ttnn.deallocate(h_after_mixer_fp32)
-    else:
-        h_after_mixer = ttnn.add(residual_1, mixer_out)
+    h_after_mixer = ttnn.add(residual_1, mixer_out)
     ttnn.deallocate(mixer_out)
     if sub_capture is not None:
         sub_capture["after_mixer"] = _ttnn_to_numpy_replicated(h_after_mixer, mesh).reshape(-1)
@@ -960,16 +943,7 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     ttnn.deallocate(h_norm_2)
     if sub_capture is not None:
         sub_capture["moe_out"] = _ttnn_to_numpy_replicated(moe_out, mesh).reshape(-1)
-    # Residual-add 2. Same fp32-upcast option as residual-add 1.
-    if use_fp32_add:
-        r2_fp32 = ttnn.typecast(residual_2, ttnn.float32)
-        mo_fp32 = ttnn.typecast(moe_out, ttnn.float32)
-        h_final_fp32 = ttnn.add(r2_fp32, mo_fp32)
-        ttnn.deallocate(r2_fp32); ttnn.deallocate(mo_fp32)
-        h_final = ttnn.typecast(h_final_fp32, ttnn.bfloat16)
-        ttnn.deallocate(h_final_fp32)
-    else:
-        h_final = ttnn.add(residual_2, moe_out)
+    h_final = ttnn.add(residual_2, moe_out)
     ttnn.deallocate(residual_2); ttnn.deallocate(moe_out)
     return h_final, new_dn, new_kv
 
@@ -981,12 +955,12 @@ def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
     for drift-attribution comparison vs HF. Keys: top_idxs, top_weights,
     routed_full, shared_full, final.
     """
-    # Router (replicated weight, replicated input → replicated output)
-    logits = ttnn.matmul(h_tt, w["router_weight"], compute_kernel_config=HIFI4)  # [1, 256]
+    # Router: replicated weight, replicated input → replicated output.
+    logits = ttnn.matmul(h_tt, w["router_weight"], compute_kernel_config=HIFI4)
     probs = ttnn.softmax(logits, dim=-1)
-    # topk
+    ttnn.deallocate(logits)
     top_vals, top_idxs = ttnn.topk(probs, k=TOP_K, dim=-1)
-    # Renormalize: top_vals / sum(top_vals)
+    ttnn.deallocate(probs)
     sum_v = ttnn.sum(top_vals, dim=-1, keepdim=True)
     weights = ttnn.div(top_vals, sum_v)
 
@@ -1100,44 +1074,15 @@ class State:
         self.rot_idxs_buf = None    # uint32 [1, 1] ROW_MAJOR — for cos/sin table lookup
         self.cos_table_tt = None    # fp32 [MAX_KV, ROTARY_DIM] — pre-baked cos values for all positions
         self.sin_table_tt = None    # fp32 [MAX_KV, ROTARY_DIM] — pre-baked sin values for all positions
-        # Attention path selection. "manual" is the historical Q@K^T → softmax → @V
-        # path used through B16/B17. "sdpa" routes through ttnn paged_scaled_dot_product_attention_decode
-        # with the 27B B3 compute_kernel_config (HiFi2, no fp32_dest_acc). See
-        # research/35b_a3b_sdpa_swap_design.md + feedback_35b_a3b_attn_layer_drift.md.
-        # Set BEFORE bootstrap; the cache allocation + paged plumbing depends on this flag.
-        # Default flipped to "sdpa" 2026-05-22: 85-pos ladder showed pos-0 bit-perfect,
-        # median cos_final 0.94 → 0.95, structural cleanup. Top-1 81% vs 80% is within
-        # noise; the dominant 35B drift mechanism is NOT the SDPA bug (it's something
-        # else — see feedback_35b_a3b_sdpa_swap_result.md). Override with "manual"
-        # before bootstrap for A/B comparisons.
+        # Attention path. "manual" = legacy Q@K^T → softmax → @V (kept as
+        # precision-clean fallback). "sdpa" = paged_scaled_dot_product_attention_decode
+        # with the 27B B3 compute_kernel_config (HiFi2, no fp32_dest_acc).
+        # Set BEFORE bootstrap; the cache allocation + paged plumbing depends on this.
         self.attn_mode = "sdpa"
-        # Phase 2 ablation flag: skip the K-broadcast workaround in the SDPA path
-        # and apply RoPE directly on [1, HEAD_DIM] K. The broadcast was added in
-        # commit c5b0012 to work around a ttnn [1, HEAD_DIM] slice/concat bug
-        # (feedback_qwen36_attn_rope_single_row_ttnn_bug.md). Phase 1 drift
-        # attribution identified the 4x redundant bf16 ops as the prime
-        # per-step-noise suspect. Set True to test whether the ttnn bug is fixed
-        # in the current build — if K is silently corrupted, drift will collapse;
-        # if drift is unchanged or improves, broadcast workaround can be removed.
-        self.attn_sdpa_no_broadcast = False
-        # SDPA compute kernel config variant. "B3" = 27B-validated recipe
-        # (HiFi2, no fp32_dest_acc) — currently default. "hifi4_fp32" =
-        # HiFi4 + fp32_dest_acc_en=True for max precision. The 27B bug that
-        # made this variant buggy may not apply at 35B-A3B's GQA shapes.
-        # See feedback_35b_a3b_drift_is_user_facing.md.
-        self.sdpa_compute_variant = "B3"
-        # Residual-add dtype. "bf16" = current behavior (ttnn.add stays bf16).
-        # "fp32" = upcast operands to fp32 before each residual ADD in
-        # layer_forward_ttnn, then cast back to bf16. The bf16 ADD of large-
-        # magnitude tensors at late layers (L39 has L2~117) loses ~0.014
-        # cos to bf16 quantization on the sum. fp32 add removes that noise.
-        # ttnn.add's Python binding doesn't expose compute_kernel_config,
-        # so explicit casts are how we plumb fp32 accumulation here.
-        self.residual_add_dtype = "bf16"
-        # SDPA-mode plumbing — only populated when attn_mode == "sdpa".
-        self.cur_pos_buf = None             # int32 [1] device — replicated; consumed by paged_update_cache + paged SDPA
+        # SDPA-mode plumbing — populated by bootstrap when attn_mode == "sdpa".
+        self.cur_pos_buf = None             # int32 [1] device
         self.page_table_tt = None           # int32 [1, NUM_BLOCKS] — identity mapping for B=1
-        self.paged_write_mem_cfg = None     # HEIGHT_SHARDED L1 mem_cfg for the paged_update_cache input tile
+        self.paged_write_mem_cfg = None     # HEIGHT_SHARDED L1 mem_cfg for paged_update_cache input tile
         self.paged_sdpa_progcfg = None      # SDPAProgramConfig (CoreCoord(4,4), exp_approx_mode=False)
         self.sdpa_compute_kernel_config = None  # B3: HiFi2 + math_approx=False + fp32_dest_acc=False + packer_l1=False
 
@@ -1171,19 +1116,14 @@ class State:
                                    self.sdpa_block_size, HEAD_DIM_ATTN)
                     kc_init = np.zeros(cache_shape, dtype=np.float32)
                     vc_init = np.zeros(cache_shape, dtype=np.float32)
-                    # state.kv_cache_dtype controls KV storage precision.
-                    # bf16 is default + 27B-validated. fp32 was hard-rejected by
-                    # paged SDPA decode in 27B's ttnn build (feedback_fp32_kv_cache.md);
-                    # may have been fixed or may still apply. Try via flag for the
-                    # 35B drift-mitigation probe.
-                    kv_dtype = getattr(self, "kv_cache_dtype", "bf16")
-                    kv_tt_dtype = ttnn.float32 if kv_dtype == "fp32" else ttnn.bfloat16
+                    # paged SDPA decode requires bf16 KV (fp32 hard-rejected by
+                    # the ttnn kernel — see feedback_fp32_kv_cache.md).
                     kc = ttnn.from_torch(
-                        torch.from_numpy(kc_init), dtype=kv_tt_dtype, layout=ttnn.TILE_LAYOUT,
+                        torch.from_numpy(kc_init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                         device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=1),
                     )
                     vc = ttnn.from_torch(
-                        torch.from_numpy(vc_init), dtype=kv_tt_dtype, layout=ttnn.TILE_LAYOUT,
+                        torch.from_numpy(vc_init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                         device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=1),
                     )
                     kv.append((kc, vc))
@@ -1498,25 +1438,18 @@ def bootstrap(state, log):
             k_chunk_size=0,
             exp_approx_mode=False,
         )
-        if state.sdpa_compute_variant == "hifi4_fp32":
-            state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
-                math_fidelity=ttnn.MathFidelity.HiFi4,
-                math_approx_mode=False,
-                fp32_dest_acc_en=True,
-                packer_l1_acc=False,
-            )
-            variant_label = "hifi4_fp32 (HiFi4 + fp32_dest_acc + no packer_l1)"
-        else:  # "B3" default
-            state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
-                math_fidelity=ttnn.MathFidelity.HiFi2,
-                math_approx_mode=False,
-                fp32_dest_acc_en=False,
-                packer_l1_acc=False,
-            )
-            variant_label = "B3 (HiFi2 + no fp32_dest_acc + no packer_l1)"
+        # B3 recipe (27B-validated): HiFi2 + math_approx_mode=False +
+        # fp32_dest_acc_en=False + packer_l1_acc=False. On Blackhole P150
+        # HiFi4+fp32_dest_acc is buggy for SDPA decode at large positions
+        # (feedback_fp32_sdpa_cliff_probe.md).
+        state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=False,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=False,
+        )
         log(f"  SDPA paged plumbing: NUM_BLOCKS={SDPA_NUM_BLOCKS}, "
             f"BLOCK_SIZE={SDPA_BLOCK_SIZE}, MAX_KV={MAX_KV}")
-        log(f"  SDPA compute_kernel_config: {variant_label}")
     else:
         log("  attn_mode=manual; SDPA plumbing skipped")
 

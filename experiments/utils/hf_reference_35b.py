@@ -64,6 +64,11 @@ def main():
     ap.add_argument("--hook-attn-layer", type=int, default=None,
                     help="ALSO hook q_proj/k_proj/v_proj/q_norm/k_norm/o_proj outputs on this "
                          "decoder layer (must be a full_attention layer). Saves as L<N>_attn_<sub>.npy.")
+    ap.add_argument("--hook-dn-layer", type=int, default=None,
+                    help="ALSO hook DN sub-modules (in_proj_qkv/z/a/b, conv1d, norm, out_proj, "
+                         "core_attn_out pre-hook) on this decoder layer (must be a linear_attention "
+                         "layer). Also hooks input_layernorm/mixer/post_attention_layernorm/mlp at "
+                         "that layer (matching --hook-attn-layer semantics).")
     args = ap.parse_args()
 
     if args.prompt is not None:
@@ -167,7 +172,52 @@ def main():
         # localize drift within the MoE compute.
         mlp_LN = model.model.layers[N].mlp
         handles.append(mlp_LN.register_forward_hook(make_hook(f"moe_L{N}_out")))
-        log(f"  hooking attn + mlp submodules on layer {N}")
+        # Layer-internal points at layer N, matching server_35b_ttnn's
+        # sub_capture keys (in_norm, mixer_out, post_attn_norm). after_mixer
+        # and final layer output can be derived from hidden_states[N] +
+        # these captures.
+        LN = model.model.layers[N]
+        handles.append(LN.input_layernorm.register_forward_hook(make_hook(f"in_norm_L{N}")))
+        handles.append(LN.self_attn.register_forward_hook(make_hook(f"mixer_out_L{N}")))
+        handles.append(LN.post_attention_layernorm.register_forward_hook(make_hook(f"post_attn_norm_L{N}")))
+        # Hook the router (Qwen3_5MoeTopKRouter at mlp.gate) to capture
+        # (router_logits, router_scores, router_indices). HF computes softmax
+        # in fp32 explicitly (modeling_qwen3_5_moe.py:776). TT uses bf16
+        # softmax — comparing TT vs HF top_idxs tests whether bf16 precision
+        # flips the top-k expert selection. This is H3 (MoE router stability).
+        def router_hook(_module, _inp, output):
+            # output is (router_logits, router_scores, router_indices)
+            router_logits, router_scores, router_indices = output
+            intra[f"moe_L{N}_router_logits"] = router_logits.detach().float().cpu().numpy()
+            intra[f"moe_L{N}_router_scores"] = router_scores.detach().float().cpu().numpy()
+            intra[f"moe_L{N}_router_top_idxs"] = router_indices.detach().int().cpu().numpy()
+        handles.append(mlp_LN.gate.register_forward_hook(router_hook))
+        log(f"  hooking attn + mlp + router submodules on layer {N}")
+
+    # Optional: hook DN sub-modules on an arbitrary linear_attention layer.
+    # Mirrors --hook-attn-layer but for DN. Key naming: <sub>_L<N>.
+    if args.hook_dn_layer is not None:
+        N = args.hook_dn_layer
+        if layer_types[N] != "linear_attention":
+            raise ValueError(f"--hook-dn-layer {N} is type {layer_types[N]!r}, not linear_attention")
+        LN = model.model.layers[N]
+        dn = LN.linear_attn
+        handles.append(LN.input_layernorm.register_forward_hook(make_hook(f"in_norm_L{N}")))
+        handles.append(LN.linear_attn.register_forward_hook(make_hook(f"mixer_out_L{N}")))
+        handles.append(LN.post_attention_layernorm.register_forward_hook(make_hook(f"post_attn_norm_L{N}")))
+        handles.append(LN.mlp.register_forward_hook(make_hook(f"moe_L{N}_out")))
+        for sub_name in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
+                         "conv1d", "norm", "out_proj"):
+            sub_mod = getattr(dn, sub_name)
+            handles.append(sub_mod.register_forward_hook(make_hook(f"dn_{sub_name}_L{N}")))
+        def dn_norm_pre_hook(_module, inp):
+            args_ = inp if isinstance(inp, tuple) else (inp,)
+            if len(args_) >= 1:
+                intra[f"dn_core_attn_out_L{N}"] = args_[0].detach().float().cpu().numpy()
+            if len(args_) >= 2:
+                intra[f"dn_norm_gate_z_L{N}"] = args_[1].detach().float().cpu().numpy()
+        handles.append(dn.norm.register_forward_pre_hook(dn_norm_pre_hook))
+        log(f"  hooking DN submodules on layer {N}")
 
     log("HF forward pass with output_hidden_states=True + L0 sub-hooks…")
     t0 = time.time()

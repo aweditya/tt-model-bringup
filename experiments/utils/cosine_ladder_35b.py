@@ -60,24 +60,14 @@ def main():
                     help="cap at first N positions (0 = full prompt). Use small N for smoke runs.")
     ap.add_argument("--drift-cos-threshold", type=float, default=0.99,
                     help="layer cosine below this counts as divergence")
-    ap.add_argument("--attn-mode", choices=["manual", "sdpa"], default="manual",
-                    help="attention path: 'manual' (B16/B17 default) or 'sdpa' (paged + B3 config)")
-    ap.add_argument("--no-rope-broadcast", action="store_true",
-                    help="(sdpa mode only) skip the K-broadcast workaround; apply RoPE directly on [1, HEAD_DIM]. "
-                         "Phase 2 ablation — if ttnn [1, HEAD_DIM] slice bug is still live, K will be corrupted.")
-    ap.add_argument("--capture-attn-layer", type=int, default=None,
-                    help="(sdpa mode only) capture attn sub-step intermediates at this decoder layer "
-                         "index (0..n_layers-1). Must be a full_attention layer. Saves npz alongside JSON.")
-    ap.add_argument("--sdpa-variant", choices=["B3", "hifi4_fp32"], default="B3",
-                    help="(sdpa mode only) compute_kernel_config variant for paged SDPA. "
-                         "B3 = 27B-validated recipe; hifi4_fp32 = HiFi4 + fp32_dest_acc.")
-    ap.add_argument("--kv-cache-dtype", choices=["bf16", "fp32"], default="bf16",
-                    help="(sdpa mode only) KV cache storage dtype. fp32 was hard-rejected by "
-                         "paged SDPA decode in 27B's ttnn build — may have been fixed since.")
-    ap.add_argument("--residual-add-dtype", choices=["bf16", "fp32"], default="bf16",
-                    help="dtype for the residual ADDs in layer_forward_ttnn. fp32 = upcast "
-                         "before each ttnn.add, cast back to bf16 after — mitigates bf16 "
-                         "quantization noise on large-magnitude tensors at late layers.")
+    ap.add_argument("--attn-mode", choices=["manual", "sdpa"], default="sdpa",
+                    help="attention path: 'manual' (legacy Q@K^T) or 'sdpa' (paged + B3 config). Default sdpa.")
+    ap.add_argument("--capture-attn-layer", "--capture-layer", dest="capture_attn_layer",
+                    type=int, default=None,
+                    help="capture layer-internal intermediates at this decoder layer index "
+                         "(0..n_layers-1). Works for both full_attention (populates attn_sub) "
+                         "and linear_attention (populates dn_sub) layers. Always populates "
+                         "layer_* + moe_sub. Saves npz alongside JSON.")
     args = ap.parse_args()
 
     oracle_dir = Path(args.oracle)
@@ -98,14 +88,9 @@ def main():
 
     # Bootstrap (1,4) mesh + load all 40 layer weights. ~106 s on qb1 per
     # B16 smoke timings.
-    log(f"bootstrapping (1,4) mesh + uploading weights… "
-        f"(attn_mode={args.attn_mode}, no_rope_broadcast={args.no_rope_broadcast})")
+    log(f"bootstrapping (1,4) mesh + uploading weights… (attn_mode={args.attn_mode})")
     state = srv.State()
     state.attn_mode = args.attn_mode  # MUST be set before bootstrap; allocates paged plumbing if sdpa
-    state.attn_sdpa_no_broadcast = args.no_rope_broadcast
-    state.sdpa_compute_variant = args.sdpa_variant
-    state.kv_cache_dtype = args.kv_cache_dtype
-    state.residual_add_dtype = args.residual_add_dtype
     t0 = time.time()
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders (paged if sdpa)
@@ -144,7 +129,7 @@ def main():
                 if isinstance(v, dict):
                     continue  # attn_sub / moe_sub handled below
                 attn_sub_by_pos[f"pos{pos:03d}_layer_{k}"] = v
-            for sub_dict_name in ("attn_sub", "moe_sub"):
+            for sub_dict_name in ("attn_sub", "moe_sub", "dn_sub"):
                 sd = L_sub.get(sub_dict_name, {})
                 for k, v in sd.items():
                     attn_sub_by_pos[f"pos{pos:03d}_{k}"] = v
