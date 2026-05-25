@@ -26,6 +26,7 @@ Run (qb1):
     export LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib:$LD_LIBRARY_PATH && \
     .venv/bin/python -u experiments/utils/profile_35b_ttnn.py
 """
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -38,7 +39,7 @@ import server_35b_ttnn as srv  # noqa: E402
 
 PROMPT = "The capital of France is"
 WARMUP_STEPS = 3
-DECODE_STEPS = 24
+DECODE_STEPS_DEFAULT = 24
 
 
 def log(msg):
@@ -54,9 +55,17 @@ def stats(label, times_ms):
 
 
 def main():
-    log("bootstrap (~107 s — uploads 40 layers of weights)…")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--moe-mode", choices=["topk", "pattern_a"], default="topk",
+                    help="topk = host-readback dispatch (trace-incompatible, baseline); "
+                         "pattern_a = on-device mask (trace-clean, ~12× slower eager).")
+    ap.add_argument("--decode-steps", type=int, default=DECODE_STEPS_DEFAULT)
+    args = ap.parse_args()
+
+    log(f"bootstrap (moe_mode={args.moe_mode}; ~107 s for topk, ~210 s for pattern_a)…")
     t0 = time.time()
     state = srv.State()
+    state.moe_mode = args.moe_mode  # set BEFORE bootstrap — controls upload layout
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()
     bootstrap_s = time.time() - t0
@@ -88,12 +97,12 @@ def main():
     stats("prefill (per-token)", prefill_ms)
 
     # ── DECODE ────────────────────────────────────────────────────────
-    log(f"\ndecode: greedy generate {DECODE_STEPS} tokens autoregressively…")
+    log(f"\ndecode: greedy generate {args.decode_steps} tokens autoregressively…")
     decode_ms = []
     pos = len(prompt_ids)
     cur = last_argmax
     generated = [cur]
-    for step in range(DECODE_STEPS - 1):
+    for step in range(args.decode_steps - 1):
         t = time.time()
         next_id = srv.step_forward_ttnn(state, cur, pos)
         decode_ms.append((time.time() - t) * 1000.0)
