@@ -623,8 +623,20 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
         # full out_proj output (which has no TP partitioning).
         dn_sub_capture["dn_out_proj"] = _ttnn_to_numpy_replicated(out, mesh).reshape(-1)
 
-    # Return out + new recurrent state + new conv state (both evolve per token).
-    return out, conv_state_new, state_new
+    # B17-B-DN: in-place state update. Copy the freshly-computed conv_state_new
+    # and state_new INTO the original state buffers, then dealloc the temporaries.
+    # This makes the state mutation trace-friendly (same buffer addresses are
+    # used every step; trace replay overwrites them rather than reallocating).
+    # Same pattern as 27B server_tp.py:938-944.
+    # Reshape to match the IN state buffer's exact logical shape (the concat
+    # output's rank can differ from the cached buffer's rank by a leading 1).
+    conv_state_new = ttnn.reshape(conv_state_new, list(conv_state_in.shape))
+    ttnn.copy(conv_state_new, conv_state_in)
+    ttnn.deallocate(conv_state_new)
+    state_new = ttnn.reshape(state_new, list(recurrent_state_in.shape))
+    ttnn.copy(state_new, recurrent_state_in)
+    ttnn.deallocate(state_new)
+    return out, conv_state_in, recurrent_state_in
 
 
 def _apply_partial_rope(x, cos_tt, sin_tt, n_heads):
@@ -1463,20 +1475,29 @@ def _precompute_cos_sin_table(mesh, max_pos):
 
 
 def step_forward_ttnn(state, tok_id, pos, capture=None):
-    """Eager-mode public API: updates input buffers + runs step_forward_inner.
+    """Eager-mode public API: updates input buffers + runs step_forward_inner +
+    does the 8-byte argmax readback OUTSIDE the inner step.
 
-    Caller-friendly: pass tok_id (int) and pos (int). For trace capture, call
-    update_input_buffers + step_forward_inner directly (so update writes happen
-    OUTSIDE the captured trace region).
+    Caller-friendly: pass tok_id (int) and pos (int). Returns next_id (int).
+    For trace capture, call update_input_buffers + step_forward_inner directly
+    (both writes-to-buffers and the argmax readback happen OUTSIDE the captured
+    trace region).
     """
     update_input_buffers(state, tok_id, pos)
-    return step_forward_inner(state, capture=capture)
+    argmax_tt = step_forward_inner(state, capture=capture)
+    # 8-byte readback of the on-device argmax — the ONLY host transfer per step.
+    next_id_t = ttnn.to_torch(
+        argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+    )
+    ttnn.deallocate(argmax_tt)
+    return int(next_id_t.flatten()[0].item())
 
 
 def step_forward_inner(state, capture=None):
     """Trace-friendly forward step: reads ONLY from pre-allocated buffers
     (state.tok_buf, state.rot_idxs_buf) and per-layer weights. No host writes
-    inside. Returns next_id (int — one 8-byte readback at end).
+    or readbacks inside. Returns the on-device argmax tensor (UINT32 [1, 1]);
+    caller is responsible for the host readback + deallocation.
     """
     embed_out = ttnn.embedding(state.tok_buf, state.embed_tt)  # [1, 1, HIDDEN] per chip
     h_tt = ttnn.to_layout(embed_out, ttnn.TILE_LAYOUT)
@@ -1543,14 +1564,9 @@ def step_forward_inner(state, capture=None):
     ttnn.deallocate(logits)
     argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
     ttnn.deallocate(logits_rm)
-
-    # 5. Single 8-byte readback of the argmax — ONLY host transfer per step.
-    next_id_t = ttnn.to_torch(
-        argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
-    )
-    ttnn.deallocate(argmax_tt)
-    next_id = int(next_id_t.flatten()[0].item())
-    return next_id
+    # Return the device argmax tensor — the host readback happens in the
+    # outer step_forward_ttnn (outside any captured trace region). B17-D.
+    return argmax_tt
 
 
 def bootstrap(state, log):
