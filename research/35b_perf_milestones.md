@@ -42,6 +42,22 @@ floor at 4-MoE signposted region; needs full trace bench measurement.)
   The MoE expert matmul is memory-pattern bound at shape [64,1,2048]@[64,2048,1024]
   on Blackhole — not math-bound. Dropping fp32_dest_acc additionally risked
   long-context fp16 accumulator drift (user veto, per 27B precedent).
+- **Async all_reduce overlap with shared-expert window** (2026-05-26, `dd6b665`).
+  Isolation harness on (1,4) mesh with the production-equivalent comm + 4 shadow
+  matmuls: cos(serial, async) = 0.99999931, but async was 1.2% slower
+  (1.331 vs 1.315 ms/iter). Async setup tax exceeds the overlap savings; the
+  shared-expert compute window isn't deep enough to amortize the semaphore
+  pool setup. Reaffirms `feedback_async_ccl_negative` for serial-with-side-comm
+  patterns.
+- **bf8 expert weights** (2026-05-26, reverted same commit). cos(topk, batched)
+  = 0.99999668 — clean pass. But tracy showed kernel-time identical at 930 μs
+  median (vs bf16 930.6 μs) and signposted op2op within noise (9.13 vs 9.48 ms).
+  Back-of-envelope: at gate_up shape, weight DRAM read = 64 MB/chip / 404 GB/s
+  ≈ 158 μs vs actual 1837 μs — we're 11x above the BW floor, so the matmul
+  isn't BW-bound. The 27B precedent (bf8 MLP in prod) makes correctness
+  reliable, but no tt-perf-report-visible perf delta means no ship per
+  user's "must be guided by tt-perf-report" gate. Saved as a memory-pressure
+  lever for future DRAM-bound contexts (long prefill, vocab-sharded LM head).
 
 ## What's left (profile-driven candidates)
 
