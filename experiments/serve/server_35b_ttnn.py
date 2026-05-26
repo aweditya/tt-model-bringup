@@ -1050,14 +1050,12 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     return h_final, new_dn, new_kv
 
 
-def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
-    """MoE block fully on-device. h_tt [1, 2048] replicated. Returns [1, 2048] replicated.
+def _moe_router_topk(h_tt, w):
+    """Router: h @ W_router → softmax → topk → normalize.
 
-    sub_capture (optional dict): when set, populates with key MoE intermediates
-    for drift-attribution comparison vs HF. Keys: top_idxs, top_weights,
-    routed_full, shared_full, final.
+    Returns (top_idxs, weights_normalized), both [1, TOP_K] replicated.
+    Caller owns dealloc.
     """
-    # Router: replicated weight, replicated input → replicated output.
     logits = ttnn.matmul(h_tt, w["router_weight"], compute_kernel_config=HIFI4)
     probs = ttnn.softmax(logits, dim=-1)
     ttnn.deallocate(logits)
@@ -1065,26 +1063,42 @@ def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
     ttnn.deallocate(probs)
     sum_v = ttnn.sum(top_vals, dim=-1, keepdim=True)
     weights = ttnn.div(top_vals, sum_v)
+    ttnn.deallocate(top_vals); ttnn.deallocate(sum_v)
+    return top_idxs, weights
 
-    # NOTE: ttnn.embedding can gather rows from a weight table given a uint32 index
-    # tensor. For per-expert weight gather: experts_gate_up has shape [256, 256, 2048]
-    # per chip. We need each of the K=8 selected experts' [256, 2048] slab.
-    # Approach: ttnn.embedding(top_idxs, experts_gate_up) → [1, K=8, 256, 2048]
-    # Then per-expert matmul against h_tt.
-    # FIRST PASS: Python loop over K to avoid complex gather; each iter does
-    # ttnn.embedding(single_idx, table) → [1, 256, 2048] then matmul.
 
-    # B17-B v3: on-device expert dispatch. Don't FLATTEN experts (caused L1
-    # overflow). Instead: read top_idxs / weights via host readback (same as
-    # original) so trace doesn't apply here, but Python loop body uses the
-    # SAME slice pattern as before. This restores the original (working)
-    # MoE path. Trace support deferred — see research/b17_trace_handoff.
+def _moe_shared_expert(h_tt, w, mesh):
+    """Shared expert FFN + sigmoid gate. Returns gated_shared [1, HIDDEN] replicated."""
+    s_gate = ttnn.matmul(h_tt, w["shared_gate"], compute_kernel_config=HIFI4)
+    s_up = ttnn.matmul(h_tt, w["shared_up"], compute_kernel_config=HIFI4)
+    s_mid = ttnn.mul(ttnn.silu(s_gate), s_up)
+    ttnn.deallocate(s_gate); ttnn.deallocate(s_up)
+    shared_partial = ttnn.matmul(s_mid, w["shared_down"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(s_mid)
+    shared_full = all_reduce_tt(shared_partial, mesh)
+    ttnn.deallocate(shared_partial)
+    gate_logit = ttnn.matmul(h_tt, w["shared_expert_gate"], compute_kernel_config=HIFI4)
+    gate_sig = ttnn.sigmoid(gate_logit)
+    ttnn.deallocate(gate_logit)
+    gated_shared = ttnn.mul(shared_full, gate_sig)
+    ttnn.deallocate(shared_full); ttnn.deallocate(gate_sig)
+    return gated_shared
+
+
+def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
+    """MoE block, host-readback expert selection. A/B reference path (trace-incompatible).
+
+    h_tt [1, HIDDEN] replicated → returns [1, HIDDEN] replicated. sub_capture (optional dict)
+    fills with router/expert intermediates for drift-attribution vs HF oracle.
+    """
+    top_idxs, weights = _moe_router_topk(h_tt, w)
     top_idxs_host = ttnn.to_torch(
         top_idxs, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
     ).int().numpy()[0].reshape(-1)
     weights_host = ttnn.to_torch(
         weights, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)
     ).float().numpy()[0].reshape(-1)
+    ttnn.deallocate(top_idxs); ttnn.deallocate(weights)
     if sub_capture is not None:
         sub_capture["moe_top_idxs"] = top_idxs_host.astype(np.int32).copy()
         sub_capture["moe_top_weights"] = weights_host.astype(np.float32).copy()
@@ -1128,19 +1142,8 @@ def moe_forward_ttnn(h_tt, w, mesh, sub_capture=None):
             ttnn.deallocate(routed_partial); ttnn.deallocate(weighted)
             routed_partial = new_routed
 
-    # SHARED EXPERT (sharded intermediate dim)
-    s_gate = ttnn.matmul(h_tt, w["shared_gate"], compute_kernel_config=HIFI4)  # [1, 128] per chip
-    s_up = ttnn.matmul(h_tt, w["shared_up"], compute_kernel_config=HIFI4)      # [1, 128] per chip
-    s_mid = ttnn.mul(ttnn.silu(s_gate), s_up)
-    shared_partial = ttnn.matmul(s_mid, w["shared_down"], compute_kernel_config=HIFI4)  # [1, 2048] per chip (partial)
-    shared_full = all_reduce_tt(shared_partial, mesh)      # [1, 2048] replicated
+    gated_shared = _moe_shared_expert(h_tt, w, mesh)
 
-    # Scalar gate (replicated weight; output [1, 1] replicated)
-    gate_logit = ttnn.matmul(h_tt, w["shared_expert_gate"], compute_kernel_config=HIFI4)  # [1, 1]
-    gate_sig = ttnn.sigmoid(gate_logit)
-    gated_shared = ttnn.mul(shared_full, gate_sig)  # broadcast
-
-    # Routed sum + shared (routed is 0 for first cut)
     if routed_partial is None:
         if sub_capture is not None:
             sub_capture["moe_final"] = _ttnn_to_numpy_replicated(gated_shared, mesh).reshape(-1)
@@ -1168,17 +1171,9 @@ def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
     path; same upload format, same correctness, ~2× faster). DeepSeek-V3
     reference: experiments/.refs/tt-metal/models/demos/deepseek_v3/tt/experts.py:255-267.
     """
-    # Router (identical to topk path).
-    logits = ttnn.matmul(h_tt, w["router_weight"], compute_kernel_config=HIFI4)
-    probs = ttnn.softmax(logits, dim=-1)
-    ttnn.deallocate(logits)
-    top_vals, top_idxs = ttnn.topk(probs, k=TOP_K, dim=-1)
-    ttnn.deallocate(probs)
-    sum_v = ttnn.sum(top_vals, dim=-1, keepdim=True)
-    weights = ttnn.div(top_vals, sum_v)
-    ttnn.deallocate(top_vals); ttnn.deallocate(sum_v)
+    top_idxs, weights = _moe_router_topk(h_tt, w)
 
-    # On-device routing weight per local expert (identical to looped variant).
+    # On-device routing weight per local expert.
     mask = ttnn.eq(w["local_expert_ids"], top_idxs)
     ttnn.deallocate(top_idxs)
     mask_f = ttnn.typecast(mask, ttnn.bfloat16)
@@ -1250,25 +1245,12 @@ def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
     routed_local = ttnn.matmul(rw_1xK, expert_out_2d, compute_kernel_config=HIFI4)  # [1, HIDDEN]
     ttnn.deallocate(rw_1xK); ttnn.deallocate(expert_out_2d)
 
-    # All-reduce + shared expert path are identical to the looped variant.
     routed_full = all_reduce_tt(routed_local, mesh)
     ttnn.deallocate(routed_local)
     if sub_capture is not None:
         sub_capture["moe_routed_full"] = _ttnn_to_numpy_replicated(routed_full, mesh).reshape(-1)
 
-    s_gate = ttnn.matmul(h_tt, w["shared_gate"], compute_kernel_config=HIFI4)
-    s_up = ttnn.matmul(h_tt, w["shared_up"], compute_kernel_config=HIFI4)
-    s_mid = ttnn.mul(ttnn.silu(s_gate), s_up)
-    ttnn.deallocate(s_gate); ttnn.deallocate(s_up)
-    shared_partial = ttnn.matmul(s_mid, w["shared_down"], compute_kernel_config=HIFI4)
-    ttnn.deallocate(s_mid)
-    shared_full = all_reduce_tt(shared_partial, mesh)
-    ttnn.deallocate(shared_partial)
-    gate_logit = ttnn.matmul(h_tt, w["shared_expert_gate"], compute_kernel_config=HIFI4)
-    gate_sig = ttnn.sigmoid(gate_logit)
-    ttnn.deallocate(gate_logit)
-    gated_shared = ttnn.mul(shared_full, gate_sig)
-    ttnn.deallocate(shared_full); ttnn.deallocate(gate_sig)
+    gated_shared = _moe_shared_expert(h_tt, w, mesh)
     if sub_capture is not None:
         sub_capture["moe_gated_shared"] = _ttnn_to_numpy_replicated(gated_shared, mesh).reshape(-1)
 
