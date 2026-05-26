@@ -17,6 +17,7 @@ ms/tok = 540 tok/s.
 | 2026-05-25 | batched Pattern A TRACED | 146 | 6.85 | 39x | — |
 | 2026-05-26 | + cleanup pass (refactor, no perf change) | 146 | 6.85 | 39x | `eb237fd` |
 | 2026-05-26 | + fused SwiGLU + DN SILU + shared SIGMOID | 145.1 | 6.89 | 39x | `90b1518` |
+| 2026-05-26 | + qwen36_gdn_decode_owned (FIRST COHERENT GEN) | 143.8 | 6.95 | 39x | (this row) |
 
 ## The trace-amortization wall (2026-05-26)
 

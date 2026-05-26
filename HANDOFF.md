@@ -8,7 +8,11 @@
 
 | Mode | ms/tok | tok/s |
 |---|---|---|
-| **Batched Pattern A traced + activation fusions** | **145.1** | **6.89** |
+| **Batched MoE + fused-kernel GDN, traced + activation fusions** | **143.8** | **6.95** |
+
+First verified end-to-end coherent greedy decode: "The capital of France
+is Paris, a city renowned for its rich history, culture, and iconic
+landmarks. Paris is situated in" (20/20 tokens, owned_gdn default).
 
 Production path: `state.moe_mode = "pattern_a_batched"` in `experiments/serve/server_35b_ttnn.py`. Run via `experiments/utils/trace_demo_full_step.py --moe-mode pattern_a_batched`.
 

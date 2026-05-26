@@ -535,10 +535,11 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *, use_owned_g
     if use_owned_gdn:
         # Fused owned kernel (qwen36_gdn_decode_owned). Production 27B pattern:
         # clone state via ttnn.add(H, 0.0) so the kernel writes into a fresh
-        # buffer; explicit copy-back commits the new state. The "inplace" variant
-        # has documented multi-step correctness issues (INTEGRATION.md notes
-        # 1/5 streams matched), so we use the safe default mode.
-        # All inputs in bf16 (matches state dtype per kernel requirement).
+        # buffer; commit via copy-back below. State is uploaded rank-5 to keep
+        # manual broadcasting happy; rebrand to rank-4 [1, NV_PER_CHIP, 128, 128]
+        # here because the kernel validator rejects rank-5. ttnn.add(_, 0.0)
+        # both materializes the clone AND lets us request the rank-4 output
+        # shape implicitly via the reshape immediately after.
         alpha = ttnn.reshape(g_decay, [1, NV_PER_CHIP, 1, 1])
         beta_r = ttnn.reshape(beta, [1, NV_PER_CHIP, 1, 1])
         ttnn.deallocate(g_decay); ttnn.deallocate(beta)
@@ -546,7 +547,9 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *, use_owned_g
         k_4d = ttnn.reshape(k_rep, [1, NV_PER_CHIP, 1, HEAD_K_DIM])
         v_4d = ttnn.reshape(v_h, [1, NV_PER_CHIP, 1, HEAD_V_DIM])
         ttnn.deallocate(q_rep); ttnn.deallocate(k_rep); ttnn.deallocate(v_h)
-        H_owned_in = ttnn.add(recurrent_state_in, 0.0)
+        state_5d_clone = ttnn.add(recurrent_state_in, 0.0)
+        H_owned_in = ttnn.reshape(state_5d_clone, [1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM])
+        ttnn.deallocate(state_5d_clone)
         H_new, out_flat = ttnn.experimental.qwen36_gdn_decode_owned(
             H_owned_in, q_4d, k_4d, v_4d, alpha, beta_r,
             native_io=True,
@@ -556,9 +559,7 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *, use_owned_g
         # Kernel returns flat [1, NV_PER_CHIP * HEAD_V_DIM]; reshape to [1, NV_PER_CHIP, HEAD_V_DIM]
         core_attn_out = ttnn.reshape(out_flat, [1, NV_PER_CHIP, HEAD_V_DIM])
         ttnn.deallocate(out_flat)
-        # H_new aliases H_owned_in (kernel mutated the clone); commit to the
-        # persistent buffer below via the shared copy-back block.
-        state_new = H_new
+        state_new = H_new  # rank-4; reshape back to rank-5 in the copy-back block
     else:
         # Manual recurrence (correctness reference path).
         g_b = ttnn.reshape(g_decay, [1, NV_PER_CHIP, 1, 1])
@@ -628,7 +629,11 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *, use_owned_g
         ttnn.deallocate(silu_z)
     else:
         # Production: silu(z_2d) * normed fused into one dispatch (1.72x in
-        # isolation, bit-identical; test_fused_binary_activations_isolated.py).
+        # isolation, bit-identical). CRITICAL: the sequential `silu(z_2d);
+        # mul(normed, silu_z); dealloc(z_2d)` form produces incoherent text in
+        # multi-step generation (probably an op-scheduling / dealloc-race
+        # interaction). Verified empirically: reverting to sequential broke
+        # the Paris canary; restoring the fused form fixed it.
         gated = ttnn.mul(z_2d, normed, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
     ttnn.deallocate(normed); ttnn.deallocate(z_2d)
 
@@ -1279,8 +1284,10 @@ class State:
         # ttnn.experimental.qwen36_gdn_decode_owned (fused kernel, requires
         # qb1 tt-metal rebuilt with the qwen36 kernel suite — see
         # experiments/owned_ops/qwen36_gdn_decode_owned/integrate_into_ttmetal.py).
-        # Falls back to the manual mul/sum recurrence when False.
-        self.dn_owned_gdn = False
+        # PROMOTED to default 2026-05-26: kernel produces coherent text
+        # ("Paris, a city renowned for its rich history…"); manual fallback
+        # left in place for A/B debug.
+        self.dn_owned_gdn = True
         # B17 trace-capture input buffers (pre-allocated, written in-place
         # OUTSIDE the trace via update_input_buffers).
         self.tok_buf = None         # uint32 [1, 1] ROW_MAJOR — for ttnn.embedding(state.embed_tt)
@@ -1306,19 +1313,19 @@ class State:
         for L in range(n):
             if self.layer_types[L] == "linear_attention":
                 cs_np = np.zeros((NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
-                # Recurrent state: rank-4 logical (1, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM)
-                # sharded along V-head dim → per-chip rank-4 (1, NV_PER_CHIP, 128, 128) bf16.
-                # Rank-4 + bf16 matches 27B server_tp.py upload pattern AND the
-                # qwen36_gdn_decode_owned kernel's "q dtype must match state dtype"
-                # requirement (since our q/k/v are bf16 post-norm).
-                rs_np = np.zeros((1, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
+                # Recurrent state: rank-5 logical (NCHIPS, 1, NV_PER_CHIP, 128, 128)
+                # sharded dim=0 → per-chip rank-5 (1, 1, NV_PER_CHIP, 128, 128). The
+                # rank-5 layout is what dn_forward_ttnn's manual recurrence expects;
+                # the owned_gdn kernel branch reshapes to rank-4 view on-the-fly.
+                # bf16 matches q/k/v dtype (kernel requires q dtype == state dtype).
+                rs_np = np.zeros((NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
                 cs_tt = ttnn.from_torch(
                     torch.from_numpy(cs_np), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                     device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
                 )
                 rs_tt = ttnn.from_torch(
                     torch.from_numpy(rs_np), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                    device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=1),
+                    device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
                 )
                 dn.append((cs_tt, rs_tt))
                 kv.append(None)
