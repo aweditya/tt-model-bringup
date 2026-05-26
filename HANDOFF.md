@@ -8,7 +8,7 @@
 
 | Mode | ms/tok | tok/s |
 |---|---|---|
-| **Batched Pattern A traced** | **145.9** | **6.85** |
+| **Batched Pattern A traced + activation fusions** | **145.1** | **6.89** |
 
 Production path: `state.moe_mode = "pattern_a_batched"` in `experiments/serve/server_35b_ttnn.py`. Run via `experiments/utils/trace_demo_full_step.py --moe-mode pattern_a_batched`.
 

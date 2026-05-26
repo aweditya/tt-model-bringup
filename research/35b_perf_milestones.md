@@ -16,10 +16,28 @@ ms/tok = 540 tok/s.
 | 2026-05-25 | batched Pattern A eager | 267 | 3.74 | 72x | `961ce7f` |
 | 2026-05-25 | batched Pattern A TRACED | 146 | 6.85 | 39x | — |
 | 2026-05-26 | + cleanup pass (refactor, no perf change) | 146 | 6.85 | 39x | `eb237fd` |
-| 2026-05-26 | + fused SwiGLU silu+mul | TBD | TBD | TBD | `eb237fd` |
+| 2026-05-26 | + fused SwiGLU + DN SILU + shared SIGMOID | 145.1 | 6.89 | 39x | `90b1518` |
 
-(SwiGLU fusion measured 1.87x in isolation. Per-token impact below Tracy noise
-floor at 4-MoE signposted region; needs full trace bench measurement.)
+## The trace-amortization wall (2026-05-26)
+
+Three correct, bit-identical activation fusions landed (SwiGLU on batched MoE
+experts, SILU on DN RMSNormGated tail, SIGMOID on shared-expert gating). Each
+saves ~1 dispatch per call × 30-40 layers. Isolation showed clean speedups
+(1.72x-1.97x). End-to-end traced number moved from 146.0 to 145.1 ms/tok.
+
+Why so little gain in trace? **Trace already eliminates ~all dispatch
+latency.** A dispatch-reducing fusion in eager translates to almost nothing
+in trace — there's no host-side dispatch loop to shorten. Future per-token
+wins must come from one of:
+
+1. Reducing **kernel time per op** — but the dominant ops (gate_up @ 1.84 ms,
+   down @ similar) aren't compute or BW bound at these shapes. HiFi2 and bf8
+   both no-op'd here.
+2. Reducing **op COUNT** in trace — each op still has trace-internal overhead
+   (~tens of microseconds). Fewer, larger ops > many tiny ones.
+3. Writing **custom fused kernels** that genuinely combine multiple math
+   stages (silu+mul+matmul, or DN-step-fused). These DO move kernel time
+   per call. Cost: tt-metal C++ work + correctness gate.
 
 ## Where the wins came from
 
