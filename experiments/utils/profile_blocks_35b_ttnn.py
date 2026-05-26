@@ -51,40 +51,28 @@ def _sync(mesh):
 
 
 def install_block_timers(mesh):
-    """Monkey-patch the 3 block forwards with timed wrappers."""
+    """Monkey-patch the 3 block forwards with timed wrappers. Wraps BOTH MoE
+    variants (topk + pattern_a_batched) — layer_forward resolves the function
+    name from module globals at runtime so monkey-patching is honored."""
     orig_dn = srv.dn_forward_ttnn
     orig_attn = srv.attn_forward_ttnn
-    orig_moe = srv.moe_forward_ttnn
+    orig_moe_topk = srv.moe_forward_ttnn
+    orig_moe_pa_batched = srv.moe_forward_ttnn_pattern_a_batched
 
-    # Pass through **kwargs so additions like sub_capture / state /
-    # kv_cache don't break the wrapper when block signatures evolve.
-    def timed_dn(*args, **kwargs):
-        _sync(mesh)
-        t0 = time.time()
-        out = orig_dn(*args, **kwargs)
-        _sync(mesh)
-        _step_times_ms["dn"].append((time.time() - t0) * 1000.0)
-        return out
+    def make_timed(orig, bucket):
+        def timed(*args, **kwargs):
+            _sync(mesh)
+            t0 = time.time()
+            out = orig(*args, **kwargs)
+            _sync(mesh)
+            _step_times_ms[bucket].append((time.time() - t0) * 1000.0)
+            return out
+        return timed
 
-    def timed_attn(*args, **kwargs):
-        _sync(mesh)
-        t0 = time.time()
-        out = orig_attn(*args, **kwargs)
-        _sync(mesh)
-        _step_times_ms["attn"].append((time.time() - t0) * 1000.0)
-        return out
-
-    def timed_moe(*args, **kwargs):
-        _sync(mesh)
-        t0 = time.time()
-        out = orig_moe(*args, **kwargs)
-        _sync(mesh)
-        _step_times_ms["moe"].append((time.time() - t0) * 1000.0)
-        return out
-
-    srv.dn_forward_ttnn = timed_dn
-    srv.attn_forward_ttnn = timed_attn
-    srv.moe_forward_ttnn = timed_moe
+    srv.dn_forward_ttnn = make_timed(orig_dn, "dn")
+    srv.attn_forward_ttnn = make_timed(orig_attn, "attn")
+    srv.moe_forward_ttnn = make_timed(orig_moe_topk, "moe")
+    srv.moe_forward_ttnn_pattern_a_batched = make_timed(orig_moe_pa_batched, "moe")
 
 
 def main():

@@ -39,6 +39,26 @@ wins must come from one of:
    stages (silu+mul+matmul, or DN-step-fused). These DO move kernel time
    per call. Cost: tt-metal C++ work + correctness gate.
 
+## Block-attribution profile (2026-05-26 — eager, post-fusion)
+
+`profile_blocks_35b_ttnn.py` with all 3 MoE variants wrapped:
+
+| Block | total/tok (ms) | per-layer (ms) | layers | share |
+|---|---|---|---|---|
+| MoE   | 148.0 | 3.70 | 40 | 48.2% |
+| DN    | 133.8 | 4.46 | 30 | 43.6% |
+| ATTN  |  25.1 | 2.51 | 10 |  8.2% |
+
+Eager total ~331 ms/tok; traced 145.1 ms/tok. Assuming proportional collapse
+in trace: MoE ≈ 65 ms/tok, DN ≈ 57 ms/tok, ATTN ≈ 11 ms/tok, other ≈ 12 ms.
+Both MoE and DN are major. Single-block 50% reductions (custom kernels) would
+move us from 145 → 110-115 ms/tok = 8.7-9.1 tok/s.
+
+The DN per-layer (4.46 ms) is HIGHER than MoE per-layer (3.70 ms) — DN's
+~15-op recurrence + L2-norm sequence is the per-layer hot path. 27B has an
+owned_gdn kernel (memory `feedback_owned_decay_gate_shipped`, +2.5%) that
+fused the analogous chain. Bringing similar for 35B is the next major lever.
+
 ## Where the wins came from
 
 1. **Correctness foundation** (`fd4367f`): q/k_norm `+1` zero-centered offset.
