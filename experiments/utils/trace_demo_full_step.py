@@ -46,13 +46,12 @@ def log(msg):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--moe-mode", choices=["pattern_a", "pattern_a_batched"],
-                    default="pattern_a",
-                    help="Trace requires no host readback in step; pattern_a (looped, "
-                         "validated, 308 ms/tok) is the default. pattern_a_batched is "
-                         "WIP — ttnn matmul rank/broadcast plumbing not yet resolved.")
+    ap.add_argument("--moe-mode", choices=["pattern_a_batched"],
+                    default="pattern_a_batched",
+                    help="Trace requires no host readback in step; pattern_a_batched "
+                         "is the only trace-clean MoE path.")
     args = ap.parse_args()
-    log(f"bootstrap (moe_mode={args.moe_mode} — both are trace-clean)…")
+    log(f"bootstrap (moe_mode={args.moe_mode})…")
     state = srv.State()
     state.moe_mode = args.moe_mode
     srv.bootstrap(state, log)

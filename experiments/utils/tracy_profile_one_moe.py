@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Tracy-instrumented profile of a single MoE call (Pattern A looped).
+"""Tracy-instrumented profile of a single MoE call (pattern_a_batched).
 
-Why: profiling the full 5120-op forward overflows the Tracy DRAM marker
-buffer (12000 markers per RISCV per core). The MoE structure repeats
-identically across all 40 layers, so one MoE call gives us the same
-information about WHICH ops eat time.
+Why: profiling the full forward overflows the Tracy DRAM marker buffer
+(12000 markers per RISCV per core). The MoE structure repeats identically
+across all 40 layers, so one MoE call gives the same per-op breakdown.
 
 Captures:
   - Pattern A MoE on layer 0's weights with synthetic input
@@ -42,9 +41,9 @@ def log(msg):
 
 
 def main():
-    log("bootstrap (moe_mode=pattern_a)…")
+    log("bootstrap (moe_mode=pattern_a_batched)…")
     state = srv.State()
-    state.moe_mode = "pattern_a"
+    state.moe_mode = "pattern_a_batched"
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()
 
@@ -54,9 +53,7 @@ def main():
     h_tt = srv.np_to_replicated(h_np, state.mesh)
     log(f"h_tt shape={list(h_tt.shape)} dtype={h_tt.dtype}")
 
-    # Profile the production MoE path. Swap moe_fn between the looped
-    # (moe_forward_ttnn_pattern_a) and batched (moe_forward_ttnn_pattern_a_batched)
-    # variants depending on which one you're optimizing.
+    # Production MoE path.
     moe_fn = srv.moe_forward_ttnn_pattern_a_batched
 
     log("warmup 2 MoE calls…")

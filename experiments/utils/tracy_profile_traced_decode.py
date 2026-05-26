@@ -7,7 +7,7 @@ per token are dispatch-bound or BW-bound. Decides whether the batched
 expert matmul is the right next optimization.
 
 Setup:
-  - Bootstrap pattern_a (the looped MoE — currently the working trace path)
+  - Bootstrap pattern_a_batched (the production trace-clean MoE path)
   - Capture trace once
   - Run a few warmup execute_trace iterations (unsignposted)
   - tracy.signpost("Performance pass start")
@@ -57,9 +57,9 @@ def log(msg):
 
 
 def main():
-    log("bootstrap (moe_mode=pattern_a, the working traced path)…")
+    log("bootstrap (moe_mode=pattern_a_batched, the production trace path)…")
     state = srv.State()
-    state.moe_mode = "pattern_a"
+    state.moe_mode = "pattern_a_batched"
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()
 

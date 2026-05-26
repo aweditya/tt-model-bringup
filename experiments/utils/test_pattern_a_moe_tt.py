@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
-"""Pattern A MoE TT correctness test — compare Pattern A vs topk MoE on device.
+"""Pattern A MoE TT correctness test — topk vs pattern_a_batched on device.
 
-Runs two bootstraps back-to-back: one with state.moe_mode="topk" and one with
-"pattern_a". On each, computes the MoE output for layer 0 on the embed of
-"The capital of France is". Compares cos and abs error.
+Two bootstraps back-to-back, layer-0 MoE on the embed of
+"The capital of France is". Cosine target > 0.9999.
 
-Pre-q/k-norm-fix the MoE function was the same in both; this test verifies
-the new Pattern A path produces numerically equivalent output.
-
-Cosine target: > 0.9999 (allowing bf16 noise).
-Abs error: should be small relative to magnitude; reported, not gated.
-
-Run (qb1):
-  cd ~/tt-xla && tt-smi -r 0,1,2,3 && \\
-  export TT_METAL_HOME=$HOME/tenstorrent/tt-metal && \\
-  export TT_BUILD_DIR=$TT_METAL_HOME/build_Release && \\
-  export ARCH_NAME=blackhole && \\
-  export PYTHONPATH=$TT_METAL_HOME/ttnn:$PYTHONPATH && \\
-  export LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib:$LD_LIBRARY_PATH && \\
+Run (qb1): see HANDOFF.md for the env-var bootstrap; then
   .venv/bin/python -u experiments/utils/test_pattern_a_moe_tt.py
 """
 import sys
@@ -62,7 +49,7 @@ def run_with_mode(mode):
     )
     ttnn.deallocate(h_tt)
 
-    moe_fn = (srv.moe_forward_ttnn_pattern_a if mode == "pattern_a"
+    moe_fn = (srv.moe_forward_ttnn_pattern_a_batched if mode == "pattern_a_batched"
               else srv.moe_forward_ttnn)
     t0 = time.time()
     out = moe_fn(h_norm, state.per_layer_tt[0], state.mesh)
@@ -84,19 +71,19 @@ def run_with_mode(mode):
 def main():
     out_topk, t_topk = run_with_mode("topk")
     log("")
-    out_pa, t_pa = run_with_mode("pattern_a")
+    out_pa, t_pa = run_with_mode("pattern_a_batched")
     log("")
     log("=== COMPARISON ===")
     c = cos(out_topk, out_pa)
     abs_err = np.abs(out_topk - out_pa).max()
     rel_err = np.linalg.norm(out_topk - out_pa) / np.linalg.norm(out_topk)
-    log(f"  cos(topk, pattern_a):   {c:.8f}")
+    log(f"  cos(topk, batched):     {c:.8f}")
     log(f"  max |Δ|:                {abs_err:.6e}")
     log(f"  rel ||Δ|| / ||topk||:   {rel_err:.6e}")
-    log(f"  one-MoE-call time:      topk={t_topk*1000:.1f} ms   pattern_a={t_pa*1000:.1f} ms   ratio={t_pa/t_topk:.2f}×")
+    log(f"  one-MoE-call time:      topk={t_topk*1000:.1f} ms   batched={t_pa*1000:.1f} ms   ratio={t_pa/t_topk:.2f}x")
 
     assert c > 0.9999, f"COSINE TOO LOW: {c:.6f}"
-    log(f"PASS ✓  Pattern A MoE matches topk MoE within bf16 noise.")
+    log("PASS  pattern_a_batched MoE matches topk MoE within bf16 noise.")
 
 
 if __name__ == "__main__":

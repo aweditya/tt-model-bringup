@@ -56,14 +56,13 @@ def stats(label, times_ms):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--moe-mode", choices=["topk", "pattern_a", "pattern_a_batched"], default="topk",
-                    help="topk = host-readback dispatch (trace-incompatible, baseline); "
-                         "pattern_a = on-device mask + 64-iter loop (trace-clean, ~12× slower eager); "
-                         "pattern_a_batched = batched matmul over stacked experts (trace-clean, far fewer kernel launches).")
+    ap.add_argument("--moe-mode", choices=["topk", "pattern_a_batched"], default="topk",
+                    help="topk = host-readback A/B reference (trace-incompatible); "
+                         "pattern_a_batched = batched on-device MoE (trace-clean, production).")
     ap.add_argument("--decode-steps", type=int, default=DECODE_STEPS_DEFAULT)
     args = ap.parse_args()
 
-    log(f"bootstrap (moe_mode={args.moe_mode}; ~107 s for topk, ~210 s for pattern_a)…")
+    log(f"bootstrap (moe_mode={args.moe_mode})…")
     t0 = time.time()
     state = srv.State()
     state.moe_mode = args.moe_mode  # set BEFORE bootstrap — controls upload layout
