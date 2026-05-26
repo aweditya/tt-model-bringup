@@ -245,39 +245,6 @@ def cmd_probe_ccl_equivalence_tp(args):
     print(f"\n{data.get('note', '')}")
 
 
-def cmd_probe_prefill_vs_decode_loop_tp(args):
-    payload = {"mode": args.mode}
-    if args.prompt:
-        payload["prompt"] = args.prompt
-    if args.debug_ccl:
-        payload["debug_ccl"] = True
-    if args.test_dn_mode:
-        payload["test_dn_mode"] = args.test_dn_mode
-    if args.test_decay_gate_mode:
-        payload["test_decay_gate_mode"] = args.test_decay_gate_mode
-    if args.force_sync_per_position:
-        payload["force_sync_per_position"] = True
-    if args.debug_state:
-        payload["debug_state"] = True
-    if args.use_chunked_dn:
-        payload["use_chunked_dn"] = True
-    if args.profile_chunked_dn:
-        payload["profile_chunked_dn"] = True
-    data = _send("probe_prefill_vs_decode_loop_tp", payload, timeout=600.0)
-    if data.get("error"):
-        print(f"ERROR: {data['error']}", file=sys.stderr)
-        sys.exit(4)
-    pc = data["per_position_cosine"]
-    print(f"mode={data['mode']}  seq_len={data['seq_len']}  vocab={data['vocab']}")
-    print(f"reference (decode-loop) wall: {data['reference_ms']:.0f} ms")
-    print(f"test ({data['mode']}) wall: {data['test_ms']:.0f} ms")
-    print(f"\nper-position cosine: min={pc['min']:.6f}  median={pc['median']:.6f}  "
-          f"mean={pc['mean']:.6f}  max={pc['max']:.6f}")
-    print(f"max_abs_diff: {data['max_abs_diff']:.6e}")
-    print(f"top1 agreement: {data['top1_agreement']}")
-    verdict = "PASS" if data["pass_gate_0p999"] else "FAIL"
-    print(f"\nGate (per-pos cos >= 0.999): {verdict}")
-
 
 def cmd_probe_async_ccl_components_tp(args):
     data = _send("probe_async_ccl_components_tp", {
@@ -730,49 +697,6 @@ def main():
                                "plumbing entirely.")
     mrc.add_argument("--prompt", default=None)
     mrc.set_defaults(fn=cmd_probe_multirow_construct_vs_per_position)
-    pvd = sub.add_parser("probe_prefill_vs_decode_loop_tp",
-                          help="B.1 prefill validation harness: compare per-position logits "
-                               "from sequential decode-loop reference vs forward_prefill_tp_inner. "
-                               "Gate: cos >= 0.999 per position. Initial B.1 stub is decode-loop "
-                               "wrapped → cos = 1.0 trivially (validates harness itself).")
-    pvd.add_argument("--prompt", default=None,
-                      help="prompt to tokenize and validate (default: 'The capital of France is')")
-    pvd.add_argument("--mode", default="stub",
-                      choices=["stub", "batched_mlp", "sequential_via_slices",
-                               "per_position_list", "parallel_attn"],
-                      help="prefill implementation under test: 'stub' (B.1 decode-loop "
-                           "wrapper; cos=1.0 expected) or 'batched_mlp' (B.2.1 layer-outer "
-                           "iteration with batched MLP per layer; gate cos>=0.999)")
-    pvd.add_argument("--debug-ccl", action="store_true",
-                      help="enable _tp_all_reduce shape+values diagnostic (first 8 calls "
-                           "per path; tag 'dec' for decode-loop, 'pre' for prefill)")
-    pvd.add_argument("--test-dn-mode", default=None,
-                      choices=["manual", "owned_gdn", "owned_gdn_inplace"],
-                      help="override deltanet_recurrence_mode for the TEST path only "
-                           "(reference still uses production default). Use 'manual' to "
-                           "test whether owned_gdn kernel has hidden cross-call state.")
-    pvd.add_argument("--force-sync-per-position", action="store_true",
-                      help="add ttnn.synchronize_device between per-position DN calls in v3 "
-                           "to test the async-ordering hypothesis")
-    pvd.add_argument("--test-decay-gate-mode", default=None,
-                      choices=["manual", "owned_decay_gate"],
-                      help="override deltanet_decay_gate_mode for the TEST path only. "
-                           "Use 'manual' to test whether owned_decay_gate kernel is the culprit.")
-    pvd.add_argument("--debug-state", action="store_true",
-                      help="print layer 0 dn['ssm'] mean/norm/v0 and conv_st_split after "
-                           "each position's DN call in both decode-loop reference (tag='dec') "
-                           "and v3 prefill (tag='pre'). Use to find where state evolution "
-                           "first diverges.")
-    pvd.add_argument("--use-chunked-dn", action="store_true",
-                      help="v4 (task #75): route v3 prefill DN body through "
-                           "deltanet_chunked_neumann_tp (currently a STUB that loops "
-                           "per-position internally — same math; will be replaced with "
-                           "real Neumann chunked math in future sessions)")
-    pvd.add_argument("--profile-chunked-dn", action="store_true",
-                      help="v4 Stage 4b-iii diag: per-phase walltime breakdown of "
-                           "_chunked_dn_with_chunked_recurrence_tp (6 phases). "
-                           "Requires --use-chunked-dn and seq_len being a power of 2.")
-    pvd.set_defaults(fn=cmd_probe_prefill_vs_decode_loop_tp)
     chr_ = sub.add_parser("probe_chunked_recurrence_tp",
                           help="v4 Stage 4b: validate _chunked_recurrence_tp on mesh vs "
                                "numpy per-position reference. Gate: cos ≥ 0.99 at bf16.")
