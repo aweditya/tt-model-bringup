@@ -1,7 +1,11 @@
 # tt-model-bringup: Tenstorrent Blackhole LLM bringup (Qwen3.6-family)
 
+## Read First
+
+**For any post-compaction or fresh session: read [`HANDOFF.md`](HANDOFF.md) first.** It is one page and contains the current perf number, the hardware-ceiling reference, the production code path, and what to do next. Don't grep around to figure out where things are.
+
 ## Project Overview
-Exploratory research project for Stanford CS440LX. **Originally scoped as a JAX/XLA backend (hence the legacy `tt-xla` name); the work pivoted to direct TT-Metal model bringup + custom compute kernels for Qwen3.6 on Tenstorrent Blackhole.** Current production: Qwen3.6-27B on qb2 4× P150 mesh @ 12.93 tok/s with custom owned_gdn and owned_decay_gate kernels. Upcoming: Qwen3.6-35B-A3B MoE bringup.
+Exploratory research project for Stanford CS440LX. **Originally scoped as a JAX/XLA backend (hence the legacy `tt-xla` name); the work pivoted to direct TT-Metal model bringup + custom compute kernels for Qwen3.6 on Tenstorrent Blackhole.** Currently working on Qwen3.6-35B-A3B MoE bringup on qb1 (1,4) P150 mesh. Per-token perf number lives in `HANDOFF.md`; the **target is the hardware BW ceiling**, not any prior model's number.
 
 GitHub: `aweditya/tt-model-bringup` (renamed 2026-05-19). Local working dir stays `tt-xla/` (renaming breaks Claude settings); remote dirs on qb1/qb2 stay `~/tt-xla/` (renaming would break too many rsync paths).
 
