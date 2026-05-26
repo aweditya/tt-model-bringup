@@ -414,6 +414,222 @@ def variant_L_production_like_h_reshape4d_then_concat(mesh):
     return True
 
 
+def variant_M_full_pattern_a_chain(mesh):
+    """Reproduce production's full Pattern A op chain to find what makes
+    `ttnn.mul(expert_out, routing_weight_broadcast)` fail in-server.
+
+    Production sequence (post-router):
+      mask = ttnn.eq(local_expert_ids, top_idxs)
+      mask = reshape; typecast to bf16
+      weights_2d = ttnn.reshape(weights, [1, TOP_K])
+      weighted_mask = ttnn.mul(mask_f, weights_2d); reshape
+      routing_weight = ttnn.sum(weighted_mask, dim=-1, keepdim=True)  ← view-producing chain
+      routing_weight_3d = ttnn.reshape(routing_weight, [E_LOCAL, 1, 1])  ← view atop view
+      # ... gate_up matmul, slice, silu, mul, down matmul ...
+      routing_weight_broadcast = ttnn.repeat(routing_weight_3d, [1, 1, HIDDEN])
+      weighted = ttnn.mul(expert_out, routing_weight_broadcast)   ← FAILS
+
+    Hypothesis: the routing_weight buffer is a view chain that gets evicted /
+    invalidated by an intervening allocator call. The fix is probably
+    ttnn.clone or ttnn.experimental.* to force materialization.
+    """
+    log("VARIANT M: full Pattern A chain — production-like routing weight construction")
+    # Stand-in for w["local_expert_ids"], w["top_idxs"], w["weights"]:
+    local_ids_np = np.arange(E_LOCAL, dtype=np.int16).reshape(NCHIPS, E_LOCAL // NCHIPS, 1)
+    # That doesn't quite match the prod shape; just use a synthetic [E_LOCAL, 1] uint16
+    # tiled across chips for the eq.
+    local_ids_full = np.tile(np.arange(E_LOCAL, dtype=np.int16)[:, None], (NCHIPS, 1, 1))
+    # Just create a per-chip [E_LOCAL, 1] uint16 ROW_MAJOR like the real upload.
+    local_ids_stacked = np.stack(
+        [np.arange(c * E_LOCAL, (c + 1) * E_LOCAL, dtype=np.int16)[:, None]
+         for c in range(NCHIPS)], axis=0
+    )
+    local_expert_ids = ttnn.from_torch(
+        torch.from_numpy(local_ids_stacked),
+        dtype=ttnn.uint16, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
+    )
+
+    # Synthetic top_idxs + weights (replicated across chips, normalized).
+    top_idxs_np = np.array([[5, 10, 17, 32, 48, 99, 130, 220]], dtype=np.int16)  # [1, TOP_K=8]
+    top_idxs = ttnn.from_torch(
+        torch.from_numpy(top_idxs_np),
+        dtype=ttnn.uint16, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
+    weights_np = np.array([[0.3, 0.25, 0.15, 0.1, 0.08, 0.06, 0.04, 0.02]], dtype=np.float32)
+    weights = ttnn.from_torch(
+        torch.from_numpy(weights_np),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
+
+    # Replicate the production op chain verbatim:
+    mask = ttnn.eq(local_expert_ids, top_idxs)
+    ttnn.deallocate(top_idxs); ttnn.deallocate(local_expert_ids)
+    mask_f = ttnn.typecast(mask, ttnn.bfloat16)
+    ttnn.deallocate(mask)
+    weights_2d = ttnn.reshape(weights, [1, TOP_K_LOCAL])
+    ttnn.deallocate(weights)
+    weighted_mask = ttnn.mul(mask_f, weights_2d)
+    ttnn.deallocate(mask_f); ttnn.deallocate(weights_2d)
+    weighted_mask = ttnn.reshape(weighted_mask, [E_LOCAL, TOP_K_LOCAL])
+    routing_weight = ttnn.sum(weighted_mask, dim=-1, keepdim=True)  # → [E_LOCAL, 1] view-chain candidate
+    ttnn.deallocate(weighted_mask)
+    routing_weight_3d = ttnn.reshape(routing_weight, [E_LOCAL, 1, 1])  # view of view
+    log(f"  routing_weight_3d shape={list(routing_weight_3d.shape)} mem={routing_weight_3d.memory_config()}")
+
+    # Now do the batched FFN chain that follows in production.
+    W_flat_np = weights_stacked_np.reshape(NCHIPS * E_LOCAL, HIDDEN, 2 * MOE_INTER)
+    W_gate_up_tt = to_ttnn_sharded(W_flat_np, mesh, shard_dim=0)
+    W_down_np = np.broadcast_to(
+        rng.normal(0, 0.05, size=(E_LOCAL, MOE_INTER, HIDDEN)).astype(np.float32),
+        (NCHIPS, E_LOCAL, MOE_INTER, HIDDEN),
+    ).copy().reshape(NCHIPS * E_LOCAL, MOE_INTER, HIDDEN)
+    W_down_tt = to_ttnn_sharded(W_down_np, mesh, shard_dim=0)
+
+    h_tt = _make_production_like_h(mesh)
+    h_3d = ttnn.reshape(h_tt, [1, 1, HIDDEN])
+    h_3d_rep = ttnn.concat([h_3d] * E_LOCAL, dim=0)
+    ttnn.deallocate(h_3d)
+    gate_up = ttnn.matmul(h_3d_rep, W_gate_up_tt)
+    ttnn.deallocate(h_3d_rep); ttnn.deallocate(W_gate_up_tt)
+    gate = ttnn.slice(gate_up, [0, 0, 0], [E_LOCAL, 1, MOE_INTER])
+    up = ttnn.slice(gate_up, [0, 0, MOE_INTER], [E_LOCAL, 1, 2 * MOE_INTER])
+    ttnn.deallocate(gate_up)
+    silu_gate = ttnn.silu(gate)
+    mid = ttnn.mul(silu_gate, up)
+    ttnn.deallocate(gate); ttnn.deallocate(up); ttnn.deallocate(silu_gate)
+    expert_out = ttnn.matmul(mid, W_down_tt)
+    ttnn.deallocate(mid); ttnn.deallocate(W_down_tt)
+    log(f"  expert_out shape={list(expert_out.shape)} mem={expert_out.memory_config()}")
+    log(f"  routing_weight_3d STILL shape={list(routing_weight_3d.shape)} mem={routing_weight_3d.memory_config()}")
+
+    # The exact line that fails in production:
+    rw_broadcast = ttnn.repeat(routing_weight_3d, [1, 1, HIDDEN])
+    log(f"  rw_broadcast shape={list(rw_broadcast.shape)}")
+    weighted = ttnn.mul(expert_out, rw_broadcast)
+    log(f"  weighted shape={list(weighted.shape)} — IF WE REACH HERE, THE BUG ISN'T VIEW DECAY")
+    ttnn.deallocate(weighted); ttnn.deallocate(rw_broadcast); ttnn.deallocate(expert_out)
+    ttnn.deallocate(routing_weight_3d); ttnn.deallocate(routing_weight); ttnn.deallocate(h_tt)
+    return True
+
+
+TOP_K_LOCAL = 8  # local alias for variant M
+
+
+def variant_N_full_chain_simple_routing(mesh):
+    """Skip the eq+typecast prefix (which has its own bugs that DON'T repro
+    production). Construct routing_weight directly via from_torch, then run
+    the full FFN chain + the failing mul. Tests just whether the chain
+    matmul → slice → silu → mul → down → mul-with-routing works in isolation.
+    """
+    log("VARIANT N: full FFN chain + final mul with from_torch routing_weight")
+    # Set up batched weights (variant H layout)
+    W_flat_np = weights_stacked_np.reshape(NCHIPS * E_LOCAL, HIDDEN, 2 * MOE_INTER)
+    W_gate_up_tt = to_ttnn_sharded(W_flat_np, mesh, shard_dim=0)
+    W_down_np = np.broadcast_to(
+        rng.normal(0, 0.05, size=(E_LOCAL, MOE_INTER, HIDDEN)).astype(np.float32),
+        (NCHIPS, E_LOCAL, MOE_INTER, HIDDEN),
+    ).copy().reshape(NCHIPS * E_LOCAL, MOE_INTER, HIDDEN)
+    W_down_tt = to_ttnn_sharded(W_down_np, mesh, shard_dim=0)
+
+    # Routing weight as a CLEAN from_torch tensor (no view chain).
+    rw_np = np.zeros((E_LOCAL, 1, 1), dtype=np.float32)
+    rw_np[5, 0, 0] = 0.3; rw_np[10, 0, 0] = 0.25; rw_np[17, 0, 0] = 0.15
+    rw_np[32, 0, 0] = 0.1; rw_np[48, 0, 0] = 0.08; rw_np[1, 0, 0] = 0.04
+    routing_weight_3d = ttnn.from_torch(
+        torch.from_numpy(rw_np),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
+    log(f"  routing_weight_3d shape={list(routing_weight_3d.shape)} mem={routing_weight_3d.memory_config()}")
+
+    # Production-like h chain
+    h_tt = _make_production_like_h(mesh)
+    h_3d = ttnn.reshape(h_tt, [1, 1, HIDDEN])
+    h_3d_rep = ttnn.concat([h_3d] * E_LOCAL, dim=0)
+    ttnn.deallocate(h_3d)
+    gate_up = ttnn.matmul(h_3d_rep, W_gate_up_tt)
+    ttnn.deallocate(h_3d_rep); ttnn.deallocate(W_gate_up_tt)
+    gate = ttnn.slice(gate_up, [0, 0, 0], [E_LOCAL, 1, MOE_INTER])
+    up = ttnn.slice(gate_up, [0, 0, MOE_INTER], [E_LOCAL, 1, 2 * MOE_INTER])
+    ttnn.deallocate(gate_up)
+    silu_gate = ttnn.silu(gate)
+    mid = ttnn.mul(silu_gate, up)
+    ttnn.deallocate(gate); ttnn.deallocate(up); ttnn.deallocate(silu_gate)
+    expert_out = ttnn.matmul(mid, W_down_tt)
+    ttnn.deallocate(mid); ttnn.deallocate(W_down_tt)
+    log(f"  expert_out shape={list(expert_out.shape)} mem={expert_out.memory_config()}")
+    log(f"  routing_weight_3d (after FFN chain) shape={list(routing_weight_3d.shape)} mem={routing_weight_3d.memory_config()}")
+
+    # Now the failing op from production:
+    rw_broadcast = ttnn.repeat(routing_weight_3d, [1, 1, HIDDEN])
+    log(f"  rw_broadcast shape={list(rw_broadcast.shape)}")
+    weighted = ttnn.mul(expert_out, rw_broadcast)
+    log(f"  weighted shape={list(weighted.shape)} (reached!)")
+    ttnn.deallocate(weighted); ttnn.deallocate(rw_broadcast); ttnn.deallocate(expert_out)
+    ttnn.deallocate(routing_weight_3d); ttnn.deallocate(h_tt)
+    return True
+
+
+def variant_O_routing_weight_via_sum_reshape(mesh):
+    """Like N but routing_weight is built via the exact production sequence
+    (sum + reshape → view chain) to test the dangling-view hypothesis.
+    """
+    log("VARIANT O: routing_weight built via sum+reshape view chain")
+    # Build a weighted_mask [E_LOCAL, TOP_K_LOCAL] from scratch as TILE bf16.
+    wm_np = np.zeros((E_LOCAL, TOP_K_LOCAL), dtype=np.float32)
+    wm_np[5, 0] = 0.3; wm_np[10, 1] = 0.25; wm_np[17, 2] = 0.15
+    wm_np[32, 3] = 0.1; wm_np[48, 4] = 0.08; wm_np[1, 5] = 0.04
+    weighted_mask = ttnn.from_torch(
+        torch.from_numpy(wm_np),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
+    # Production sequence: sum (with keepdim) → reshape to 3D.
+    routing_weight = ttnn.sum(weighted_mask, dim=-1, keepdim=True)  # [E_LOCAL, 1]
+    ttnn.deallocate(weighted_mask)
+    routing_weight_3d = ttnn.reshape(routing_weight, [E_LOCAL, 1, 1])
+    log(f"  routing_weight (post-sum) shape={list(routing_weight.shape)} mem={routing_weight.memory_config()}")
+    log(f"  routing_weight_3d (post-reshape view) shape={list(routing_weight_3d.shape)} mem={routing_weight_3d.memory_config()}")
+    # NOTE: not deallocating routing_weight (per our fix in fd4367f - this WAS the view).
+
+    # Same FFN chain as variant N:
+    W_flat_np = weights_stacked_np.reshape(NCHIPS * E_LOCAL, HIDDEN, 2 * MOE_INTER)
+    W_gate_up_tt = to_ttnn_sharded(W_flat_np, mesh, shard_dim=0)
+    W_down_np = np.broadcast_to(
+        rng.normal(0, 0.05, size=(E_LOCAL, MOE_INTER, HIDDEN)).astype(np.float32),
+        (NCHIPS, E_LOCAL, MOE_INTER, HIDDEN),
+    ).copy().reshape(NCHIPS * E_LOCAL, MOE_INTER, HIDDEN)
+    W_down_tt = to_ttnn_sharded(W_down_np, mesh, shard_dim=0)
+    h_tt = _make_production_like_h(mesh)
+    h_3d = ttnn.reshape(h_tt, [1, 1, HIDDEN])
+    h_3d_rep = ttnn.concat([h_3d] * E_LOCAL, dim=0)
+    ttnn.deallocate(h_3d)
+    gate_up = ttnn.matmul(h_3d_rep, W_gate_up_tt)
+    ttnn.deallocate(h_3d_rep); ttnn.deallocate(W_gate_up_tt)
+    gate = ttnn.slice(gate_up, [0, 0, 0], [E_LOCAL, 1, MOE_INTER])
+    up = ttnn.slice(gate_up, [0, 0, MOE_INTER], [E_LOCAL, 1, 2 * MOE_INTER])
+    ttnn.deallocate(gate_up)
+    silu_gate = ttnn.silu(gate)
+    mid = ttnn.mul(silu_gate, up)
+    ttnn.deallocate(gate); ttnn.deallocate(up); ttnn.deallocate(silu_gate)
+    expert_out = ttnn.matmul(mid, W_down_tt)
+    ttnn.deallocate(mid); ttnn.deallocate(W_down_tt)
+    log(f"  expert_out shape={list(expert_out.shape)} mem={expert_out.memory_config()}")
+    log(f"  routing_weight_3d post-FFN shape={list(routing_weight_3d.shape)} mem={routing_weight_3d.memory_config()}")
+
+    # The failing op:
+    rw_broadcast = ttnn.repeat(routing_weight_3d, [1, 1, HIDDEN])
+    log(f"  rw_broadcast shape={list(rw_broadcast.shape)}")
+    weighted = ttnn.mul(expert_out, rw_broadcast)
+    log(f"  weighted shape={list(weighted.shape)} (reached!)")
+    ttnn.deallocate(weighted); ttnn.deallocate(rw_broadcast); ttnn.deallocate(expert_out)
+    ttnn.deallocate(routing_weight); ttnn.deallocate(h_tt)  # don't dealloc routing_weight_3d separately (view)
+    return True
+
+
 VARIANTS = [
     ("A: rank-4 chip-sharded, broadcast", variant_A_rank4_with_chip_dim),
     ("B: rank-3 expert-sharded (16/chip)", variant_B_rank3_shard_expert_dim),
@@ -427,6 +643,9 @@ VARIANTS = [
     ("J: production-like h + concat",      variant_J_production_like_h_concat),
     ("K: production-like h + repeat",      variant_K_production_like_h_repeat),
     ("L: production-like h + to_memory_config(DRAM) + concat", variant_L_production_like_h_reshape4d_then_concat),
+    ("M: full Pattern A chain (mul-with-routing-weight repro attempt)", variant_M_full_pattern_a_chain),
+    ("N: FFN chain + final mul with from_torch routing_weight",        variant_N_full_chain_simple_routing),
+    ("O: routing_weight built via sum+reshape view (production replica)", variant_O_routing_weight_via_sum_reshape),
 ]
 
 

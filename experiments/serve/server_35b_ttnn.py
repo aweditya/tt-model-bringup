@@ -1352,12 +1352,15 @@ def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
     routing_weight = ttnn.sum(weighted_mask, dim=-1, keepdim=True)  # [E_LOCAL, 1]
     ttnn.deallocate(weighted_mask)
     # Reshape for broadcast against [E_LOCAL, 1, HIDDEN] expert outputs.
-    # NOTE: ttnn.reshape returns a VIEW that shares the underlying buffer.
-    # Do NOT deallocate the original routing_weight — that would invalidate
-    # the view and any later op on routing_weight_3d fails with
-    # "Tensor is not allocated". The buffer is reclaimed when the function
-    # returns (after the last user of routing_weight_3d, the .mul below).
-    routing_weight_3d = ttnn.reshape(routing_weight, [E_LOCAL, 1, 1])
+    # ttnn.reshape returns a VIEW; under the memory pressure of 40 layers of
+    # loaded weights + caches, the underlying buffer can be evicted before
+    # we use it later in the FFN chain (the failure we hit was "Tensor is not
+    # allocated" at the ttnn.mul after the down matmul). ttnn.clone forces a
+    # fresh allocation so the buffer survives intervening ops.
+    routing_weight_3d_view = ttnn.reshape(routing_weight, [E_LOCAL, 1, 1])
+    routing_weight_3d = ttnn.clone(routing_weight_3d_view)
+    ttnn.deallocate(routing_weight_3d_view)
+    ttnn.deallocate(routing_weight)
 
     # BATCHED expert FFN — variant H from the isolated test suite:
     #   weights per-chip: [E_LOCAL, HIDDEN, 2*MOE_INTER] rank 3 (sharded along
@@ -1370,8 +1373,11 @@ def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
     # attempts). See test_batched_expert_matmul_isolated.py for the full
     # variant matrix.
     h_3d = ttnn.reshape(h_tt, [1, 1, HIDDEN])
+    # NOTE: h_3d is a VIEW of h_tt. Do NOT deallocate it — that frees the
+    # underlying buffer of h_tt, and the caller's h_tt is still needed
+    # later (shared expert matmuls + the residual ADD outside this fn).
+    # This is the same view-decay rule that hit routing_weight_3d.
     h_3d_repeat = ttnn.concat([h_3d] * E_LOCAL, dim=0)
-    ttnn.deallocate(h_3d)
     gate_up_batched = ttnn.matmul(
         h_3d_repeat, w["experts_gate_up_local"], compute_kernel_config=HIFI4
     )  # → [E_LOCAL, 1, 2*MOE_INTER]
@@ -1387,17 +1393,23 @@ def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
         mid_batched, w["experts_down_local"], compute_kernel_config=HIFI4
     )  # [E_LOCAL, 1, HIDDEN]
     ttnn.deallocate(mid_batched)
-    routing_weight_broadcast = ttnn.repeat(routing_weight_3d, [1, 1, HIDDEN])
 
-    # Apply routing weights + reduce over expert dim 0. routing_weight_3d was
-    # [E_LOCAL, 1, 1] which is exactly what we need to broadcast against
-    # [E_LOCAL, 1, HIDDEN].
-    weighted_batched = ttnn.mul(expert_out_batched, routing_weight_broadcast)
-    ttnn.deallocate(expert_out_batched); ttnn.deallocate(routing_weight_broadcast)
-    routed_local_3d = ttnn.sum(weighted_batched, dim=0, keepdim=True)  # [1, 1, HIDDEN]
-    ttnn.deallocate(weighted_batched)
-    routed_local = ttnn.reshape(routed_local_3d, [1, HIDDEN])
-    ttnn.deallocate(routed_local_3d)
+    # Apply routing weights + sum over expert dim, fused into a single matmul:
+    #   mul(expert_out [E_LOCAL,1,H], rw_broadcast [E_LOCAL,1,H]) + sum(dim=0)
+    # is mathematically equivalent to
+    #   matmul(rw_1xK [1, E_LOCAL], expert_out_2d [E_LOCAL, H]) → [1, H]
+    # The matmul reads both operands directly, avoiding the view-decay under
+    # memory pressure that broke the standalone mul-then-sum path. The reshape
+    # views (rw_1xK, expert_out_2d) ARE deallocated here — only the underlying
+    # tensors they came from need to be dealloc'd separately (routing_weight_3d
+    # is the clone, expert_out_batched was an independent allocation from
+    # matmul).
+    expert_out_2d = ttnn.reshape(expert_out_batched, [E_LOCAL, HIDDEN])
+    ttnn.deallocate(expert_out_batched)
+    rw_1xK = ttnn.reshape(routing_weight_3d, [1, E_LOCAL])
+    ttnn.deallocate(routing_weight_3d)
+    routed_local = ttnn.matmul(rw_1xK, expert_out_2d, compute_kernel_config=HIFI4)  # [1, HIDDEN]
+    ttnn.deallocate(rw_1xK); ttnn.deallocate(expert_out_2d)
 
     # All-reduce + shared expert path are identical to the looped variant.
     routed_full = all_reduce_tt(routed_local, mesh)
