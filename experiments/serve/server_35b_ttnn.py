@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
-"""B16 — Fully on-device server_35b: ttnn-on-mesh forward with NO host↔device
-data movement in the per-token inner loop.
+"""Fully on-device server for Qwen3.6-35B-A3B on a (1,4) Blackhole mesh.
 
-Companion to server_35b.py (numpy-hybrid fallback). Per user's roadmap:
-  1. Fully on-device (this) — surfaces correctness bugs immediately
-  2. Trace capture (B17) — eliminates dispatch overhead
-  3. Custom ops + comm/compute overlap (B18+)
+Per-token decode: ttnn ops only, no host↔device traffic in the inner loop
+except an 8-byte argmax readback. MoE mode = state.moe_mode (`"topk"` for
+A/B vs `"pattern_a_batched"` for trace-clean production).
 
-Architecture:
-  - Mesh (1,4) opened once at bootstrap
-  - All 40 layers' weights uploaded to mesh as ttnn tensors, SHARDED per
-    the validated patterns from B10/B11/B12.8:
-      DN:  V-head axis split (NV_PER_CHIP=8); replicated A_log/dt_bias/etc.
-      attn: Q-head axis split (NQ_PER_CHIP=4); REPLICATED KV
-      MoE: intermediate-dim axis split (MOE_INTER_CHIP=128)
-  - Layernorm weights pre-multiplied by `1.0` and add `1.0` ahead of upload
-    (model uses `output * (1 + weight)` convention; ttnn.rms_norm does
-     `output * weight`, so we store `(1 + weight)` as the effective weight)
-  - Per-token forward: ttnn ops only; hidden stays on device throughout
-  - Argmax on device; only 1 token-id (8 bytes) flows back to host per step
-
-Run via `experiments/serve/scripts/serve_35b_ttnn.sh start`.
+See HANDOFF.md for perf numbers + hardware-ceiling context. Sharding:
+DN on V-head, attn on Q-head, MoE on intermediate dim.
 """
 import json
 import os
@@ -79,24 +65,17 @@ CONV_DIM_CHIP = CONV_DIM // NCHIPS
 NQ_PER_CHIP = NUM_Q_HEADS // NCHIPS
 MOE_INTER_CHIP = MOE_INTER // NCHIPS
 
-# Pattern A MoE: each chip owns a fixed slice of experts (FULL intermediate dim
-# per expert) rather than all-experts × partial-intermediate. Enables trace-
-# clean on-device dispatch via ttnn.eq mask instead of host readback.
+# Pattern A MoE: each chip owns 64 experts (full intermediate dim per expert).
 # See research/35b_moe_pattern_a_plan.md.
-E_LOCAL = NUM_EXPERTS // NCHIPS  # = 64 experts per chip
+E_LOCAL = NUM_EXPERTS // NCHIPS
 
 VOCAB = 248320
 MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 MAX_KV = 4096  # max KV cache length; bump later for long context
 
 
-# 27B-style compute kernel config — HiFi4 + fp32_dest_acc_en=True. Passed to
-# every ttnn.matmul/ttnn.linear in the model forward to keep DEST register
-# accumulation in fp32 even when inputs/weights are bf16. Mirrors 91f.py's
-# discipline (every linear takes compute_kernel_config=hifi4) which is the
-# established 27B mixed-precision pattern. 35B's server was missing this
-# config on every matmul outside the SDPA call — the dominant cause of
-# accumulated bf16 quant noise at late layers (L31/L39).
+# HiFi4 + fp32_dest_acc_en on every matmul. Matches 91f. Without this,
+# bf16 noise accumulates at L31/L39 (multi-day debug).
 HIFI4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
@@ -607,8 +586,8 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
         dn_sub_capture["_debug_z_2d_shape"] = list(z_2d.shape)
         dn_sub_capture["_debug_norm_weight_shape"] = list(w["norm_weight"].shape)
     ttnn.deallocate(z)
-    # Bug isolation: ttnn.rms_norm(x, weight=w) output cos 0.9582 vs numpy oracle.
-    # Try: call ttnn.rms_norm WITHOUT weight, then multiply explicitly.
+    # RMSNormGated: rms_norm WITHOUT weight, then explicit ttnn.mul (weight fused
+    # into rms_norm gave cos 0.9582 vs numpy oracle).
     normed_raw = ttnn.rms_norm(core_2d, epsilon=EPS)
     ttnn.deallocate(core_2d)
     normed = ttnn.mul(normed_raw, w["norm_weight"])
@@ -642,13 +621,9 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
         # full out_proj output (which has no TP partitioning).
         dn_sub_capture["dn_out_proj"] = _ttnn_to_numpy_replicated(out, mesh).reshape(-1)
 
-    # B17-B-DN: in-place state update. Copy the freshly-computed conv_state_new
-    # and state_new INTO the original state buffers, then dealloc the temporaries.
-    # This makes the state mutation trace-friendly (same buffer addresses are
-    # used every step; trace replay overwrites them rather than reallocating).
-    # Same pattern as 27B server_tp.py:938-944.
-    # Reshape to match the IN state buffer's exact logical shape (the concat
-    # output's rank can differ from the cached buffer's rank by a leading 1).
+    # Trace-friendly in-place state update: ttnn.copy into the existing buffers
+    # so every step writes the same addresses. Reshape matches the IN buffer's
+    # rank (concat output rank can differ by a leading 1).
     conv_state_new = ttnn.reshape(conv_state_new, list(conv_state_in.shape))
     ttnn.copy(conv_state_new, conv_state_in)
     ttnn.deallocate(conv_state_new)
@@ -899,43 +874,22 @@ def attn_forward_ttnn_manual(h_tt, w, mesh, cos_tt, sin_tt, kv_cache=None):
     k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
 
-    # RoPE deferred (see commit ab711e7). NOOP_ROPE=True confirmed to match
-    # the no-RoPE baseline pos 1 L39 cos exactly (0.9484); turning on
-    # _apply_partial_rope (even with cos=1, sin=0) regresses to 0.81. Bug
-    # is inside the slice/concat round-trip when integrated, even though
-    # the helper passes isolated micro-probes. Flip ENABLE_ROPE to True
-    # when the integration issue is fixed.
-    _ = cos_tt; _ = sin_tt
-    ENABLE_ROPE = True
-    BROADCAST_KV = True  # broadcast K and V both to [NQ_PER_CHIP, HEAD_DIM]
-    if ENABLE_ROPE:
-        # Q: direct rotation, works in micro-probe and integration
-        q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
-        ttnn.deallocate(q_n); q_n = q_n_rope
-        # K: broadcast to NQ_PER_CHIP rows BEFORE rotation. Cache will also
-        # store [NQ_PER_CHIP, HEAD_DIM] per step. Attention math holds (each
-        # Q head attends to identical 4 K copies; softmax splits weight
-        # equally; V also broadcast so weighted sum recovers correct result).
-        if BROADCAST_KV:
-            k_n_b = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
-            ttnn.deallocate(k_n)
-            k_n_rope = _apply_partial_rope(k_n_b, cos_tt, sin_tt, NQ_PER_CHIP)
-            ttnn.deallocate(k_n_b)
-            k_n = k_n_rope
+    # K-broadcast workaround for the single-row [1, HEAD_DIM] ttnn slice/concat
+    # bug. We broadcast K (and V below) to [NQ_PER_CHIP, HEAD_DIM] BEFORE RoPE so
+    # the rotation path stays on multi-row tiles. Attention math holds: 4
+    # identical K/V copies + softmax over identical values distributes evenly,
+    # weighted sum recovers single-head attention. See
+    # feedback_qwen36_attn_rope_single_row_ttnn_bug.md.
+    q_n_rope = _apply_partial_rope(q_n, cos_tt, sin_tt, NQ_PER_CHIP)
+    ttnn.deallocate(q_n); q_n = q_n_rope
+    k_n_b = ttnn.concat([k_n] * NQ_PER_CHIP, dim=0)
+    ttnn.deallocate(k_n)
+    k_n = _apply_partial_rope(k_n_b, cos_tt, sin_tt, NQ_PER_CHIP)
+    ttnn.deallocate(k_n_b)
 
-    # === KV cache evolution ===
-    # k_n: [NQ_PER_CHIP, HEAD_DIM] when ENABLE_ROPE+BROADCAST_KV is on,
-    #      else [1, HEAD_DIM]
-    # v: from matmul, [1, HEAD_DIM]
     v_h = ttnn.reshape(v, [1, HEAD_DIM_ATTN])
-    # When BROADCAST_KV is on, also broadcast V to match K's row count so
-    # K/V cache shapes stay consistent. Math: 4 identical V copies + 4
-    # identical K copies → softmax distributes evenly → weighted sum recovers
-    # the single-head attention result.
-    BROADCAST_V_LOCAL = (ENABLE_ROPE and BROADCAST_KV)
-    if BROADCAST_V_LOCAL:
-        v_h_broadcast = ttnn.concat([v_h] * NQ_PER_CHIP, dim=0)
-        ttnn.deallocate(v_h); v_h = v_h_broadcast
+    v_h_broadcast = ttnn.concat([v_h] * NQ_PER_CHIP, dim=0)
+    ttnn.deallocate(v_h); v_h = v_h_broadcast
     if kv_cache is None:
         # pos 0: cache IS current K, V (no concat needed). Use direct refs.
         k_hist = k_n
