@@ -1029,7 +1029,7 @@ def _moe_shared_expert(h_tt, w, mesh):
     """Shared expert FFN + sigmoid gate. Returns gated_shared [1, HIDDEN] replicated."""
     s_gate = ttnn.matmul(h_tt, w["shared_gate"], compute_kernel_config=HIFI4)
     s_up = ttnn.matmul(h_tt, w["shared_up"], compute_kernel_config=HIFI4)
-    s_mid = ttnn.mul(ttnn.silu(s_gate), s_up)
+    s_mid = ttnn.mul(s_gate, s_up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
     ttnn.deallocate(s_gate); ttnn.deallocate(s_up)
     shared_partial = ttnn.matmul(s_mid, w["shared_down"], compute_kernel_config=HIFI4)
     ttnn.deallocate(s_mid)
@@ -1177,9 +1177,14 @@ def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
     gate_batched = ttnn.slice(gate_up_batched, [0, 0, 0], [E_LOCAL, 1, MOE_INTER])
     up_batched = ttnn.slice(gate_up_batched, [0, 0, MOE_INTER], [E_LOCAL, 1, 2 * MOE_INTER])
     ttnn.deallocate(gate_up_batched)
-    silu_gate = ttnn.silu(gate_batched)
-    mid_batched = ttnn.mul(silu_gate, up_batched)
-    ttnn.deallocate(gate_batched); ttnn.deallocate(up_batched); ttnn.deallocate(silu_gate)
+    # SwiGLU fused: silu(gate) * up in a single dispatch. Bit-identical to the
+    # two-op sequential form (see test_fused_swiglu_isolated.py, 1.87x faster
+    # in isolation). DeepSeek-V3 reference: experts.py:185, 261.
+    mid_batched = ttnn.mul(
+        gate_batched, up_batched,
+        input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+    )
+    ttnn.deallocate(gate_batched); ttnn.deallocate(up_batched)
 
     expert_out_batched = ttnn.matmul(
         mid_batched, w["experts_down_local"], compute_kernel_config=HIFI4
