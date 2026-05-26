@@ -362,7 +362,7 @@ def all_reduce_tt(x_tt, mesh):
     return ttnn.all_reduce(x_tt, cluster_axis=1)
 
 
-def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
+def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *, use_owned_gdn=False):
     """DN block fully on-device. h_tt [1, HIDDEN] replicated.
 
     Implements:
@@ -531,49 +531,70 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
     k_rep = ttnn.reshape(k_rep_4d, [1, NV_PER_CHIP, HEAD_K_DIM])
     ttnn.deallocate(q_rep_4d); ttnn.deallocate(k_rep_4d)
 
-    # Reshape g_decay [1, 8] → [1, 8, 1, 1] for state broadcast
-    g_b = ttnn.reshape(g_decay, [1, NV_PER_CHIP, 1, 1])
-    ttnn.deallocate(g_decay)
+    # === Recurrence: owned fused kernel vs manual chain ===
+    if use_owned_gdn:
+        # Fused owned kernel (qwen36_gdn_decode_owned). Production 27B pattern:
+        # clone state via ttnn.add(H, 0.0) so the kernel writes into a fresh
+        # buffer; explicit copy-back commits the new state. The "inplace" variant
+        # has documented multi-step correctness issues (INTEGRATION.md notes
+        # 1/5 streams matched), so we use the safe default mode.
+        # All inputs in bf16 (matches state dtype per kernel requirement).
+        alpha = ttnn.reshape(g_decay, [1, NV_PER_CHIP, 1, 1])
+        beta_r = ttnn.reshape(beta, [1, NV_PER_CHIP, 1, 1])
+        ttnn.deallocate(g_decay); ttnn.deallocate(beta)
+        q_4d = ttnn.reshape(q_rep, [1, NV_PER_CHIP, 1, HEAD_K_DIM])
+        k_4d = ttnn.reshape(k_rep, [1, NV_PER_CHIP, 1, HEAD_K_DIM])
+        v_4d = ttnn.reshape(v_h, [1, NV_PER_CHIP, 1, HEAD_V_DIM])
+        ttnn.deallocate(q_rep); ttnn.deallocate(k_rep); ttnn.deallocate(v_h)
+        H_owned_in = ttnn.add(recurrent_state_in, 0.0)
+        H_new, out_flat = ttnn.experimental.qwen36_gdn_decode_owned(
+            H_owned_in, q_4d, k_4d, v_4d, alpha, beta_r,
+            native_io=True,
+        )
+        ttnn.deallocate(q_4d); ttnn.deallocate(k_4d); ttnn.deallocate(v_4d)
+        ttnn.deallocate(alpha); ttnn.deallocate(beta_r)
+        # Kernel returns flat [1, NV_PER_CHIP * HEAD_V_DIM]; reshape to [1, NV_PER_CHIP, HEAD_V_DIM]
+        core_attn_out = ttnn.reshape(out_flat, [1, NV_PER_CHIP, HEAD_V_DIM])
+        ttnn.deallocate(out_flat)
+        # H_new aliases H_owned_in (kernel mutated the clone); commit to the
+        # persistent buffer below via the shared copy-back block.
+        state_new = H_new
+    else:
+        # Manual recurrence (correctness reference path).
+        g_b = ttnn.reshape(g_decay, [1, NV_PER_CHIP, 1, 1])
+        ttnn.deallocate(g_decay)
+        state = ttnn.mul(recurrent_state_in, g_b)
+        ttnn.deallocate(g_b)
 
-    # state = state * g
-    state = ttnn.mul(recurrent_state_in, g_b)
-    ttnn.deallocate(g_b)
+        k_col = ttnn.reshape(k_rep, [1, NV_PER_CHIP, HEAD_K_DIM, 1])
+        state_k = ttnn.mul(state, k_col)
+        kv_mem = ttnn.sum(state_k, dim=-2)
+        ttnn.deallocate(state_k)
+        kv_mem_3d = ttnn.reshape(kv_mem, [1, NV_PER_CHIP, HEAD_V_DIM])
+        ttnn.deallocate(kv_mem)
 
-    # k_col: [1, 8, 128] → [1, 8, 128, 1]
-    k_col = ttnn.reshape(k_rep, [1, NV_PER_CHIP, HEAD_K_DIM, 1])
-    # kv_mem = sum(state * k_col, dim=-2)
-    state_k = ttnn.mul(state, k_col)
-    kv_mem = ttnn.sum(state_k, dim=-2)  # [1, 8, 1, 128] or [1, 8, 128]
-    ttnn.deallocate(state_k)
-    # kv_mem might be [1, 8, 1, 128]; reshape to match v_h [1, 8, 128]
-    kv_mem_3d = ttnn.reshape(kv_mem, [1, NV_PER_CHIP, HEAD_V_DIM])
-    ttnn.deallocate(kv_mem)
+        v_minus_kv = ttnn.sub(v_h, kv_mem_3d)
+        ttnn.deallocate(kv_mem_3d); ttnn.deallocate(v_h)
+        beta_b = ttnn.reshape(beta, [1, NV_PER_CHIP, 1])
+        ttnn.deallocate(beta)
+        delta = ttnn.mul(v_minus_kv, beta_b)
+        ttnn.deallocate(v_minus_kv); ttnn.deallocate(beta_b)
 
-    # delta = (v - kv_mem) * beta
-    v_minus_kv = ttnn.sub(v_h, kv_mem_3d)
-    ttnn.deallocate(kv_mem_3d); ttnn.deallocate(v_h)
-    beta_b = ttnn.reshape(beta, [1, NV_PER_CHIP, 1])
-    ttnn.deallocate(beta)
-    delta = ttnn.mul(v_minus_kv, beta_b)
-    ttnn.deallocate(v_minus_kv); ttnn.deallocate(beta_b)
+        delta_row = ttnn.reshape(delta, [1, NV_PER_CHIP, 1, HEAD_V_DIM])
+        ttnn.deallocate(delta)
+        k_delta = ttnn.mul(k_col, delta_row)
+        ttnn.deallocate(k_col); ttnn.deallocate(delta_row)
+        state_new = ttnn.add(state, k_delta)
+        ttnn.deallocate(state); ttnn.deallocate(k_delta)
 
-    # state += k_col * delta.unsqueeze(-2)
-    delta_row = ttnn.reshape(delta, [1, NV_PER_CHIP, 1, HEAD_V_DIM])
-    ttnn.deallocate(delta)
-    k_delta = ttnn.mul(k_col, delta_row)
-    ttnn.deallocate(k_col); ttnn.deallocate(delta_row)
-    state_new = ttnn.add(state, k_delta)
-    ttnn.deallocate(state); ttnn.deallocate(k_delta)
-
-    # out = sum(state_new * q_col, dim=-2)
-    q_col = ttnn.reshape(q_rep, [1, NV_PER_CHIP, HEAD_K_DIM, 1])
-    ttnn.deallocate(q_rep)
-    state_q = ttnn.mul(state_new, q_col)
-    ttnn.deallocate(q_col)
-    core_attn_out_4d = ttnn.sum(state_q, dim=-2)  # [1, 8, 1, 128]
-    ttnn.deallocate(state_q)
-    core_attn_out = ttnn.reshape(core_attn_out_4d, [1, NV_PER_CHIP, HEAD_V_DIM])
-    ttnn.deallocate(core_attn_out_4d)
+        q_col = ttnn.reshape(q_rep, [1, NV_PER_CHIP, HEAD_K_DIM, 1])
+        ttnn.deallocate(q_rep)
+        state_q = ttnn.mul(state_new, q_col)
+        ttnn.deallocate(q_col)
+        core_attn_out_4d = ttnn.sum(state_q, dim=-2)
+        ttnn.deallocate(state_q)
+        core_attn_out = ttnn.reshape(core_attn_out_4d, [1, NV_PER_CHIP, HEAD_V_DIM])
+        ttnn.deallocate(core_attn_out_4d)
 
     # === RMSNormGated: (output / sqrt(mean(x^2)) * norm_weight) * silu(z) ===
     # per-head; norm_weight is [HEAD_V_DIM=128] replicated
@@ -636,6 +657,7 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
     conv_state_new = ttnn.reshape(conv_state_new, list(conv_state_in.shape))
     ttnn.copy(conv_state_new, conv_state_in)
     ttnn.deallocate(conv_state_new)
+    # Both paths produce a fresh state tensor; commit to the persistent buffer.
     state_new = ttnn.reshape(state_new, list(recurrent_state_in.shape))
     ttnn.copy(state_new, recurrent_state_in)
     ttnn.deallocate(state_new)
@@ -977,8 +999,10 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
         sub_capture["in_norm"] = _ttnn_to_numpy_replicated(h_norm_1, mesh).reshape(-1)
     if layer_type == "linear_attention":
         dn_sc = sub_capture.setdefault("dn_sub", {}) if sub_capture is not None else None
+        use_owned_gdn = bool(getattr(state, "dn_owned_gdn", False))
         mixer_out, new_conv, new_rec = dn_forward_ttnn(
             h_norm_1, w, mesh, dn_state, dn_sub_capture=dn_sc,
+            use_owned_gdn=use_owned_gdn,
         )
         new_dn = (new_conv, new_rec)
         new_kv = kv_cache
@@ -1251,6 +1275,12 @@ class State:
         #   "topk"             — host-readback expert selection (A/B reference, trace-incompatible)
         #   "pattern_a_batched"— batched matmul over stacked experts (trace-clean, production)
         self.moe_mode = "pattern_a_batched"
+        # DeltaNet recurrence path: when True, dn_forward_ttnn calls
+        # ttnn.experimental.qwen36_gdn_decode_owned (fused kernel, requires
+        # qb1 tt-metal rebuilt with the qwen36 kernel suite — see
+        # experiments/owned_ops/qwen36_gdn_decode_owned/integrate_into_ttmetal.py).
+        # Falls back to the manual mul/sum recurrence when False.
+        self.dn_owned_gdn = False
         # B17 trace-capture input buffers (pre-allocated, written in-place
         # OUTSIDE the trace via update_input_buffers).
         self.tok_buf = None         # uint32 [1, 1] ROW_MAJOR — for ttnn.embedding(state.embed_tt)
@@ -1276,14 +1306,19 @@ class State:
         for L in range(n):
             if self.layer_types[L] == "linear_attention":
                 cs_np = np.zeros((NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
-                rs_np = np.zeros((NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
+                # Recurrent state: rank-4 logical (1, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM)
+                # sharded along V-head dim → per-chip rank-4 (1, NV_PER_CHIP, 128, 128) bf16.
+                # Rank-4 + bf16 matches 27B server_tp.py upload pattern AND the
+                # qwen36_gdn_decode_owned kernel's "q dtype must match state dtype"
+                # requirement (since our q/k/v are bf16 post-norm).
+                rs_np = np.zeros((1, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
                 cs_tt = ttnn.from_torch(
                     torch.from_numpy(cs_np), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                     device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
                 )
                 rs_tt = ttnn.from_torch(
-                    torch.from_numpy(rs_np), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
-                    device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
+                    torch.from_numpy(rs_np), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=1),
                 )
                 dn.append((cs_tt, rs_tt))
                 kv.append(None)

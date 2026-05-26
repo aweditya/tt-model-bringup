@@ -50,10 +50,14 @@ def main():
                     default="pattern_a_batched",
                     help="Trace requires no host readback in step; pattern_a_batched "
                          "is the only trace-clean MoE path.")
+    ap.add_argument("--owned-gdn", action="store_true",
+                    help="Use the fused qwen36_gdn_decode_owned kernel for DN "
+                         "recurrence (requires tt-metal rebuilt with the kernel).")
     args = ap.parse_args()
-    log(f"bootstrap (moe_mode={args.moe_mode})…")
+    log(f"bootstrap (moe_mode={args.moe_mode}, owned_gdn={args.owned_gdn})…")
     state = srv.State()
     state.moe_mode = args.moe_mode
+    state.dn_owned_gdn = bool(args.owned_gdn)
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()
 
