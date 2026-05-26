@@ -65,8 +65,7 @@ def run_with_mode(mode):
     moe_fn = (srv.moe_forward_ttnn_pattern_a if mode == "pattern_a"
               else srv.moe_forward_ttnn)
     t0 = time.time()
-    debug_capture = {"__debug_shapes": True} if mode == "pattern_a" else None
-    out = moe_fn(h_norm, state.per_layer_tt[0], state.mesh, sub_capture=debug_capture)
+    out = moe_fn(h_norm, state.per_layer_tt[0], state.mesh)
     ttnn.synchronize_device(state.mesh)
     elapsed = time.time() - t0
     log(f"  one MoE call took {elapsed * 1000:.1f} ms (eager, single layer)")
