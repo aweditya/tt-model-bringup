@@ -1230,9 +1230,9 @@ class State:
         self.dn_caches_tt = None
         self.kv_caches_tt = None
         # MoE dispatch mode (set BEFORE bootstrap — controls upload format):
-        #   "topk"             — host-readback expert selection (trace-incompatible)
-        #   "pattern_a_batched"— batched matmul over stacked experts (trace-clean)
-        self.moe_mode = "topk"
+        #   "topk"             — host-readback expert selection (A/B reference, trace-incompatible)
+        #   "pattern_a_batched"— batched matmul over stacked experts (trace-clean, production)
+        self.moe_mode = "pattern_a_batched"
         # B17 trace-capture input buffers (pre-allocated, written in-place
         # OUTSIDE the trace via update_input_buffers).
         self.tok_buf = None         # uint32 [1, 1] ROW_MAJOR — for ttnn.embedding(state.embed_tt)
