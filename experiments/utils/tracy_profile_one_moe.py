@@ -54,19 +54,22 @@ def main():
     h_tt = srv.np_to_replicated(h_np, state.mesh)
     log(f"h_tt shape={list(h_tt.shape)} dtype={h_tt.dtype}")
 
-    # Warmup: 2 MoE calls so JIT cache is populated (capturing during JIT hangs).
+    # Profile the production MoE path. Swap moe_fn between the looped
+    # (moe_forward_ttnn_pattern_a) and batched (moe_forward_ttnn_pattern_a_batched)
+    # variants depending on which one you're optimizing.
+    moe_fn = srv.moe_forward_ttnn_pattern_a_batched
+
     log("warmup 2 MoE calls…")
     for _ in range(2):
-        out = srv.moe_forward_ttnn_pattern_a(h_tt, state.per_layer_tt[0], state.mesh)
+        out = moe_fn(h_tt, state.per_layer_tt[0], state.mesh)
         ttnn.deallocate(out)
     ttnn.synchronize_device(state.mesh)
 
-    # Signposted MoE call — Tracy captures every ttnn op dispatched here.
     log("signposted MoE call…")
     ttnn.synchronize_device(state.mesh)
     tracy.signpost("Performance pass start")
     t0 = time.time()
-    out = srv.moe_forward_ttnn_pattern_a(h_tt, state.per_layer_tt[0], state.mesh)
+    out = moe_fn(h_tt, state.per_layer_tt[0], state.mesh)
     ttnn.synchronize_device(state.mesh)
     elapsed = (time.time() - t0) * 1000.0
     tracy.signpost("Performance pass end")
