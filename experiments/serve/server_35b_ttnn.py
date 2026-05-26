@@ -596,15 +596,20 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None):
     ttnn.deallocate(core_2d)
     normed = ttnn.mul(normed_raw, w["norm_weight"])
     ttnn.deallocate(normed_raw)
-    silu_z = ttnn.silu(z_2d)
-    ttnn.deallocate(z_2d)
     if dn_sub_capture is not None:
+        # Debug-only path: materialize silu_z separately for cos ladder taps.
+        silu_z = ttnn.silu(z_2d)
         dn_sub_capture["dn_norm_rms_only"] = _reassemble_heads_chip_to_hf(
             _ttnn_to_numpy_perchip(normed, mesh))
         dn_sub_capture["dn_norm_silu_z"] = _reassemble_heads_chip_to_hf(
             _ttnn_to_numpy_perchip(silu_z, mesh))
-    gated = ttnn.mul(normed, silu_z)
-    ttnn.deallocate(normed); ttnn.deallocate(silu_z)
+        gated = ttnn.mul(normed, silu_z)
+        ttnn.deallocate(silu_z)
+    else:
+        # Production: silu(z_2d) * normed fused into one dispatch (1.72x in
+        # isolation, bit-identical; test_fused_binary_activations_isolated.py).
+        gated = ttnn.mul(z_2d, normed, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+    ttnn.deallocate(normed); ttnn.deallocate(z_2d)
 
     # Reshape back to [1, V_DIM_CHIP=1024]
     gated_1d = ttnn.reshape(gated, [1, VALUE_DIM_CHIP])
@@ -1036,10 +1041,14 @@ def _moe_shared_expert(h_tt, w, mesh):
     shared_full = all_reduce_tt(shared_partial, mesh)
     ttnn.deallocate(shared_partial)
     gate_logit = ttnn.matmul(h_tt, w["shared_expert_gate"], compute_kernel_config=HIFI4)
-    gate_sig = ttnn.sigmoid(gate_logit)
-    ttnn.deallocate(gate_logit)
-    gated_shared = ttnn.mul(shared_full, gate_sig)
-    ttnn.deallocate(shared_full); ttnn.deallocate(gate_sig)
+    # Fused: gated_shared = sigmoid(gate_logit) * shared_full. Bit-identical to
+    # the sequential sigmoid+mul (1.97x in isolation, see
+    # test_fused_binary_activations_isolated.py).
+    gated_shared = ttnn.mul(
+        gate_logit, shared_full,
+        input_tensor_a_activations=[ttnn.UnaryOpType.SIGMOID],
+    )
+    ttnn.deallocate(gate_logit); ttnn.deallocate(shared_full)
     return gated_shared
 
 
