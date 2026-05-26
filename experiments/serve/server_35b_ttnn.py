@@ -75,7 +75,11 @@ MAX_KV = 4096  # max KV cache length; bump later for long context
 
 
 # HiFi4 + fp32_dest_acc_en on every matmul. Matches 91f. Without this,
-# bf16 noise accumulates at L31/L39 (multi-day debug).
+# bf16 noise accumulates at L31/L39 (multi-day debug). HiFi2 swap was
+# evaluated on the batched MoE experts and is a wash on Blackhole for
+# these shapes (kernel time identical at 930 μs whether fp32_dest is on
+# or off — the matmul is memory-pattern bound, not math-bound). See
+# research/35b_tt_perf_report_findings.md.
 HIFI4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
