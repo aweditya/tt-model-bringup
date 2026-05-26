@@ -127,23 +127,6 @@ class MeshServerState:
         # num_links=1 at production [1, 5120] bf16 shape; the bare
         # `ttnn.all_reduce(partial)` path uses unknown defaults.
         self.collective_mode = "explicit_all_reduce"
-        # B.2.2 workaround: when True, _tp_all_reduce uses composite
-        # reduce_scatter + all_gather instead of all_reduce. Different code
-        # path → different output tensor lineage → may avoid the wedge in
-        # downstream slice + DN. v3 prefill toggles this on per-call.
-        # (CONFIRMED to also wedge — same underlying kernels as all_reduce.)
-        self.force_composite_ccl = False
-        # B.2.2 workaround #2: when True, _tp_all_reduce uses all_gather +
-        # ttnn.sum instead of all_reduce. Different kernel set (no
-        # reduce_scatter), different semaphore lifecycle. Mirrors the
-        # ttnn.all_reduce fallback path for edge cases.
-        self.force_custom_allreduce = False
-        # v4 (task #75): when True, v3 prefill's DN body calls
-        # deltanet_chunked_neumann_tp instead of per-position loop. Currently
-        # a STUB that just loops per-position internally — same math, allows
-        # iterative replacement of stub body with real Neumann chunked math.
-        # See research/v4_chunked_dn_design_2026_05_20.md.
-        self.use_chunked_dn = False
         self.rope_mode = "manual"
         self.deltanet_decay_mode = "manual"
         # 2026-05-18: defaulted to "owned_gdn" after Tier 3 long-context gate
@@ -152,25 +135,8 @@ class MeshServerState:
         # explicitly. Set to "manual" to revert to the legacy TTNN
         # broadcast-reduce recurrence.
         self.deltanet_recurrence_mode = "owned_gdn"
-        # 2026-05-18 (later): owned conv1d kernel gate work.
-        # "manual" = production manual concat/mul/sum/silu/slice chain.
-        # "owned_conv1d" = ttnn.experimental.qwen36_conv1d_decode_owned
-        #   (per-step slices conv_st/w_conv into single-column views,
-        #    restitches state_next; slower than manual but correctness-
-        #    isolated for G3 cosine_ladder_tp validation).
-        # G4 production flip will pre-split weights/state at bootstrap to
-        # eliminate the per-step slice/restitch overhead.
-        self.deltanet_conv1d_mode = "manual"
-        # 2026-05-19: owned decay/gate kernel gate work.
-        # "manual" = production manual log(exp+1) + neg-exp + sigmoid chain.
-        # "owned_decay_gate" = ttnn.experimental.qwen36_decay_gate_decode_owned
-        #   (reshapes dn['dt_bias']/dn['A_log'] rank-1 → rank-2 per step,
-        #    calls kernel, reshapes decay output back to [1, NV, 1, 1] for
-        #    downstream recurrence). G2 correctness gate; G4 default flip
-        #    will move the reshape to bootstrap for zero per-step overhead.
-        # G4 default flip (decay/gate G3 PASS: 6/500 = 1.2% top-1 disag at
-        # 500-token cosine ladder; med_cos 0.9988). Fused kernel ships as
-        # production default.
+        # G4 owned decay/gate fused kernel (qwen36_decay_gate_decode_owned).
+        # Manual fallback path lives behind state.deltanet_decay_gate_mode=="manual".
         self.deltanet_decay_gate_mode = "owned_decay_gate"
         self.profile_records = None
         self.profile_context_stack = []
@@ -661,43 +627,6 @@ def _tp_all_reduce(state: MeshServerState, partial):
                 state._ccl_out_count = _oc + 1
         return _result
 
-    # B.2.2 workaround: composite reduce_scatter + all_gather (instead of
-    # all_reduce) — different op chain at API surface, but per the
-    # all_reduce kernel audit it uses the SAME underlying kernels as
-    # all_reduce's internal implementation. Confirmed to also wedge.
-    if getattr(state, 'force_composite_ccl', False):
-        scattered = ttnn.reduce_scatter(
-            partial, dim=1, cluster_axis=1,
-            num_links=2, topology=ttnn.Topology.Ring,
-        )
-        gathered = ttnn.all_gather(
-            scattered, dim=1, cluster_axis=1,
-            num_links=2, topology=ttnn.Topology.Ring,
-        )
-        ttnn.deallocate(scattered)
-        return _diag_output(gathered, "composite")
-
-    # B.2.2 workaround #2: CUSTOM all_reduce via all_gather + local sum.
-    # This is what ttnn.all_reduce's fallback path uses for edge cases
-    # (per audit: all_reduce_async.cpp:203-238) but avoiding reduce_scatter
-    # entirely. all_gather is a single collective; sum is pure compute (no
-    # fabric). Different kernel set, different semaphore lifecycle.
-    if getattr(state, 'force_custom_allreduce', False):
-        seq_len_local = partial.shape[-2]
-        hidden_local = partial.shape[-1]
-        # all_gather along dim=1 with cluster_axis=1 → [seq_len, NCHIPS*HIDDEN]
-        gathered = ttnn.all_gather(
-            partial, dim=1, cluster_axis=1,
-            num_links=2, topology=ttnn.Topology.Ring,
-        )
-        # Reshape [seq_len, 4*HIDDEN] → [seq_len, 4, HIDDEN]
-        reshaped = ttnn.reshape(gathered, [seq_len_local, 4, hidden_local])
-        # Sum across the chip axis → [seq_len, HIDDEN]
-        summed = ttnn.sum(reshaped, dim=1)
-        ttnn.deallocate(gathered)
-        ttnn.deallocate(reshaped)
-        return _diag_output(summed, "custom_AG+sum")
-
     if state.collective_mode == "explicit_all_reduce":
         return _diag_output(ttnn.all_reduce(
             partial,
@@ -779,42 +708,17 @@ def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg,
         b_tt = ttnn.slice(all_tt, [0, CONV_DIM_CHIP + VAL_DIM_CHIP + NV_PER_CHIP],
                           [1, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP])
     ttnn.deallocate(all_tt)
-    # 4. conv1d on per-chip slab
+    # 4. conv1d on per-chip slab (manual: 3-tap mul+sum recurrence).
     with _profile_scope(state, "deltanet_conv"):
-        if state.deltanet_conv1d_mode == "owned_conv1d":
-            # Owned conv1d kernel — G4 PRE-SPLIT design (after the G3 wire-in
-            # bug investigation in df1cccc / e168c4d showed per-step slice+
-            # concat+copy_back was broken at multi-step state persistence).
-            #
-            # dn['conv_st_split'] holds 3 single-column state tensors (one per
-            # historical tap). dn['w_conv_split'] holds 4 single-column weight
-            # tensors. Both pre-allocated at Stage B bootstrap with data
-            # in tile-column 0 (the only position the kernel reads).
-            #
-            # The kernel mutates state0/1/2 IN PLACE via its writer (state0 ←
-            # state1, state1 ← state2, state2 ← mixed). No concat. No copy
-            # back to dn['conv_st']. Next forward call reads the already-
-            # shifted split tensors directly.
-            state0, state1, state2 = dn['conv_st_split']
-            w0, w1, w2, w3 = dn['w_conv_split']
-            mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
-            ttnn.deallocate(mixed_qkv)
-            _, _, _, conv_out_2d = ttnn.experimental.qwen36_conv1d_decode_owned(
-                mixed_col, state0, state1, state2, w0, w1, w2, w3)
-            ttnn.deallocate(mixed_col)
-            conv_state_new = None  # owned path mutates split tensors in place
-            conv_out = ttnn.reshape(conv_out_2d, [CONV_DIM_CHIP])
-            ttnn.deallocate(conv_out_2d)
-        else:
-            mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
-            ttnn.deallocate(mixed_qkv)
-            conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
-            ttnn.deallocate(mixed_col)
-            conv_prod = ttnn.mul(conv_input, dn['w_conv'])
-            conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
-            ttnn.deallocate(conv_prod)
-            conv_state_new = ttnn.slice(conv_input, [0, 1], [CONV_DIM_CHIP, cfg['conv_kernel']])
-            ttnn.deallocate(conv_input)
+        mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
+        ttnn.deallocate(mixed_qkv)
+        conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
+        ttnn.deallocate(mixed_col)
+        conv_prod = ttnn.mul(conv_input, dn['w_conv'])
+        conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
+        ttnn.deallocate(conv_prod)
+        conv_state_new = ttnn.slice(conv_input, [0, 1], [CONV_DIM_CHIP, cfg['conv_kernel']])
+        ttnn.deallocate(conv_input)
     # 5. Q/K/V per-chip head-sliced
     q_flat = ttnn.slice(conv_out, [0], [KEY_DIM_CHIP])
     k_flat = ttnn.slice(conv_out, [KEY_DIM_CHIP], [2 * KEY_DIM_CHIP])
@@ -1268,30 +1172,19 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
                                [1, CONV_DIM_CHIP + VAL_DIM_CHIP])
         ttnn.deallocate(all_pos)
 
-        # Conv1d (mirrors helper's logic)
-        if state.deltanet_conv1d_mode == "owned_conv1d":
-            state0, state1, state2 = dn['conv_st_split']
-            w0, w1, w2, w3 = dn['w_conv_split']
-            mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
-            ttnn.deallocate(mixed_qkv)
-            _, _, _, conv_out_2d = ttnn.experimental.qwen36_conv1d_decode_owned(
-                mixed_col, state0, state1, state2, w0, w1, w2, w3)
-            ttnn.deallocate(mixed_col)
-            conv_out = ttnn.reshape(conv_out_2d, [CONV_DIM_CHIP])
-            ttnn.deallocate(conv_out_2d)
-        else:
-            mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
-            ttnn.deallocate(mixed_qkv)
-            conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
-            ttnn.deallocate(mixed_col)
-            conv_prod = ttnn.mul(conv_input, dn['w_conv'])
-            conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
-            ttnn.deallocate(conv_prod)
-            conv_state_new = ttnn.slice(conv_input, [0, 1],
-                                         [CONV_DIM_CHIP, cfg['conv_kernel']])
-            ttnn.deallocate(conv_input)
-            ttnn.copy(conv_state_new, dn['conv_st'])
-            ttnn.deallocate(conv_state_new)
+        # Conv1d (manual 3-tap mul+sum recurrence).
+        mixed_col = ttnn.reshape(mixed_qkv, [CONV_DIM_CHIP, 1])
+        ttnn.deallocate(mixed_qkv)
+        conv_input = ttnn.concat([dn['conv_st'], mixed_col], dim=-1)
+        ttnn.deallocate(mixed_col)
+        conv_prod = ttnn.mul(conv_input, dn['w_conv'])
+        conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
+        ttnn.deallocate(conv_prod)
+        conv_state_new = ttnn.slice(conv_input, [0, 1],
+                                     [CONV_DIM_CHIP, cfg['conv_kernel']])
+        ttnn.deallocate(conv_input)
+        ttnn.copy(conv_state_new, dn['conv_st'])
+        ttnn.deallocate(conv_state_new)
 
         q_flat = ttnn.slice(conv_out, [0], [KEY_DIM_CHIP])
         k_flat = ttnn.slice(conv_out, [KEY_DIM_CHIP], [2 * KEY_DIM_CHIP])
@@ -7676,10 +7569,6 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     if mode not in ("manual", "owned_gdn", "owned_gdn_inplace"):
         return {"error": f"deltanet_recurrence_mode must be one of manual/owned_gdn/owned_gdn_inplace, got {mode}"}
 
-    conv1d_mode = str(args.get("deltanet_conv1d_mode", "manual"))
-    if conv1d_mode not in ("manual", "owned_conv1d"):
-        return {"error": f"deltanet_conv1d_mode must be one of manual/owned_conv1d, got {conv1d_mode}"}
-
     decay_gate_mode = str(args.get("deltanet_decay_gate_mode", "manual"))
     if decay_gate_mode not in ("manual", "owned_decay_gate"):
         return {"error": f"deltanet_decay_gate_mode must be one of manual/owned_decay_gate, got {decay_gate_mode}"}
@@ -7702,11 +7591,9 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
 
     _reset_state_buffers(state)
     old_mode = state.deltanet_recurrence_mode
-    old_conv1d_mode = state.deltanet_conv1d_mode
     old_decay_gate_mode = state.deltanet_decay_gate_mode
     old_rope_mode = state.rope_mode
     state.deltanet_recurrence_mode = mode
-    state.deltanet_conv1d_mode = conv1d_mode
     state.deltanet_decay_gate_mode = decay_gate_mode
     state.rope_mode = rope_mode
 
@@ -7743,7 +7630,6 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         decode_ms = (_time.time() - t_decode) * 1000.0
     finally:
         state.deltanet_recurrence_mode = old_mode
-        state.deltanet_conv1d_mode = old_conv1d_mode
         state.deltanet_decay_gate_mode = old_decay_gate_mode
         state.rope_mode = old_rope_mode
 
@@ -7755,7 +7641,6 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
     state.last_run = {
         "cmd": "cosine_ladder_tp",
         "deltanet_recurrence_mode": mode,
-        "deltanet_conv1d_mode": conv1d_mode,
         "deltanet_decay_gate_mode": decay_gate_mode,
         "rope_mode": rope_mode,
         "n_prompt": P,
@@ -7766,7 +7651,6 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         "ok": True,
         "path": out_path,
         "deltanet_recurrence_mode": mode,
-        "deltanet_conv1d_mode": conv1d_mode,
         "deltanet_decay_gate_mode": decay_gate_mode,
         "rope_mode": rope_mode,
         "n_prompt": P,
@@ -7777,261 +7661,6 @@ def handle_cosine_ladder_tp(state: MeshServerState, args: dict) -> dict:
         "ms_per_step": decode_ms / max(M - 1, 1),
     }
 
-
-def handle_probe_deltanet_conv1d_split_check_tp(state: MeshServerState, args: dict) -> dict:
-    """Mesh-aware probe for the owned conv1d wire-in bug investigation
-    (commit 64a31b1 documents the G3/G4 failures).
-
-    Reads back both the combined dn['conv_st']/dn['w_conv'] (rank-2,
-    [CONV_DIM_CHIP, K] padded [chip_rows, 32]) and the split tensors
-    dn['conv_st_split'][k]/dn['w_conv_split'][k] (rank-2, [CONV_DIM_CHIP, 1]
-    padded [chip_rows, 32]) from a chosen DeltaNet layer, via the mesh
-    composer. Compares each split[k] to the column-k slice of combined.
-
-    If split[k] != combined[:, k:k+1] at BF16-tolerance, the G4 bootstrap
-    pre-split upload is buggy on mesh (likely a relayout_conv interaction
-    with single-column input + ShardTensorToMesh dim=0). If they match,
-    the bug is in mesh kernel dispatch or multi-step state evolution.
-
-    args:
-      layer_idx:    int  (default 0) — DeltaNet layer to inspect
-      max_abs_diff: float (default 0.05) — BF16-tolerance threshold
-
-    Returns: {ok, layer_idx, comparisons, all_match, diagnosis}.
-    """
-    import numpy as np
-    import ttnn
-
-    if state.mesh is None or not state.layers:
-        return {"error": "server not fully loaded"}
-
-    layer_idx = int(args.get("layer_idx", 0))
-    threshold = float(args.get("max_abs_diff", 0.05))
-
-    dn_layers = [(i, L) for i, L in enumerate(state.layers) if L["type"] == "linear_attention"]
-    if not dn_layers:
-        return {"error": "no DeltaNet layers in state.layers"}
-    if layer_idx < 0 or layer_idx >= len(dn_layers):
-        return {"error": f"layer_idx out of range; only {len(dn_layers)} DeltaNet layers"}
-    dn = dn_layers[layer_idx][1]["dn"]
-    if "conv_st_split" not in dn or "w_conv_split" not in dn:
-        return {"error": "this server lacks pre-split conv_st/w_conv tensors (rebuild against G4 server_tp)"}
-
-    def readback(t):
-        return ttnn.to_torch(
-            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
-        ).float().cpu().numpy()
-
-    conv_st_combined = readback(dn["conv_st"])
-    w_conv_combined = readback(dn["w_conv"])
-    conv_st_split_np = [readback(t) for t in dn["conv_st_split"]]
-    w_conv_split_np = [readback(t) for t in dn["w_conv_split"]]
-
-    comparisons = {}
-    all_match = True
-
-    def compare(name, combined, split_list, K):
-        nonlocal all_match
-        for k in range(K):
-            if combined.ndim != 2:
-                comparisons[f"{name}_{k}"] = {
-                    "shape_match": False,
-                    "combined_shape": list(combined.shape),
-                    "reason": f"combined is not rank-2: shape {combined.shape}",
-                }
-                all_match = False
-                continue
-            expected = combined[:, k:k + 1]
-            actual = split_list[k]
-            if expected.shape != actual.shape:
-                comparisons[f"{name}_{k}"] = {
-                    "shape_match": False,
-                    "expected_shape": list(expected.shape),
-                    "actual_shape": list(actual.shape),
-                }
-                all_match = False
-                continue
-            diff = np.abs(expected - actual)
-            max_diff = float(diff.max())
-            pass_gate = max_diff <= threshold
-            comparisons[f"{name}_{k}"] = {
-                "shape_match": True,
-                "expected_shape": list(expected.shape),
-                "max_abs_diff": max_diff,
-                "pass_gate": pass_gate,
-                "expected_first_3": expected[:3].flatten().tolist(),
-                "actual_first_3": actual[:3].flatten().tolist(),
-            }
-            if not pass_gate:
-                all_match = False
-
-    compare("conv_st_split", conv_st_combined, conv_st_split_np, 3)
-    compare("w_conv_split", w_conv_combined, w_conv_split_np, 4)
-
-    # =========================================================================
-    # CHECK B — memory_config / layout asymmetry between split tensors and
-    # column slices of the combined tensors. Even when data is bit-equivalent,
-    # different memory_config (interleaved/sharded, L1/DRAM, alignment) can
-    # cause the kernel to mis-interpret a tensor.
-    # =========================================================================
-    def tensor_meta(t):
-        try:
-            return {
-                "memory_config": str(t.memory_config()),
-                "layout": str(t.layout),
-                "dtype": str(t.dtype),
-                "shape": str(t.shape),
-            }
-        except Exception as e:
-            return {"error": f"meta probe failed: {type(e).__name__}: {e}"}
-
-    layout_check = {
-        "combined_conv_st": tensor_meta(dn["conv_st"]),
-        "combined_w_conv": tensor_meta(dn["w_conv"]),
-        "split_conv_st_0": tensor_meta(dn["conv_st_split"][0]),
-        "split_w_conv_0":  tensor_meta(dn["w_conv_split"][0]),
-        "live_slice_conv_st_0": tensor_meta(
-            ttnn.slice(dn["conv_st"], [0, 0], [dn["conv_st"].shape[0], 1])),
-        "live_slice_w_conv_0": tensor_meta(
-            ttnn.slice(dn["w_conv"], [0, 0], [dn["w_conv"].shape[0], 1])),
-    }
-    # If split's metadata differs from a live slice's metadata at any field, flag it.
-    layout_meta_match = (
-        layout_check["split_conv_st_0"].get("memory_config")
-            == layout_check["live_slice_conv_st_0"].get("memory_config")
-        and layout_check["split_w_conv_0"].get("memory_config")
-            == layout_check["live_slice_w_conv_0"].get("memory_config")
-    )
-
-    # =========================================================================
-    # CHECK A — single-forward conv_out comparison. State is freshly zeroed
-    # before each run. Synthesize a fixed mixed_qkv (mesh-sharded dim=1 to
-    # match production layout). Run both manual and owned conv1d blocks;
-    # compare conv_out element-wise.
-    # =========================================================================
-    import numpy as np
-    import torch
-    from full_layer_tp_probe import CONV_DIM, CONV_DIM_CHIP
-    cfg = state.cfg
-    KERNEL = cfg["conv_kernel"]
-    rng = np.random.default_rng(int(args.get("seed", 0)))
-    mixed_full = rng.uniform(-0.1, 0.1, (1, CONV_DIM)).astype(np.float32)
-
-    def fresh_mixed():
-        return ttnn.from_torch(
-            torch.from_numpy(mixed_full),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=state.mesh,
-            mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
-        )
-
-    # Reset state to zeros (also zeros split tensors).
-    _reset_state_buffers(state)
-
-    # --- MANUAL conv1d block (matches deltanet_step_tp else-branch) ---
-    mixed_tt = fresh_mixed()
-    mixed_col_m = ttnn.reshape(mixed_tt, [CONV_DIM_CHIP, 1])
-    conv_input = ttnn.concat([dn["conv_st"], mixed_col_m], dim=-1)
-    conv_prod = ttnn.mul(conv_input, dn["w_conv"])
-    conv_out_manual = ttnn.silu(ttnn.sum(conv_prod, dim=-1))
-    manual_back = ttnn.to_torch(
-        conv_out_manual,
-        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
-    ).float().cpu().numpy()
-    if manual_back.ndim == 2 and manual_back.shape[1] == 1:
-        manual_back = manual_back[:, 0]
-    elif manual_back.ndim == 1:
-        pass
-    else:
-        manual_back = manual_back.reshape(-1)
-
-    # Reset state again to zero conv_st_split (manual run didn't touch them,
-    # but be defensive).
-    _reset_state_buffers(state)
-
-    # --- OWNED conv1d block (matches deltanet_step_tp if-branch) ---
-    mixed_tt2 = fresh_mixed()
-    state0, state1, state2 = dn["conv_st_split"]
-    w0, w1, w2, w3 = dn["w_conv_split"]
-    mixed_col_o = ttnn.reshape(mixed_tt2, [CONV_DIM_CHIP, 1])
-    _, _, _, conv_out_owned_2d = ttnn.experimental.qwen36_conv1d_decode_owned(
-        mixed_col_o, state0, state1, state2, w0, w1, w2, w3)
-    conv_out_owned = ttnn.reshape(conv_out_owned_2d, [CONV_DIM_CHIP])
-    owned_back = ttnn.to_torch(
-        conv_out_owned,
-        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
-    ).float().cpu().numpy().reshape(-1)
-
-    # Reset state one more time so we don't leave dn['conv_st_split'] polluted.
-    _reset_state_buffers(state)
-
-    forward_diff = np.abs(manual_back - owned_back)
-    forward_check = {
-        "manual_first_5": manual_back[:5].tolist(),
-        "owned_first_5": owned_back[:5].tolist(),
-        "max_abs_diff": float(forward_diff.max()),
-        "mean_abs_diff": float(forward_diff.mean()),
-        "p99_abs_diff": float(np.percentile(forward_diff, 99)),
-        "num_above_1e_3": int((forward_diff > 1e-3).sum()),
-        "shape_match": manual_back.shape == owned_back.shape,
-        "shape": list(manual_back.shape),
-    }
-    FORWARD_THRESHOLD = 0.05  # ~half a BF16 ULP at magnitude 1
-    forward_clean = forward_check["max_abs_diff"] <= FORWARD_THRESHOLD
-
-    # =========================================================================
-    # DIAGNOSIS — chained reasoning over all 3 checks
-    # =========================================================================
-    diagnosis_lines = []
-    if all_match:
-        diagnosis_lines.append(
-            "CHECK split-data: PASS (bootstrap pre-split is bit-exact vs slicing)")
-    else:
-        diagnosis_lines.append(
-            "CHECK split-data: FAIL (bootstrap pre-split doesn't match slice; "
-            "fix relayout_conv or pre-split-at-slice-level)")
-    if layout_meta_match:
-        diagnosis_lines.append(
-            "CHECK layout-meta: PASS (split and live-slice memory_config match)")
-    else:
-        diagnosis_lines.append(
-            "CHECK layout-meta: FAIL (split memory_config differs from live-slice's; "
-            "fix to upload split with same memory_config as ttnn.slice produces)")
-    if forward_clean:
-        diagnosis_lines.append(
-            "CHECK single-forward: PASS (owned kernel produces same conv_out as "
-            "manual chain on mesh at zero state). Bug is in MULTI-STEP state "
-            "evolution — kernel's per-call output is right, but state mutation "
-            "across forwards goes wrong.")
-    else:
-        diagnosis_lines.append(
-            "CHECK single-forward: FAIL (owned conv_out differs from manual at "
-            "step 0 with zero state, max_diff={:.4f}). Mesh kernel dispatch is "
-            "buggy — kernel produces wrong output per-call on mesh despite "
-            "passing G0 standalone single-device.".format(
-                forward_check["max_abs_diff"]))
-
-    state.last_run = {
-        "cmd": "probe_deltanet_conv1d_split_check_tp",
-        "layer_idx": layer_idx,
-        "all_match": all_match,
-        "layout_meta_match": layout_meta_match,
-        "forward_clean": forward_clean,
-    }
-
-    return {
-        "ok": True,
-        "layer_idx": layer_idx,
-        "threshold": threshold,
-        "comparisons": comparisons,
-        "all_match": all_match,
-        "layout_check": layout_check,
-        "layout_meta_match": layout_meta_match,
-        "forward_check": forward_check,
-        "forward_clean": forward_clean,
-        "diagnosis": " | ".join(diagnosis_lines),
-    }
 
 
 def handle_probe_deltanet_owned_decay_gate_real_tensors_tp(state: MeshServerState, args: dict) -> dict:
@@ -8190,7 +7819,6 @@ HANDLERS = {
     "probe_deltanet_owned_gdn_benchmark_tp": handle_probe_deltanet_owned_gdn_benchmark_tp,
     "probe_deltanet_softplus_decay_tp": handle_probe_deltanet_softplus_decay_tp,
     "cosine_ladder_tp": handle_cosine_ladder_tp,
-    "probe_deltanet_conv1d_split_check_tp": handle_probe_deltanet_conv1d_split_check_tp,
     "probe_deltanet_owned_decay_gate_real_tensors_tp": handle_probe_deltanet_owned_decay_gate_real_tensors_tp,
     "probe_ccl_equivalence_tp": handle_probe_ccl_equivalence_tp,
     "probe_neumann_inverse_mesh_tp": handle_probe_neumann_inverse_mesh_tp,

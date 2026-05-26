@@ -466,14 +466,6 @@ def cmd_probe_deltanet_softplus_decay_tp(args):
     print(json.dumps(data, indent=2, default=str))
 
 
-def cmd_probe_deltanet_conv1d_split_check_tp(args):
-    data = _send("probe_deltanet_conv1d_split_check_tp", {
-        "layer_idx": args.layer_idx,
-        "max_abs_diff": args.max_abs_diff,
-    })
-    print(json.dumps(data, indent=2, default=str))
-
-
 def cmd_probe_deltanet_owned_decay_gate_real_tensors_tp(args):
     payload = {
         "seed": args.seed,
@@ -547,7 +539,6 @@ def cmd_cosine_ladder_tp(args):
             "prompt_ids": prompt_ids,
             "generated_ids": generated_ids,
             "deltanet_recurrence_mode": mode,
-            "deltanet_conv1d_mode": args.deltanet_conv1d_mode,
             "deltanet_decay_gate_mode": args.deltanet_decay_gate_mode,
             "rope_mode": args.rope_mode,
             "out_path": out_path,
@@ -887,11 +878,6 @@ def main():
     dn_sp.add_argument("--warmup", type=int, default=2)
     dn_sp.add_argument("--max-tokens", type=int, default=20)
     dn_sp.set_defaults(fn=cmd_probe_deltanet_softplus_decay_tp)
-    sp_check = sub.add_parser("probe_deltanet_conv1d_split_check_tp",
-                                help="mesh-aware split-vs-combined comparison for owned conv1d wire-in bug investigation")
-    sp_check.add_argument("--layer-idx", type=int, default=0)
-    sp_check.add_argument("--max-abs-diff", type=float, default=0.05)
-    sp_check.set_defaults(fn=cmd_probe_deltanet_conv1d_split_check_tp)
     dg_g1 = sub.add_parser("probe_deltanet_owned_decay_gate_real_tensors_tp",
                             help="G1 real-tensor sweep for owned decay/gate kernel")
     dg_g1.add_argument("--layer-idx", type=int, default=None,
@@ -912,12 +898,6 @@ def main():
                      help="positions to teacher-force (P + M ≤ MAX_POS=256)")
     cl.add_argument("--modes", default="manual,owned_gdn",
                      help="comma-separated recurrence modes (e.g. manual,owned_gdn)")
-    cl.add_argument("--deltanet-conv1d-mode", choices=["manual", "owned_conv1d"],
-                     default="manual",
-                     help="DeltaNet conv1d kernel toggle. owned_conv1d routes through "
-                          "ttnn.experimental.qwen36_conv1d_decode_owned for the G3 long-"
-                          "context correctness gate (slower than manual per-step due to "
-                          "per-step weight/state slicing; G4 will pre-split at bootstrap).")
     cl.add_argument("--deltanet-decay-gate-mode", choices=["manual", "owned_decay_gate"],
                      default="manual",
                      help="DeltaNet decay/gate kernel toggle. owned_decay_gate routes "
