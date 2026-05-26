@@ -24,27 +24,41 @@ We're 39× over the bf16 floor. **27B's 12.93 tok/s is not the target** — it's
 
 ## Profile-driven next steps
 
-Latest tracy run on batched MoE (`research/35b_tt_perf_report_findings.md`):
-- Matmul kernel median: **930 μs** (batched, was 30 μs unbatched)
-- Dispatch fraction (eager): **0.998** — trace fixes this
-- `tt-perf-report` flags every Pattern A matmul **SLOW** with three pieces of actionable advice:
+Latest tracy run on batched MoE post-cleanup + SwiGLU fusion:
+- Signposted region kernel: 7.45 ms / 4 MoE calls = 1.86 ms/call kernel time
+- Signposted op2op gap: 9.48 ms / 4 = 2.37 ms/call dispatch gap
+- Dispatch fraction inside MoE region: 0.56 (down from 0.997 pre-batching)
+- Median matmul kernel: 930 μs (batched gate_up + down each ~1.84 ms)
 
-| Advice | Source | Expected delta |
-|---|---|---|
-| HiFi2 on expert matmuls | per-op advice in CSV | 2× kernel time → ~75 ms saved/tok in traced |
-| L1-resident input | per-op advice | cuts BW pressure on per-step input |
-| bf8 expert weights | tt-perf-report + memory bank (27B already uses) | halves DRAM BW |
+**Empirically rejected (2026-05-26):** HiFi2 on expert matmuls — kernel time
+identical at HiFi4 / HiFi2+fp32_dest / HiFi2+fp16_dest. Memory-pattern bound,
+not math-bound. See `de9d94d`.
 
-Apply in that order. Each commit gets a real measurement, not a projection.
+**Active candidates** (priority order; see `research/35b_perf_milestones.md`):
+
+1. **Async all_reduce overlap** — `routed_local`'s all_reduce can hide behind
+   the shared-expert 4-matmul block. 35B has the parallel work that 27B
+   didn't (see `feedback_async_ccl_negative` for the 27B precedent).
+2. **Eliminate `ttnn.concat([h_3d] * E_LOCAL, dim=0)`** — 256 KB copy per
+   call; pursue custom matmul broadcast or `ttnn.experimental.broadcast`.
+3. **Routing-weight construction fusion** — ~9 ops of pure dispatch.
+4. **bf8 expert weights** — halves DRAM BW; bf8 KV neutral and bf8 MLP is
+   27B production. Low correctness risk; needs single-layer cos probe.
+
+Workflow per the user directive: isolation test → bench in isolation → cos
+gate → integrate → tracy re-profile → commit. No projection without measurement.
 
 ## Canonical files
 
-- `experiments/serve/server_35b_ttnn.py` — server. Production path is the batched mode.
+- `experiments/serve/server_35b_ttnn.py` — server. Default `state.moe_mode = "pattern_a_batched"`.
 - `experiments/utils/trace_demo_full_step.py` — captures + benches the full traced step.
 - `experiments/utils/run_tracy_probe.sh` — one-command tracy + tt-perf-report.
 - `experiments/utils/tracy_profile_one_moe.py` — canonical scope (one MoE; full forward overflows the marker buffer).
 - `experiments/utils/analyze_ops_perf_results.py` — pandas-free CSV analyzer.
-- `experiments/utils/test_batched_expert_matmul_isolated.py` — 5-second iteration suite for ttnn shape probes.
+- `experiments/utils/test_batched_expert_matmul_isolated.py` — regression test for the production matmul shape.
+- `experiments/utils/test_fused_swiglu_isolated.py` — 5-second isolation harness; template for the next fusion probes.
+- `experiments/utils/test_pattern_a_moe_tt.py` — topk vs pattern_a_batched cos gate (run after every MoE edit).
+- `experiments/utils/delete_line_range.py` — helper for bulk in-place line deletions (no inline `python -c`).
 
 ## Read BEFORE doing anything (in this order)
 
