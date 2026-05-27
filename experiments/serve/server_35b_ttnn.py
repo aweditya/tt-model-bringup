@@ -61,7 +61,7 @@ NV_PER_CHIP = NUM_V_HEADS // NCHIPS
 NK_PER_CHIP = NUM_K_HEADS // NCHIPS
 KEY_DIM_CHIP = NK_PER_CHIP * HEAD_K_DIM
 VALUE_DIM_CHIP = NV_PER_CHIP * HEAD_V_DIM
-CONVALUE_DIM_CHIP = CONV_DIM // NCHIPS
+CONV_DIM_CHIP = CONV_DIM // NCHIPS
 NQ_PER_CHIP = NUM_Q_HEADS // NCHIPS
 MOE_INTER_CHIP = MOE_INTER // NCHIPS
 
@@ -142,7 +142,7 @@ def upload_dn_layer(sd, mesh):
         k_slice = shard_along(in_proj_qkv[KEY_DIM:2*KEY_DIM], 0)[chip]
         v_slice = shard_along(in_proj_qkv[2*KEY_DIM:], 0)[chip]
         per_chip_qkv.append(np.concatenate([q_slice, k_slice, v_slice], axis=0).T)  # [2048, 2048]
-    # Fuse the 4 in_proj weights into one concatenated [HIDDEN, CONVALUE_DIM_CHIP +
+    # Fuse the 4 in_proj weights into one concatenated [HIDDEN, CONV_DIM_CHIP +
     # VALUE_DIM_CHIP + 2*NV_PER_CHIP] = [2048, 3088] per-chip matrix. The
     # downstream dn_forward_ttnn slices the fused matmul output back into
     # mixed_qkv / z / a / b. Bench (experiments/bench_dn_in_proj_fusion.py):
@@ -373,7 +373,7 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
     """DN block fully on-device. h_tt [1, HIDDEN] replicated.
 
     Implements:
-      mixed_qkv = h @ in_proj_qkv         # [1, CONVALUE_DIM_CHIP] per chip
+      mixed_qkv = h @ in_proj_qkv         # [1, CONV_DIM_CHIP] per chip
       conv1d update + silu                  # currently PLACEHOLDER (silu only)
       split q/k/v                           # per-chip [1, NK_PER_CHIP/NV_PER_CHIP, HEAD_DIM]
       beta = sigmoid(b)
@@ -385,7 +385,7 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
       RMSNormGated(out, z)                  # per-head rms_norm * silu(z)
       out_proj                              # column-sharded; all_reduce sums partials
 
-    dn_state: (conv_state_tt [1, CONVALUE_DIM_CHIP, KERNEL] per chip,
+    dn_state: (conv_state_tt [1, CONV_DIM_CHIP, KERNEL] per chip,
                recurrent_state_tt [1, NV_PER_CHIP, K_DIM, V_DIM] per chip)
     Returns (output_tt [1, HIDDEN] replicated, new_conv_state, new_recurrent_state).
     """
@@ -397,7 +397,7 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
     # ms (bit-exact). See bench_dn_in_proj_fusion.py for the experiment.
     fused = ttnn.matmul(h_tt, w["in_proj_combined"], compute_kernel_config=HIFI4)
     fr = len(list(fused.shape))  # rank: 2 for single-chip, 3 on mesh
-    OFF_QKV_END = CONVALUE_DIM_CHIP                              # 2048
+    OFF_QKV_END = CONV_DIM_CHIP                              # 2048
     OFF_Z_END   = OFF_QKV_END + VALUE_DIM_CHIP                   # 3072
     OFF_A_END   = OFF_Z_END + NV_PER_CHIP                    # 3080
     OFF_B_END   = OFF_A_END + NV_PER_CHIP                    # 3088
@@ -433,32 +433,32 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
     #   2. append current input as last slot: new_state[..., -1] = mixed_qkv
     #   3. conv_out = sum(new_state * w_conv, dim=-1)  (no bias for this layer)
     #   4. silu(conv_out)
-    # conv_state shape per chip [1, CONVALUE_DIM_CHIP, KERNEL=4]; w_conv same.
+    # conv_state shape per chip [1, CONV_DIM_CHIP, KERNEL=4]; w_conv same.
     # mesh-aware shape: conv_state may be rank 4 with leading mesh-shard dim
     cs_rank = len(list(conv_state_in.shape))
-    cur = ttnn.reshape(mixed_qkv, [1, CONVALUE_DIM_CHIP, 1])
+    cur = ttnn.reshape(mixed_qkv, [1, CONV_DIM_CHIP, 1])
     ttnn.deallocate(mixed_qkv)
     # Slice last KERNEL-1 positions from old state: state[..., 1:KERNEL]
     if cs_rank == 4:
-        prior = ttnn.slice(conv_state_in, [0, 0, 0, 1], [1, 1, CONVALUE_DIM_CHIP, CONV_KERNEL])
-        prior = ttnn.reshape(prior, [1, CONVALUE_DIM_CHIP, CONV_KERNEL - 1])
+        prior = ttnn.slice(conv_state_in, [0, 0, 0, 1], [1, 1, CONV_DIM_CHIP, CONV_KERNEL])
+        prior = ttnn.reshape(prior, [1, CONV_DIM_CHIP, CONV_KERNEL - 1])
     else:
-        prior = ttnn.slice(conv_state_in, [0, 0, 1], [1, CONVALUE_DIM_CHIP, CONV_KERNEL])
+        prior = ttnn.slice(conv_state_in, [0, 0, 1], [1, CONV_DIM_CHIP, CONV_KERNEL])
     # Concat shifted state + current as new state (last slot = current)
     conv_state_new = ttnn.concat([prior, cur], dim=-1)
     ttnn.deallocate(prior); ttnn.deallocate(cur)
     # Conv: pointwise mul with w_conv (handle weight rank like conv_state)
     cw_rank_local = len(list(w["conv1d_weight"].shape))
     if cw_rank_local == 4:
-        w_conv = ttnn.reshape(w["conv1d_weight"], [1, CONVALUE_DIM_CHIP, CONV_KERNEL])
+        w_conv = ttnn.reshape(w["conv1d_weight"], [1, CONV_DIM_CHIP, CONV_KERNEL])
     else:
         w_conv = w["conv1d_weight"]
     state_w = ttnn.mul(conv_state_new, w_conv)
     if cw_rank_local == 4:
         ttnn.deallocate(w_conv)
-    conv_out_3d = ttnn.sum(state_w, dim=-1, keepdim=True)  # [1, CONVALUE_DIM_CHIP, 1]
+    conv_out_3d = ttnn.sum(state_w, dim=-1, keepdim=True)  # [1, CONV_DIM_CHIP, 1]
     ttnn.deallocate(state_w)
-    conv_out = ttnn.reshape(conv_out_3d, [1, CONVALUE_DIM_CHIP])
+    conv_out = ttnn.reshape(conv_out_3d, [1, CONV_DIM_CHIP])
     ttnn.deallocate(conv_out_3d)
     if dn_sub_capture is not None:
         # HF conv1d hook captures pre-silu output. Reassemble to HF layout.
@@ -471,17 +471,17 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
 
     # === Split q/k/v from silu_out ===
     # ttnn.matmul output on mesh has rank 3 (with leading batch/mesh padding):
-    # per-chip logical shape [1, 1, CONVALUE_DIM_CHIP]. Slice begins/ends must match.
+    # per-chip logical shape [1, 1, CONV_DIM_CHIP]. Slice begins/ends must match.
     # Layout per chip: [Q_CHIP=512 | K_CHIP=512 | V_CHIP=1024]
     sr = len(list(silu_out.shape))  # detect rank
     if sr == 3:
         q_flat = ttnn.slice(silu_out, [0, 0, 0], [1, 1, KEY_DIM_CHIP])
         k_flat = ttnn.slice(silu_out, [0, 0, KEY_DIM_CHIP], [1, 1, 2 * KEY_DIM_CHIP])
-        v_flat = ttnn.slice(silu_out, [0, 0, 2 * KEY_DIM_CHIP], [1, 1, CONVALUE_DIM_CHIP])
+        v_flat = ttnn.slice(silu_out, [0, 0, 2 * KEY_DIM_CHIP], [1, 1, CONV_DIM_CHIP])
     else:
         q_flat = ttnn.slice(silu_out, [0, 0], [1, KEY_DIM_CHIP])
         k_flat = ttnn.slice(silu_out, [0, KEY_DIM_CHIP], [1, 2 * KEY_DIM_CHIP])
-        v_flat = ttnn.slice(silu_out, [0, 2 * KEY_DIM_CHIP], [1, CONVALUE_DIM_CHIP])
+        v_flat = ttnn.slice(silu_out, [0, 2 * KEY_DIM_CHIP], [1, CONV_DIM_CHIP])
     ttnn.deallocate(silu_out)
 
     # Reshape to per-head: q/k [1, NK_PER_CHIP=4, HEAD_K_DIM=128], v [1, NV_PER_CHIP=8, HEAD_V_DIM=128]
@@ -1353,7 +1353,7 @@ class State:
         kv = []
         for L in range(n):
             if self.layer_types[L] == "linear_attention":
-                cs_np = np.zeros((NCHIPS, 1, CONVALUE_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
+                cs_np = np.zeros((NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
                 # Recurrent state: rank-5 logical (NCHIPS, 1, NV_PER_CHIP, 128, 128)
                 # sharded dim=0 → per-chip rank-5 (1, 1, NV_PER_CHIP, 128, 128). The
                 # rank-5 layout is what dn_forward_ttnn's manual recurrence expects;
@@ -1760,7 +1760,7 @@ def main():
     if state.layer_types[0] == "linear_attention":
         print("\n  DN smoke (layer 0)…")
         # Build zero state tensors (sharded per chip)
-        conv_state_np = np.zeros((NCHIPS, 1, CONVALUE_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
+        conv_state_np = np.zeros((NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
         recurrent_state_np = np.zeros((NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
         conv_state_tt = ttnn.from_torch(
             torch.from_numpy(conv_state_np), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
@@ -1811,7 +1811,7 @@ def main():
 
     # Full layer smoke (layer 0 = DN + MoE composed with residuals + layernorms)
     print("\n  Layer 0 composed smoke (DN + MoE + residuals + layernorms)…")
-    conv_state_np2 = np.zeros((NCHIPS, 1, CONVALUE_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
+    conv_state_np2 = np.zeros((NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
     rec_state_np2 = np.zeros((NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
     conv_state_tt2 = ttnn.from_torch(
         torch.from_numpy(conv_state_np2), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
