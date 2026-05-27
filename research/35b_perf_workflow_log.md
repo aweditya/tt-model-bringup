@@ -78,6 +78,66 @@ candidates, predict the trace gain (not eager) by estimating what
 fraction is genuine kernel work vs dispatch. Dispatch-only wins won't
 move 143.6 ms/tok much.
 
+### A003 — Router topk reorder (DONE 2026-05-27)
+
+`softmax(logits, 256) → topk(K) → sum → div(top_vals, sum)` is exactly
+`topk(logits, K) → softmax(K)` (softmax is monotonic so top_idxs match,
+and softmax(top_logits) == softmax(logits)[top_idxs] / sum after-norm).
+4 ops → 2 ops, smaller softmax.
+
+| Step | Result |
+|---|---|
+| 3 Isolate | 1.71x in iso (0.43 -> 0.25 ms). pcc(candidate vs current aligned)=0.999985 |
+| 4 E2E eager | 201 -> 199 ms/tok eager |
+| 5 Trace | 140.66 -> 140.41 ms/tok = -0.25 ms (-0.18%, sub-noise) |
+| 6 Long ctx | 100-tok eager " Paris" + coherent then known greedy degenerate |
+
+**Verdict: ship for code-cleanliness.** Trace win is sub-noise; the
+2-op form is also clearer code.
+
+### A004 — Explicit core_grid=10x11 on batched MoE matmuls (DONE 2026-05-27 — BIG WIN)
+
+Tracy + tt-perf-report revealed the dominant op:
+`MatmulDeviceOperation b={64} x 32 x 2048 x 1024` = 1838 us, 62.1% of
+MoE step, but using only **11 of 110 Tensix cores**. Default ttnn
+program-config picks 11 for this shape.
+
+| Step | Result |
+|---|---|
+| 1 Profile | Dominant op: 1838 us @ 11/110 cores, 29.9% of 404 GB/s peak |
+| 2 Hypothesis | core_grid=10x11 (110 cores). Roofline: 634 us best case. |
+| 3 Isolate | 2.00 -> 1.25 ms = **1.60x** (test_moe_gate_up_core_grid.py). pcc=0.999991 |
+| 4 E2E eager | 199 -> 194 ms/tok (small visible savings in eager) |
+| 5 Trace A/B | 140.41 -> 110.40 ms/tok = **-30.01 ms/tok (-21.4%)** |
+| 6 Long ctx | 50-tok " Paris, a city renowned..." coherent first 30 tok |
+
+**Why trace realized 100% of the kernel-time gain** (vs A002/A003's ~5%):
+A004 saves *kernel time* (actual device matmul compute), not dispatch.
+Trace amortizes dispatch overhead but cannot amortize kernel work.
+Kernel-time reductions translate ~1:1 to trace ms/tok.
+
+**Verdict: SHIP.** Applied to `gate_up_batched` + `expert_out_batched`
+in `moe_forward_ttnn_pattern_a_batched`.
+
+### A005 — Broader core_grid (REJECTED 2026-05-27)
+
+Tried applying core_grid=10x11 to DN `in_proj_combined` + shared expert
+matmuls. **Trace ms/tok regressed +2.99 (110.40 → 113.39)**. ttnn's
+default picks the right grid for those smaller shapes; forced full-grid
+adds overhead. Reverted. Lesson: do not apply core_grid blindly —
+Step 3 isolation is non-skippable.
+
+## Cumulative trace ms/tok timeline
+
+| Stage | ms/tok | Δ from prev |
+|---|---|---|
+| Pre-2026-05-27 baseline | 141.79 | — |
+| +A002 QK norm | 140.66 | -1.13 |
+| +A003 router topk | 140.41 | -0.25 |
+| +A004 batched core_grid | **110.40** | **-30.01** |
+
+**Total: -31.4 ms/tok (-22.1%)** in one session.
+
 ## Trace-A/B harness — open chore
 
 We don't have a trace-mode A/B bench checked in. We need one before any

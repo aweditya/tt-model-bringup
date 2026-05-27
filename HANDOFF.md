@@ -8,14 +8,31 @@
 
 | Mode | ms/tok | tok/s |
 |---|---|---|
-| **Batched MoE + owned_gdn + owned_decay_gate, traced + fusions** | **143.6** | **6.96** |
+| **+A002 QK norm + A003 router topk + A004 core_grid (2026-05-27)** | **110.4** | **9.06** |
+| Pre-2026-05-27 baseline (traced) | 141.8 | 7.05 |
+
+**A004 core_grid=10x11 on batched MoE matmuls = -30 ms/tok (-21%) trace.**
+The dominant `MatmulDeviceOperation b={64}x32x2048x1024` was using only
+11/110 cores by default; forcing the full Tensix grid drops kernel time
+from 1.84 ms to 1.25 ms. Bit-clean correctness (pcc=0.999991).
+
+Cumulative wins 2026-05-27 (see `research/35b_perf_workflow_log.md`):
+- A002 QK L2-norm via ttnn.rms_norm: -1.13 ms/tok
+- A003 router softmax-then-topk → topk-then-softmax: -0.25 ms/tok
+- A004 core_grid=10x11 on batched MoE: -30.01 ms/tok
+- TOTAL: -31.4 ms/tok (-22%)
+
+Rejected: A005 core_grid on non-batched matmuls — +3 ms/tok regression
+(ttnn default already optimal for smaller shapes).
 
 Coherent greedy decode + long-context PASS:
 - 20/20 tokens: "Paris, a city renowned for its iconic landmarks such as
   the Eiffel Tower, the Louvre Museum"
+- 50-token eager: " Paris, a city renowned for its rich history and
+  cultural heritage. The Eiffel Tower, an iconic symbol of Paris..."
 - Needle-haystack L=100: `N4Y2BWLS` retrieved verbatim.
 
-Production path: `state.moe_mode = "pattern_a_batched"` in `experiments/serve/server_35b_ttnn.py`. Run via `experiments/utils/trace_demo_full_step.py --moe-mode pattern_a_batched`.
+Production path: `state.moe_mode = "pattern_a_batched"` in `experiments/serve/server_35b_ttnn.py`. Run via `experiments/utils/trace_demo_full_step.py --moe-mode pattern_a_batched` or `experiments/bench_step_forward_traced.py`.
 
 ## Hardware ceiling (the actual target)
 
