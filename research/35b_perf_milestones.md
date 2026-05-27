@@ -19,6 +19,27 @@ ms/tok = 540 tok/s.
 | 2026-05-26 | + fused SwiGLU + DN SILU + shared SIGMOID | 145.1 | 6.89 | 39x | `90b1518` |
 | 2026-05-26 | + qwen36_gdn_decode_owned (FIRST COHERENT GEN) | 143.8 | 6.95 | 39x | (this row) |
 
+## Long-context PASS (2026-05-26)
+
+needle-haystack L=100 retrieves `N4Y2BWLS` verbatim. Supersedes the earlier
+`feedback_35b_a3b_drift_is_user_facing` memory (TT generates garbage at
+L=100). prefill 258 ms/tok, decode 253 ms/tok.
+
+## Block attribution post-owned-GDN (eager, per token)
+
+| Block | OLD ms | NEW ms | Δ | per-layer | share |
+|---|---|---|---|---|---|
+| MoE | 148.0 | 145.7 | -2.3 | 3.64 (×40) | **51.9%** |
+| DN | 133.8 | 111.5 | -22.3 | 3.72 (×30) | 39.7% |
+| ATTN | 25.1 | 23.8 | -1.3 | 2.38 (×10) | 8.5% |
+
+DN dropped 22 ms/tok eager (kernel collapsed 24 ops → 1), but traced only
+moved 145.1 → 143.8 ms — the trace-amortization wall. Dispatch-count
+reductions barely help in trace; future wins must reduce kernel-time per op.
+
+MoE is now the dominant block (52%). Per-layer MoE ≈ per-layer DN, but
+MoE has 40 layers vs DN's 30.
+
 ## The trace-amortization wall (2026-05-26)
 
 Three correct, bit-identical activation fusions landed (SwiGLU on batched MoE
