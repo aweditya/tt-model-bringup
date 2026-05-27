@@ -64,8 +64,14 @@ void kernel_main() {
         read_tile_to_cb(h_acc, t, cb_h, tile_bytes);
     }
 
-    // Phase 2: per-expert W1, W2, and one rw_broadcast tile.
+    // Phase 2: per-expert. Order matters: push rw[e] FIRST so it's available
+    // when compute enters the eo block (which calls cb_wait_front(cb_rw, 1)
+    // *before* draining cb_w2). If rw were pushed after W2, the reader can
+    // block on cb_w2 full while compute waits on empty cb_rw → deadlock.
     for (uint32_t e = 0; e < experts; ++e) {
+        // rw_broadcast[e] (one TILE×TILE tile at flat index e).
+        read_tile_to_cb(rw_acc, e, cb_rw, tile_bytes);
+
         const uint32_t w1_expert_base = e * hidden_tiles * gate_up_tiles;
         for (uint32_t j = 0; j < gate_up_tiles; ++j) {
             for (uint32_t k = 0; k < hidden_tiles; ++k) {
@@ -78,8 +84,5 @@ void kernel_main() {
                 read_tile_to_cb(w2_acc, w2_expert_base + k * hidden_tiles + j, cb_w2, tile_bytes);
             }
         }
-        // One rw_broadcast tile per expert: rw_broadcast[e] is a single
-        // [TILE, TILE] tile at flat index e.
-        read_tile_to_cb(rw_acc, e, cb_rw, tile_bytes);
     }
 }

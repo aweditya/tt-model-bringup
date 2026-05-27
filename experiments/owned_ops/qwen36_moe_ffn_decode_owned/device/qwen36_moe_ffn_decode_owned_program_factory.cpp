@@ -80,10 +80,14 @@ Qwen36MoeFfnDecodeOwnedProgramFactory::cached_program_t Qwen36MoeFfnDecodeOwnedP
     [[maybe_unused]] const uint32_t experts =
         static_cast<uint32_t>(W1.logical_shape()[0]);
 
-    // CB sizes:
+    // CB sizes. Compute calls cb_wait_front(cb_w1, hidden_tiles) and
+    // cb_wait_front(cb_w2, mid_tiles), so CB_W1 must hold ≥ hidden_tiles
+    // and CB_W2 must hold ≥ mid_tiles to avoid reader/compute deadlock.
+    // 2× for ping-pong headroom (reader prefetches the next column while
+    // compute drains the current one).
     //   CB_H:         hidden_tiles tiles resident (read once, used all experts)
-    //   CB_W1:        2 tiles streamed (double-buffered prefetch)
-    //   CB_W2:        2 tiles streamed
+    //   CB_W1:        2*hidden_tiles (must fit one full inner-reduce + prefetch)
+    //   CB_W2:        2*mid_tiles    (must fit one full inner-reduce + prefetch)
     //   CB_RW:        2 tiles (one rw_broadcast tile per expert, double-buffered)
     //   CB_GATE_UP:   gate_up_tiles resident (one expert's full output row)
     //   CB_SILU_TMP:  2 tiles scratch
@@ -92,17 +96,17 @@ Qwen36MoeFfnDecodeOwnedProgramFactory::cached_program_t Qwen36MoeFfnDecodeOwnedP
     //   CB_EO_SCALED: 2 tiles (eo[j] * rw_broadcast[e])
     //   CB_PARTIAL:   2*hidden_tiles depth (ping-pong headroom; D-G1a-04 note)
     //   CB_OUT:       2 tiles drain
-    create_circular_buffer(program, single_core, CB_H,         hidden_tiles,    tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_W1,        2,               tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_W2,        2,               tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_RW,        2,               tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_GATE_UP,   gate_up_tiles,   tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_SILU_TMP,  2,               tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_MID,       mid_tiles,       tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_EO,        2,               tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_EO_SCALED, 2,               tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_H,         hidden_tiles,     tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_W1,        2 * hidden_tiles, tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_W2,        2 * mid_tiles,    tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_RW,        2,                tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_GATE_UP,   gate_up_tiles,    tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_SILU_TMP,  2,                tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_MID,       mid_tiles,        tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_EO,        2,                tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_EO_SCALED, 2,                tensor_tile_size, tensor_format);
     create_circular_buffer(program, single_core, CB_PARTIAL,   2 * hidden_tiles, tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_OUT,       2,               tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_OUT,       2,                tensor_tile_size, tensor_format);
 
     std::vector<uint32_t> reader_compile_time_args = {CB_H, CB_W1, CB_W2, CB_RW};
     TensorAccessorArgs(h_buffer).append_to(reader_compile_time_args);

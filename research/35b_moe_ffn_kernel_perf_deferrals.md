@@ -29,6 +29,29 @@ the kernel is correct.
 `max_abs_diff=2.44e-4` vs bf16 numpy oracle. Routing-weight scaling
 verified end-to-end. Next stage G2 splits work across cores.
 
+## Deadlocks caught at large-shape (H=256, I=128, E=8) — methodology lesson
+
+**Bug 1 — CB sizing**: `cb_wait_front(cb_w1, hidden_tiles)` requires
+CB_W1 depth ≥ hidden_tiles. G0/G1 had CB_W1 depth = 2, which happened
+to equal hidden_tiles at the toy shape but deadlocked at production-ish
+shapes. Same trap for cb_w2 vs mid_tiles. **Rule:** any `wait_front(cb, N)`
+must have CB depth ≥ N — at *runtime* N, not compile-time. This was
+mis-classified as "D-G0-06 CB sizing untuned" (perf deferral) when it
+was actually a correctness invariant.
+
+**Bug 2 — producer ordering**: Reader pushed `W1 → W2 → rw` per expert.
+Compute waits on `cb_rw` *inside* the eo block, after silu*up and at the
+start of the W2 drain loop. At large shape: reader fills cb_w2 to depth
+(2*mid_tiles=8) while only 1 of 32 W2 tiles for the expert have been
+pushed, then blocks on cb_reserve_back(cb_w2). Compute, waiting on
+cb_rw which is empty, can't drain cb_w2. **Reader must produce rw
+*before* W2** (and ideally before W1 too) per expert.
+
+**Lesson**: toy shapes that satisfy `hidden_tiles ≤ small_CB_depth`
+and `mid_tiles*hidden_tiles ≤ small_CB_depth` mask both classes of
+deadlock. Future G-stages: stress-test at hidden_tiles ≥ 8 and
+mid_tiles*hidden_tiles ≥ 2*small_CB_depth before claiming correctness.
+
 (Rows will be added as G1, G2, G3 land. Use this doc as input to a future
 "perf cleanup pass" session once the kernel is correct.)
 
