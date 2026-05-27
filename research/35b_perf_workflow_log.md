@@ -141,6 +141,30 @@ on-device argmax — that's a structural refactor, not a core_grid kwarg.
 
 Parked for now; revisit if going below 100 ms/tok requires it.
 
+### A007 — h in L1 for batched MoE gate_up (REJECTED 2026-05-27)
+
+tt-perf-report's specific advice on the dominant matmul: "place input 0
+in L1 (currently DEV_0_DRAM_INTERLEAVED)". Tested in isolation
+(`experiments/test_moe_gate_up_h_in_l1.py`) on top of A004:
+
+  DRAM (A004 baseline):   1.224 ms/call
+  L1 interleaved:         1.244 ms/call   delta -0.020 ms (slower)
+  L1 in + L1 out:         1.244 ms/call   delta -0.020
+  cast DRAM->L1 + matmul: 1.238 ms/call   delta -0.013
+
+PCC: 1.0 bit-clean — all variants compute identically. Pure perf null
+result. **The math:** input 0 (h_3d_repeat) = 256 KB; input 1 (W) =
+256 MB. Input 0 is 0.1% of total DRAM traffic. At ~280 GB/s achieved
+BW, reading 256 KB takes ~0.9 us out of 1224 us kernel = 0.07% saving
+possible. Below noise floor. tt-perf-report's "place input 0 in L1"
+advice presumes input 0 is meaningfully sized; it isn't here.
+
+What would actually move this matmul (the remaining 2x gap to roofline):
+  1. **bf8 weights** — halves W DRAM read (256 -> 128 MB). 27B production.
+  2. **Sharded L1** for h_3d_repeat — each core's slice local, no NoC.
+     Requires matching matmul's expected shard layout (complex setup).
+  3. **Output subblock 2x2** instead of 1x1 — requires custom MatmulProgramConfig.
+
 ## Cumulative trace ms/tok timeline
 
 | Stage | ms/tok | Δ from prev |
