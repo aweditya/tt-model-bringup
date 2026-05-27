@@ -137,6 +137,58 @@ def run_threeop_path(h_E_tt, W1_tt, W2_tt, rw_E_tt, device, n_warmup, n_iters, E
     return np.array(ts), out_np
 
 
+def run_threeop_traced(h_E_tt, W1_tt, W2_tt, rw_E_tt, device, n_warmup, n_iters, E, H, I):
+    """Capture the 3-op chain in a trace, then time execute_trace.
+
+    Trace mode amortizes dispatch overhead — the question is whether the
+    dispatch tax visible in eager mode survives trace.
+    """
+    import ttnn
+
+    # Run forward once eagerly so the kernel JIT cache is warm and the
+    # captured trace doesn't include compilation.
+    def forward():
+        gate_up = ttnn.matmul(h_E_tt, W1_tt)
+        gate = ttnn.slice(gate_up, [0, 0, 0], [E, 1, I])
+        up   = ttnn.slice(gate_up, [0, 0, I], [E, 1, 2 * I])
+        silu_gate = ttnn.silu(gate)
+        mid = ttnn.multiply(silu_gate, up)
+        eo = ttnn.matmul(mid, W2_tt)
+        scaled = ttnn.multiply(eo, rw_E_tt)
+        routed = ttnn.sum(scaled, dim=0, keepdim=False)
+        return routed
+
+    out_warm = forward()
+    ttnn.synchronize_device(device)
+    ttnn.deallocate(out_warm)
+
+    # Capture the trace.
+    trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+    out_trace = forward()
+    ttnn.end_trace_capture(device, trace_id, cq_id=0)
+
+    # Warmup execute_trace calls.
+    for _ in range(n_warmup):
+        ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
+    ttnn.synchronize_device(device)
+
+    # Timed iters.
+    ts = []
+    for _ in range(n_iters):
+        ttnn.synchronize_device(device)
+        t0 = time.perf_counter()
+        ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
+        ttnn.synchronize_device(device)
+        ts.append((time.perf_counter() - t0) * 1000.0)
+
+    out_np = to_host(out_trace)
+    if out_np.ndim == 2 and out_np.shape[0] == 1:
+        out_np = out_np[0]
+
+    ttnn.release_trace(device, trace_id)
+    return np.array(ts), out_np
+
+
 def run_threeop_breakdown(h_E_tt, W1_tt, W2_tt, rw_E_tt, device, n_warmup, n_iters, E, H, I):
     """Time EACH ttnn op in the 3-op chain separately. Sync-bounded per op."""
     import ttnn
@@ -220,6 +272,8 @@ def main():
     ap.add_argument("--n-iters", type=int, default=20)
     ap.add_argument("--breakdown", action="store_true",
                     help="Also report per-op breakdown of the 3-op chain.")
+    ap.add_argument("--traced", action="store_true",
+                    help="Also report trace-mode timing for the 3-op chain.")
     args = ap.parse_args()
 
     if args.hidden % TILE or args.moe_inter % TILE:
@@ -270,6 +324,16 @@ def main():
         ratio = three_ts.mean() / kernel_ts.mean() if kernel_ts.mean() > 0 else float("inf")
         log(f"speedup: 3-op / kernel = {ratio:.3f}x  "
             f"({'kernel wins' if ratio > 1 else '3-op wins'})")
+
+        if args.traced:
+            log("--- 3-op chain TRACED ---")
+            traced_ts, traced_out = run_threeop_traced(
+                h_E_tt, W1_tt, W2_tt, rw_E_tt, device, args.n_warmup, args.n_iters, E, H, I)
+            log(f"3-op traced: mean {traced_ts.mean():.3f} ms  median {np.median(traced_ts):.3f}  "
+                f"min {traced_ts.min():.3f}  max {traced_ts.max():.3f}  std {traced_ts.std():.3f}")
+            log(f"3-op traced pcc vs oracle = {oracle.pcc(traced_out, expected):.6f}")
+            log(f"eager / traced ratio = {three_ts.mean() / traced_ts.mean():.3f}x  "
+                f"(dispatch savings from trace)")
 
         if args.breakdown:
             log("--- 3-op per-op breakdown ---")
