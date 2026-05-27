@@ -8,11 +8,12 @@
 
 | Mode | ms/tok | tok/s |
 |---|---|---|
-| **Batched MoE + fused-kernel GDN, traced + activation fusions** | **143.8** | **6.95** |
+| **Batched MoE + owned_gdn + owned_decay_gate, traced + fusions** | **143.6** | **6.96** |
 
-First verified end-to-end coherent greedy decode: "The capital of France
-is Paris, a city renowned for its rich history, culture, and iconic
-landmarks. Paris is situated in" (20/20 tokens, owned_gdn default).
+Coherent greedy decode + long-context PASS:
+- 20/20 tokens: "Paris, a city renowned for its iconic landmarks such as
+  the Eiffel Tower, the Louvre Museum"
+- Needle-haystack L=100: `N4Y2BWLS` retrieved verbatim.
 
 Production path: `state.moe_mode = "pattern_a_batched"` in `experiments/serve/server_35b_ttnn.py`. Run via `experiments/utils/trace_demo_full_step.py --moe-mode pattern_a_batched`.
 

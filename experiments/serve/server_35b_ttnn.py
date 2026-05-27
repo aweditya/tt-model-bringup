@@ -362,7 +362,8 @@ def all_reduce_tt(x_tt, mesh):
     return ttnn.all_reduce(x_tt, cluster_axis=1)
 
 
-def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *, use_owned_gdn=False):
+def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
+                    use_owned_gdn=False, use_owned_decay_gate=False):
     """DN block fully on-device. h_tt [1, HIDDEN] replicated.
 
     Implements:
@@ -497,18 +498,30 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *, use_owned_g
     k_h = k_n
 
     # === beta + g ===
-    beta = ttnn.sigmoid(b)  # [1, 8] per chip
-    ttnn.deallocate(b)
-    # g = -exp(A_log) * softplus(a + dt_bias)
-    # A_log per chip [8], dt_bias per chip [8]
-    # softplus = log(1 + exp(x)); ttnn has softplus
-    a_plus_dt = ttnn.add(a, w["dt_bias"])  # broadcast OK if shapes align
-    ttnn.deallocate(a)
-    softplus_v = ttnn.softplus(a_plus_dt)
-    ttnn.deallocate(a_plus_dt)
-    neg_exp_alog = ttnn.neg(ttnn.exp(w["A_log"]))  # [8] per chip
-    g_decay = ttnn.exp(ttnn.mul(softplus_v, neg_exp_alog))  # [1, 8] per chip, or [8]
-    ttnn.deallocate(softplus_v); ttnn.deallocate(neg_exp_alog)
+    if use_owned_decay_gate:
+        # Fused kernel: g_decay = exp(-exp(A_log) * softplus(a + dt_bias));
+        # beta = sigmoid(b). Replaces 6 ops with 1. Kernel requires rank-2
+        # [1, NV_PER_CHIP] for all 4 inputs; matmul outputs (a, b) on mesh
+        # may be rank-3 [1, 1, NV_PER_CHIP], so reshape both. dt_bias/A_log
+        # reshapes are VIEWs — do NOT deallocate (27B pattern, server_tp.py:769).
+        a_r2 = ttnn.reshape(a, [1, NV_PER_CHIP])
+        b_r2 = ttnn.reshape(b, [1, NV_PER_CHIP])
+        dt_bias_r2 = ttnn.reshape(w["dt_bias"], [1, NV_PER_CHIP])
+        A_log_r2 = ttnn.reshape(w["A_log"], [1, NV_PER_CHIP])
+        g_decay, beta = ttnn.experimental.qwen36_decay_gate_decode_owned(
+            a_r2, b_r2, dt_bias_r2, A_log_r2)
+        ttnn.deallocate(a_r2); ttnn.deallocate(b_r2)
+        ttnn.deallocate(a); ttnn.deallocate(b)
+    else:
+        beta = ttnn.sigmoid(b)  # [1, 8] per chip
+        ttnn.deallocate(b)
+        a_plus_dt = ttnn.add(a, w["dt_bias"])
+        ttnn.deallocate(a)
+        softplus_v = ttnn.softplus(a_plus_dt)
+        ttnn.deallocate(a_plus_dt)
+        neg_exp_alog = ttnn.neg(ttnn.exp(w["A_log"]))
+        g_decay = ttnn.exp(ttnn.mul(softplus_v, neg_exp_alog))
+        ttnn.deallocate(softplus_v); ttnn.deallocate(neg_exp_alog)
 
     # === Recurrence (state update + output query) ===
     # State per chip: [1, NV_PER_CHIP=8, HEAD_K_DIM=128, HEAD_V_DIM=128]
@@ -1005,9 +1018,11 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     if layer_type == "linear_attention":
         dn_sc = sub_capture.setdefault("dn_sub", {}) if sub_capture is not None else None
         use_owned_gdn = bool(getattr(state, "dn_owned_gdn", False))
+        use_owned_decay_gate = bool(getattr(state, "dn_owned_decay_gate", False))
         mixer_out, new_conv, new_rec = dn_forward_ttnn(
             h_norm_1, w, mesh, dn_state, dn_sub_capture=dn_sc,
             use_owned_gdn=use_owned_gdn,
+            use_owned_decay_gate=use_owned_decay_gate,
         )
         new_dn = (new_conv, new_rec)
         new_kv = kv_cache
@@ -1288,6 +1303,10 @@ class State:
         # ("Paris, a city renowned for its rich history…"); manual fallback
         # left in place for A/B debug.
         self.dn_owned_gdn = True
+        # Fused decay/gate kernel — replaces 6 ops (add/softplus/exp/neg/mul/exp
+        # + sigmoid) with one kernel call producing (g_decay, beta). Same
+        # build artifact as owned_gdn.
+        self.dn_owned_decay_gate = True
         # B17 trace-capture input buffers (pre-allocated, written in-place
         # OUTSIDE the trace via update_input_buffers).
         self.tok_buf = None         # uint32 [1, 1] ROW_MAJOR — for ttnn.embedding(state.embed_tt)

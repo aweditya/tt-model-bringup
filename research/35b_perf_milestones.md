@@ -17,7 +17,8 @@ ms/tok = 540 tok/s.
 | 2026-05-25 | batched Pattern A TRACED | 146 | 6.85 | 39x | — |
 | 2026-05-26 | + cleanup pass (refactor, no perf change) | 146 | 6.85 | 39x | `eb237fd` |
 | 2026-05-26 | + fused SwiGLU + DN SILU + shared SIGMOID | 145.1 | 6.89 | 39x | `90b1518` |
-| 2026-05-26 | + qwen36_gdn_decode_owned (FIRST COHERENT GEN) | 143.8 | 6.95 | 39x | (this row) |
+| 2026-05-26 | + qwen36_gdn_decode_owned (FIRST COHERENT GEN) | 143.8 | 6.95 | 39x | `a8520af` |
+| 2026-05-26 | + qwen36_decay_gate_decode_owned                | 143.6 | 6.96 | 39x | (this row) |
 
 ## Long-context PASS (2026-05-26)
 
