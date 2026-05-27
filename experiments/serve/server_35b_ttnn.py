@@ -1270,8 +1270,14 @@ def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
     # later (shared expert matmuls + the residual ADD outside this fn).
     # This is the same view-decay rule that hit routing_weight_3d.
     h_3d_repeat = ttnn.concat([h_3d] * E_LOCAL, dim=0)
+    # A004: explicit core_grid=10x11 (all 110 Tensix cores) on the batched
+    # gate_up matmul. ttnn's default picks 11 cores for this shape; isolation
+    # sweep (experiments/test_moe_gate_up_core_grid.py) showed 1.60x speedup
+    # with full grid (2.00 -> 1.25 ms/call), pcc=0.999991 vs default.
     gate_up_batched = ttnn.matmul(
-        h_3d_repeat, w["experts_gate_up_local"], compute_kernel_config=HIFI4
+        h_3d_repeat, w["experts_gate_up_local"],
+        compute_kernel_config=HIFI4,
+        core_grid=ttnn.CoreGrid(y=10, x=11),
     )  # → [E_LOCAL, 1, 2*MOE_INTER]
     ttnn.deallocate(h_3d_repeat)
     gate_batched = ttnn.slice(gate_up_batched, [0, 0, 0], [E_LOCAL, 1, MOE_INTER])
@@ -1286,8 +1292,11 @@ def moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh, sub_capture=None):
     )
     ttnn.deallocate(gate_batched); ttnn.deallocate(up_batched)
 
+    # A004: same explicit core_grid for the down matmul (similar shape class).
     expert_out_batched = ttnn.matmul(
-        mid_batched, w["experts_down_local"], compute_kernel_config=HIFI4
+        mid_batched, w["experts_down_local"],
+        compute_kernel_config=HIFI4,
+        core_grid=ttnn.CoreGrid(y=10, x=11),
     )  # [E_LOCAL, 1, HIDDEN]
     ttnn.deallocate(mid_batched)
 
