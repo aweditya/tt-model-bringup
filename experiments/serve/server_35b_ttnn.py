@@ -369,7 +369,8 @@ def all_reduce_tt(x_tt, mesh):
 
 
 def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
-                    use_owned_gdn=False, use_owned_decay_gate=False):
+                    use_owned_gdn=False, use_owned_decay_gate=False,
+                    qk_l2_weight_tt=None, qk_l2_eps=None):
     """DN block fully on-device. h_tt [1, HIDDEN] replicated.
 
     Implements:
@@ -489,23 +490,31 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
     k_h = ttnn.reshape(k_flat, [1, NK_PER_CHIP, HEAD_K_DIM])
     v_h = ttnn.reshape(v_flat, [1, NV_PER_CHIP, HEAD_V_DIM])
 
-    # L2-normalize Q/K per-head: x / sqrt(sum(x*x, dim=-1, keepdim=True) + eps)
-    # Use ttnn.rsqrt to avoid a divide. eps matches HF GatedDeltaNet (1e-6).
-    q_sq = ttnn.mul(q_h, q_h)
-    q_sumsq = ttnn.sum(q_sq, dim=-1, keepdim=True)
-    ttnn.deallocate(q_sq)
-    q_inv = ttnn.rsqrt(ttnn.add(q_sumsq, EPS))
-    ttnn.deallocate(q_sumsq)
-    q_n = ttnn.mul(q_h, q_inv)
-    ttnn.deallocate(q_h); ttnn.deallocate(q_inv)
+    # L2-normalize Q/K per-head: x / sqrt(sum(x*x, dim=-1, keepdim=True) + eps).
+    # Fused path uses ttnn.rms_norm with weight=1/sqrt(d), eps_rms=eps/d so
+    # the output equals the manual L2-norm. 10.99x faster eager
+    # (experiments/test_qk_l2_norm_fusion.py).
+    if qk_l2_weight_tt is not None:
+        q_n = ttnn.rms_norm(q_h, weight=qk_l2_weight_tt, epsilon=qk_l2_eps)
+        k_n = ttnn.rms_norm(k_h, weight=qk_l2_weight_tt, epsilon=qk_l2_eps)
+        ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+    else:
+        # Manual chain (legacy / debug). eps matches HF GatedDeltaNet (1e-6).
+        q_sq = ttnn.mul(q_h, q_h)
+        q_sumsq = ttnn.sum(q_sq, dim=-1, keepdim=True)
+        ttnn.deallocate(q_sq)
+        q_inv = ttnn.rsqrt(ttnn.add(q_sumsq, EPS))
+        ttnn.deallocate(q_sumsq)
+        q_n = ttnn.mul(q_h, q_inv)
+        ttnn.deallocate(q_h); ttnn.deallocate(q_inv)
 
-    k_sq = ttnn.mul(k_h, k_h)
-    k_sumsq = ttnn.sum(k_sq, dim=-1, keepdim=True)
-    ttnn.deallocate(k_sq)
-    k_inv = ttnn.rsqrt(ttnn.add(k_sumsq, EPS))
-    ttnn.deallocate(k_sumsq)
-    k_n = ttnn.mul(k_h, k_inv)
-    ttnn.deallocate(k_h); ttnn.deallocate(k_inv)
+        k_sq = ttnn.mul(k_h, k_h)
+        k_sumsq = ttnn.sum(k_sq, dim=-1, keepdim=True)
+        ttnn.deallocate(k_sq)
+        k_inv = ttnn.rsqrt(ttnn.add(k_sumsq, EPS))
+        ttnn.deallocate(k_sumsq)
+        k_n = ttnn.mul(k_h, k_inv)
+        ttnn.deallocate(k_h); ttnn.deallocate(k_inv)
 
     # HF Qwen3_5MoeGatedDeltaNet scales query by 1/sqrt(head_k_dim) before
     # the recurrence (standard attention scaling), see torch_chunk_gated_delta_rule
@@ -1041,10 +1050,15 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
         dn_sc = sub_capture.setdefault("dn_sub", {}) if sub_capture is not None else None
         use_owned_gdn = bool(getattr(state, "dn_owned_gdn", False))
         use_owned_decay_gate = bool(getattr(state, "dn_owned_decay_gate", False))
+        use_fused_qk_norm = bool(getattr(state, "dn_fused_qk_norm", False))
+        qk_l2_w = getattr(state, "qk_l2_weight_tt", None) if use_fused_qk_norm else None
+        qk_l2_eps = getattr(state, "qk_l2_eps", EPS / HEAD_K_DIM) if use_fused_qk_norm else None
         mixer_out, new_conv, new_rec = dn_forward_ttnn(
             h_norm_1, w, mesh, dn_state, dn_sub_capture=dn_sc,
             use_owned_gdn=use_owned_gdn,
             use_owned_decay_gate=use_owned_decay_gate,
+            qk_l2_weight_tt=qk_l2_w,
+            qk_l2_eps=qk_l2_eps,
         )
         new_dn = (new_conv, new_rec)
         new_kv = kv_cache
@@ -1329,6 +1343,10 @@ class State:
         # + sigmoid) with one kernel call producing (g_decay, beta). Same
         # build artifact as owned_gdn.
         self.dn_owned_decay_gate = True
+        # Fuse Q/K L2-norm into ttnn.rms_norm (5-op manual chain x2 -> 1 op x2).
+        # Bit-clean correctness vs manual (pcc=0.999986 isolated). Isolation bench
+        # showed 10.99x eager speedup, predicted ~35 ms/tok eager savings if linear.
+        self.dn_fused_qk_norm = True
         # B17 trace-capture input buffers (pre-allocated, written in-place
         # OUTSIDE the trace via update_input_buffers).
         self.tok_buf = None         # uint32 [1, 1] ROW_MAJOR — for ttnn.embedding(state.embed_tt)
@@ -1670,6 +1688,22 @@ def bootstrap(state, log):
     )
     state.cos_table_tt, state.sin_table_tt = _precompute_cos_sin_table(state.mesh, MAX_KV)
     log(f"  tok_buf, rot_idxs_buf, cos/sin tables ({MAX_KV} positions) ready.")
+
+    # QK L2-norm fusion weight: shape [HEAD_K_DIM] filled with 1/sqrt(d) so
+    # ttnn.rms_norm(x, weight=qk_l2_weight, epsilon=EPS/HEAD_K_DIM) computes
+    # x / sqrt(sum(x*x, dim=-1) + EPS). Replaces the 5-op manual L2-norm
+    # chain per Q and per K with a single rms_norm call.
+    # Isolation bench (experiments/test_qk_l2_norm_fusion.py) shows 10.99x
+    # speedup eager (0.64 -> 0.058 ms/call) at pcc=0.999986 vs the manual
+    # chain (both above the 0.999 correctness gate).
+    qk_l2_w_np = (np.ones(HEAD_K_DIM, dtype=np.float32) / np.sqrt(HEAD_K_DIM)).reshape(1, HEAD_K_DIM)
+    state.qk_l2_weight_tt = ttnn.from_torch(
+        torch.from_numpy(qk_l2_w_np),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    state.qk_l2_eps = EPS / HEAD_K_DIM
+    log(f"  qk_l2_weight (fused QK L2-norm) ready: [{HEAD_K_DIM}], eps_rms={state.qk_l2_eps:.2e}")
 
     if state.attn_mode == "sdpa":
         # Paged SDPA plumbing — mirrors 27B server_tp.py:468-525.
