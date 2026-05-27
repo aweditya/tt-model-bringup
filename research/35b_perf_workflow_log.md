@@ -127,6 +127,20 @@ default picks the right grid for those smaller shapes; forced full-grid
 adds overhead. Reverted. Lesson: do not apply core_grid blindly —
 Step 3 isolation is non-skippable.
 
+### A006 — lm_head core_grid (REJECTED 2026-05-27)
+
+Isolated sweep (`experiments/test_lm_head_core_grid.py`):
+  default:        1.732 ms/call
+  core_grid 10x11: 1.716 ms/call  (1.01x — within noise)
+  core_grid 8x8:   1.947 ms/call  (0.89x — regression)
+
+ttnn's default picks the right grid for the lm_head's large output dim
+(VOCAB=152064). The 27B "vocab-sharded lm_head" 5.1% win came from
+sharding the WEIGHT across the 4-chip mesh (divides matmul cost by 4) +
+on-device argmax — that's a structural refactor, not a core_grid kwarg.
+
+Parked for now; revisit if going below 100 ms/tok requires it.
+
 ## Cumulative trace ms/tok timeline
 
 | Stage | ms/tok | Δ from prev |
