@@ -1123,6 +1123,11 @@ def _moe_router_topk(h_tt, w, use_topk_first=True):
 
 def _moe_shared_expert(h_tt, w, mesh):
     """Shared expert FFN + sigmoid gate. Returns gated_shared [1, HIDDEN] replicated."""
+    # A005 REJECTED: core_grid=10x11 on these (non-batched) matmuls regressed
+    # trace ms/tok by +3 ms (110.40 -> 113.39). Default ttnn picks the right
+    # grid for these smaller shapes; forced full-grid adds overhead. Keep
+    # core_grid override ONLY on the batched MoE matmuls (A004) which had
+    # default 11/110 and benefited from full-grid.
     s_gate = ttnn.matmul(h_tt, w["shared_gate"], compute_kernel_config=HIFI4)
     s_up = ttnn.matmul(h_tt, w["shared_up"], compute_kernel_config=HIFI4)
     s_mid = ttnn.mul(s_gate, s_up, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
