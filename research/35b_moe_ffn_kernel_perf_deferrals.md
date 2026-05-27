@@ -52,6 +52,20 @@ and `mid_tiles*hidden_tiles ≤ small_CB_depth` mask both classes of
 deadlock. Future G-stages: stress-test at hidden_tiles ≥ 8 and
 mid_tiles*hidden_tiles ≥ 2*small_CB_depth before claiming correctness.
 
+## G1b correctness — full shape sweep (2026-05-26 post-fix)
+
+Single-core (1 of 110 Tensix), bf16, HiFi4 + fp32_dest_acc:
+
+| Shape | hidden_tiles | mid_tiles | E | PCC | ms/call |
+|---|---|---|---|---|---|
+| H=64,  I=32,  E=2 | 2  | 1  | 2 | 0.99998756 | 13   |
+| H=256, I=128, E=8 | 8  | 4  | 8 | 0.99998482 | 10.5 |
+| H=512, I=256, E=8 | 16 | 8  | 8 | 0.99998386 | 16.4 |
+| H=2048,I=512, E=8 | 64 | 16 | 8 | 0.99998389 | **26.4** ← prod 35B-A3B (top-K=8) |
+
+**26.4 ms/call single-core at production shape is the G2 baseline.**
+G2's multi-core split must beat this to be worth shipping.
+
 (Rows will be added as G1, G2, G3 land. Use this doc as input to a future
 "perf cleanup pass" session once the kernel is correct.)
 
