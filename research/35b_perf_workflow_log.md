@@ -174,6 +174,37 @@ gate_up matmul) with two orthogonal mechanisms: A004 parallelizes
 (11 -> 110 cores) and A008 shrinks the BW footprint (256 -> 128 MB).
 Stacking is multiplicative.
 
+### A008 Step 6 follow-up — needle-haystack L=100
+
+Per user directive, ran needle-haystack L=100 frac=0.5 trial=1 with bf8
+server (`experiments/needle_haystack_35b_ttnn_inproc.py`). Output:
+  `'The question is the the the the the the the the the the the...'`
+  Grade: N (needle 'W79QHBGJ' not retrieved).
+
+**Paired A/B**: swapped server to pre-bf8 baseline (just A002+A003+A004,
+bf16 weights), re-ran same prompt. Got BYTE-IDENTICAL degenerate output:
+  `'The question is the the the the the the the the the the the...'`
+  Grade: N.
+
+**A/B conclusion**: bf8 is NOT the cause. The L=100 chat-templated +
+greedy needle path is broken in the *baseline* (pre-A008 state). Per
+memory `[feedback_long_context_chat_template_behavior_not_drift]`,
+Qwen3.6 chat template + greedy drifts early.
+
+Also ran with `--no-chat-template`: output `'4\n\n<think>\nHere\'s a
+thinking process: 1. **Analyze User Input:**...'` — still no needle in
+24 tokens of decode but at least semi-coherent reasoning structure.
+
+**Verdict on A008**: SHIP. The isolation gate (Step 3) is the load-
+bearing correctness check (PCC=0.999903 vs bf16, 3 seeds). The 50-tok
+eager generation (Step 4) is the best coherent output of the session.
+Step 6 A/B proves bf8 doesn't regress long-context vs the (already
+broken) baseline.
+
+Opens A009 — separate workflow iteration to fix L=100 needle retrieval
+in the production server. Likely involves the chat template path, the
+greedy decode mode, and/or 24-token decode budget being too tight.
+
 ### A007 — h in L1 for batched MoE gate_up (REJECTED 2026-05-27)
 
 tt-perf-report's specific advice on the dominant matmul: "place input 0
