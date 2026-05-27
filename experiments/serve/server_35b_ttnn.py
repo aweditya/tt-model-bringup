@@ -322,14 +322,20 @@ def upload_moe_layer_pattern_a(sd, mesh):
     # [NCHIPS*E_LOCAL=256, HIDDEN, 2*MOE_INTER] rank 3, per-chip [E_LOCAL, H, 2I].
     egu_flat = np.concatenate(per_chip_egu, axis=0)  # [256, HIDDEN, 2*MOE_INTER]
     ed_flat = np.concatenate(per_chip_ed, axis=0)    # [256, MOE_INTER, HIDDEN]
+    # A008: MoE expert weights uploaded as bf8_b (block-floating-point 8-bit
+    # with shared exponent per TILE). Halves the per-call DRAM read for the
+    # batched gate_up + down matmuls (256 MB -> 128 MB on the largest one).
+    # Isolation (test_moe_bf8_weights_correctness.py, 3 seeds): pcc=0.999903
+    # vs bf16 reference at production shape, magnitude ratio 1.0, no scale
+    # shift. Matches the 27B production format per memory.
     out["experts_gate_up_local"] = ttnn.from_torch(
         torch.from_numpy(egu_flat.astype(np.float32)),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh,
+        dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh,
         mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
     )
     out["experts_down_local"] = ttnn.from_torch(
         torch.from_numpy(ed_flat.astype(np.float32)),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh,
+        dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh,
         mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
     )
 
