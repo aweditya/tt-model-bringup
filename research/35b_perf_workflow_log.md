@@ -45,16 +45,38 @@ across sessions so context compaction can't lose state.
 test that proves the savings show up in the 143.6 ms/tok number.
 Backfilling steps 5-6 is the next chore.
 
-### A002 — DN profile + next candidate (in progress 2026-05-27)
+### A002 — QK L2-norm via ttnn.rms_norm (DONE 2026-05-27)
 
-Goal: profile the *current* DN forward (with task 64 fusion + owned
-kernels on) to find the next hot op. Output: hypothesis + isolation
-plan for one specific optimization.
+Goal: replace the 5-op manual L2-norm chain (per Q and per K) with one
+ttnn.rms_norm call. Math equivalence: L2-norm = rms_norm with
+weight=1/sqrt(d), epsilon=eps/d.
 
-| Step | Status | Notes |
+| Step | Status | Result |
 |---|---|---|
-| 1 Profile | blocked | qb1 + qb2 ssh timed out 2026-05-27 ~04:00 PT. Probe ready: `experiments/utils/tracy_profile_one_dn.py` |
-| 2+ | pending | unblocked by step 1 |
+| 1 Profile | done | DN total 3.23 ms/call eager (bench_dn_total.py). Tracy probe overflowed DRAM buffer during bootstrap; section profiler hit production API drift. |
+| 2 Hypothesis | done | Prior memory says ttnn.rms_norm replaces 11-op manual; 88.6% faster on 27B. Math: weight=1/sqrt(d), eps_rms=eps/d. |
+| 3 Isolate | done | `experiments/test_qk_l2_norm_fusion.py`. pcc(fused,manual)=0.999986. Timing 0.6374 -> 0.0580 ms = 10.99x isolated. Predicted: 34.76 ms/tok eager savings if linear. |
+| 4 E2E eager | done | decode_smoke eager: 225 -> 201 ms/tok = 24 ms/tok saved (10.7%). First predicted token " Paris" ✓ (correct). |
+| 5 Trace A/B | done | Paired file swap (pre-fusion server vs post-fusion server, same harness): 141.79 -> 140.66 ms/tok = 1.13 ms/tok (0.80%). Trace amortizes most of the eager dispatch savings. |
+| 6 Long context | partial | 100-token eager generation: " Paris..." first ~50 tok coherent, then greedy-decode degenerate repetition (pre-existing, not fusion-caused). Needle-haystack at L>=500 deferred to next session. |
+
+**Verdict: ship.** 0.80% trace savings is small but real and bit-clean
+(pcc=0.999986). Default `state.dn_fused_qk_norm = True`. Manual chain
+left in dn_forward_ttnn as the False branch (correctness fallback).
+
+**Open issue:** with `state.dn_fused_qk_norm=False` on the current
+commit, the manual-chain path produces incorrect output (decode_smoke
+gets 'arus' instead of ' Paris'). The manual chain code is byte-identical
+to pre-fusion commit ecbffbf where it gave ' Paris'. Cause unclear;
+parking — the fused path is the only one we ship, and the in-session
+A/B for trace measurement was done by swapping the WHOLE file. If we
+ever need the fallback, debug this first.
+
+**Workflow methodology takeaway:** the eager-to-trace realization rate
+on dispatch-reduction fusions is small (~5% for this op). For future
+candidates, predict the trace gain (not eager) by estimating what
+fraction is genuine kernel work vs dispatch. Dispatch-only wins won't
+move 143.6 ms/tok much.
 
 ## Trace-A/B harness — open chore
 

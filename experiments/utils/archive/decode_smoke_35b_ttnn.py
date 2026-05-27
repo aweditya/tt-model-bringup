@@ -40,10 +40,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-new", type=int, default=MAX_NEW)
     ap.add_argument("--prompt", default=PROMPT)
+    ap.add_argument("--fused-qk-norm", choices=["default", "true", "false"], default="default",
+                     help="Override state.dn_fused_qk_norm (default keeps State() value).")
     args = ap.parse_args()
     MAX_NEW = args.max_new
     log(f"bootstrap… (max_new={MAX_NEW}, prompt={args.prompt!r})")
     state = srv.State()
+    if args.fused_qk_norm != "default":
+        state.dn_fused_qk_norm = (args.fused_qk_norm == "true")
+        log(f"OVERRIDE dn_fused_qk_norm = {state.dn_fused_qk_norm}")
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()
 
