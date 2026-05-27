@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Isolation test for qwen36_moe_ffn_decode_owned.
 
-G1a: gates against the full chain (h @ W1 -> silu*up -> @ W2 -> sum over
-experts), with routing_weight set to all-ones (D-G1a-01 — kernel ignores
-rw). Compares the kernel's [1, HIDDEN] output to the numpy oracle.
+G1b: gates against the full chain (h @ W1 -> silu*up -> @ W2 -> rw[e] *
+expert_out[e] summed over experts). routing_weight is pre-broadcast to
+shape [E, TILE, TILE] (D-G1b-01) by the caller; the kernel consumes one
+TILE×TILE tile per expert and multiplies eo[j] by it. Compares the
+kernel's [1, HIDDEN] output to the numpy oracle.
 
 Run on a TT host with the kernel integrated into ttnn:
   cd ~/tt-xla
@@ -44,13 +46,19 @@ def to_host(t):
     return ttnn.to_torch(t).float().numpy()
 
 
-def moe_ffn_oracle_no_rw(fx):
-    """Oracle with routing_weight forced to all-ones (kernel ignores rw)."""
-    fx_no_rw = oracle.MoeFfnFixture(
-        h=fx.h, W1=fx.W1, W2=fx.W2,
-        routing_weight=np.ones_like(fx.routing_weight),
-    )
-    return oracle.moe_ffn_oracle(fx_no_rw, bf16=True)
+TILE = 32
+
+
+def broadcast_rw_to_tiles(rw_1d):
+    """Pre-broadcast a [E] rw vector to [E, TILE, TILE] (D-G1b-01).
+
+    The kernel consumes a single TILE×TILE tile per expert as the
+    scalar-broadcast operand for the eo[j] * rw[e] mul. Caller is
+    responsible for the broadcast (LLK-level row-scalar bcast would
+    let us drop this, see deferral list).
+    """
+    rw = rw_1d.astype(np.float32).reshape(-1, 1, 1)
+    return np.broadcast_to(rw, (rw.shape[0], TILE, TILE)).copy()
 
 
 def main():
@@ -74,20 +82,17 @@ def main():
     device = ttnn.open_device(device_id=args.device_id)
     try:
         H, I, E = args.hidden, args.moe_inter, args.experts
-        log(f"shapes: h=[1,{H}] W1=[{E},{H},{2*I}] W2=[{E},{I},{H}] rw=[1,{E}]")
+        log(f"shapes: h=[1,{H}] W1=[{E},{H},{2*I}] W2=[{E},{I},{H}] rw_bcast=[{E},{TILE},{TILE}]")
 
         fx = oracle.make_fixture(E=E, HIDDEN=H, MOE_INTER=I, seed=args.seed)
-        # Override rw to all-ones for G1a (kernel ignores rw anyway, but this
-        # makes the oracle expectations explicit).
-        fx.routing_weight = np.ones(E, dtype=np.float32)
+        expected = oracle.moe_ffn_oracle(fx, bf16=True)
 
-        expected = moe_ffn_oracle_no_rw(fx)
-
-        # Upload inputs.
+        # Upload inputs. rw is pre-broadcast to [E, TILE, TILE] (D-G1b-01).
+        rw_bcast = broadcast_rw_to_tiles(fx.routing_weight)
         h_tt  = to_ttnn(fx.h.reshape(1, H), device)
         W1_tt = to_ttnn(fx.W1, device)
         W2_tt = to_ttnn(fx.W2, device)
-        rw_tt = to_ttnn(fx.routing_weight.reshape(1, E), device)
+        rw_tt = to_ttnn(rw_bcast, device)
 
         log("calling qwen36_moe_ffn_decode_owned…")
         t0 = time.time()
@@ -109,7 +114,7 @@ def main():
             log(f"  expected[:8] = {expected[:8].tolist()}")
             raise SystemExit(1)
 
-        log(f"PASS  G1a: kernel matches oracle (rw=ones, pcc={pcc_val:.6f}).")
+        log(f"PASS  G1b: kernel matches oracle (rw applied, pcc={pcc_val:.6f}).")
 
         for t in [h_tt, W1_tt, W2_tt, rw_tt, out]:
             try: ttnn.deallocate(t)

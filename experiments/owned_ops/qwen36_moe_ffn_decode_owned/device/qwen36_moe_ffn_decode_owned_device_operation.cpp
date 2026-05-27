@@ -70,13 +70,17 @@ void Qwen36MoeFfnDecodeOwnedDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(W2_padded[-2] % TILE == 0 && W2_padded[-1] % TILE == 0,
              "W2 padded inner/outer dims must be TILE-aligned");
 
-    // routing_weight: rank-2 [1, E]. Currently unused by G1a (D-G1a-01) but
-    // we still validate so the API stays stable when G1b lights it up.
+    // routing_weight: rank-3 [E, TILE, TILE] — each [e, :, :] slab is rw[e]
+    // broadcast to a full TILE×TILE tile (D-G1b-01). Caller is responsible
+    // for the broadcast.
     const auto& rw_logical = tensor_args.routing_weight.logical_shape();
-    TT_FATAL(rw_logical.rank() == 2, "routing_weight must be rank 2; got rank {}", rw_logical.rank());
-    TT_FATAL(rw_logical[0] == 1, "routing_weight dim 0 must be 1");
-    TT_FATAL(rw_logical[1] == W1_logical[0],
-             "routing_weight dim 1 ({}) must equal E ({})", rw_logical[1], W1_logical[0]);
+    const auto& rw_padded  = tensor_args.routing_weight.padded_shape();
+    TT_FATAL(rw_logical.rank() == 3, "routing_weight must be rank 3 (pre-broadcast); got rank {}", rw_logical.rank());
+    TT_FATAL(rw_logical[0] == W1_logical[0],
+             "routing_weight dim 0 ({}) must equal E ({})", rw_logical[0], W1_logical[0]);
+    TT_FATAL(rw_padded[-2] == TILE && rw_padded[-1] == TILE,
+             "routing_weight padded shape must end in [{}, {}]; got [{}, {}]",
+             TILE, TILE, rw_padded[-2], rw_padded[-1]);
 
     if (tensor_args.preallocated_output.has_value()) {
         validate_device_tensor(tensor_args.preallocated_output.value(), tensor_args.h, "output_tensor");

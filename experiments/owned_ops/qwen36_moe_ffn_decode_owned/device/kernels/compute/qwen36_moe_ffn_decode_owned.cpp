@@ -127,12 +127,14 @@ void kernel_main() {
     constexpr uint32_t cb_h         = get_compile_time_arg_val(0);
     constexpr uint32_t cb_w1        = get_compile_time_arg_val(1);
     constexpr uint32_t cb_w2        = get_compile_time_arg_val(2);
-    constexpr uint32_t cb_gate_up   = get_compile_time_arg_val(3);
-    constexpr uint32_t cb_silu_tmp  = get_compile_time_arg_val(4);
-    constexpr uint32_t cb_mid       = get_compile_time_arg_val(5);
-    constexpr uint32_t cb_eo        = get_compile_time_arg_val(6);
-    constexpr uint32_t cb_partial   = get_compile_time_arg_val(7);
-    constexpr uint32_t cb_out       = get_compile_time_arg_val(8);
+    constexpr uint32_t cb_rw        = get_compile_time_arg_val(3);
+    constexpr uint32_t cb_gate_up   = get_compile_time_arg_val(4);
+    constexpr uint32_t cb_silu_tmp  = get_compile_time_arg_val(5);
+    constexpr uint32_t cb_mid       = get_compile_time_arg_val(6);
+    constexpr uint32_t cb_eo        = get_compile_time_arg_val(7);
+    constexpr uint32_t cb_eo_scaled = get_compile_time_arg_val(8);
+    constexpr uint32_t cb_partial   = get_compile_time_arg_val(9);
+    constexpr uint32_t cb_out       = get_compile_time_arg_val(10);
 
     const uint32_t hidden_tiles   = get_arg_val<uint32_t>(0);
     const uint32_t gate_up_tiles  = get_arg_val<uint32_t>(1);
@@ -162,24 +164,32 @@ void kernel_main() {
         }
         cb_pop_front(cb_gate_up, gate_up_tiles);
 
-        // -------- eo = mid @ W2[e], accumulate into CB_PARTIAL --------
+        // -------- eo = mid @ W2[e], scale by rw[e], accumulate into CB_PARTIAL --------
+        // rw_broadcast tile for this expert is already waiting in cb_rw.
+        cb_wait_front(cb_rw, ONE_TILE);
         cb_wait_front(cb_mid, mid_tiles);
         for (uint32_t j = 0; j < hidden_tiles; ++j) {
             cb_wait_front(cb_w2, mid_tiles);
             matmul_reduce_one_tile(cb_mid, cb_w2, mid_tiles, cb_eo);
             cb_pop_front(cb_w2, mid_tiles);
 
+            // Scale eo[j] by rw_broadcast[e] (one tile of rw[e] broadcast).
             cb_wait_front(cb_eo, ONE_TILE);
+            mul_one_tile(cb_eo, 0, cb_rw, 0, cb_eo_scaled);
+            cb_pop_front(cb_eo, ONE_TILE);
+
+            cb_wait_front(cb_eo_scaled, ONE_TILE);
             if (e == 0) {
-                copy_one_tile(cb_eo, 0, cb_partial);
+                copy_one_tile(cb_eo_scaled, 0, cb_partial);
             } else {
                 cb_wait_front(cb_partial, ONE_TILE);
-                add_one_tile(cb_partial, 0, cb_eo, 0, cb_partial);
+                add_one_tile(cb_partial, 0, cb_eo_scaled, 0, cb_partial);
                 cb_pop_front(cb_partial, ONE_TILE);
             }
-            cb_pop_front(cb_eo, ONE_TILE);
+            cb_pop_front(cb_eo_scaled, ONE_TILE);
         }
         cb_pop_front(cb_mid, mid_tiles);
+        cb_pop_front(cb_rw, ONE_TILE);
     }
 
     cb_pop_front(cb_h, hidden_tiles);

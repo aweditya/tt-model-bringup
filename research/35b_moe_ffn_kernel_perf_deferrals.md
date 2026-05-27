@@ -22,6 +22,12 @@ the kernel is correct.
 | D-G1a-04 | G1a | CB_PARTIAL is implicitly zero-initialized on the very first expert iteration by NOT calling matmul_tiles' accumulate flag on iteration 0 (separate "first iter" branch). | Branchy compute kernel; one extra conditional per output tile per expert. | Pre-fill CB_PARTIAL with zeros via a small init pass; eliminates the branch. |
 | D-G1a-05 | G1a | gate_up resident as 2*MOE_INTER/TILE tiles in L1; split into gate/up by tile-index instead of slice. | None functional — but means we can't easily swap to a streamed gate_up if memory pressure changes. | Re-evaluate when production HIDDEN/MOE_INTER scales up. |
 | D-G1a-06 | G1a | Validate restricted: W1 rank-3 [E, HIDDEN, 2*MOE_INTER], W2 rank-3 [E, MOE_INTER, HIDDEN]; no sharded layouts. | Won't run on (1,4) mesh-sharded tensors yet. | G4 mesh adapter. |
+| D-G1b-01 | G1b | `routing_weight` is consumed as pre-broadcast `[E, TILE, TILE]` (each `[e]` slab filled with `rw[e]`). Caller (Python wrapper) must broadcast a `[1, E]` rw into this shape before invoking. | One extra ttnn op + ~E*TILE*TILE*2 bytes per call (≈ 128 KB for E=64). | LLK-level row-scalar-to-tile bcast (`mul_tiles_bcast<ROW>` or pack one rw lane to scalar reg + `mul_unary`) would consume `[1, E]` directly. |
+| D-G1b-02 | G1b | Compute multiplies `eo[j]` by `rw_broadcast[e]` BEFORE accumulating, requiring one extra mul_tiles per (e, j). | One additional ~32×32 mul per output tile per expert. ~Negligible for E=64, HIDDEN_TILES=64 vs the matmul cost. | Could fuse into matmul_reduce's pack step if mm supports scalar-output-scale. |
+
+**G1b PASS (2026-05-26)**: H=64, I=32, E=2 toy shape, `pcc=0.99998756`,
+`max_abs_diff=2.44e-4` vs bf16 numpy oracle. Routing-weight scaling
+verified end-to-end. Next stage G2 splits work across cores.
 
 (Rows will be added as G1, G2, G3 land. Use this doc as input to a future
 "perf cleanup pass" session once the kernel is correct.)
