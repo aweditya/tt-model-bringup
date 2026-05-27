@@ -18,12 +18,16 @@ namespace {
 
 constexpr uint32_t TILE = tt::constants::TILE_HEIGHT;
 
-// G0 scaffold CBs — minimal set:
-//   CB_H:        input row, one tile wide
-//   CB_OUT:      output row, one tile wide
-// Real CBs for matmul/silu/etc come in G1+.
-constexpr uint32_t CB_H = tt::CBIndex::c_0;
-constexpr uint32_t CB_OUT = tt::CBIndex::c_1;
+// CB index assignments (single-core G1a).
+constexpr uint32_t CB_H        = tt::CBIndex::c_0;
+constexpr uint32_t CB_W1       = tt::CBIndex::c_1;
+constexpr uint32_t CB_W2       = tt::CBIndex::c_2;
+constexpr uint32_t CB_GATE_UP  = tt::CBIndex::c_3;
+constexpr uint32_t CB_SILU_TMP = tt::CBIndex::c_4;
+constexpr uint32_t CB_MID      = tt::CBIndex::c_5;
+constexpr uint32_t CB_EO       = tt::CBIndex::c_6;
+constexpr uint32_t CB_PARTIAL  = tt::CBIndex::c_7;
+constexpr uint32_t CB_OUT      = tt::CBIndex::c_8;
 
 CBHandle create_circular_buffer(
     Program& program,
@@ -46,26 +50,59 @@ Qwen36MoeFfnDecodeOwnedProgramFactory::cached_program_t Qwen36MoeFfnDecodeOwnedP
     Program program = CreateProgram();
 
     const auto& h = tensor_args.h;
-    auto* h_buffer = h.buffer();
+    const auto& W1 = tensor_args.W1;
+    const auto& W2 = tensor_args.W2;
+
+    auto* h_buffer  = h.buffer();
+    auto* w1_buffer = W1.buffer();
+    auto* w2_buffer = W2.buffer();
     auto* out_buffer = output_tensor.buffer();
 
-    // G0: single core, work = HIDDEN/TILE output tiles. The kernel writes one
-    // zero tile per output column tile. G1+ will split work across cores.
+    // Single-core G1a (D-G1a-02).
     CoreRangeSet single_core = CoreRangeSet(CoreRange(CoreCoord(0, 0), CoreCoord(0, 0)));
 
     const tt::DataFormat tensor_format = datatype_to_dataformat_converter(h.dtype());
     const uint32_t tensor_tile_size = tt::tile_size(tensor_format);
 
-    const uint32_t hidden_tiles = h.padded_shape()[-1] / TILE;
+    // Shape-derived tile counts.
+    const auto& h_padded  = h.padded_shape();
+    const auto& W1_padded = W1.padded_shape();
+    const auto& W2_padded = W2.padded_shape();
+    const uint32_t hidden_tiles  = h_padded[-1] / TILE;             // HIDDEN/TILE
+    const uint32_t gate_up_tiles = W1_padded[-1] / TILE;            // 2*MOE_INTER/TILE
+    const uint32_t mid_tiles     = W2_padded[-2] / TILE;            // MOE_INTER/TILE
+    // `experts` is consumed at override_runtime_arguments time (recomputed
+    // from tensor shapes there); kept here to centralize the shape derivation.
+    [[maybe_unused]] const uint32_t experts =
+        static_cast<uint32_t>(W1.logical_shape()[0]);
 
-    // Double-buffered: 2 tiles per CB so reader can prefetch while compute runs.
-    create_circular_buffer(program, single_core, CB_H, 2, tensor_tile_size, tensor_format);
-    create_circular_buffer(program, single_core, CB_OUT, 2, tensor_tile_size, tensor_format);
+    // CB sizes:
+    //   CB_H:        hidden_tiles tiles resident (read once, used all experts)
+    //   CB_W1:       2 tiles streamed (double-buffered prefetch)
+    //   CB_W2:       2 tiles streamed
+    //   CB_GATE_UP:  gate_up_tiles resident (one expert's full output row)
+    //   CB_SILU_TMP: 2 tiles scratch
+    //   CB_MID:      mid_tiles resident
+    //   CB_EO:       2 tiles (one expert_out tile at a time)
+    //   CB_PARTIAL:  2*hidden_tiles depth (ping-pong headroom; D-G1a-04 note)
+    //   CB_OUT:      2 tiles drain
+    create_circular_buffer(program, single_core, CB_H,        hidden_tiles,  tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_W1,       2,             tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_W2,       2,             tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_GATE_UP,  gate_up_tiles, tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_SILU_TMP, 2,             tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_MID,      mid_tiles,     tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_EO,       2,             tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_PARTIAL,  2 * hidden_tiles, tensor_tile_size, tensor_format);
+    create_circular_buffer(program, single_core, CB_OUT,      2,             tensor_tile_size, tensor_format);
 
-    std::vector<uint32_t> reader_compile_time_args = {CB_H};
+    std::vector<uint32_t> reader_compile_time_args = {CB_H, CB_W1, CB_W2};
     TensorAccessorArgs(h_buffer).append_to(reader_compile_time_args);
+    TensorAccessorArgs(w1_buffer).append_to(reader_compile_time_args);
+    TensorAccessorArgs(w2_buffer).append_to(reader_compile_time_args);
 
-    std::vector<uint32_t> compute_compile_time_args = {CB_H, CB_OUT};
+    std::vector<uint32_t> compute_compile_time_args = {
+        CB_H, CB_W1, CB_W2, CB_GATE_UP, CB_SILU_TMP, CB_MID, CB_EO, CB_PARTIAL, CB_OUT};
 
     std::vector<uint32_t> writer_compile_time_args = {CB_OUT};
     TensorAccessorArgs(out_buffer).append_to(writer_compile_time_args);
@@ -103,6 +140,8 @@ Qwen36MoeFfnDecodeOwnedProgramFactory::cached_program_t Qwen36MoeFfnDecodeOwnedP
         .num_cores = 1,
         .hidden_tiles = hidden_tiles,
     };
+    // Stash extra shape info on shared via additional fields below would require
+    // header changes; instead we recompute from buffers in override_runtime_arguments.
 
     cached_program_t cached_program{std::move(program), std::move(shared_variables)};
     override_runtime_arguments(cached_program, operation_attributes, tensor_args, output_tensor);
@@ -111,20 +150,28 @@ Qwen36MoeFfnDecodeOwnedProgramFactory::cached_program_t Qwen36MoeFfnDecodeOwnedP
 
 void Qwen36MoeFfnDecodeOwnedProgramFactory::override_runtime_arguments(
     cached_program_t& cached_program,
-    const Qwen36MoeFfnDecodeOwnedParams& operation_attributes,
+    [[maybe_unused]] const Qwen36MoeFfnDecodeOwnedParams& operation_attributes,
     const Qwen36MoeFfnDecodeOwnedInputs& tensor_args,
     Tensor& output_tensor) {
-    auto* h_buffer = tensor_args.h.buffer();
-    auto* out_buffer = output_tensor.buffer();
-
     auto& program = cached_program.program;
     const auto& shared = cached_program.shared_variables;
 
-    const uint32_t debug_fill = operation_attributes.debug_fill ? 1 : 0;
+    auto* h_buffer  = tensor_args.h.buffer();
+    auto* w1_buffer = tensor_args.W1.buffer();
+    auto* w2_buffer = tensor_args.W2.buffer();
+    auto* out_buffer = output_tensor.buffer();
 
-    std::vector<uint32_t> reader_args = {h_buffer->address(), shared.hidden_tiles};
-    std::vector<uint32_t> compute_args = {shared.hidden_tiles, debug_fill};
-    std::vector<uint32_t> writer_args = {out_buffer->address(), shared.hidden_tiles};
+    // Recompute the per-call dimensions (in tiles).
+    const uint32_t hidden_tiles  = tensor_args.h.padded_shape()[-1] / tt::constants::TILE_HEIGHT;
+    const uint32_t gate_up_tiles = tensor_args.W1.padded_shape()[-1] / tt::constants::TILE_HEIGHT;
+    const uint32_t mid_tiles     = tensor_args.W2.padded_shape()[-2] / tt::constants::TILE_HEIGHT;
+    const uint32_t experts       = static_cast<uint32_t>(tensor_args.W1.logical_shape()[0]);
+
+    std::vector<uint32_t> reader_args = {
+        h_buffer->address(), w1_buffer->address(), w2_buffer->address(),
+        hidden_tiles, gate_up_tiles, mid_tiles, experts};
+    std::vector<uint32_t> compute_args = {hidden_tiles, gate_up_tiles, mid_tiles, experts};
+    std::vector<uint32_t> writer_args = {out_buffer->address(), hidden_tiles};
 
     SetRuntimeArgs(program, shared.reader_kernel_id, shared.cores[0], reader_args);
     SetRuntimeArgs(program, shared.compute_kernel_id, shared.cores[0], compute_args);

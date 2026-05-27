@@ -38,19 +38,51 @@ void Qwen36MoeFfnDecodeOwnedDeviceOperation::validate_on_program_cache_miss(
     validate_device_tensor(tensor_args.W2, tensor_args.h, "W2");
     validate_device_tensor(tensor_args.routing_weight, tensor_args.h, "routing_weight");
 
-    // h logical shape [1, HIDDEN] with padded last-dim a multiple of TILE.
     const auto& h_logical = tensor_args.h.logical_shape();
     const auto& h_padded = tensor_args.h.padded_shape();
     TT_FATAL(h_logical.rank() == 2, "h must be rank 2; got rank {}", h_logical.rank());
     TT_FATAL(h_logical[0] == 1, "h dim 0 must be 1; got {}", h_logical[0]);
     TT_FATAL(h_logical[1] > 0, "h hidden dim must be > 0");
     TT_FATAL(h_padded[-1] % TILE == 0, "h padded hidden must be a multiple of {}; got {}", TILE, h_padded[-1]);
+    const uint32_t HIDDEN = static_cast<uint32_t>(h_logical[1]);
+
+    // W1: rank-3 [E, HIDDEN, 2*MOE_INTER].
+    const auto& W1_logical = tensor_args.W1.logical_shape();
+    const auto& W1_padded  = tensor_args.W1.padded_shape();
+    TT_FATAL(W1_logical.rank() == 3, "W1 must be rank 3; got rank {}", W1_logical.rank());
+    TT_FATAL(W1_logical[0] > 0, "W1 E dim must be > 0");
+    TT_FATAL(static_cast<uint32_t>(W1_logical[1]) == HIDDEN,
+             "W1 dim 1 (HIDDEN={}) must match h hidden dim ({})", W1_logical[1], HIDDEN);
+    TT_FATAL(W1_padded[-2] % TILE == 0 && W1_padded[-1] % TILE == 0,
+             "W1 padded inner/outer dims must be TILE-aligned");
+    TT_FATAL(W1_padded[-1] % 2 == 0, "W1 last dim (2*MOE_INTER) must be even");
+
+    // W2: rank-3 [E, MOE_INTER, HIDDEN]. MOE_INTER = W1_last/2.
+    const auto& W2_logical = tensor_args.W2.logical_shape();
+    const auto& W2_padded  = tensor_args.W2.padded_shape();
+    TT_FATAL(W2_logical.rank() == 3, "W2 must be rank 3; got rank {}", W2_logical.rank());
+    TT_FATAL(W2_logical[0] == W1_logical[0], "W2 E ({}) must match W1 E ({})", W2_logical[0], W1_logical[0]);
+    TT_FATAL(static_cast<uint32_t>(W2_logical[-1]) == HIDDEN,
+             "W2 last dim ({}) must match HIDDEN ({})", W2_logical[-1], HIDDEN);
+    TT_FATAL(2 * static_cast<uint32_t>(W2_logical[-2]) == static_cast<uint32_t>(W1_logical[-1]),
+             "2 * W2 dim -2 ({}) must equal W1 last dim ({})",
+             W2_logical[-2], W1_logical[-1]);
+    TT_FATAL(W2_padded[-2] % TILE == 0 && W2_padded[-1] % TILE == 0,
+             "W2 padded inner/outer dims must be TILE-aligned");
+
+    // routing_weight: rank-2 [1, E]. Currently unused by G1a (D-G1a-01) but
+    // we still validate so the API stays stable when G1b lights it up.
+    const auto& rw_logical = tensor_args.routing_weight.logical_shape();
+    TT_FATAL(rw_logical.rank() == 2, "routing_weight must be rank 2; got rank {}", rw_logical.rank());
+    TT_FATAL(rw_logical[0] == 1, "routing_weight dim 0 must be 1");
+    TT_FATAL(rw_logical[1] == W1_logical[0],
+             "routing_weight dim 1 ({}) must equal E ({})", rw_logical[1], W1_logical[0]);
 
     if (tensor_args.preallocated_output.has_value()) {
         validate_device_tensor(tensor_args.preallocated_output.value(), tensor_args.h, "output_tensor");
     }
     if (args.output_memory_config.has_value()) {
-        TT_FATAL(!args.output_memory_config->is_sharded(), "output sharding is not supported in G0 bring-up");
+        TT_FATAL(!args.output_memory_config->is_sharded(), "output sharding is not supported in G1a bring-up");
     }
 }
 

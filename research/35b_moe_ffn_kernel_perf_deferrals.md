@@ -16,6 +16,12 @@ the kernel is correct.
 | D-G0-06 | G0 | No CB sizing tuning — all CBs are double-buffered (depth 2), no analysis of which want depth=2 vs key_tiles*2 | Possibly some bubble cycles in the pipeline | Profile via tracy after G1 lands; tune deep buffers for the matmul streams. |
 | D-G0-07 | G0 | HiFi4 + fp32_dest_acc_en hardcoded in program_factory | Matches production matmul fidelity (correct for production); can't experiment with HiFi2 without rebuilds | Plumb compute_kernel_config through the op as the friend-repo `qwen36_gdn_decode` does. |
 | D-G0-08 | G0 | Compute kernel runs the same loop regardless of `debug_fill` | No actual debug-fill behavior yet | Wire debug_fill = copy h's first tile to output once G1 reads h for real. |
+| D-G1a-01 | G1a | Ignore routing_weight entirely (treat rw[e] = 1.0 for all e). Output is plain `sum_e expert_out[e]` instead of weighted sum. | Correctness loss for real model — must be re-enabled before integration. | G1b adds rw; deferral retires there. |
+| D-G1a-02 | G1a | Single-core loop over all E experts. 1 of 110 cores used. | ~99% compute idle. | G2 splits work per-expert across cores. |
+| D-G1a-03 | G1a | Reader streams W1[e]/W2[e] sequentially per expert (no overlap across experts). | Reader bandwidth not pipelined with compute on expert boundaries. | G2's multi-core split makes per-expert streaming the natural granularity. |
+| D-G1a-04 | G1a | CB_PARTIAL is implicitly zero-initialized on the very first expert iteration by NOT calling matmul_tiles' accumulate flag on iteration 0 (separate "first iter" branch). | Branchy compute kernel; one extra conditional per output tile per expert. | Pre-fill CB_PARTIAL with zeros via a small init pass; eliminates the branch. |
+| D-G1a-05 | G1a | gate_up resident as 2*MOE_INTER/TILE tiles in L1; split into gate/up by tile-index instead of slice. | None functional — but means we can't easily swap to a streamed gate_up if memory pressure changes. | Re-evaluate when production HIDDEN/MOE_INTER scales up. |
+| D-G1a-06 | G1a | Validate restricted: W1 rank-3 [E, HIDDEN, 2*MOE_INTER], W2 rank-3 [E, MOE_INTER, HIDDEN]; no sharded layouts. | Won't run on (1,4) mesh-sharded tensors yet. | G4 mesh adapter. |
 
 (Rows will be added as G1, G2, G3 land. Use this doc as input to a future
 "perf cleanup pass" session once the kernel is correct.)
