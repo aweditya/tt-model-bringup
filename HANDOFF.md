@@ -8,22 +8,25 @@
 
 | Mode | ms/tok | tok/s |
 |---|---|---|
-| **+A002 QK norm + A003 router topk + A004 core_grid (2026-05-27)** | **110.4** | **9.06** |
-| Pre-2026-05-27 baseline (traced) | 141.8 | 7.05 |
+| **+A002 + A003 + A004 + A008 bf8 MoE (2026-05-27)** | **81.16** | **12.32** |
+| +A002 + A003 + A004 (intermediate) | 110.40 | 9.06 |
+| Pre-2026-05-27 baseline (traced) | 141.79 | 7.05 |
 
-**A004 core_grid=10x11 on batched MoE matmuls = -30 ms/tok (-21%) trace.**
-The dominant `MatmulDeviceOperation b={64}x32x2048x1024` was using only
-11/110 cores by default; forcing the full Tensix grid drops kernel time
-from 1.84 ms to 1.25 ms. Bit-clean correctness (pcc=0.999991).
+**Net: -60.6 ms/tok (-42.8%), tok/s 1.75x in one workflow session.**
 
 Cumulative wins 2026-05-27 (see `research/35b_perf_workflow_log.md`):
 - A002 QK L2-norm via ttnn.rms_norm: -1.13 ms/tok
 - A003 router softmax-then-topk → topk-then-softmax: -0.25 ms/tok
-- A004 core_grid=10x11 on batched MoE: -30.01 ms/tok
-- TOTAL: -31.4 ms/tok (-22%)
+- **A004 core_grid=10x11 on batched MoE matmuls: -30.01 ms/tok**
+- **A008 bf8_b MoE expert weights (halves W DRAM): -29.24 ms/tok**
 
-Rejected: A005 core_grid on non-batched matmuls — +3 ms/tok regression
-(ttnn default already optimal for smaller shapes).
+Both big wins target the SAME dominant op (batched MoE gate_up matmul)
+with two orthogonal mechanisms — A004 parallelizes (11→110 cores) and
+A008 shrinks the BW footprint (256→128 MB). Stacking is multiplicative.
+
+Rejected: A005 core_grid on non-batched matmuls (+3 ms regression),
+A006 lm_head core_grid (no-op), A007 h-in-L1 (no-op, math says input 0
+is 0.1% of DRAM traffic).
 
 Coherent greedy decode + long-context PASS:
 - 20/20 tokens: "Paris, a city renowned for its iconic landmarks such as

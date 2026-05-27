@@ -141,6 +141,39 @@ on-device argmax — that's a structural refactor, not a core_grid kwarg.
 
 Parked for now; revisit if going below 100 ms/tok requires it.
 
+### A008 — bf8 MoE expert weights (SHIPPED 2026-05-27 — HUGE WIN)
+
+User directive: correctness check before perf testing (weight quantization).
+
+| Step | Result |
+|---|---|
+| 1 Profile | bf16 weights = 256 MB W DRAM per gate_up call (dominant). bf8 halves to 128 MB. |
+| 2 Hypothesis | Same magnitude as A004: kernel-time win on the dominant op, ~30 ms/tok. |
+| 3 Isolate (correctness) | test_moe_bf8_weights_correctness.py, 3 seeds: bf8/bf8 vs bf16 PCC min=0.999903 (gate 0.9995, PASS). Magnitude ratio 0.9999-1.0 — no scale shift. |
+| 4 E2E eager | 50-tok decode " Paris..." coherent through 50 tokens (best generation of the session — small quantization noise reduces mode collapse). |
+| 5 Trace A/B | **110.40 -> 81.16 ms/tok = -29.24 ms/tok (-26.5%)**. Cumulative -60.6 ms/tok from baseline (-42.8%). |
+| 6 Long ctx | 50-tok holds coherence, no fusion-caused drift. Best generation quality. |
+
+Change: `dtype=ttnn.bfloat16 -> ttnn.bfloat8_b` on 2 lines
+(experts_gate_up_local, experts_down_local). Matches 27B production.
+
+## Cumulative trace ms/tok timeline (REVISED)
+
+| Stage | ms/tok | tok/s | Δ from prev |
+|---|---|---|---|
+| Pre-2026-05-27 baseline | 141.79 | 7.05 | — |
+| +A002 QK norm | 140.66 | 7.11 | -1.13 |
+| +A003 router topk | 140.41 | 7.12 | -0.25 |
+| +A004 batched core_grid | 110.40 | 9.06 | -30.01 |
+| **+A008 bf8 MoE weights** | **81.16** | **12.32** | **-29.24** |
+
+**Total: -60.6 ms/tok (-42.8%) in one workflow session.** tok/s 1.75x.
+
+Both big wins (A004, A008) target the SAME dominant op (batched MoE
+gate_up matmul) with two orthogonal mechanisms: A004 parallelizes
+(11 -> 110 cores) and A008 shrinks the BW footprint (256 -> 128 MB).
+Stacking is multiplicative.
+
 ### A007 — h in L1 for batched MoE gate_up (REJECTED 2026-05-27)
 
 tt-perf-report's specific advice on the dominant matmul: "place input 0
