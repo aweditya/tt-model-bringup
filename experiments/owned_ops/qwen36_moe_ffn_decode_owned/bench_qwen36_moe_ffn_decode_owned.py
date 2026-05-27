@@ -137,6 +137,78 @@ def run_threeop_path(h_E_tt, W1_tt, W2_tt, rw_E_tt, device, n_warmup, n_iters, E
     return np.array(ts), out_np
 
 
+def run_threeop_breakdown(h_E_tt, W1_tt, W2_tt, rw_E_tt, device, n_warmup, n_iters, E, H, I):
+    """Time EACH ttnn op in the 3-op chain separately. Sync-bounded per op."""
+    import ttnn
+
+    def time_op(fn, n_w, n_i):
+        for _ in range(n_w):
+            fn().__class__  # warmup; result discarded by caller via deallocate
+        ttnn.synchronize_device(device)
+        ts = []
+        results = []
+        for _ in range(n_i):
+            ttnn.synchronize_device(device)
+            t0 = time.perf_counter()
+            out = fn()
+            ttnn.synchronize_device(device)
+            ts.append((time.perf_counter() - t0) * 1000.0)
+            results.append(out)
+        return np.array(ts), results
+
+    # ---- bmm1: gate_up = h @ W1 ----
+    bmm1_ts, gate_up_list = time_op(
+        lambda: ttnn.matmul(h_E_tt, W1_tt), n_warmup, n_iters)
+    gate_up = gate_up_list[-1]
+    for x in gate_up_list[:-1]:
+        ttnn.deallocate(x)
+
+    # ---- slice gate/up ----
+    slice_ts, _ = time_op(
+        lambda: (ttnn.slice(gate_up, [0, 0, 0], [E, 1, I]),
+                 ttnn.slice(gate_up, [0, 0, I], [E, 1, 2 * I])),
+        n_warmup, n_iters)
+    # Get a real gate/up for next steps.
+    gate = ttnn.slice(gate_up, [0, 0, 0], [E, 1, I])
+    up   = ttnn.slice(gate_up, [0, 0, I], [E, 1, 2 * I])
+    ttnn.deallocate(gate_up)
+
+    # ---- silu + mul (treated as fused step in our path) ----
+    def silu_mul():
+        s = ttnn.silu(gate)
+        m = ttnn.multiply(s, up)
+        ttnn.deallocate(s)
+        return m
+    silumul_ts, mid_list = time_op(silu_mul, n_warmup, n_iters)
+    mid = mid_list[-1]
+    for x in mid_list[:-1]:
+        ttnn.deallocate(x)
+
+    # ---- bmm2: eo = mid @ W2 ----
+    bmm2_ts, eo_list = time_op(
+        lambda: ttnn.matmul(mid, W2_tt), n_warmup, n_iters)
+    eo = eo_list[-1]
+    for x in eo_list[:-1]:
+        ttnn.deallocate(x)
+
+    # ---- rw * eo, sum over experts ----
+    def rw_sum():
+        scaled = ttnn.multiply(eo, rw_E_tt)
+        routed = ttnn.sum(scaled, dim=0, keepdim=False)
+        ttnn.deallocate(scaled)
+        return routed
+    rwsum_ts, _ = time_op(rw_sum, n_warmup, n_iters)
+
+    ttnn.deallocate(gate); ttnn.deallocate(up); ttnn.deallocate(mid); ttnn.deallocate(eo)
+    return {
+        "bmm1 h@W1":   bmm1_ts,
+        "slice gate/up": slice_ts,
+        "silu*up":     silumul_ts,
+        "bmm2 mid@W2": bmm2_ts,
+        "rw·eo + sum": rwsum_ts,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device-id", type=int, default=0)
@@ -146,6 +218,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--n-warmup", type=int, default=3)
     ap.add_argument("--n-iters", type=int, default=20)
+    ap.add_argument("--breakdown", action="store_true",
+                    help="Also report per-op breakdown of the 3-op chain.")
     args = ap.parse_args()
 
     if args.hidden % TILE or args.moe_inter % TILE:
@@ -196,6 +270,19 @@ def main():
         ratio = three_ts.mean() / kernel_ts.mean() if kernel_ts.mean() > 0 else float("inf")
         log(f"speedup: 3-op / kernel = {ratio:.3f}x  "
             f"({'kernel wins' if ratio > 1 else '3-op wins'})")
+
+        if args.breakdown:
+            log("--- 3-op per-op breakdown ---")
+            br = run_threeop_breakdown(
+                h_E_tt, W1_tt, W2_tt, rw_E_tt, device, args.n_warmup, args.n_iters, E, H, I)
+            sum_mean = sum(v.mean() for v in br.values())
+            for name, ts in br.items():
+                log(f"  {name:18s} mean {ts.mean():7.3f} ms  "
+                    f"median {np.median(ts):7.3f}  "
+                    f"({100*ts.mean()/sum_mean:5.1f}% of sum)")
+            log(f"  {'sum-of-isolated':18s} mean {sum_mean:7.3f} ms "
+                f"vs chained {three_ts.mean():.3f} ms  "
+                f"(chained / sum = {three_ts.mean()/sum_mean:.3f})")
 
         for t in [h_tt, W1_tt, W2_tt, rw_bcast_tt, h_E_tt, rw_E_tt]:
             try: ttnn.deallocate(t)
