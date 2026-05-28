@@ -138,15 +138,19 @@ def main():
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--blocks-per-seq", type=int, default=8)
+    ap.add_argument("--owned-gdn", action="store_true",
+                    help="use the batched owned_gdn DN recurrence kernel")
     args = ap.parse_args()
     batches = [int(x) for x in args.batches.split(",")]
 
     log("bootstrap production 27B server (server_tp)…")
     state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
     base.bootstrap(state)
-    state.deltanet_recurrence_mode = "manual"   # owned_gdn is B=1-only
+    state.deltanet_recurrence_mode = "manual"
     state.deltanet_decay_gate_mode = "manual"
     state.deltanet_decay_mode = "native_softplus"
+    state.cb_dn_recurrence_mode = "owned_gdn" if args.owned_gdn else "manual"
+    log(f"DN recurrence: {state.cb_dn_recurrence_mode}")
 
     prompt_ids = state.tok.encode("The capital of France is the city of")[:6]
     log("=== production B=1 reference ===")

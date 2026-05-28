@@ -538,3 +538,30 @@ original, so the B=1 prod path (server_tp owned_gdn) is UNTOUCHED.
 `server_tp_cb.deltanet_step_batched` (produce owned_gdn inputs per fold + call
 with debug_mode=10), validate cb_validate_27b bit-identical + cosine ladder,
 then re-run cb_profile_blocks/cb_bench_trace to measure the DN-slope drop.
+
+## DNK-G2 — batched owned_gdn integrated + measured (2026-05-28)
+
+`server_tp_cb.deltanet_step_batched` gains a `cb_dn_recurrence_mode="owned_gdn"`
+path: fold q/k/v/decay/beta + slot['ssm'] into [1, B·NV, …], call
+`qwen36_gdn_decode_owned(..., native_io=True, debug_mode=10)` (the patched
+batched-safe kernel). The op updates state in place via the folded view (=the
+commit); out [1, B·NV·V] → [B, VAL_DIM_CHIP].
+
+**Correctness** (`cb_validate_27b.py --owned-gdn`, prod ref also owned_gdn):
+3a logit_cos=1.0 (bit-identical B=1), 3b/3c PASS. Trace correctness PASS.
+
+**Throughput** (`cb_bench_trace.py --owned-gdn`, traced):
+
+| B  | manual ms | owned_gdn ms | manual tok/s | owned_gdn tok/s | gain |
+|----|-----------|--------------|--------------|-----------------|------|
+| 1  | 77.15     | 74.80        | 12.96        | 13.37           | +3%  |
+| 32 | 212.69    | 190.41       | 150.45       | 168.06          | +11.7% |
+| 64 | 348.79    | 307.24       | 183.49       | 208.30          | +13.5% |
+
+Per-block profile (`cb_profile_blocks.py --owned-gdn`): DN slope 4.25 → 3.61
+ms/seq (−15%); B=32 DN block 170.7 → 148.5 ms. **Asymptote ~232 → ~277 tok/s.**
+
+**Combined: B=64 owned_gdn = 208 tok/s = 16.1× the B=1 production 12.96 tok/s**,
+bit-identical. The remaining DN cost is the surrounding ops (in_proj/out_proj
+matmuls, conv1d, q/k + output norms, decay/gate) — all scale with B; owned_gdn
+only fuses the recurrence. Those matmuls are the next lever to push past ~277.

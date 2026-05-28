@@ -124,6 +124,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-pos", type=int, default=6, help="prompt length to teacher-force")
     ap.add_argument("--batch", type=int, default=4)
+    ap.add_argument("--owned-gdn", action="store_true",
+                    help="exercise the batched owned_gdn DN recurrence in CB (vs prod owned_gdn)")
     args = ap.parse_args()
 
     log("bootstrap production 27B server (server_tp)…")
@@ -140,9 +142,14 @@ def main():
     # pos 0 (widest entropy) the tiny diff flips argmax. For an apples-to-apples
     # gate, run the reference with the same manual math.
     import numpy as np
-    state.deltanet_recurrence_mode = "manual"
+    # CB uses manual decay/gate; recurrence is manual by default, owned_gdn under
+    # --owned-gdn (the batched kernel, debug_mode=10). Match the prod reference's
+    # recurrence so the comparison is apples-to-apples.
+    state.deltanet_recurrence_mode = "owned_gdn" if args.owned_gdn else "manual"
     state.deltanet_decay_gate_mode = "manual"
     state.deltanet_decay_mode = "native_softplus"  # CB uses ttnn.softplus
+    state.cb_dn_recurrence_mode = "owned_gdn" if args.owned_gdn else "manual"
+    log(f"DN recurrence mode: {'owned_gdn (batched kernel)' if args.owned_gdn else 'manual'}")
 
     # Two FRESH passes (each consumes its own state once; no stale re-run —
     # the earlier logit-check bug re-ran prod over already-consumed KV/DN).

@@ -287,24 +287,47 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     ttnn.deallocate(g)
     ttnn.deallocate(a_tt); ttnn.deallocate(b_tt)
 
-    # 8. recurrence (manual — validated to batch bit-exact)
-    H_4d = slot['ssm']                                    # [B,NV,K,V]
-    H_decayed = ttnn.mul(H_4d, decay)
-    ttnn.deallocate(decay)
-    k_col = ttnn.reshape(k, [B, NV_PER_CHIP, K_DIM, 1])
-    kv_mem = ttnn.reshape(ttnn.sum(ttnn.mul(H_decayed, k_col), dim=-2),
-                          [B, NV_PER_CHIP, V_DIM])
-    v_3d = ttnn.reshape(v, [B, NV_PER_CHIP, V_DIM])
-    delta = ttnn.mul(ttnn.sub(v_3d, kv_mem), ttnn.reshape(beta, [B, NV_PER_CHIP, 1]))
-    ttnn.deallocate(kv_mem); ttnn.deallocate(beta)
-    H_new = ttnn.add(H_decayed,
-                     ttnn.mul(k_col, ttnn.reshape(delta, [B, NV_PER_CHIP, 1, V_DIM])))
-    ttnn.deallocate(H_decayed); ttnn.deallocate(delta)
-    q_col = ttnn.reshape(q, [B, NV_PER_CHIP, K_DIM, 1])
-    out = ttnn.reshape(ttnn.sum(ttnn.mul(H_new, q_col), dim=-2), [B, VAL_DIM_CHIP])
-    ttnn.copy(H_new, slot['ssm'])  # commit per-slot recurrent state
-    ttnn.deallocate(H_new); ttnn.deallocate(q_col); ttnn.deallocate(k_col)
-    ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v); ttnn.deallocate(v_3d)
+    # 8. recurrence — manual (validated bit-exact) OR batched owned_gdn kernel.
+    if getattr(state, 'cb_dn_recurrence_mode', 'manual') == 'owned_gdn':
+        # FOLD batch into slots (each slot's recurrence is independent) and call
+        # the owned-GDN fused kernel with debug_mode=10 (batched-safe two-CB
+        # output; see experiments/kernel_patches/qwen36_gdn_decode_owned/). The
+        # op updates state in place — passing the folded VIEW of slot['ssm']
+        # commits the next state directly (create_output_tensors returns the
+        # state tensor). out is flat [1, S*V_DIM] → [B, VAL_DIM_CHIP].
+        S = B * NV_PER_CHIP
+        H_in = ttnn.reshape(slot['ssm'], [1, S, K_DIM, V_DIM])
+        q_f = ttnn.reshape(q, [1, S, 1, K_DIM])
+        k_f = ttnn.reshape(k, [1, S, 1, K_DIM])
+        v_f = ttnn.reshape(v, [1, S, 1, V_DIM])
+        alpha_f = ttnn.reshape(decay, [1, S, 1, 1])
+        beta_f = ttnn.reshape(beta, [1, S, 1, 1])
+        H_new, out_f = ttnn.experimental.qwen36_gdn_decode_owned(
+            H_in, q_f, k_f, v_f, alpha_f, beta_f,
+            native_io=True, debug_mode=10, output_memory_config=ttnn.L1_MEMORY_CONFIG)
+        out = ttnn.reshape(out_f, [B, VAL_DIM_CHIP])
+        # H_in/H_new alias slot['ssm'] (in-place commit) — do NOT deallocate.
+        # out aliases out_f — keep. decay/beta/q/k/v consumed by the op.
+        ttnn.deallocate(decay); ttnn.deallocate(beta)
+        ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
+    else:
+        H_4d = slot['ssm']                                    # [B,NV,K,V]
+        H_decayed = ttnn.mul(H_4d, decay)
+        ttnn.deallocate(decay)
+        k_col = ttnn.reshape(k, [B, NV_PER_CHIP, K_DIM, 1])
+        kv_mem = ttnn.reshape(ttnn.sum(ttnn.mul(H_decayed, k_col), dim=-2),
+                              [B, NV_PER_CHIP, V_DIM])
+        v_3d = ttnn.reshape(v, [B, NV_PER_CHIP, V_DIM])
+        delta = ttnn.mul(ttnn.sub(v_3d, kv_mem), ttnn.reshape(beta, [B, NV_PER_CHIP, 1]))
+        ttnn.deallocate(kv_mem); ttnn.deallocate(beta)
+        H_new = ttnn.add(H_decayed,
+                         ttnn.mul(k_col, ttnn.reshape(delta, [B, NV_PER_CHIP, 1, V_DIM])))
+        ttnn.deallocate(H_decayed); ttnn.deallocate(delta)
+        q_col = ttnn.reshape(q, [B, NV_PER_CHIP, K_DIM, 1])
+        out = ttnn.reshape(ttnn.sum(ttnn.mul(H_new, q_col), dim=-2), [B, VAL_DIM_CHIP])
+        ttnn.copy(H_new, slot['ssm'])  # commit per-slot recurrent state
+        ttnn.deallocate(H_new); ttnn.deallocate(q_col); ttnn.deallocate(k_col)
+        ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v); ttnn.deallocate(v_3d)
 
     # 9. Per-head RMSNormGated: norm over V_DIM (head dim, NOT full VAL_DIM_CHIP)
     # then * silu(z), matching production deltanet_step_tp lines 820-826.
