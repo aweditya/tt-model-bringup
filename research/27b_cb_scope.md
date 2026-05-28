@@ -510,3 +510,31 @@ consumes them). The "last slots survive" signature fits a too-shallow output CB.
 rewrite.** Copy the op → `qwen36_gdn_decode_owned_batched` (keep B=1 prod
 untouched, per user), fix the output CB pipelining for high slot counts, rebuild
 ttnn, re-run this isolation at B=32 (S=384), then fold-integrate into CB.
+
+## CB6/G1 — batched DeltaNet kernel WORKS (debug_mode=10, no rebuild) (2026-05-28)
+
+Root cause of the high-S output bug: the production path (mode 0) computes
+`out = q @ state_next` by reading `cb_state_out`, which the WRITER also pops —
+a dual-consumer race. Once a core handles >1 block (slots > ~24), the writer
+pops a block's state_out tiles before the output matmul reads them → wrong
+OUTPUT for early slots (recurrence unaffected; it never reads q/output). Kernel
+was only tested at slots=12 (B=1) so it never surfaced.
+
+Fix (patched compute kernel, `experiments/kernel_patches/qwen36_gdn_decode_owned/`):
+a `safe_out` path (selected by `debug_mode=10`) routes the output matmul through
+`cb_state_next_internal` (compute-owned), leaving `cb_state_out` to the writer
+alone. Done as an IN-LOOP CONDITIONAL inside mode 0's branch (a duplicate branch
+overflowed the 70656 B TENSIX kernel-config limit at 77024 B; the conditional
+fits — add_state_to_two is already in the binary). **Device kernels JIT-compile
+from the .cpp → NO ttnn rebuild.** `debug_mode=0` is byte-identical to the
+original, so the B=1 prod path (server_tp owned_gdn) is UNTOUCHED.
+
+`cb_owned_gdn_batch_isolation.py` (fold [B,NV,K,V]→[1,B·NV,K,V], debug_mode=10):
+  B ∈ {1,2,4,8,16,32}: cos(H_new) & cos(out) ≈ 0.99998 — ALL PASS.
+  debug_mode=0: B=1,2 pass, B≥3 out-fails (the original race) — confirms mode 0
+  unchanged.
+
+**The batched DeltaNet recurrence kernel is validated.** Next: integrate into
+`server_tp_cb.deltanet_step_batched` (produce owned_gdn inputs per fold + call
+with debug_mode=10), validate cb_validate_27b bit-identical + cosine ladder,
+then re-run cb_profile_blocks/cb_bench_trace to measure the DN-slope drop.

@@ -62,7 +62,7 @@ def gdn_ref(H, q, k, v, decay, beta):
     return H_new, out
 
 
-def run(device, B, seed):
+def run(device, B, seed, debug_mode=0):
     import ttnn
     rng = np.random.default_rng(seed)
     H = rng.normal(0, 0.3, (B, NV, K, V)).astype(np.float32)
@@ -88,7 +88,7 @@ def run(device, B, seed):
 
     H_new, out = ttnn.experimental.qwen36_gdn_decode_owned(
         H_tt, q_tt, k_tt, v_tt, decay_tt, beta_tt,
-        native_io=True, output_memory_config=ttnn.L1_MEMORY_CONFIG)
+        native_io=True, debug_mode=debug_mode, output_memory_config=ttnn.L1_MEMORY_CONFIG)
     ttnn.synchronize_device(device)
     H_out = ttnn.to_torch(H_new).float().numpy().reshape(B, NV, K, V)
     out_out = ttnn.to_torch(out).float().numpy().reshape(B, NV, V)
@@ -104,6 +104,8 @@ def run(device, B, seed):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device-id", type=int, default=0)
+    ap.add_argument("--debug-mode", type=int, default=0,
+                    help="owned_gdn debug_mode; 10 = batched-safe two-CB output path")
     args = ap.parse_args()
     import ttnn
     log(f"opening device {args.device_id}")
@@ -111,9 +113,10 @@ def main():
     try:
         any_fail = False
         # B=1 sanity first (must match numpy → confirms our ref + I/O layout)
-        for B in (1, 2, 3, 4, 8):
+        log(f"debug_mode={args.debug_mode} (0=prod fast path, 10=batched-safe two-CB)")
+        for B in (1, 2, 4, 8, 16, 32):
             try:
-                ch, co, per_slot = run(device, B, seed=B)
+                ch, co, per_slot = run(device, B, seed=B, debug_mode=args.debug_mode)
                 okH, okO = ch >= 0.99, co >= 0.99
                 any_fail = any_fail or not (okH and okO)
                 log(f"  B={B}: cos(H_new)={ch:.6f} cos(out)={co:.6f}  "
