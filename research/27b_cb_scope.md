@@ -670,3 +670,35 @@ shiftacc is flagged OFF (cb_conv_mode default "kdim"); owned_gdn (+12-14%) is th
 current shippable CB win. LESSON: a "vector-op fusion" that still touches
 tile-padded tensors (slices/concat of a [.,.,K] state) doesn't capture the win —
 the state itself must be padding-free.
+
+## DNK-G4 DONE — 3-column conv lands: B=64 = 593 tok/s (2.85×) (2026-05-28)
+
+Refactored the conv state to 3 SEPARATE padding-free `[B,C]` columns (setup_cb_
+state/cb_reset_states/cb_reset_slots) + shift-accumulate compute + in-place
+shift. This is the version the isolation predicted (the contained one regressed
+because its `[B,C,3]` state slices/concat still hit the K-pad). conv now
+unconditional in CB (kdim removed).
+
+**Throughput (traced, owned_gdn + 3-col conv):**
+
+| B  | prev (owned_gdn+kdim) | NOW (+3-col conv) | gain |
+|----|-----------------------|-------------------|------|
+| 1  | 74.80 ms / 13.37 tok/s | 63.31 ms / 15.80 tok/s | +18% |
+| 32 | 190.41 ms / 168.06     | 84.90 ms / **376.92**  | **2.24×** |
+| 64 | 307.24 ms / 208.30     | 107.90 ms / **593.12** | **2.85×** |
+
+Correctness: cb_validate --owned-gdn PASS (logit_cos 0.9995; 3b/3c PASS).
+**Cost model collapsed: slope 3.6 → 0.71 ms/seq** (conv WAS the batch-scaling
+cost). Floor ≈ 62.6 ms (weights + collectives + lm_head). **Asymptote
+~277 → ~1400 tok/s.** B=64 = 593 tok/s = **45.8× the B=1 prod 12.96**.
+
+### Where the hardware ceiling now sits
+- B=1 latency 63 ms vs the 18.6 ms weight-stream floor → still ~3.4× over; the
+  residual 44 ms floor is collectives (2×64 all-reduces) + 248K-vocab lm_head +
+  embed/norms. Those are the next FLOOR-reduction targets.
+- Throughput: slope 0.71 ms/seq is now small; the binding limit at large B is
+  the floor + the SDPA core cap (needs B ≤ ~110 cores). B≈110 projects ~780
+  tok/s; the ~1400 asymptote needs B→∞ (memory + cores cap it).
+- GATE before prod-default: shiftacc conv is NOT bit-identical (0.9995 vs the
+  kdim 1.0 — bf16 op order). Run the long-context cosine ladder (needle) to
+  confirm no drift amplification before shipping as the only conv path.

@@ -104,13 +104,16 @@ def setup_cb_state(state, B, blocks_per_seq=None):
             torch.zeros(B, NV_PER_CHIP, K_DIM, V_DIM), dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT, device=mesh,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
-        # conv_st: [B, CONV_DIM_CHIP, CONV_K-1] (the running window, base stores
-        # CONV_K-1 columns and concats the new col each step).
-        conv_st = ttnn.from_torch(
-            torch.zeros(B, CONV_DIM_CHIP, CONV_K - 1), dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT, device=mesh,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
-        state.cb_dn[li] = {'ssm': ssm, 'conv_st': conv_st}
+        # conv state as CONV_K-1 SEPARATE [B, CONV_DIM_CHIP] columns (padding-free
+        # shift register; DNK-G4). A single [B,C,K-1] tensor would pad the K-1
+        # dim to a full 32-row tile (8× waste) — the very cost we're removing.
+        # Shift-accumulate reads these columns directly (no padded slices).
+        conv_cols = [
+            ttnn.from_torch(torch.zeros(B, CONV_DIM_CHIP), dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT, device=mesh,
+                            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+            for _ in range(CONV_K - 1)]
+        state.cb_dn[li] = {'ssm': ssm, 'conv_cols': conv_cols}
 
     # Batched input buffers.
     state.cb_tok_buf = ttnn.from_torch(
@@ -143,8 +146,7 @@ def setup_cb_state(state, B, blocks_per_seq=None):
 def cb_reset_states(state):
     """Zero all per-slot DN/conv/KV state (fresh start)."""
     for li, d in state.cb_dn.items():
-        for key in ('ssm', 'conv_st'):
-            t = d[key]
+        for t in [d['ssm'], *d['conv_cols']]:
             z = ttnn.mul(t, 0.0)
             ttnn.copy(z, t)
             ttnn.deallocate(z)
@@ -172,16 +174,15 @@ def cb_reset_slots(state, slot_ids):
     mask4 = ttnn.from_torch(keep.reshape(B, 1, 1, 1), dtype=ttnn.bfloat16,
                             layout=ttnn.TILE_LAYOUT, device=mesh,
                             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
-    mask3 = ttnn.from_torch(keep.reshape(B, 1, 1), dtype=ttnn.bfloat16,
+    mask2 = ttnn.from_torch(keep.reshape(B, 1), dtype=ttnn.bfloat16,
                             layout=ttnn.TILE_LAYOUT, device=mesh,
                             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
     for li, d in state.cb_dn.items():
-        for key, mask in (('ssm', mask4), ('conv_st', mask3)):
-            t = d[key]
+        for t, mask in [(d['ssm'], mask4), *[(c, mask2) for c in d['conv_cols']]]:
             masked = ttnn.mul(t, mask)
             ttnn.copy(masked, t)
             ttnn.deallocate(masked)
-    ttnn.deallocate(mask4); ttnn.deallocate(mask3)
+    ttnn.deallocate(mask4); ttnn.deallocate(mask2)
 
 
 def update_input_buffers_batched(state, token_ids, cur_positions):
@@ -239,55 +240,35 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
                       [B, CONV_DIM_CHIP + VAL_DIM_CHIP + 2 * NV_PER_CHIP])
     ttnn.deallocate(all_tt)
 
-    # 4. conv1d: window = [conv_st (B,CONV,K-1) | cur (B,CONV,1)] → mul w_conv → sum → silu
+    # 4. conv1d — SHIFT-ACCUMULATE (DNK-G4): out = silu(Σ_k w[:,k]·window_k) as
+    # muls+adds on [B,C] tiles, NO K-dim tile padding (28.76× vs the [B,C,K]
+    # form, which padded K=4→32). State = 3 separate padding-free [B,C] columns
+    # (slot['conv_cols'], oldest→newest = c0,c1,c2); window = [c0,c1,c2,cur].
+    # Weight taps w_conv[:,k] as [1,C] (sliced from a one-time transpose; tiny,
+    # batch-independent). State shifts in place: c0←c1, c1←c2, c2←cur — safe on
+    # the in-order command queue (all acc reads complete before the shift writes).
     if 'conv' in dn_skip:
-        conv_out = mixed_qkv  # passthrough (skip window mul/sum/silu + state commit)
-    elif getattr(state, 'cb_conv_mode', 'kdim') == 'shiftacc':
-        # SHIFT-ACCUMULATE conv (DNK-G4: 28.76× faster isolated, no K-dim tile
-        # padding). out = silu(Σ_k w[:,k]·window_k) as muls+adds on [B,C] tiles.
-        # window = [s0,s1,s2,cur]; w taps from w_conv^T [K,C] (cached). s0/s1/s2
-        # are VIEWS of slot['conv_st'] (persistent) — never deallocate them.
+        conv_out = mixed_qkv  # profiling passthrough
+    else:
         if 'w_conv_T' not in dn:
             dn['w_conv_T'] = ttnn.transpose(dn['w_conv'], -2, -1)  # [K, C], one-time
         wT = dn['w_conv_T']
-        def _wtap(kk):
+        def _tap(kk):  # w_conv[:,kk] as [1,C] — view of cached wT, batch-indep
             return ttnn.reshape(ttnn.slice(wT, [kk, 0], [kk + 1, CONV_DIM_CHIP]),
                                 [1, CONV_DIM_CHIP])
-        def _col(j):
-            return ttnn.reshape(ttnn.slice(slot['conv_st'], [0, 0, j], [B, CONV_DIM_CHIP, j + 1]),
-                                [B, CONV_DIM_CHIP])
-        s0, s1, s2 = _col(0), _col(1), _col(2)
-        cur = mixed_qkv  # [B, C]
-        acc = ttnn.mul(s0, _wtap(0))
-        for j, sj in ((1, s1), (2, s2)):
-            term = ttnn.mul(sj, _wtap(j)); nacc = ttnn.add(acc, term)
+        cols = slot['conv_cols']            # [c0, c1, c2], each [B, C], no padding
+        cur = mixed_qkv                      # [B, C]
+        acc = ttnn.mul(cols[0], _tap(0))
+        for j in range(1, CONV_K - 1):
+            term = ttnn.mul(cols[j], _tap(j)); nacc = ttnn.add(acc, term)
             ttnn.deallocate(acc); ttnn.deallocate(term); acc = nacc
-        term = ttnn.mul(cur, _wtap(3)); nacc = ttnn.add(acc, term)
+        term = ttnn.mul(cur, _tap(CONV_K - 1)); nacc = ttnn.add(acc, term)
         ttnn.deallocate(acc); ttnn.deallocate(term); acc = nacc
         conv_out = ttnn.silu(acc); ttnn.deallocate(acc)
-        # shift state: new conv_st = [s1, s2, cur]
-        new_st = ttnn.concat([ttnn.reshape(s1, [B, CONV_DIM_CHIP, 1]),
-                              ttnn.reshape(s2, [B, CONV_DIM_CHIP, 1]),
-                              ttnn.reshape(cur, [B, CONV_DIM_CHIP, 1])], dim=-1)
-        ttnn.copy(new_st, slot['conv_st'])
-        ttnn.deallocate(new_st); ttnn.deallocate(mixed_qkv)  # s0/s1/s2 are views — leave
-    else:
-        cur_col = ttnn.reshape(mixed_qkv, [B, CONV_DIM_CHIP, 1])
+        ttnn.copy(cols[1], cols[0])          # shift: c0 ← c1
+        ttnn.copy(cols[2], cols[1])          #        c1 ← c2
+        ttnn.copy(cur, cols[2])              #        c2 ← cur
         ttnn.deallocate(mixed_qkv)
-        conv_input = ttnn.concat([slot['conv_st'], cur_col], dim=-1)   # [B,CONV,K]
-        ttnn.deallocate(cur_col)
-        # w_conv is [CONV_DIM_CHIP, K]; reshape to [1,CONV,K] to broadcast over B.
-        # VIEW of the persistent weight — do NOT deallocate (view-decay rule:
-        # freeing the view frees dn['w_conv'], crashing the next step).
-        w_conv_b = ttnn.reshape(dn['w_conv'], [1, CONV_DIM_CHIP, CONV_K])
-        conv_prod = ttnn.mul(conv_input, w_conv_b)
-        conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))              # [B,CONV]
-        ttnn.deallocate(conv_prod)
-        # new conv state = last K-1 columns
-        conv_state_new = ttnn.slice(conv_input, [0, 0, 1], [B, CONV_DIM_CHIP, CONV_K])
-        ttnn.deallocate(conv_input)
-        ttnn.copy(conv_state_new, slot['conv_st'])  # commit per-slot conv state
-        ttnn.deallocate(conv_state_new)
 
     # 5. q/k/v head slices on last dim
     q_flat = ttnn.slice(conv_out, [0, 0], [B, KEY_DIM_CHIP])
