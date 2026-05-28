@@ -448,3 +448,36 @@ is the lever to lift the ~232 tok/s asymptote ~N×.
 
 This is a multi-session kernel R&D effort + a host/build decision → flagged for
 the user. The CB system itself is complete and correct on manual DN today.
+
+## CB6/G0 — owned_gdn is hard-asserted B=1 (2026-05-28)
+
+`cb_owned_gdn_batch_isolation.py`: built the owned-GDN inputs at B=1/2/4 and
+called `ttnn.experimental.qwen36_gdn_decode_owned` directly.
+- B=1: cos(H_new)=0.999984, cos(out)=0.999986 vs numpy GatedDeltaNet ref —
+  confirms the ref + I/O layout (H[B,NV,K,V], q/k[B,NV,1,K], v[B,NV,1,V],
+  decay/beta[B,NV,1,1]).
+- B=2 and B=4: **`TT_FATAL @ qwen36_gdn_decode_owned_device_operation.cpp:118:
+  state_logical[0] == 1`** — the device op hard-asserts batch=1.
+
+GOOD NEWS that supersedes the earlier feasibility note: **the owned-GDN kernels
+ARE present in qb1's ttnn build** (`ttnn.experimental.qwen36_gdn_decode_owned`
+and 7 siblings) — the CLAUDE.md "qb2-only" note is STALE (like the old "qb1 has
+no fabric" note). So no host move is needed; the work is local to qb1.
+
+**The batched-DN-kernel task is now precisely defined:**
+1. Relax the `state_logical[0] == 1` assert in the device op AND batch the
+   program factory to parallelize the recurrence over B (the compute likely
+   hardcodes B=1 layout — must verify in the kernel source, not just the assert).
+2. Rebuild ttnn on qb1 (`cmake --install` does NOT update the venv .so —
+   cp build_Release/ttnn/_ttnn*.so into .venv). Must NOT regress the B=1 path
+   (production prod server uses owned_gdn at B=1).
+3. Correctness: bf16 H math preserved (A010 long-context gate); cosine ladder.
+4. Then swap CB manual recurrence → batched owned_gdn; re-run cb_profile_blocks
+   to confirm the DN slope drops, re-measure the throughput asymptote.
+
+This modifies a custom Metal kernel + rebuilds ttnn (risk to the B=1 prod path,
+long build cycle) → flagged for user direction. A no-rebuild alternative worth a
+quick timing check first: loop owned_gdn per-slot (B× B=1 calls) inside the CB
+DN step and compare traced cost vs the manual batched recurrence — if the fused
+per-slot op beats the 6-op manual path even serialized, it's a win with zero
+kernel changes.
