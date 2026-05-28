@@ -266,3 +266,36 @@ dispatch). Since compute barely grows with B, traced B=32 PROJECTS to
 ~12.93 × ~31 ≈ ~400 tok/s aggregate — but that is a projection. CB4 must
 capture an actual B=32 trace and measure (never cite projection as measurement,
 per feedback_real_vs_projected).
+
+## CB4 — TRACED B=32 throughput MEASURED (2026-05-28)
+
+`cb_bench_trace.py` captures one decode trace of the batched forward at fixed B
+(vLLM CUDA-graph pattern) and times `execute_trace`. **traced-correctness PASS**:
+traced B=1 teacher-forced argmax == production reference (execute_trace threads
+DN ssm/conv + paged KV state in-place).
+
+| B  | execute ms/step | aggregate tok/s | vs B=1 |
+|----|-----------------|-----------------|--------|
+| 1  | 77.15           | 12.96           | 1.0×   |
+| 8  | 106.44          | 75.16           | 5.8×   |
+| 32 | 212.62          | 150.50          | 11.6×  |
+
+**Traced B=1 = 12.96 tok/s matches production 12.93** → the trace + manual-DN
+path is sound. **B=32 continuous batching = 150.5 tok/s aggregate = 11.6×.**
+
+The eager projection (~400 tok/s) was WRONG and this is why we measure
+(feedback_real_vs_projected): eager is dispatch-bound so batching looked free
+(31×); under trace dispatch is amortized and *compute* is exposed. Per-step
+compute grows 2.76× from B=1→32 because the decode matmuls cross from
+memory-bound (weight streaming amortized across the batch) toward compute-bound
+(FLOPs ∝ B). Rough crossover: memory≈77 ms flat, compute≈4.2 ms/token, so
+compute==memory near B≈18; beyond that compute dominates and throughput scales
+sub-linearly. B=32 still delivers 11.6× at 2.76× latency (4.7 tok/s/seq).
+
+Notes:
+- DN here is MANUAL recurrence (owned_gdn is B=1-only). A batched owned-GDN
+  kernel would cut the B=1 (and B>1) compute further — open lever.
+- Higher B (64/128) untested; ~110 cores + memory allow it. The throughput peak
+  is likely past B=32 but with diminishing returns as compute-bound. Worth a sweep.
+- This is static equal-length B=32. Real serving needs CB2 (ragged per-slot
+  lengths) + CB3 (Orca scheduler) on top — orchestration, not new device risk.
