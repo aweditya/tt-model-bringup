@@ -123,6 +123,20 @@ def setup_cb_state(state, B, blocks_per_seq=None):
         torch.zeros(B, 1, dtype=torch.int32), layout=ttnn.ROW_MAJOR_LAYOUT,
         dtype=ttnn.uint32, device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
     setup_cb_write_mem_cfg(state)  # B-core HEIGHT_SHARDED L1 for paged KV writes
+
+    # paged SDPA decode parallelizes over batch → requires num_cores >= B
+    # (sdpa_decode_program_factory: "num_cores_available >= B"). Production's
+    # progcfg is CoreCoord(4,4)=16 cores (fine for B<=16). Size a CB grid that
+    # covers B. SDPA only uses B of the cores; the rest idle. q/k chunking is
+    # auto (0) and per-batch-element, so a larger grid keeps per-slot numerics
+    # identical to production (verified: B=1 logit_cos stays 1.0).
+    grid = mesh.compute_with_storage_grid_size()
+    ncores = grid.x * grid.y
+    if B > ncores:
+        raise RuntimeError(f"CB B={B} exceeds {ncores} available cores for SDPA decode")
+    state.cb_sdpa_progcfg = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=grid,
+        q_chunk_size=0, k_chunk_size=0, exp_approx_mode=False)
     return state
 
 
@@ -374,7 +388,7 @@ def _attn_finish(state, x_tt, q_r, gate_tt, kv, attn, B, NQ_PER_CHIP, HEAD_DIM):
         q_sdpa, kv['kc'], kv['vc'],
         cur_pos_tensor=state.cb_cur_pos_buf,
         page_table_tensor=state.cb_page_table_tt,
-        program_config=state.paged_sdpa_progcfg,
+        program_config=state.cb_sdpa_progcfg,
         compute_kernel_config=state.sdpa_compute_kernel_config,
     )
     attn_ph = ttnn.reshape(attn_out, [B, NQ_PER_CHIP, HEAD_DIM])
