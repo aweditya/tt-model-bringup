@@ -299,3 +299,31 @@ Notes:
   is likely past B=32 but with diminishing returns as compute-bound. Worth a sweep.
 - This is static equal-length B=32. Real serving needs CB2 (ragged per-slot
   lengths) + CB3 (Orca scheduler) on top — orchestration, not new device risk.
+
+## Throughput-vs-B sweep + roofline model (2026-05-28)
+
+`cb_bench_trace.py --batches 1,16,32,48,64` (traced execute_trace, manual DN):
+
+| B  | execute ms/step | aggregate tok/s | vs B=1 |
+|----|-----------------|-----------------|--------|
+| 1  | 77.15           | 12.96           | 1.0×   |
+| 16 | 140.57          | 113.82          | 8.8×   |
+| 32 | 212.69          | 150.45          | 11.6×  |
+| 48 | 279.99          | 171.44          | 13.2×  |
+| 64 | 348.79          | 183.49          | 14.2×  |
+
+**Linear cost model (fits to <2%):** `step_ms ≈ 73 + 4.3·B`.
+- 73 ms = batch-independent floor = weight streaming (memory-bound; the same
+  ~7.5 GB/chip of weights is loaded once per step regardless of B).
+- 4.3 ms/seq = per-token compute (matmul FLOPs ∝ B, per-slot DN recurrence,
+  per-slot SDPA). Crossover (compute == memory) at B ≈ 73/4.3 ≈ 17.
+- **Aggregate throughput asymptote = 1000/4.3 ≈ 232 tok/s** (fully
+  compute-bound). B=64 reaches 183 = 79% of the asymptote.
+
+**Implications:**
+- Sweet spots: B=32 balances throughput (11.6×) and per-seq latency
+  (4.7 tok/s/seq); B=64 maxes throughput (14.2×) at 2.9 tok/s/seq. Pick by SLA.
+- To raise the ~232 tok/s ceiling, cut the 4.3 ms/token: **batched owned-GDN
+  recurrence kernel** (manual DN is the current B>1 path) and/or faster batched
+  matmuls are the levers. The kernel-dataflow representation work
+  (research/kernel_dataflow_representation.md) targets exactly this.
