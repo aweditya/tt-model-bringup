@@ -619,3 +619,23 @@ of mostly-padding traffic per layer.
 
 Potential: if conv 109→~20 ms, DN-only 152→63 ms, full step ~190→~100 ms →
 B=32 ~168→~320 tok/s (≈2×). Highest-value remaining lever by far.
+
+## DNK-G4 — conv shift-accumulate reformulation: 28.76× faster (2026-05-28)
+
+`cb_conv_reform_isolation.py` (B=32, traced): the current [B,C,K=4] conv
+(concat→mul→sum→silu, K padded to 32 tile) vs **shift-accumulate**
+(`out = silu(Σ_k w_k·s_k)`, per-tap w_k=[1,C], state = 3 separate [B,C] columns,
+no K dim):
+
+| impl | per-call | cos vs numpy |
+|------|----------|--------------|
+| current [B,C,K] | 1452.98 µs | 0.999991 |
+| **shift-accumulate** | **50.53 µs** | 0.999989 |
+
+**28.76× faster, bit-correct.** The K=4→32 TILE padding was the entire cost; the
+[B,C]-only form removes it. **No custom kernel — pure ttnn reformulation** (the
+old `feedback_conv1d_circular_buffer` "slice-shift failed" note was a different
+form / single-chip; this works). Projected: conv 109→~4 ms across 48 layers →
+DN-only 152→~47 ms → full step ~190→~85 ms → **B=32 ~168→~370 tok/s (≈2.2×)**.
+Next: integrate (state = 3 [B,C] columns + shift; pre-transpose w_conv to per-tap
+[1,C]), validate cb_validate bit-identical + cosine ladder, measure.
