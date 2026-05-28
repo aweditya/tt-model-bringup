@@ -8,7 +8,7 @@
 
 | Mode | ms/tok | tok/s |
 |---|---|---|
-| **+A002 + A003 + A004 + A008 bf8 MoE (2026-05-27)** | **81.16** | **12.32** |
+| **+A002 + A003 + A004 + A008 bf8 MoE + A009 sampler hook (2026-05-27)** | **81.16** | **12.32** |
 | +A002 + A003 + A004 (intermediate) | 110.40 | 9.06 |
 | Pre-2026-05-27 baseline (traced) | 141.79 | 7.05 |
 
@@ -19,6 +19,9 @@ Cumulative wins 2026-05-27 (see `research/35b_perf_workflow_log.md`):
 - A003 router softmax-then-topk → topk-then-softmax: -0.25 ms/tok
 - **A004 core_grid=10x11 on batched MoE matmuls: -30.01 ms/tok**
 - **A008 bf8_b MoE expert weights (halves W DRAM): -29.24 ms/tok**
+- A009 DRY+rep_penalty top-K sampler hook (opt-in via state.sampler_topk;
+  fast path unaffected): fixes greedy mode collapse for long-context
+  coherent generation. +180 ms/tok in sampler mode (eager only).
 
 Both big wins target the SAME dominant op (batched MoE gate_up matmul)
 with two orthogonal mechanisms — A004 parallelizes (11→110 cores) and
@@ -27,6 +30,18 @@ A008 shrinks the BW footprint (256→128 MB). Stacking is multiplicative.
 Rejected: A005 core_grid on non-batched matmuls (+3 ms regression),
 A006 lm_head core_grid (no-op), A007 h-in-L1 (no-op, math says input 0
 is 0.1% of DRAM traffic).
+
+**Long-context cliff check (cosine ladder vs HF needle100 oracle):**
+
+  Post-A002+A003+A004+A008:  94/97 top-1 (96.9%), median cos_final 0.9970
+  Pre-session baseline:       97/100 top-1 (97.0%)
+
+The drift cliff (memory says in (100, 130]) did NOT move earlier. Our
+optimizations are correctness-clean — the L≥100 needle-retrieval failure
+is the pre-existing DN-recurrent-state drift documented at
+`[feedback_35b_a3b_l32_dn_decode_drift]`, not session-induced.
+
+A009 ships the *sampler hook* (eager only); the deeper drift fix is A010.
 
 Coherent greedy decode + long-context PASS:
 - 20/20 tokens: "Paris, a city renowned for its iconic landmarks such as
