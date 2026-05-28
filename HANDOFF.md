@@ -65,6 +65,35 @@ Coherent greedy decode + long-context PASS:
 
 Production path: `state.moe_mode = "pattern_a_batched"` in `experiments/serve/server_35b_ttnn.py`. Run via `experiments/utils/trace_demo_full_step.py --moe-mode pattern_a_batched` or `experiments/bench_step_forward_traced.py`.
 
+## 27B continuous batching — PARALLEL TRACK (2026-05-27/28)
+
+vLLM-style continuous batching for the DENSE 27B (so decode doesn't waste 31/32
+tile rows). **All in `experiments/serve/server_tp_cb.py`** (imports production
+`server_tp.py`, which stays byte-for-byte pristine). Full scope + numbers:
+`research/27b_cb_scope.md`.
+
+- **CB1 DONE** — batched forward bit-identical to production. `cb_validate_27b.py`
+  PASS: per-position logit_cos=1.0, B=4/32 identical slots, B=4 distinct-slot
+  isolation (per-slot KV+DN state). Root cause that blocked it: view-decay
+  (`ttnn.slice`/`reshape` return VIEWS; deallocating the source corrupts them —
+  masked at pos 0). See `feedback_ttnn_slice_view_decay`.
+- **CB4 DONE — TRACED throughput measured** (`cb_bench_trace.py`):
+
+  | B  | ms/step | agg tok/s | × |
+  |----|---------|-----------|---|
+  | 1  | 77.15   | 12.96     | 1.0× (==prod 12.93) |
+  | 32 | 212.69  | 150.45    | 11.6× |
+  | 64 | 348.79  | 183.49    | 14.2× |
+
+  Cost model `step_ms ≈ 73 + 4.3·B` (memory-bound 73 ms floor + 4.3 ms/seq
+  compute; crossover B≈17; aggregate **asymptote ~232 tok/s**). DN here is
+  MANUAL recurrence (owned_gdn is B=1-only) — a batched owned-GDN kernel is the
+  lever to raise the ceiling.
+- **NEXT**: CB2 (ragged per-slot lengths — primitives already isolated:
+  `cur_pos=-1` skip + per-slot page tables) → CB3 (Orca iteration-level
+  scheduler + block manager). Orchestration, no remaining device-correctness
+  risk. The throughput proof is done; a real server needs the scheduler.
+
 ## Hardware ceiling (the actual target)
 
 P150 measured: **404 GB/s/chip** DRAM BW, 110 worker cores, 31.81 GB DRAM (`feedback_p150_memory_bandwidth_measured`).
