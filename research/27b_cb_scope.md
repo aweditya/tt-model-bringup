@@ -371,3 +371,16 @@ CB2 (ragged + admission), CB3 (scheduler), CB4 (traced throughput 11.6×@B=32).
 - Chunked prefill (currently one-token/step prefill is simple but slow).
 - Sampling (DRY/rep-penalty) instead of greedy; OpenAI endpoint (user deferred).
 - Batched owned-GDN kernel to lift the ~232 tok/s compute ceiling.
+
+## CB3 traced — scheduler runs at trace speed (2026-05-28)
+
+`cb_scheduler.py --trace`: step() runs `execute_trace` instead of the eager
+forward (admission cb_reset_slots + update_input_buffers run eager between
+replays — they mutate persistent buffers in-place, which the next replay reads).
+5 reqs / 2 slots: **all bit-identical to references**, 11.8 iters/s (~85 ms/iter
+= the 73+4.3·B model at B=2; eager was ~252 ms/iter). Confirms admission +
+execute_trace compose. The CB serving system is correct AND production-speed.
+
+**CB1–CB4 all DONE.** A working vLLM-style continuous-batching system for 27B on
+Blackhole: bit-identical correctness, 11.6×@B=32 / 14.2×@B=64 throughput, Orca
+scheduler with admission/eviction/queueing, traced execution.

@@ -85,17 +85,45 @@ def greedy_ref(state, prompt, max_new, eos_id):
 class Scheduler:
     """Orca iteration-level scheduler over a fixed pool of B slots."""
 
-    def __init__(self, state, B, max_new, eos_id):
+    def __init__(self, state, B, max_new, eos_id, use_trace=False):
         self.state = state
         self.B = B
         self.max_new = max_new
         self.eos_id = eos_id
+        self.use_trace = use_trace
+        self._trace_id = None
+        self._argmax_handle = None
         cb.setup_cb_state(state, B)
         cb.cb_reset_states(state)
+        if use_trace:
+            self._capture_trace()
         self.slots = [None] * B          # slot -> request id or None
         self.waiting = deque()           # request ids
         self.reqs = {}                   # id -> request dict
         self._next_id = 0
+
+    def _capture_trace(self):
+        """Capture the batched forward once (CB4 pattern). step() then replays
+        via execute_trace at ~compute speed. Admission (cb_reset_slots) and
+        update_input_buffers run eager BETWEEN execute_trace calls — they mutate
+        the persistent buffers in-place, which the next replay reads."""
+        import ttnn
+        st = self.state
+        for i in range(2):  # JIT warmup (capture-during-JIT hangs on Blackhole)
+            cb.update_input_buffers_batched(st, [DUMMY_TOK] * self.B, [i] * self.B)
+            am = cb.forward_batch_tp_inner(st); ttnn.deallocate(am)
+        ttnn.synchronize_device(st.mesh)
+        cb.update_input_buffers_batched(st, [DUMMY_TOK] * self.B, [2] * self.B)
+        self._trace_id = ttnn.begin_trace_capture(st.mesh, cq_id=0)
+        self._argmax_handle = cb.forward_batch_tp_inner(st)
+        ttnn.end_trace_capture(st.mesh, self._trace_id, cq_id=0)
+        cb.cb_reset_states(st)  # clean slate after warmup dirtied the state
+
+    def release(self):
+        if self._trace_id is not None:
+            import ttnn
+            ttnn.release_trace(self.state.mesh, self._trace_id)
+            self._trace_id = None
 
     def submit(self, prompt):
         rid = self._next_id; self._next_id += 1
@@ -136,7 +164,16 @@ class Scheduler:
             if rid is not None:
                 r = self.reqs[rid]
                 toks[s] = r['next_tok']; curs[s] = r['cur_pos']
-        out = _batched_step(self.state, toks, curs)
+        if self.use_trace:
+            import ttnn
+            cb.update_input_buffers_batched(self.state, toks, curs)
+            ttnn.execute_trace(self.state.mesh, self._trace_id, cq_id=0, blocking=False)
+            vals = ttnn.to_torch(self._argmax_handle,
+                                 mesh_composer=ttnn.ConcatMeshToTensor(self.state.mesh, dim=0)
+                                 ).flatten().tolist()
+            out = [int(v) for v in vals[:self.B]]
+        else:
+            out = _batched_step(self.state, toks, curs)
         active = 0
         for s in range(self.B):
             rid = self.slots[s]
@@ -167,6 +204,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--slots", type=int, default=2)
     ap.add_argument("--max-new", type=int, default=8)
+    ap.add_argument("--trace", action="store_true",
+                    help="run the scheduler via execute_trace (production speed)")
     args = ap.parse_args()
 
     log("bootstrap production 27B server (server_tp)…")
@@ -195,12 +234,18 @@ def main():
         refs.append(g)
         log(f"  req {i}: {g}")
 
-    log(f"=== scheduler: {len(prompts)} requests through {args.slots} slots ===")
-    sched = Scheduler(state, args.slots, args.max_new, eos_id)
+    log(f"=== scheduler ({'TRACED' if args.trace else 'eager'}): "
+        f"{len(prompts)} requests through {args.slots} slots ===")
+    sched = Scheduler(state, args.slots, args.max_new, eos_id, use_trace=args.trace)
     for p in pid:
         sched.submit(p)
+    t0 = time.perf_counter()
     iters = sched.run()
-    log(f"  completed in {iters} scheduler iterations")
+    dt = time.perf_counter() - t0
+    gen_tokens = sum(len(sched.reqs[i]['gen']) for i in range(len(pid)))
+    log(f"  completed in {iters} scheduler iterations, {dt:.2f}s "
+        f"({iters/dt:.1f} iters/s, {gen_tokens/dt:.1f} generated tok/s)")
+    sched.release()
 
     ok = True
     for i in range(len(pid)):
