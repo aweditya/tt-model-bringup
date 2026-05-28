@@ -163,6 +163,14 @@ If ANY term is near zero, tile-level optimization will NOT save the kernel.
 - **In-order command queue** lets you shift state in place with sequential
   `ttnn.copy`s (read-before-write within a step is safe) — used by the conv
   shift register and the DN ssm commit.
+- **Never `from_torch` (host→device) inside a `begin/end_trace_capture` region**
+  — host transfers can't be captured and the capture HANGS (cost a 55-min hang).
+  Pre-allocate all inputs before capture; only ttnn device ops in the captured
+  build fn.
+- **M=1 GEMV is latency/overhead-bound, ~46% of peak DRAM BW on P150** — it does
+  NOT saturate BW and core_grid tuning won't help (the default already uses all
+  110 cores; fewer is slower). Decode matmuls (M=1) are near this ceiling; the
+  throughput win is amortizing them across the batch (M=B), not tuning the GEMV.
 
 ---
 
