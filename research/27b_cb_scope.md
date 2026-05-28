@@ -409,3 +409,42 @@ products on [B,NV,K,V] — FLOPs ∝ B, many small ops). Cutting the 4.25 ms/seq
 N× lifts the ~232 tok/s asymptote by ~N× (e.g. 2.5× → ~500 tok/s). This is the
 clear next kernel target, and a prime candidate for the TDG dataflow methodology
 (research/kernel_dataflow_representation.md).
+
+## CB6 — batched DeltaNet kernel: scope + feasibility (2026-05-28)
+
+CB5 pins the target: DN recurrence = 97% of the per-token compute slope. The
+manual CB recurrence (server_tp_cb deltanet_step_batched, mirroring server_tp.py
+:810-819) does decay·H + gated·outer(k,v) on the [B,NV,K,V] H-state with ~6 ttnn
+ops — so the H-state DRAM traffic (read+write H every step) scales ∝ B. That
+traffic, not FLOPs, is almost certainly the 4.25 ms/seq (TEST THIS with a
+within-DN profile before building — non-negotiable).
+
+**The fused kernel that fixes this already exists for B=1:**
+`ttnn.experimental.qwen36_gdn_decode_owned(H, q, k, v, decay, beta4, ...)`
+(production default `deltanet_recurrence_mode="owned_gdn"`) fuses the recurrence
+into one op, minimizing H round-trips. A **batched** version (B>1 leading dim)
+is the lever to lift the ~232 tok/s asymptote ~N×.
+
+**Feasibility constraints (must resolve before building):**
+1. **Host**: the owned kernels are built into **qb2's** tt-metal, NOT qb1's
+   (CLAUDE.md §5). CB lives on qb1. Options: (a) build the kernel into qb1's
+   tt-metal; (b) move CB to qb2 (has the kernel + the prod TP server — risk to
+   prod); (c) keep manual DN on qb1, prototype the batched kernel on qb2.
+2. **B=1 in the program factory**: confirm whether qwen36_gdn_decode_owned
+   hardcodes batch=1 (typical for custom Metal program factories) — batching
+   may need program-factory changes + recompile, not just a bigger input.
+3. **Correctness gate (A010)**: H-state precision is the long-context drift
+   lever — bf16 H is the minimum; bf8 H is OUT. So we CANNOT shrink H traffic by
+   quantizing H; the win must come from fusion / keeping H resident, not
+   precision. The batched kernel must preserve bf16 H math (cosine-ladder gate).
+
+**Recommended staging (G0→G4, isolation-first per project pattern):**
+- G0: within-DN profile (confirm H-traffic is the cost) + read qwen36_gdn_decode_owned
+  source on qb2; numpy oracle for the batched recurrence.
+- G1: batched kernel on ONE core, B>1, bit-exact vs numpy + vs manual.
+- G2-G3: multi-core / sharding for B=32 (TDG dataflow methodology applies here —
+  research/kernel_dataflow_representation.md).
+- G4: integrate into server_tp_cb, cosine-ladder long-context gate, re-profile.
+
+This is a multi-session kernel R&D effort + a host/build decision → flagged for
+the user. The CB system itself is complete and correct on manual DN today.
