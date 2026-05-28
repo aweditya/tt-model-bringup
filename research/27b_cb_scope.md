@@ -345,3 +345,29 @@ positions, admission DN-reset, KV self-overwrite, slot isolation across a reset.
 Device foundation for continuous batching is now COMPLETE: batched forward
 (CB1), throughput (CB4), ragged + admission (CB2). All that remains is CB3 —
 the Orca iteration-level scheduler (Python control loop, no new device risk).
+
+## CB3 — Orca scheduler WORKS (2026-05-28)
+
+`experiments/serve/cb_scheduler.py` — Orca iteration-level scheduler over the
+validated primitives. 5 requests through 2 slots, 44 iterations: **every
+request's continuous-batched greedy output is bit-identical to its standalone
+B=1 greedy reference.** Admission (cb_reset_slots on a free slot), eviction
+(EOS/max_new), queueing (5 reqs > 2 slots → 3 queued + admitted as slots free),
+prefill→decode threading, and per-slot isolation all correct.
+
+Design = vLLM/Orca adopted as-is: fixed B slots, iteration-level admit/advance/
+evict between steps, Mamba-style per-slot DN state reset on admission, prefill
+one-token/step through the decode path, FREE slots parked at cur_pos=0 (isolated,
+output ignored). Greedy (argmax) decode.
+
+**CB device foundation + scheduler COMPLETE**: CB1 (correct batched forward),
+CB2 (ragged + admission), CB3 (scheduler), CB4 (traced throughput 11.6×@B=32).
+
+### Remaining (perf + productionization, not correctness)
+- **Wire the CB4 trace into the scheduler** so step() runs execute_trace
+  (150 tok/s @ B=32) instead of the eager forward (the scheduler is currently
+  eager). cb_reset_slots + update_input_buffers run eager between execute_trace
+  calls — straightforward.
+- Chunked prefill (currently one-token/step prefill is simple but slow).
+- Sampling (DRY/rep-penalty) instead of greedy; OpenAI endpoint (user deferred).
+- Batched owned-GDN kernel to lift the ~232 tok/s compute ceiling.
