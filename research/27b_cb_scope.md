@@ -481,3 +481,32 @@ quick timing check first: loop owned_gdn per-slot (B× B=1 calls) inside the CB
 DN step and compare traced cost vs the manual batched recurrence — if the fused
 per-slot op beats the 6-op manual path even serialized, it's a win with zero
 kernel changes.
+
+## CB6/G0b — FOLD trick works for recurrence; kernel has high-S output bug (2026-05-28)
+
+Key insight: owned_gdn parallelizes over `slots = state.shape[1]` and each slot's
+recurrence is INDEPENDENT (README SPMD unit = (slot, value_tile)). So fold the
+batch into slots: reshape [B,NV,K,V] → [1, B·NV, K,V] and call the UNMODIFIED
+kernel — no program-factory batching, no rebuild needed for the work split.
+
+`cb_owned_gdn_batch_isolation.py` (fold mode), per-slot out cos:
+| B | S=B·NV | cos(H_new) | cos(out) | pattern |
+|---|--------|------------|----------|---------|
+| 1 | 12 | 0.99998 | 0.99999 | OK |
+| 2 | 24 | 0.99999 | 0.99998 | OK |
+| 3 | 36 | 0.99998 | 0.844 | slots 0-16 WRONG (~0.5), 17-35 OK (1.0) |
+| 4 | 48 | 0.99999 | 0.605 | slots 0-40 WRONG, 41-47 OK |
+| 8 | 96 | 0.99999 | 0.564 | mostly wrong, tail better |
+
+**The recurrence (H_new) is bit-correct at ALL S** — the fold + work-split are
+fine. Only `out = q @ state_next` is wrong, and only for EARLY slots once
+S > ~24-32 (prod kernel was only tested at slots=12). H doesn't use q/output;
+out does → the bug is isolated to the **output path** (state_next→out matmul),
+almost certainly a circular-buffer depth / read-after-overwrite when many blocks
+pipeline (early slots' state_out tiles get clobbered before the output matmul
+consumes them). The "last slots survive" signature fits a too-shallow output CB.
+
+**Revised plan: this is a localized OUTPUT-path kernel fix, not a full batching
+rewrite.** Copy the op → `qwen36_gdn_decode_owned_batched` (keep B=1 prod
+untouched, per user), fix the output CB pipelining for high slot counts, rebuild
+ttnn, re-run this isolation at B=32 (S=384), then fold-integrate into CB.

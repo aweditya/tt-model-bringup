@@ -76,10 +76,15 @@ def run(device, B, seed):
     def tt(x, layout=ttnn.TILE_LAYOUT):
         return ttnn.from_torch(torch.from_numpy(np.ascontiguousarray(x.astype(np.float32))),
                                dtype=ttnn.bfloat16, layout=layout, device=device)
-    H_tt = tt(H)
-    q_tt = tt(q.reshape(B, NV, 1, K)); k_tt = tt(k.reshape(B, NV, 1, K))
-    v_tt = tt(v.reshape(B, NV, 1, V))
-    decay_tt = tt(decay.reshape(B, NV, 1, 1)); beta_tt = tt(beta.reshape(B, NV, 1, 1))
+    # FOLD-INTO-SLOTS: each slot's recurrence is independent, and the kernel
+    # parallelizes over slots = state.shape[1]. So pass [1, B*NV, ...] (batch
+    # folded into the slots dim) to the UNMODIFIED B=1 kernel — no rebuild.
+    # Contiguous [B,NV,...] reshape to [1,B*NV,...] makes slot = b*NV + nv.
+    S = B * NV
+    H_tt = tt(H.reshape(1, S, K, V))
+    q_tt = tt(q.reshape(1, S, 1, K)); k_tt = tt(k.reshape(1, S, 1, K))
+    v_tt = tt(v.reshape(1, S, 1, V))
+    decay_tt = tt(decay.reshape(1, S, 1, 1)); beta_tt = tt(beta.reshape(1, S, 1, 1))
 
     H_new, out = ttnn.experimental.qwen36_gdn_decode_owned(
         H_tt, q_tt, k_tt, v_tt, decay_tt, beta_tt,
@@ -90,7 +95,10 @@ def run(device, B, seed):
     for t in (H_tt, q_tt, k_tt, v_tt, decay_tt, beta_tt, H_new, out):
         try: ttnn.deallocate(t)
         except Exception: pass
-    return cos(H_out, H_ref), cos(out_out, out_ref)
+    # per-slot out cos (diagnose which slots fail — q-read path at high S)
+    per_slot = [round(cos(out_out[b, nv], out_ref[b, nv]), 3)
+                for b in range(B) for nv in range(NV)]
+    return cos(H_out, H_ref), cos(out_out, out_ref), per_slot
 
 
 def main():
@@ -103,13 +111,15 @@ def main():
     try:
         any_fail = False
         # B=1 sanity first (must match numpy → confirms our ref + I/O layout)
-        for B in (1, 2, 4):
+        for B in (1, 2, 3, 4, 8):
             try:
-                ch, co = run(device, B, seed=B)
+                ch, co, per_slot = run(device, B, seed=B)
                 okH, okO = ch >= 0.99, co >= 0.99
                 any_fail = any_fail or not (okH and okO)
                 log(f"  B={B}: cos(H_new)={ch:.6f} cos(out)={co:.6f}  "
                     f"{'OK' if okH and okO else 'FAIL'}")
+                if not okO:
+                    log(f"    per-slot out cos (slot=b*{NV}+nv): {per_slot}")
             except Exception as e:
                 any_fail = True
                 log(f"  B={B}: RAISED {type(e).__name__}: {str(e)[:200]}")
