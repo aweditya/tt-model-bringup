@@ -243,3 +243,26 @@ The forward is correct at static equal-length B; CB2 adds per-slot positions of
 different lengths (the `cur_pos=-1` empty-slot skip + per-slot page tables are
 already validated in isolation). Then the Orca iteration-level scheduler, then
 capture one decode trace at fixed B=32 and measure tok/s vs the 12.93 baseline.
+
+## Eager throughput scaling confirms the CB thesis (2026-05-28)
+
+`cb_bench_throughput.py` — eager batched decode, 30 timed steps, sync-bounded:
+
+| B  | ms/step (eager) | aggregate tok/s | vs B=1 |
+|----|-----------------|-----------------|--------|
+| 1  | 252.72          | 3.96            | 1.00×  |
+| 8  | 254.01          | 31.50           | 8.0×   |
+| 32 | 258.97          | 123.56          | 31.2×  |
+
+Decode at B=1 is **fully memory-bound**: 32× the batch costs only **+2.5%** per
+step (252.7→259.0 ms). The per-token matmul `[B,K]x[K,N]` streams the same
+weight bytes regardless of B, so they amortize across the batch — aggregate
+throughput scales ~linearly in B (31.2× at B=32). This is the "decode isn't
+wasting 31/32 of the tile" win, quantified.
+
+These are EAGER numbers (per-op Python dispatch ≈ 252 ms/step dominates;
+production traced B=1 = 77 ms/step = 12.93 tok/s, so trace strips ~3.3× of
+dispatch). Since compute barely grows with B, traced B=32 PROJECTS to
+~12.93 × ~31 ≈ ~400 tok/s aggregate — but that is a projection. CB4 must
+capture an actual B=32 trace and measure (never cite projection as measurement,
+per feedback_real_vs_projected).
