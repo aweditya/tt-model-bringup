@@ -256,7 +256,7 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     cur = mixed_qkv                          # [B, C]
     if 'conv' in dn_skip:
         conv_out = mixed_qkv  # profiling passthrough
-    elif getattr(state, 'cb_conv_mode', 'kdim') == 'shiftacc':
+    elif getattr(state, 'cb_conv_mode', 'shiftacc') == 'shiftacc':
         if 'w_conv_T' not in dn:
             dn['w_conv_T'] = ttnn.transpose(dn['w_conv'], -2, -1)  # [K, C], one-time
         wT = dn['w_conv_T']
