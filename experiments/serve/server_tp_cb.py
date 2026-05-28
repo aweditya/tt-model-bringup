@@ -242,6 +242,35 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     # 4. conv1d: window = [conv_st (B,CONV,K-1) | cur (B,CONV,1)] → mul w_conv → sum → silu
     if 'conv' in dn_skip:
         conv_out = mixed_qkv  # passthrough (skip window mul/sum/silu + state commit)
+    elif getattr(state, 'cb_conv_mode', 'kdim') == 'shiftacc':
+        # SHIFT-ACCUMULATE conv (DNK-G4: 28.76× faster isolated, no K-dim tile
+        # padding). out = silu(Σ_k w[:,k]·window_k) as muls+adds on [B,C] tiles.
+        # window = [s0,s1,s2,cur]; w taps from w_conv^T [K,C] (cached). s0/s1/s2
+        # are VIEWS of slot['conv_st'] (persistent) — never deallocate them.
+        if 'w_conv_T' not in dn:
+            dn['w_conv_T'] = ttnn.transpose(dn['w_conv'], -2, -1)  # [K, C], one-time
+        wT = dn['w_conv_T']
+        def _wtap(kk):
+            return ttnn.reshape(ttnn.slice(wT, [kk, 0], [kk + 1, CONV_DIM_CHIP]),
+                                [1, CONV_DIM_CHIP])
+        def _col(j):
+            return ttnn.reshape(ttnn.slice(slot['conv_st'], [0, 0, j], [B, CONV_DIM_CHIP, j + 1]),
+                                [B, CONV_DIM_CHIP])
+        s0, s1, s2 = _col(0), _col(1), _col(2)
+        cur = mixed_qkv  # [B, C]
+        acc = ttnn.mul(s0, _wtap(0))
+        for j, sj in ((1, s1), (2, s2)):
+            term = ttnn.mul(sj, _wtap(j)); nacc = ttnn.add(acc, term)
+            ttnn.deallocate(acc); ttnn.deallocate(term); acc = nacc
+        term = ttnn.mul(cur, _wtap(3)); nacc = ttnn.add(acc, term)
+        ttnn.deallocate(acc); ttnn.deallocate(term); acc = nacc
+        conv_out = ttnn.silu(acc); ttnn.deallocate(acc)
+        # shift state: new conv_st = [s1, s2, cur]
+        new_st = ttnn.concat([ttnn.reshape(s1, [B, CONV_DIM_CHIP, 1]),
+                              ttnn.reshape(s2, [B, CONV_DIM_CHIP, 1]),
+                              ttnn.reshape(cur, [B, CONV_DIM_CHIP, 1])], dim=-1)
+        ttnn.copy(new_st, slot['conv_st'])
+        ttnn.deallocate(new_st); ttnn.deallocate(mixed_qkv)  # s0/s1/s2 are views — leave
     else:
         cur_col = ttnn.reshape(mixed_qkv, [B, CONV_DIM_CHIP, 1])
         ttnn.deallocate(mixed_qkv)

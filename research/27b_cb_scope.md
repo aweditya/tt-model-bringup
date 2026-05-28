@@ -639,3 +639,34 @@ form / single-chip; this works). Projected: conv 109→~4 ms across 48 layers �
 DN-only 152→~47 ms → full step ~190→~85 ms → **B=32 ~168→~370 tok/s (≈2.2×)**.
 Next: integrate (state = 3 [B,C] columns + shift; pre-transpose w_conv to per-tap
 [1,C]), validate cb_validate bit-identical + cosine ladder, measure.
+
+## DNK-G4 integration — contained shift-accumulate REGRESSES at B=32 (2026-05-28)
+
+Integrated shift-accumulate into deltanet_step_batched behind `cb_conv_mode=
+"shiftacc"` (default "kdim" — inert). Correctness PASS (cb_validate --owned-gdn
+--shiftacc: argmax 6/6, logit_cos worst 0.999469 — bf16 op-order vs the kdim
+sum-reduce; >0.999 gate). BUT throughput REGRESSED at high B:
+
+| B  | owned_gdn+kdim | owned_gdn+shiftacc(contained) |
+|----|----------------|-------------------------------|
+| 1  | 74.80 ms       | 68.81 ms (better)             |
+| 32 | 190.41 ms      | 248.68 ms (WORSE)             |
+| 64 | 307.24 ms      | 431.47 ms (WORSE)             |
+
+**Why:** the contained version kept the `[B,C,3]` (32-padded) state and added 3
+padded-state slices + a rebuild concat + 4 per-layer weight-tap slices of
+`[K=4→32, C]` — MORE padded ops than kdim's single concat+sum. The isolation's
+28.76× came from **3 SEPARATE `[B,C]` columns (zero padded ops)**; the shortcut
+of slicing `[B,C,3]` (to avoid the setup/reset refactor) reintroduced the tax.
+
+**Correct fix (deferred):** store conv state as 3 separate `[B,C]` columns
+(refactor setup_cb_state/cb_reset_states/cb_reset_slots), pre-extract the 4
+weight taps as `[1,C]` at setup, shift via 3 in-place `ttnn.copy`s (no concat,
+no padded slices). Then re-validate (incl. long-context cosine ladder, since
+shiftacc is not bit-identical: ~0.9995) and re-measure. Projected ~2× at B=32
+stands; the contained attempt just proves the state layout matters.
+
+shiftacc is flagged OFF (cb_conv_mode default "kdim"); owned_gdn (+12-14%) is the
+current shippable CB win. LESSON: a "vector-op fusion" that still touches
+tile-padded tensors (slices/concat of a [.,.,K] state) doesn't capture the win —
+the state itself must be padding-free.

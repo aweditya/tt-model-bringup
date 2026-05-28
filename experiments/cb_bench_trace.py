@@ -140,6 +140,8 @@ def main():
     ap.add_argument("--blocks-per-seq", type=int, default=8)
     ap.add_argument("--owned-gdn", action="store_true",
                     help="use the batched owned_gdn DN recurrence kernel")
+    ap.add_argument("--shiftacc", action="store_true",
+                    help="use the shift-accumulate conv1d (DNK-G4)")
     args = ap.parse_args()
     batches = [int(x) for x in args.batches.split(",")]
 
@@ -150,7 +152,8 @@ def main():
     state.deltanet_decay_gate_mode = "manual"
     state.deltanet_decay_mode = "native_softplus"
     state.cb_dn_recurrence_mode = "owned_gdn" if args.owned_gdn else "manual"
-    log(f"DN recurrence: {state.cb_dn_recurrence_mode}")
+    state.cb_conv_mode = "shiftacc" if args.shiftacc else "kdim"
+    log(f"DN recurrence: {state.cb_dn_recurrence_mode}; conv: {state.cb_conv_mode}")
 
     prompt_ids = state.tok.encode("The capital of France is the city of")[:6]
     log("=== production B=1 reference ===")

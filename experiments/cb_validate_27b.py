@@ -126,6 +126,8 @@ def main():
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--owned-gdn", action="store_true",
                     help="exercise the batched owned_gdn DN recurrence in CB (vs prod owned_gdn)")
+    ap.add_argument("--shiftacc", action="store_true",
+                    help="exercise the shift-accumulate conv1d in CB (DNK-G4)")
     args = ap.parse_args()
 
     log("bootstrap production 27B server (server_tp)…")
@@ -149,7 +151,9 @@ def main():
     state.deltanet_decay_gate_mode = "manual"
     state.deltanet_decay_mode = "native_softplus"  # CB uses ttnn.softplus
     state.cb_dn_recurrence_mode = "owned_gdn" if args.owned_gdn else "manual"
-    log(f"DN recurrence mode: {'owned_gdn (batched kernel)' if args.owned_gdn else 'manual'}")
+    state.cb_conv_mode = "shiftacc" if args.shiftacc else "kdim"
+    log(f"DN recurrence mode: {'owned_gdn (batched kernel)' if args.owned_gdn else 'manual'}; "
+        f"conv mode: {state.cb_conv_mode}")
 
     # Two FRESH passes (each consumes its own state once; no stale re-run —
     # the earlier logit-check bug re-ran prod over already-consumed KV/DN).
