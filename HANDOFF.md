@@ -86,9 +86,20 @@ tile rows). **All in `experiments/serve/server_tp_cb.py`** (imports production
   | 64 | 348.79  | 183.49    | 14.2× |
 
   Cost model `step_ms ≈ 73 + 4.3·B` (memory-bound 73 ms floor + 4.3 ms/seq
-  compute; crossover B≈17; aggregate **asymptote ~232 tok/s**). DN here is
-  MANUAL recurrence (owned_gdn is B=1-only) — a batched owned-GDN kernel is the
-  lever to raise the ceiling.
+  compute; crossover B≈17; aggregate asymptote ~232 tok/s with manual DN).
+- **Batched owned-GDN DN kernel DONE** (`experiments/kernel_patches/qwen36_gdn_decode_owned/`):
+  owned_gdn is per-slot independent → FOLD batch into slots ([B,NV,K,V]→
+  [1,B·NV,K,V]) drives the EXISTING kernel; no ttnn rebuild (device kernels
+  JIT-compile). Mode-0 had a high-slot output race (out reads cb_state_out which
+  the writer pops) → patched compute kernel adds `debug_mode=10` safe path
+  (output via cb_state_next_internal); in-loop conditional (a dup branch
+  overflowed the 70656B TENSIX limit); `debug_mode=0` byte-identical so B=1 prod
+  untouched. CB uses it via `cb_dn_recurrence_mode="owned_gdn"`. Bit-identical to
+  prod at B=1; traced **B=32 168 tok/s (+11.7%), B=64 208 tok/s (+13.5%)**;
+  asymptote ~232→~277 tok/s. **B=64 = 16.1× the B=1 prod 12.96 tok/s.**
+- **NEXT lever past ~277**: the surrounding DN matmuls (in_proj/out_proj),
+  conv1d, q/k+output norms, decay/gate — all scale with B; owned_gdn only fuses
+  the recurrence. Plus productionization (chunked prefill, sampling, endpoint).
 - **CB2 DONE** — ragged per-slot positions + mid-batch admission
   (`cb_validate_ragged.py` PASS). `cb_reset_slots()` clears only the admitted
   slot's DN state (Mamba-style reuse); KV self-overwrites (cur_pos-bounded).
