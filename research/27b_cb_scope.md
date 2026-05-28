@@ -99,3 +99,52 @@ All CB0 unknowns resolved:
 
 **CB1 next**: add batch dim to the forward, isolate+validate each block
 (attn, DN recurrence, MLP) B=1 vs B=8 before the full forward.
+
+## CB1 isolation results (2026-05-27) — all three blocks de-risked
+
+1. **DN recurrence** (the novel/risky part): `cb_dn_recurrence_batch_isolation.py`
+   B=8, NV=4, K=V=128. Per-slot cos vs numpy ~0.99998; batched-vs-8×B=1
+   diff = **0.0 (bit-exact slot independence, no cross-slot leak)**. The
+   ttnn broadcast/reduce ops handle the leading B dim correctly:
+   `mul([B,NV,K,V],[B,NV,1,1])`, `sum(dim=-2)`, outer-product update. CB1
+   DN path = pure shape change (add leading B).
+
+2. **Dense MLP**: pure matmul, M=1→B. Standard, low-risk (this is what
+   A004's batched MoE matmul already proved at the matmul level).
+
+3. **Paged SDPA attention**: ttnn
+   `paged_scaled_dot_product_attention_decode` is **natively batched** —
+   docstring confirms `input_tensor_q [1, b, nh, dh]`, `cur_pos_tensor [b]`,
+   "parallelizes over b", and critically: **"If a position is given as (-1),
+   compute for the corresponding index in the batch is skipped."** That -1
+   is the built-in empty-slot mask for a fixed-B=32 trace. This IS vLLM
+   PagedAttention; the 27B server just calls it at b=1 today.
+
+## CB1 integration plan (precise — for review before the forward surgery)
+
+The forward (`forward_token_tp_inner` + `gated_attn_step_tp` +
+`dn_step_tp` + MLP) currently hardcodes b=1. The B-threading:
+
+- **Input buffers**: `x_buf` [1,HIDDEN] → [B,HIDDEN]; `cur_pos_buf` [1] →
+  [B] (with -1 for empty slots); `tok_buf` [1,1] → [B,1]; cos/sin lookup
+  by per-slot pos → [B, ROTARY_DIM].
+- **DN layers (×48)**: recurrent state [NV,K,V] → [B,NV,K,V]; conv state
+  [CONV_DIM,KERNEL] → [B,CONV_DIM,KERNEL]; in_proj matmul M=1→B; recurrence
+  ops gain leading B (validated). Per-slot state lives in the slot table.
+- **Attn layers (×16)**: q/k/v projections M=1→B; paged SDPA decode with
+  q [1,B,nh,dh], cur_pos_tensor [B], per-slot page_table [B, blocks/seq];
+  paged_update_cache per slot (update_idxs_tensor [B]).
+- **MLP**: matmuls M=1→B.
+- **lm_head + sample**: logits [B,VOCAB]; per-slot argmax/sampler.
+- **Trace**: capture at fixed B=32; empty slots → cur_pos=-1 (SDPA skips
+  them), DN state for empty slots is don't-care (masked at output).
+
+Risk notes: the paged_update_cache + sharded-write mem configs
+(server_tp.py:1556-1579) are tuned for b=1 HEIGHT_SHARDED L1 writes —
+the per-slot batched write is the fiddliest part; isolate it (CB2) before
+wiring. The page_table generalizes 1 table → [B, blocks/seq] (block
+manager, CB5).
+
+**Status**: CB1 uncertainties resolved. The forward surgery is mechanical
+but large + touches the production decode path → pause for review of this
+plan before executing.
