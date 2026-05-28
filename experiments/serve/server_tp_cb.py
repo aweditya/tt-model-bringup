@@ -461,12 +461,19 @@ def forward_batch_tp_inner(state, return_logits=False):
                              layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     cos_tt = ttnn.reshape(cos_raw, [B, state.rotary_dim])
     sin_tt = ttnn.reshape(sin_raw, [B, state.rotary_dim])
+    # cb_skip_blocks: profiling-only set ({'dn','attn','mlp'}); a skipped block
+    # is a no-op (x passes through). Default empty → zero behaviour change. Used
+    # by cb_profile_blocks.py to attribute per-token compute via trace timing.
+    skip = getattr(state, 'cb_skip_blocks', None) or set()
     for li, layer in enumerate(state.layers):
         if layer['type'] == 'linear_attention':
-            x_tt = deltanet_step_batched(state, x_tt, layer['dn'], li, cfg)
+            if 'dn' not in skip:
+                x_tt = deltanet_step_batched(state, x_tt, layer['dn'], li, cfg)
         else:
-            x_tt = gated_attn_step_batched(state, x_tt, layer['attn'], li, cos_tt, sin_tt, cfg)
-        x_tt = base.mlp_step_tp(state, x_tt, layer['mlp'])  # shape-agnostic
+            if 'attn' not in skip:
+                x_tt = gated_attn_step_batched(state, x_tt, layer['attn'], li, cos_tt, sin_tt, cfg)
+        if 'mlp' not in skip:
+            x_tt = base.mlp_step_tp(state, x_tt, layer['mlp'])  # shape-agnostic
     x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
     # P22 vocab-sharded LM head + on-device argmax, batched over B. Mirrors
     # server_tp.forward_token_tp_inner:1742-1748 with leading B.

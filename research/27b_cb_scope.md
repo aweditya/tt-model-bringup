@@ -384,3 +384,28 @@ execute_trace compose. The CB serving system is correct AND production-speed.
 **CB1–CB4 all DONE.** A working vLLM-style continuous-batching system for 27B on
 Blackhole: bit-identical correctness, 11.6×@B=32 / 14.2×@B=64 throughput, Orca
 scheduler with admission/eviction/queueing, traced execution.
+
+## CB5 — per-block compute attribution: DeltaNet owns 97% of the slope (2026-05-28)
+
+`cb_profile_blocks.py` (trace-timing ablation: full − skip_X = block X cost):
+
+| Block | B=1 ms | B=32 ms | scaling ms/seq |
+|-------|--------|---------|----------------|
+| DeltaNet (48 layers, manual) | 38.93 | **170.70** | **4.25** |
+| MLP (64 layers)              | 29.29 | 29.41   | 0.00 (flat) |
+| Attention (16 layers)        |  6.56 |  8.33   | 0.06 |
+| rest (embed/norm/lm_head/CCL)|  2.36 |  4.15   | 0.06 |
+| **full**                     | 77.14 | 212.60  | 4.37 |
+
+**The DeltaNet manual recurrence is 97% of the per-token compute slope**
+(4.25 of 4.37 ms/seq) and 80% of the B=32 step. MLP is perfectly memory-bound
+(0.00 ms/seq — weight bytes amortize ideally across the batch); attention and
+the rest barely scale.
+
+**Conclusion (profile-driven):** the single highest-value CB throughput lever is
+a **batched DeltaNet recurrence kernel**. The existing `owned_gdn` kernel is
+B=1-only; the CB path uses MANUAL recurrence (per-slot matmuls/muls/outer-
+products on [B,NV,K,V] — FLOPs ∝ B, many small ops). Cutting the 4.25 ms/seq by
+N× lifts the ~232 tok/s asymptote by ~N× (e.g. 2.5× → ~500 tok/s). This is the
+clear next kernel target, and a prime candidate for the TDG dataflow methodology
+(research/kernel_dataflow_representation.md).
