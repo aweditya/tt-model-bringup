@@ -565,3 +565,29 @@ ms/seq (−15%); B=32 DN block 170.7 → 148.5 ms. **Asymptote ~232 → ~277 tok
 bit-identical. The remaining DN cost is the surrounding ops (in_proj/out_proj
 matmuls, conv1d, q/k + output norms, decay/gate) — all scale with B; owned_gdn
 only fuses the recurrence. Those matmuls are the next lever to push past ~277.
+
+## DNK-G3 — DN matmuls are FLAT; the slope is per-slot vector ops (2026-05-28)
+
+`cb_dn_matmul_microbench.py` (traced, real DN weights w_in[5120,4120],
+w_out[1536,5120]):
+
+| B  | in_proj ms | out_proj+AR ms |
+|----|-----------|----------------|
+| 1  | 0.114     | 0.088          |
+| 32 | 0.114     | 0.088          |
+| 64 | 0.116     | 0.098          |
+
+**The DN matmuls are flat with B (0.000 ms/seq slope)** — weight-streaming /
+memory-bound, batch fully amortized (like the MLP). So matmul core_grid tuning
+(the A004 lever) is NOT the next win here — contrary to the initial hypothesis.
+
+The 3.61 ms/seq DN slope (owned_gdn) is the **per-slot VECTOR ops** whose
+ACTIVATION volume ∝ B: conv1d, q/k L2-norm (×2), output RMSNorm, gqa-repeat,
+and the recurrence. owned_gdn already fused the recurrence's vector ops (4.25→
+3.61). To push past ~277 tok/s the remaining vector ops must be fused too — a
+custom-kernel effort like owned_gdn. **conv1d is the prime candidate** (existing
+diagnosis `feedback_conv1d_diagnosis`: 65% sum-reduce, 21% state mgmt, 13% mul;
+`feedback_conv1d_circular_buffer` says it needs a tt-metal custom op). The
+owned_decay_gate kernel exists but decay/gate is tiny ([B,NV] scalars), so low
+value. Next profile: within-DN vector-op attribution (skip conv / qk-norm /
+out-gate) to rank the targets before the next fused kernel.
