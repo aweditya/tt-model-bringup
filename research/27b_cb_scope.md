@@ -726,3 +726,23 @@ needle-validated fast path. Recommendation: shiftacc as default for serving
 bit-identical reference. Caveat to keep on record: shiftacc is not bit-identical
 (0.9995 short / 0.963 worst at 32 pos); re-run cb_needle at more fracs/lengths
 if pushing to very long (8k) chat.
+
+## Floor profile (B=1 B-independent ~63 ms) — MLP matmul BW is the lever (2026-05-28)
+
+`cb_floor_microbench.py` (traced, B=1):
+- MLP gate/up/down matmuls: ~120 µs each → ×64 = **22.9 ms** (36% of floor). Each
+  streams a 22 MB bf8 weight ([5120,4352]) in 121 µs = **~184 GB/s = 46% of the
+  404 GB/s peak** → ~2× BW headroom.
+- 128 all-reduces ([1,5120]): 55 µs each → **7.1 ms** (11%) — smaller lever.
+- DN ~25 ms (matmuls+recurrence+norms), ATT ~6.6, rest 2.2.
+
+**Floor lever = MLP (and DN) matmul BW** (46% util → tune to ~90% would cut the
+MLP matmuls ~23→~12 ms → floor ~63→~52 → B=32 ~377→~430, B=64 ~593→~660 tok/s).
+Caveat: DRAM-sharded MLP already tried + NEGATIVE (feedback_dram_sharded_mlp_probe);
+bf8 interleaved is prod. The M=1 GEMV needs a matmul program_config / core_grid
+experiment (A004 was M>1 batched — different regime). Collectives (7 ms) are a
+secondary lever (fuse all_reduce into out-proj, rs_matmul).
+
+GOTCHA (cost a 55-min hang): a `from_torch` (host→device transfer) INSIDE a
+`begin/end_trace_capture` region HANGS — host transfers can't be captured.
+Pre-allocate all inputs before capture; only ttnn device ops inside build_fn.
