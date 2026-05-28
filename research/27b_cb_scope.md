@@ -148,3 +148,27 @@ manager, CB5).
 **Status**: CB1 uncertainties resolved. The forward surgery is mechanical
 but large + touches the production decode path → pause for review of this
 plan before executing.
+
+## All CB primitives validated (2026-05-27) — integration is now mechanical
+
+| Primitive | Isolation | Result |
+|---|---|---|
+| DN recurrence batched | `cb_dn_recurrence_batch_isolation.py` | bit-exact slot independence, cos~0.99998 |
+| Dense MLP batched | (shape-agnostic) | no change — rms_norm/matmul/add all leading-dim agnostic |
+| Paged SDPA batched decode | `cb_paged_sdpa_batch_isolation.py` | B=4 ragged [7,20,3,-1], per-slot cos>0.9997 |
+| Per-slot cur_pos + page tables | same | works; each slot attends own history |
+| Empty-slot skip (cur_pos=-1) | same | skipped, don't-care output, no cross-slot corruption |
+| Memory budget B=32 | CB0 arithmetic | ~9 GB/chip of 31.8 |
+
+**Empty-slot note**: cur_pos=-1 does NOT zero the output — it leaves
+don't-care data in that slot's output row. The scheduler must IGNORE
+inactive slots' outputs (we know which slots are active). No masking of
+other slots needed — they're unaffected.
+
+Every primitive the batched forward depends on is now validated on our
+ttnn build. The remaining work — threading B through forward_token_tp_inner
++ gated_attn_step_tp + deltanet_step_tp + I/O buffers + per-slot KV write
+— is mechanical integration with no remaining algorithmic uncertainty.
+Recommended approach: parallel batched path (new module / new functions),
+B=1 validated bit-identical to production before B>1, production B=1
+server untouched (zero regression risk). Then CB3 Orca scheduler on top.
