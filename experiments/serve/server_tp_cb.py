@@ -152,6 +152,38 @@ def cb_reset_states(state):
     # full reset would re-zero; for validation we reset by re-running setup.
 
 
+def cb_reset_slots(state, slot_ids):
+    """Reset ONLY the given slots' DN recurrent + conv state (mid-batch
+    admission of a new sequence — Mamba-style per-slot state slot reuse).
+
+    Masked multiply: keep=1 for live slots, 0 for admitted slots, broadcast
+    over the head/dim axes. The other slots' state is untouched (validated by
+    the ragged test — slot isolation holds across a reset).
+
+    KV needs NO reset: per-slot cur_pos bounds the SDPA read, so a sequence
+    restarting at pos 0 overwrites its own blocks as it prefills and never reads
+    stale data. Only the position-unbounded DN accumulator must be cleared.
+    """
+    B = state.cb_B
+    mesh = state.mesh
+    keep = torch.ones(B, dtype=torch.float32)
+    for s in slot_ids:
+        keep[s] = 0.0
+    mask4 = ttnn.from_torch(keep.reshape(B, 1, 1, 1), dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT, device=mesh,
+                            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    mask3 = ttnn.from_torch(keep.reshape(B, 1, 1), dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT, device=mesh,
+                            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    for li, d in state.cb_dn.items():
+        for key, mask in (('ssm', mask4), ('conv_st', mask3)):
+            t = d[key]
+            masked = ttnn.mul(t, mask)
+            ttnn.copy(masked, t)
+            ttnn.deallocate(masked)
+    ttnn.deallocate(mask4); ttnn.deallocate(mask3)
+
+
 def update_input_buffers_batched(state, token_ids, cur_positions):
     """token_ids: list[int] len B; cur_positions: list[int] len B (-1 = empty)."""
     B = state.cb_B

@@ -327,3 +327,21 @@ Notes:
   recurrence kernel** (manual DN is the current B>1 path) and/or faster batched
   matmuls are the levers. The kernel-dataflow representation work
   (research/kernel_dataflow_representation.md) targets exactly this.
+
+## CB2 — ragged positions + mid-batch admission VALIDATED (2026-05-28)
+
+`cb_validate_ragged.py` PASS. New primitive `cb_reset_slots(state, [slot])`:
+masked-multiply clears ONLY the admitted slot's DN recurrent + conv state
+(Mamba-style state-slot reuse). KV needs no reset — per-slot cur_pos bounds the
+SDPA read, so a sequence restarting at pos 0 overwrites its own blocks.
+
+Test: slot0 runs A at pos 0..5 continuously; slot1 runs C at pos 0..2 then is
+ADMITTED B at step 3 (cb_reset_slots([1])) and runs B at pos 0..2 — so during
+steps 3..5 the two slots sit at DIFFERENT positions (slot0=3,4,5; slot1=0,1,2)
+in the same forward. Result: slot0 argmax == ref_A (unaffected by slot1's churn
++ reset), slot1 argmax == ref_B (fresh state, own KV). Proves: per-slot ragged
+positions, admission DN-reset, KV self-overwrite, slot isolation across a reset.
+
+Device foundation for continuous batching is now COMPLETE: batched forward
+(CB1), throughput (CB4), ragged + admission (CB2). All that remains is CB3 —
+the Orca iteration-level scheduler (Python control loop, no new device risk).
