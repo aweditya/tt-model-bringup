@@ -95,12 +95,20 @@ def main():
     log("bootstrap production 27B server (server_tp)…")
     state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
     base.bootstrap(state)
-    tok = state.tokenizer
+    tok = state.tok
     prompt = "The capital of France is the city of"
     prompt_ids = tok.encode(prompt)[:args.max_pos]
     log(f"prompt_ids={prompt_ids}")
 
-    log("=== production B=1 reference ===")
+    # Match CB's DN math exactly: CB uses MANUAL recurrence + MANUAL decay/gate
+    # (owned_gdn kernel is B=1-only). Production defaults to owned_gdn +
+    # owned_decay_gate, which is numerically ~equal but not bit-identical — at
+    # pos 0 (widest entropy) the tiny diff flips argmax. For an apples-to-apples
+    # gate, run the reference with the same manual math.
+    state.deltanet_recurrence_mode = "manual"
+    state.deltanet_decay_gate_mode = "manual"
+    state.deltanet_decay_mode = "native_softplus"  # CB uses ttnn.softplus
+    log("=== production B=1 reference (manual recurrence + manual decay/gate) ===")
     ref = prod_next_ids(state, prompt_ids)
     log(f"  prod next_ids: {ref}")
 

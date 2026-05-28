@@ -194,9 +194,10 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     conv_input = ttnn.concat([slot['conv_st'], cur_col], dim=-1)   # [B,CONV,K]
     ttnn.deallocate(cur_col)
     # w_conv is [CONV_DIM_CHIP, K]; reshape to [1,CONV,K] to broadcast over B.
+    # VIEW of the persistent weight — do NOT deallocate (view-decay rule:
+    # freeing the view frees dn['w_conv'], crashing the next step).
     w_conv_b = ttnn.reshape(dn['w_conv'], [1, CONV_DIM_CHIP, CONV_K])
     conv_prod = ttnn.mul(conv_input, w_conv_b)
-    ttnn.deallocate(w_conv_b)
     conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))              # [B,CONV]
     ttnn.deallocate(conv_prod)
     # new conv state = last K-1 columns
@@ -335,14 +336,16 @@ def gated_attn_step_batched(state, x_tt, attn, li, cos_tt, sin_tt, cfg):
         return out
     q_r = rope_b(q_tt, NQ_PER_CHIP); ttnn.deallocate(q_tt)
     k_r = rope_b(k_tt, NKV_PER_CHIP); ttnn.deallocate(k_tt)
-    ttnn.deallocate(cos_b); ttnn.deallocate(sin_b)
+    # cos_b/sin_b are VIEWS of the per-forward cos_tt/sin_tt shared across all
+    # 16 attn layers — do NOT deallocate (would free cos_tt, crash next layer).
 
     # Paged KV write: input [1, B, TILE_H, HEAD_DIM] height-sharded on B cores.
     def shard_write(t):  # t [B, NKV=1, HEAD_DIM]
         t4 = ttnn.reshape(t, [1, B, 1, HEAD_DIM])
         t4 = ttnn.pad(t4, [[0, 0], [0, 0], [0, TILE_H - 1], [0, 0]], value=0.0)
         return ttnn.to_memory_config(t4, state.cb_write_mem_cfg)
-    k_sh = shard_write(k_r); v_sh = shard_write(v_r)
+    # V is NOT RoPE-rotated — write the original v_tt.
+    k_sh = shard_write(k_r); v_sh = shard_write(v_tt)
     ttnn.experimental.paged_update_cache(kv['kc'], k_sh,
                                          update_idxs_tensor=state.cb_cur_pos_buf,
                                          page_table=state.cb_page_table_tt)
@@ -350,7 +353,7 @@ def gated_attn_step_batched(state, x_tt, attn, li, cos_tt, sin_tt, cfg):
                                          update_idxs_tensor=state.cb_cur_pos_buf,
                                          page_table=state.cb_page_table_tt)
     ttnn.deallocate(k_sh); ttnn.deallocate(v_sh)
-    ttnn.deallocate(v_r)   # v_r written to cache; q_r is the query, kept
+    ttnn.deallocate(k_r); ttnn.deallocate(v_tt)  # k_r+v written to cache; q_r kept
 
     # Paged SDPA decode + gate + out_proj + residual (q_r is the query).
     return _attn_finish(state, x_tt, q_r, gate_tt, kv, attn, B, NQ_PER_CHIP, HEAD_DIM)
@@ -418,18 +421,18 @@ def forward_batch_tp_inner(state, return_logits=False):
     x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
     # P22 vocab-sharded LM head + on-device argmax, batched over B. Mirrors
     # server_tp.forward_token_tp_inner:1742-1748 with leading B.
+    # Match production lm_head (forward_token_tp_inner): NO intermediate
+    # deallocates — slice returns a VIEW of gathered; freeing gathered before
+    # untilize hits the view-decay rule ("Tensor is not allocated"). lm_head
+    # runs once per forward so the few intermediates are fine to leave.
     sharded = ttnn.linear(x_tt, state.lm_head_tt)        # [B, VOCAB_PAD/NCHIPS]/chip
     ttnn.deallocate(x_tt)
     gathered = ttnn.all_gather(sharded, dim=-1)           # [B, VOCAB_PAD] replicated
-    ttnn.deallocate(sharded)
     sliced = ttnn.slice(gathered, [0, 0], [B, state.vocab_size])
-    ttnn.deallocate(gathered)
     rm = ttnn.untilize(sliced, use_multicore=True)
-    ttnn.deallocate(sliced)
     if return_logits:
         return rm
     argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
-    ttnn.deallocate(rm)
     return argmax_tt
 
 
