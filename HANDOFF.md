@@ -1,5 +1,7 @@
 # HANDOFF — read top to bottom (replaces the 900-line version, see `git log HANDOFF.md` for the old narrative)
 
+> **Active work (2026-05-27): maintainability pass on branch `chore/maintainability`** (not merged). Living plan + how to continue: [`research/maintainability_pass.md`](research/maintainability_pass.md). Perf/correctness work below is paused, not abandoned.
+
 ## What this project is
 
 35B-A3B (MoE) bringup on Tenstorrent Blackhole (P150 × 4 mesh on `qb1`). Research-driven; goal is **the hardware ceiling**, not parity with someone else's number.
