@@ -62,6 +62,15 @@ def main():
                     help="layer cosine below this counts as divergence")
     ap.add_argument("--attn-mode", choices=["manual", "sdpa"], default="sdpa",
                     help="attention path: 'manual' (legacy Q@K^T) or 'sdpa' (paged + B3 config). Default sdpa.")
+    ap.add_argument("--owned-gdn", choices=["on", "off"], default="on",
+                    help="A010: toggle dn_owned_gdn kernel. 'off' uses the manual DN "
+                         "recurrence (slower but unfused). Lets us A/B whether the owned "
+                         "kernel is the drift source.")
+    ap.add_argument("--owned-decay-gate", choices=["on", "off"], default="on",
+                    help="A010: toggle dn_owned_decay_gate kernel. 'off' uses manual softplus/sigmoid.")
+    ap.add_argument("--dn-state-dtype", choices=["bf16", "fp32"], default="bf16",
+                    help="A010: dtype of the DN recurrent state. fp32 requires "
+                         "--owned-gdn=off (kernel rejects fp32 state).")
     ap.add_argument("--capture-attn-layer", "--capture-layer", dest="capture_attn_layer",
                     type=int, default=None,
                     help="capture layer-internal intermediates at this decoder layer index "
@@ -88,9 +97,20 @@ def main():
 
     # Bootstrap (1,4) mesh + load all 40 layer weights. ~106 s on qb1 per
     # B16 smoke timings.
-    log(f"bootstrapping (1,4) mesh + uploading weights… (attn_mode={args.attn_mode})")
+    log(f"bootstrapping (1,4) mesh + uploading weights… "
+        f"(attn_mode={args.attn_mode}, owned_gdn={args.owned_gdn}, "
+        f"owned_decay_gate={args.owned_decay_gate})")
     state = srv.State()
     state.attn_mode = args.attn_mode  # MUST be set before bootstrap; allocates paged plumbing if sdpa
+    # A010: optionally override owned-kernel toggles (default True in State.__init__).
+    state.dn_owned_gdn = (args.owned_gdn == "on")
+    state.dn_owned_decay_gate = (args.owned_decay_gate == "on")
+    # A010: optionally override DN recurrent state dtype.
+    import ttnn as _ttnn_dtype  # local import for ttnn dtypes
+    state.dn_state_dtype = (_ttnn_dtype.float32 if args.dn_state_dtype == "fp32"
+                            else _ttnn_dtype.bfloat16)
+    if args.dn_state_dtype == "fp32" and args.owned_gdn == "on":
+        log(f"WARNING: --dn-state-dtype=fp32 requires --owned-gdn=off")
     t0 = time.time()
     srv.bootstrap(state, log)
     state.reset_caches_ttnn()  # zero DN conv/recurrent caches + KV cache placeholders (paged if sdpa)

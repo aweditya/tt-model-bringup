@@ -1408,13 +1408,24 @@ class State:
                 # rank-5 layout is what dn_forward_ttnn's manual recurrence expects;
                 # the owned_gdn kernel branch reshapes to rank-4 view on-the-fly.
                 # bf16 matches q/k/v dtype (kernel requires q dtype == state dtype).
+                # A010: state.dn_state_dtype lets us A/B fp32 state to test whether
+                # bf16 accumulation in the recurrence is the long-context drift
+                # source. fp32 state requires use_owned_gdn=False (kernel still wants
+                # bf16). Default bf16 keeps the owned-kernel fast path working.
                 rs_np = np.zeros((NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
+                # A010: dn_state_dtype applies to the RECURRENT state (H_t) only.
+                # Conv state stays bf16 because the conv1d_update path concats
+                # the bf16 mixed_qkv with the prior state — dtype must match.
+                # The conv state is also fundamentally less drift-prone (only
+                # 4-tap, old positions roll out after KERNEL=4 steps), while
+                # the recurrent H_t accumulates forever.
+                _rs_dtype = getattr(self, "dn_state_dtype", ttnn.bfloat16)
                 cs_tt = ttnn.from_torch(
                     torch.from_numpy(cs_np), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                     device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
                 )
                 rs_tt = ttnn.from_torch(
-                    torch.from_numpy(rs_np), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    torch.from_numpy(rs_np), dtype=_rs_dtype, layout=ttnn.TILE_LAYOUT,
                     device=self.mesh, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
                 )
                 dn.append((cs_tt, rs_tt))
