@@ -305,17 +305,20 @@ def gated_attn_step_batched(state, x_tt, attn, li, cos_tt, sin_tt, cfg):
     h_tt = _rms_norm_manual(x_tt, attn['input_norm'], EPS, HIDDEN)
     all_tt = ttnn.linear(h_tt, attn['w_qkv'])           # [B, QG+2KV]
     ttnn.deallocate(h_tt)
+    # CRITICAL (view-decay): ttnn.slice/reshape return VIEWS. q_tt/gate_tt/k_tt/
+    # v_tt alias all_tt's buffer until materialized (q_tt/k_tt by rms_norm below;
+    # gate_tt/v_tt only when consumed). Production (gated_attn_step_tp) NEVER
+    # deallocates all_tt/qg/k_flat/v_flat for exactly this reason — freeing them
+    # here corrupts the views (was the CB attn-divergence bug). Let scope free them.
     qg = ttnn.slice(all_tt, [0, 0], [B, QG_DIM_CHIP])
     k_flat = ttnn.slice(all_tt, [0, QG_DIM_CHIP], [B, QG_DIM_CHIP + KV_DIM_CHIP])
     v_flat = ttnn.slice(all_tt, [0, QG_DIM_CHIP + KV_DIM_CHIP],
                         [B, QG_DIM_CHIP + 2 * KV_DIM_CHIP])
-    ttnn.deallocate(all_tt)
     qg = ttnn.reshape(qg, [B, NQ_PER_CHIP, 2 * HEAD_DIM])
     q_tt = ttnn.slice(qg, [0, 0, 0], [B, NQ_PER_CHIP, HEAD_DIM])
     gate_tt = ttnn.slice(qg, [0, 0, HEAD_DIM], [B, NQ_PER_CHIP, 2 * HEAD_DIM])
-    ttnn.deallocate(qg)
-    k_tt = ttnn.reshape(k_flat, [B, NKV_PER_CHIP, HEAD_DIM]); ttnn.deallocate(k_flat)
-    v_tt = ttnn.reshape(v_flat, [B, NKV_PER_CHIP, HEAD_DIM]); ttnn.deallocate(v_flat)
+    k_tt = ttnn.reshape(k_flat, [B, NKV_PER_CHIP, HEAD_DIM])
+    v_tt = ttnn.reshape(v_flat, [B, NKV_PER_CHIP, HEAD_DIM])
 
     q_tt = _rms_norm_manual(q_tt, attn['q_norm'], EPS, HEAD_DIM)
     k_tt = _rms_norm_manual(k_tt, attn['k_norm'], EPS, HEAD_DIM)
@@ -331,7 +334,8 @@ def gated_attn_step_batched(state, x_tt, attn, li, cos_tt, sin_tt, cfg):
         rotated = ttnn.add(ttnn.mul(rot, cos_b),
                            ttnn.mul(ttnn.concat([neg_x2, x1], dim=-1), sin_b))
         out = ttnn.concat([rotated, passthru], dim=-1)
-        ttnn.deallocate(rot); ttnn.deallocate(passthru); ttnn.deallocate(x1)
+        # rot/passthru/x1/x2 are VIEWS of t — freeing them frees t's buffer (and
+        # the caller frees t below). Only free the independent temporaries here.
         ttnn.deallocate(neg_x2); ttnn.deallocate(rotated)
         return out
     q_r = rope_b(q_tt, NQ_PER_CHIP); ttnn.deallocate(q_tt)
@@ -353,15 +357,19 @@ def gated_attn_step_batched(state, x_tt, attn, li, cos_tt, sin_tt, cfg):
                                          update_idxs_tensor=state.cb_cur_pos_buf,
                                          page_table=state.cb_page_table_tt)
     ttnn.deallocate(k_sh); ttnn.deallocate(v_sh)
-    ttnn.deallocate(k_r); ttnn.deallocate(v_tt)  # k_r+v written to cache; q_r kept
+    ttnn.deallocate(k_r)  # k_r is an independent RoPE output — safe to free.
+    # Do NOT deallocate v_tt: it's a VIEW of all_tt, which gate_tt also aliases
+    # and _attn_finish still needs. Freeing it would crash the gate (view-decay).
 
     # Paged SDPA decode + gate + out_proj + residual (q_r is the query).
     return _attn_finish(state, x_tt, q_r, gate_tt, kv, attn, B, NQ_PER_CHIP, HEAD_DIM)
 
 
 def _attn_finish(state, x_tt, q_r, gate_tt, kv, attn, B, NQ_PER_CHIP, HEAD_DIM):
+    # view-decay: q_sdpa/attn_ph/flat are reshape VIEWS — do not free their
+    # sources while the view is live (frees the buffer the view reads). gate_tt
+    # is a VIEW of all_tt; let scope free all_tt. Only independent tensors freed.
     q_sdpa = ttnn.reshape(q_r, [1, B, NQ_PER_CHIP, HEAD_DIM])
-    ttnn.deallocate(q_r)
     attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
         q_sdpa, kv['kc'], kv['vc'],
         cur_pos_tensor=state.cb_cur_pos_buf,
@@ -369,15 +377,10 @@ def _attn_finish(state, x_tt, q_r, gate_tt, kv, attn, B, NQ_PER_CHIP, HEAD_DIM):
         program_config=state.paged_sdpa_progcfg,
         compute_kernel_config=state.sdpa_compute_kernel_config,
     )
-    ttnn.deallocate(q_sdpa)
     attn_ph = ttnn.reshape(attn_out, [B, NQ_PER_CHIP, HEAD_DIM])
-    ttnn.deallocate(attn_out)
     gated = ttnn.mul(attn_ph, ttnn.sigmoid(gate_tt))
-    ttnn.deallocate(attn_ph); ttnn.deallocate(gate_tt)
     flat = ttnn.reshape(gated, [B, NQ_PER_CHIP * HEAD_DIM])
-    ttnn.deallocate(gated)
     partial = ttnn.linear(flat, attn['w_o'])
-    ttnn.deallocate(flat)
     reduced = _tp_all_reduce(state, partial)
     ttnn.deallocate(partial)
     res = ttnn.add(x_tt, reduced)

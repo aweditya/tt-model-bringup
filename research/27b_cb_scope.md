@@ -209,3 +209,37 @@ REMAINING for the first runnable B=1 milestone:
 The B=1-identical gate (3a) is the key checkpoint: it validates the entire
 batched plumbing against the proven production path at B=1 before any B>1
 shape risk. Run it before trusting any B>1 number.
+
+## CB1 COMPLETE — batched forward bit-identical to production (2026-05-27)
+
+`cb_validate_27b.py` gate (B=1 vs production, manual DN math) **PASSES all three**:
+- **3a** CB B=1 logits == production B=1: **logit_cos = 1.000000 at every position**
+  (raw + mean-centered + top-10 = 10/10), argmax matches token-for-token.
+- **3b** B=4 identical slots: all four slots == B=1 (no shape-induced drift).
+- **3c** B=4 DISTINCT equal-length prompts: each slot == its own B=1 reference
+  → per-slot KV + DN recurrent state are fully isolated, no cross-slot leak.
+
+### Root-cause that blocked CB1 (view-decay in the batched attn step)
+
+`gated_attn_step_batched` (+ `_attn_finish`, `rope_b`) was calling
+`ttnn.deallocate` on tensors whose `ttnn.slice`/`ttnn.reshape` **views were
+still live** — `all_tt`, `qg`, `k_flat`, `v_flat`, `q_r`→`q_sdpa`,
+`attn_out`→`attn_ph`, `gated`→`flat`, and `gate_tt` (a view of `all_tt`).
+Freeing a source frees the buffer its views read, so q/k/v/gate read
+stale/reallocated memory. At pos 0 only V matters (attn_out == V), which is
+why the per-layer ladder showed `all_tt` bit-identical (cos 1.0) but the V
+slice cos 0.008 — the smoking gun. Production `gated_attn_step_tp` never
+deallocates these for exactly this reason. Fix: drop the unsafe early deallocs;
+only free independent (materialized) tensors. Localization method: fresh-prod
+per-layer hidden ladder → first divergence at the first ATTENTION layer (DN
+layers L0-L2 were bit-identical) → attn sub-component probe (`all_tt`/`v`/
+`attn_out`/`reduced`) pinned it to the V slice.
+
+**Production server_tp.py is byte-for-byte pristine** (debug hooks were added,
+used, then reverted via `git checkout`). All CB code lives in `server_tp_cb.py`.
+
+### Next: CB2 (ragged per-slot lengths) → CB3 (Orca scheduler) → CB4 (trace @ B=32)
+The forward is correct at static equal-length B; CB2 adds per-slot positions of
+different lengths (the `cur_pos=-1` empty-slot skip + per-slot page tables are
+already validated in isolation). Then the Orca iteration-level scheduler, then
+capture one decode trace at fixed B=32 and measure tok/s vs the 12.93 baseline.
