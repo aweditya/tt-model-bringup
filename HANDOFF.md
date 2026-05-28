@@ -43,6 +43,19 @@ is the pre-existing DN-recurrent-state drift documented at
 
 A009 ships the *sampler hook* (eager only); the deeper drift fix is A010.
 
+**A010 progress (open follow-up — DN H_t fp32 fix)**: see
+`feedback_35b_dn_h_state_drift_lever.md`. Confirmed: bf16 H_t storage IS
+the long-context lever. Owned_gdn kernel is NOT the source (verified
+by A/B). But just storing H_t as fp32 doesn't work — mixed-precision
+ops break the math. Three scoped fix paths for the next session:
+  1. Cast-on-load (smallest): fp32 storage, bf16 arithmetic, fp32 again
+  2. fp32-throughout-DN (medium): cast g_b/k_col/k_delta to fp32 too
+  3. Kernel-level fp32 accumulator (largest): modify owned_gdn
+
+Hook is in place: `state.dn_state_dtype` in `reset_caches_ttnn`. Default
+bf16 (production unchanged). Cosine ladder gate is at L=97 needle:
+94/97 top1, median cos_final 0.997. Beat that to claim A010.
+
 Coherent greedy decode + long-context PASS:
 - 20/20 tokens: "Paris, a city renowned for its iconic landmarks such as
   the Eiffel Tower, the Louvre Museum"
