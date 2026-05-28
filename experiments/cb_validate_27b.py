@@ -134,7 +134,12 @@ def main():
     state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
     base.bootstrap(state)
     tok = state.tok
-    prompt = "The capital of France is the city of"
+    # Long enough to exercise many positions (--max-pos up to ~40) so a not-bit-
+    # identical op (shift-accum conv) is checked for drift amplification, not just
+    # at 6 positions. The conv feeds the position-accumulating DN H-state.
+    prompt = ("The capital of France is the city of Paris, which has long been a "
+              "center of art, science, philosophy, and political history in Europe, "
+              "drawing scholars and travelers from every corner of the wider world.")
     prompt_ids = tok.encode(prompt)[:args.max_pos]
     log(f"prompt_ids={prompt_ids}")
 
@@ -196,13 +201,14 @@ def main():
     # distinct prompts (ragged lengths are CB2). Each slot must match its own
     # B=1 reference, proving no cross-slot leakage in the batched caches/state.
     log("=== 3c: B=4 DISTINCT slots, each vs its own B=1 reference ===")
-    L = len(prompt_ids)
     alt_texts = ["The capital of France is the city of",
                  "Once upon a time there lived a young",
                  "The largest planet in our solar system is",
                  "Water boils at a temperature of one hundred"]
-    slot_prompts = [tok.encode(t)[:L] for t in alt_texts]
-    slot_prompts = [p for p in slot_prompts if len(p) == L][:4]
+    enc = [tok.encode(t) for t in alt_texts]
+    # equal-length distinct prompts: truncate all to the shortest (and to max_pos)
+    L = min(len(prompt_ids), min(len(e) for e in enc))
+    slot_prompts = [e[:L] for e in enc][:4]
     refs_3c = [cb_next_ids(state, p, 1)[0] for p in slot_prompts]
     Bc = len(slot_prompts)
     cbC = cb_next_ids(state, None, Bc, slot_prompts=slot_prompts)

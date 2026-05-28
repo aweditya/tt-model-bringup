@@ -247,17 +247,22 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     # Weight taps w_conv[:,k] as [1,C] (sliced from a one-time transpose; tiny,
     # batch-independent). State shifts in place: c0←c1, c1←c2, c2←cur — safe on
     # the in-order command queue (all acc reads complete before the shift writes).
+    # DEFAULT "kdim" is BIT-IDENTICAL to production (reconstruct the [B,C,K]
+    # window from the 3 columns + sum-reduce) — the correct path for long context.
+    # "shiftacc" is the fast (28.76× isolated) path but its bf16 op-order differs
+    # from the sum-reduce and DRIFTS over a sequence (DNK-G4: argmax flip by
+    # pos 31, worst logit_cos 0.963) — opt-in, gated on the needle test.
+    cols = slot['conv_cols']                 # [c0, c1, c2], each [B, C], oldest→newest
+    cur = mixed_qkv                          # [B, C]
     if 'conv' in dn_skip:
         conv_out = mixed_qkv  # profiling passthrough
-    else:
+    elif getattr(state, 'cb_conv_mode', 'kdim') == 'shiftacc':
         if 'w_conv_T' not in dn:
             dn['w_conv_T'] = ttnn.transpose(dn['w_conv'], -2, -1)  # [K, C], one-time
         wT = dn['w_conv_T']
         def _tap(kk):  # w_conv[:,kk] as [1,C] — view of cached wT, batch-indep
             return ttnn.reshape(ttnn.slice(wT, [kk, 0], [kk + 1, CONV_DIM_CHIP]),
                                 [1, CONV_DIM_CHIP])
-        cols = slot['conv_cols']            # [c0, c1, c2], each [B, C], no padding
-        cur = mixed_qkv                      # [B, C]
         acc = ttnn.mul(cols[0], _tap(0))
         for j in range(1, CONV_K - 1):
             term = ttnn.mul(cols[j], _tap(j)); nacc = ttnn.add(acc, term)
@@ -265,9 +270,20 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
         term = ttnn.mul(cur, _tap(CONV_K - 1)); nacc = ttnn.add(acc, term)
         ttnn.deallocate(acc); ttnn.deallocate(term); acc = nacc
         conv_out = ttnn.silu(acc); ttnn.deallocate(acc)
-        ttnn.copy(cols[1], cols[0])          # shift: c0 ← c1
-        ttnn.copy(cols[2], cols[1])          #        c1 ← c2
-        ttnn.copy(cur, cols[2])              #        c2 ← cur
+    else:  # kdim — bit-identical to production
+        wnd = ttnn.concat([ttnn.reshape(cols[0], [B, CONV_DIM_CHIP, 1]),
+                           ttnn.reshape(cols[1], [B, CONV_DIM_CHIP, 1]),
+                           ttnn.reshape(cols[2], [B, CONV_DIM_CHIP, 1]),
+                           ttnn.reshape(cur, [B, CONV_DIM_CHIP, 1])], dim=-1)  # [B,C,K]
+        w_conv_b = ttnn.reshape(dn['w_conv'], [1, CONV_DIM_CHIP, CONV_K])
+        prod = ttnn.mul(wnd, w_conv_b)
+        conv_out = ttnn.silu(ttnn.sum(prod, dim=-1))
+        ttnn.deallocate(prod); ttnn.deallocate(wnd)
+    # shift state in place (both paths; in-order CQ: acc reads done before writes)
+    if 'conv' not in dn_skip:
+        ttnn.copy(cols[1], cols[0])          # c0 ← c1
+        ttnn.copy(cols[2], cols[1])          # c1 ← c2
+        ttnn.copy(cur, cols[2])              # c2 ← cur
         ttnn.deallocate(mixed_qkv)
 
     # 5. q/k/v head slices on last dim
