@@ -259,12 +259,12 @@ within 2-7% of the historical baselines:
 
 | Script | Baseline | qb1 (2026-05-21) |
 |--------|----------|------------------|
-| `experiments/60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** |
-| `experiments/64_llama32_1b_port.py`    |  78 tok/s | **78.6 tok/s**  |
-| `experiments/67_llama32_3b_port.py`    |  34 tok/s | **33.7 tok/s**  |
-| `experiments/73_llama8b_instruct.py`   |  19 tok/s | **19 tok/s**    |
-| `experiments/76b_8b_correctness_check.py` | cos > 0.997, 8/8 | cos **0.997327**, **8/8** |
-| `experiments/80_8b_diverse_qa_demo.py` | 18 tok/s, 9/10 EOS | **18 tok/s, 9/10 EOS** |
+| `models/60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** |
+| `models/64_llama32_1b_port.py`    |  78 tok/s | **78.6 tok/s**  |
+| `models/67_llama32_3b_port.py`    |  34 tok/s | **33.7 tok/s**  |
+| `models/73_llama8b_instruct.py`   |  19 tok/s | **19 tok/s**    |
+| `models/76b_8b_correctness_check.py` | cos > 0.997, 8/8 | cos **0.997327**, **8/8** |
+| `models/80_8b_diverse_qa_demo.py` | 18 tok/s, 9/10 EOS | **18 tok/s, 9/10 EOS** |
 
 See `REPRODUCE.md` for the run recipe (stop the prod `serve.sh` first
 so device 0 is free), and `~/tt-xla/.cache/legacy_demos_2026_05_21/`
