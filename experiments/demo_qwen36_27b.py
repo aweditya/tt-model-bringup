@@ -64,7 +64,6 @@ sys.path.insert(0, os.path.expanduser("~"))
 import torch
 import ttnn
 from huggingface_hub import hf_hub_download
-from safetensors import safe_open
 from transformers import AutoTokenizer
 
 # Reuse 91f's production kernels (all 7 bug fixes baked in)
@@ -147,7 +146,7 @@ def main():
     # --------------------------------------------------------
     # Tokenizer, embed, lm_head
     # --------------------------------------------------------
-    print(f"\n[1/4] Loading tokenizer + embedding + lm_head…")
+    print("\n[1/4] Loading tokenizer + embedding + lm_head…")
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     eweights = load_embed_lm_head_weights()
     embed_np = eweights['embed']
@@ -291,15 +290,15 @@ def main():
         print(f"  decode:  {r['decode_sec']:.1f}s ({r['decode_tps']:.2f} tok/s, "
               f"{1000/r['decode_tps']:.0f} ms/tok)")
         print(f"  first token: {r['first_token_id']}  →  {r['first_token_str']!r}")
-        print(f"\n  ┌──────────────────────────────")
+        print("\n  ┌──────────────────────────────")
         for line in r['text'].split("\n"):
             print(f"  │ {line}")
-        print(f"  └──────────────────────────────")
+        print("  └──────────────────────────────")
 
     # --------------------------------------------------------
     # Sanity check
     # --------------------------------------------------------
-    print(f"\n[4/4] Branch III correctness sanity check…")
+    print("\n[4/4] Branch III correctness sanity check…")
     paris_ok = None
     if not args.skip_sanity:
         sanity = next((r for r in results if r['prompt'] == SANITY_PROMPT), None)
@@ -311,13 +310,13 @@ def main():
             print(f"  {status}  Canonical Q: '{SANITY_PROMPT}' → first token "
                   f"{sanity['first_token_str']!r} (expected {SANITY_FIRST_TOKEN!r})")
             if not paris_ok:
-                print(f"  ⚠ Branch III correctness regression — check git log and "
-                      f"compare against research/branchIII_complete.md")
+                print("  ⚠ Branch III correctness regression — check git log and "
+                      "compare against research/branchIII_complete.md")
 
     # --------------------------------------------------------
     # Summary
     # --------------------------------------------------------
-    print(f"\n" + "=" * 64)
+    print("\n" + "=" * 64)
     print(f"Performance summary across {len(results)} prompt(s):")
     print(f"  avg prefill: {np.mean([r['prefill_tps'] for r in results]):.2f} tok/s")
     print(f"  avg decode:  {np.mean([r['decode_tps'] for r in results]):.2f} tok/s "

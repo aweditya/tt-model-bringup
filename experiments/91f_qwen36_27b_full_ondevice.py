@@ -241,7 +241,6 @@ def _cosine(a, b):
 # ============================================================
 
 def deltanet_step_ondevice(x_tt, w_tt, ssm_state_tt, conv_state_tt, cfg):
-    HIDDEN = cfg['hidden']
     N_K_HEADS = cfg['n_k_heads']
     N_V_HEADS = cfg['n_v_heads']
     K_DIM = cfg['k_dim']
@@ -359,7 +358,6 @@ def deltanet_step_ondevice(x_tt, w_tt, ssm_state_tt, conv_state_tt, cfg):
 
 def gated_attn_step_ondevice(x_tt, w_tt, kv_cache_k_tt, kv_cache_v_tt,
                               kv_cfg, cur_pos_tt, cur_pos, cos_tt, sin_tt, cfg, device):
-    HIDDEN = cfg['hidden']
     N_Q = cfg['n_q_heads']
     N_KV = cfg['n_kv_heads']
     HEAD_DIM = cfg['head_dim']

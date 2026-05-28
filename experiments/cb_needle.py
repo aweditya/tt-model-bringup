@@ -32,7 +32,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 
 import server_tp as base       # noqa: E402
-import server_tp_cb as cb      # noqa: E402
 import cb_scheduler as sched   # noqa: E402
 
 sys.stdout.reconfigure(line_buffering=True)

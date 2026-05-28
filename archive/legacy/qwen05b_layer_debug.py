@@ -85,7 +85,6 @@ def _load_weights():
     from safetensors import safe_open
     from huggingface_hub import hf_hub_download
     from transformers import AutoTokenizer
-    import torch  # only for safetensors → numpy
 
     model_path = hf_hub_download("Qwen/Qwen2.5-0.5B", "model.safetensors")
     raw = {}

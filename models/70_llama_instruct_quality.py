@@ -422,18 +422,18 @@ cosine = np.dot(ref_logits, tt_logits) / (np.linalg.norm(ref_logits) * np.linalg
 top1_match = ref_top5[0] == tt_top5[0]
 top5_match = sum(1 for t in tt_top5 if t in ref_top5)
 
-print(f"\n--- Correctness ---")
+print("\n--- Correctness ---")
 print(f"  Cosine similarity: {cosine:.6f}")
 print(f"  Top-1 match: {top1_match} (numpy={tokenizer.decode([ref_top5[0]])}, ttnn={tokenizer.decode([tt_top5[0]])})")
 print(f"  Top-5 overlap: {top5_match}/5")
 
 if cosine < 0.99:
-    print(f"  WARNING: Cosine below 0.99!")
+    print("  WARNING: Cosine below 0.99!")
 else:
-    print(f"  Cosine > 0.99 — precision validated")
+    print("  Cosine > 0.99 — precision validated")
 
 # 4. Numpy reference greedy decode — first 20 tokens as ground truth
-print(f"\n--- Numpy reference greedy decode (20 tokens) ---")
+print("\n--- Numpy reference greedy decode (20 tokens) ---")
 np_tokens = list(tokens)
 np_logits = ref_logits  # already computed from prefill
 for step in range(20):
@@ -540,9 +540,9 @@ sustained = times[1:] if len(times) > 1 else times
 avg_ms = np.mean(sustained) * 1000
 
 print(f"\n{'='*60}")
-print(f"RESULTS: Llama-3.2-1B-Instruct Quality Validation")
+print("RESULTS: Llama-3.2-1B-Instruct Quality Validation")
 print(f"{'='*60}")
-print(f"\n  Correctness:")
+print("\n  Correctness:")
 print(f"    Cosine (numpy vs TT-NN): {cosine:.6f}")
 print(f"    Top-1 match: {top1_match}")
 print(f"    Top-5 overlap: {top5_match}/5")

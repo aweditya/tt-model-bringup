@@ -49,17 +49,27 @@ tt-xla/
   then archive 91f/91l. VALIDATE: qb2 (or qb1) server bootstrap + the cb_validate
   Paris/logit canary. First: `grep -nE "_91f\.|_91l\." experiments/serve/server_tp.py`
   for the full used-symbol set (server_35b_ttnn.py may load its own — out of 27B scope).
-- **M3 finish — PENDING**: rename `cb_*` suite to verb_noun (e.g.
-  validate_forward / bench_decode / profile_dn / needle_haystack); their
-  `PROJECT_ROOT = Path(__file__).resolve().parents[1]` + `sys.path.insert(.../
-  experiments/serve)` assumes top-level — fix `parents[N]` if moved into a subdir.
-  Update scripts/deploy.sh defaults. Archive `jax_qwen05b_*` + `qwen05b_*` +
-  `experiments/tt_jax/` + `pjrt_plugin/` → archive/legacy/. Run-validate imports.
-- **M2 CI/ruff — PENDING (low-risk, no device)**: ruff config (format+lint) in
-  pyproject; `.pre-commit-config.yaml`; `.github/workflows/ci.yml` (uv sync +
-  ruff check + ruff format --check + import smoke; device tests gated to a
-  self-hosted qb1 runner / documented-manual). Then ONE `ruff format` sweep over
-  the ACTIVE tree only (not archive/).
+- **M2 CI/ruff — DONE** (commit pending below): ruff lint config in pyproject
+  (select E+F; ignore the compact-style E7xx/E4xx + E501; exclude archive/scratch/
+  pjrt_plugin/experiments/utils/tt_jax), `[dependency-groups].dev` (ruff,
+  pre-commit), `.pre-commit-config.yaml` (ruff + ruff-format incremental + safety
+  hooks), `.github/workflows/ci.yml` (uvx ruff check + compileall smoke; NO heavy
+  deps, NO device — TT runs stay on qb1/qb2). Curated tree is now `ruff check`
+  clean: autofixed F401/F541 (148), hand-fixed F841×6 + the NCHIPS F811 in active
+  files. Makefile lint/fmt pinned to `ruff@0.14.0`.
+  **DEFERRED:** the big `ruff format` sweep — it splits the deliberate `a; b`
+  one-liners and would be a huge, hard-to-review, risky diff across the frozen
+  servers. Formatting lands incrementally via pre-commit on touched files; do a
+  scoped sweep later if desired. So CI does NOT run `ruff format --check`.
+- **M3 finish — PARTLY DONE**: archived `jax_qwen05b_*` (9) + `qwen05b_*` (2) →
+  `archive/legacy/` (no active importers; done during M2 to clear lint). STILL
+  PENDING: rename `cb_*` suite to verb_noun (e.g. validate_forward / bench_decode
+  / profile_dn / needle_haystack); their `PROJECT_ROOT =
+  Path(__file__).resolve().parents[1]` + `sys.path.insert(.../experiments/serve)`
+  assumes top-level — fix `parents[N]` if moved into a subdir, and update
+  scripts/deploy.sh defaults. Archive `experiments/tt_jax/` + `pjrt_plugin/` →
+  archive/legacy/. Run-validate imports. (NOTE: when files leave
+  `experiments/utils`, they re-enter the ruff lint scope — re-run `make lint`.)
 - **M4 lean code + comments — PENDING (canary-gated)**: `# GOTCHA:` convention
   for load-bearing comments (view-decay, +1 RMSNorm, K-broadcast RoPE, bf16-KV —
   the HANDOFF must-keeps); delete narrative/debug-log comments. Excise dead debug

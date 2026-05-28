@@ -12,10 +12,10 @@ setup:  ## install Python deps into .venv via uv (does NOT build ttnn — see RE
 	uv sync
 
 lint:  ## ruff lint (host-independent; never runs device code)
-	uvx ruff check .
+	uvx ruff@0.14.0 check .
 
 fmt:  ## ruff auto-format
-	uvx ruff format .
+	uvx ruff@0.14.0 format .
 
 deploy:  ## rsync code to the TT host: make deploy [P="path ..."]
 	@TT_HOST=$(TT_HOST) scripts/deploy.sh $(P)

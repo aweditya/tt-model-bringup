@@ -1,0 +1,23 @@
+# Host-only checks: lint + a syntax/compile smoke. No device, no ttnn/torch —
+# anything that needs a P150 runs on qb1/qb2 (see scripts/run_remote.sh) and is
+# out of CI scope. Config lives in pyproject.toml [tool.ruff].
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Ruff lint (curated tree)
+        run: uvx ruff check .
+      - name: Compile smoke (curated tree)
+        run: |
+          uv python install 3.10.12
+          uv run --python 3.10.12 --no-project python -m compileall -q \
+            -x 'experiments/(utils|tt_jax)/|\.refs/' experiments models scripts

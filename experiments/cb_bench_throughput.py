@@ -102,7 +102,6 @@ def main():
         ms, tps = bench_one(state, B, args.steps, args.warmup, args.blocks_per_seq)
         if base_ms is None and B == 1:
             base_ms = ms
-        eff = (base_ms / ms) if base_ms else float('nan')  # ms_B1/ms_B → per-step slowdown factor
         rows.append((B, ms, tps))
         log(f"  B={B:3d}: {ms:8.2f} ms/step   agg {tps:8.2f} tok/s"
             + (f"   (step is {ms/base_ms:.2f}x B=1; {tps/(1000.0/base_ms):.1f}x B=1 throughput)"

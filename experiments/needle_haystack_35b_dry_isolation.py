@@ -232,7 +232,6 @@ def main():
                 # We seed `history` for DRY with the prompt tokens — gives
                 # DRY visibility into chat-template "the the" patterns.
                 history = list(prompt_ids)
-                cur = last_argmax
                 pos = len(prompt_ids)
 
                 # First, evaluate the first decoded token (last_argmax) with sampler.

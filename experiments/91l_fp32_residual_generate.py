@@ -96,7 +96,7 @@ def main():
     args = p.parse_args()
 
     print("=" * 64)
-    print(f"Phase B'9 — Qwen3.6-27B with fp32 residual stream")
+    print("Phase B'9 — Qwen3.6-27B with fp32 residual stream")
     print(f"  Mode: {args.mode}   Prompt: {args.prompt!r}   Tokens: {args.tokens}")
     print("=" * 64)
 
@@ -123,13 +123,13 @@ def main():
     CONV_DIM = 2 * KEY_DIM + VAL_DIM
 
     # Tokenize
-    print(f"\n[1/5] Tokenizer + prompt encode…")
+    print("\n[1/5] Tokenizer + prompt encode…")
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     prompt_ids = tok.encode(args.prompt)
     print(f"  {len(prompt_ids)} prompt tokens: {prompt_ids}")
 
     # Embed + lm_head (host-side; fp32 numpy)
-    print(f"\n[2/5] Loading embedding + lm_head + final_norm…")
+    print("\n[2/5] Loading embedding + lm_head + final_norm…")
     eweights = load_embed_lm_head_weights()
     embed_np = eweights['embed']
     final_norm_np = eweights['final_norm']
@@ -288,7 +288,7 @@ def main():
             print(f"\n┌─ step {step} ─── cur_pos={cur_pos}  input={last_token!r} "
                   f"({tok.decode([last_token])!r})  dt={dt*1000:.0f}ms")
             print(f"│ x dtype at final: {norms.get('x_final_dtype', '?')}")
-            print(f"│ ‖x‖ checkpoints:")
+            print("│ ‖x‖ checkpoints:")
             for k, v in norms.items():
                 if isinstance(v, (int, float)):
                     print(f"│   {k:>14s}: {v:10.4f}")
@@ -298,7 +298,7 @@ def main():
             for tid_, s, lg in top5:
                 mark = " ← chosen" if tid_ == int(next_id) else ""
                 print(f"│   {tid_:6d}  {s!r:>18s}  logit={lg:8.3f}{mark}")
-            print(f"└─")
+            print("└─")
 
         # Cross-step analysis
         print("\n" + "=" * 64)
@@ -306,7 +306,7 @@ def main():
         print("=" * 64)
         keys = [k for k in diag_records[0]['norms'].keys()
                 if isinstance(diag_records[0]['norms'][k], (int, float))]
-        print(f"  step→  " + "  ".join(f"step{i}".rjust(10) for i in range(args.diag_steps)))
+        print("  step→  " + "  ".join(f"step{i}".rjust(10) for i in range(args.diag_steps)))
         for k in keys:
             row = [r['norms'][k] for r in diag_records]
             spread = (max(row) - min(row)) / (max(abs(v) for v in row) + 1e-9)
@@ -345,7 +345,7 @@ def main():
         total = time.time() - t_decode
         print(f"\n  decode: {args.tokens} tokens in {total:.1f}s = {args.tokens/total:.2f} tok/s")
         text = tok.decode(all_ids)
-        print(f"\n[Generated text]:")
+        print("\n[Generated text]:")
         print("  ┌" + "─" * 60)
         for line in text.split("\n"):
             print(f"  │ {line}")

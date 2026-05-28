@@ -19,7 +19,6 @@ Run on qb1 (server must be running):
     ssh qb1 'cd tt-xla && .venv/bin/python -m experiments.serve.scripts.compare_paged_vs_nonpaged'
 """
 import json
-import os
 import socket
 import sys
 from pathlib import Path
@@ -113,7 +112,7 @@ def main():
         print(f"  paged     tok #{first_diff}: id={ids_p[first_diff]}")
         # Show some context (token indices around first_diff)
         lo, hi = max(0, first_diff - 5), min(n, first_diff + 10)
-        print(f"\n  Context (tok#: nonpaged_id, paged_id):")
+        print("\n  Context (tok#: nonpaged_id, paged_id):")
         for i in range(lo, hi):
             mark = "  <-- DIVERGE" if i == first_diff else ""
             same = "✓" if ids_np[i] == ids_p[i] else "✗"

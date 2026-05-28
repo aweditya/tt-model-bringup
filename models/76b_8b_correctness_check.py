@@ -468,18 +468,18 @@ print(f"  TT-NN TEXT: {tokenizer.decode(tt_gen, skip_special_tokens=True)}")
 # ══════════════════════════════════════════════════════════════
 
 print(f"\n{'='*60}")
-print(f"VERDICT: Llama-3.1-8B-Instruct Correctness")
+print("VERDICT: Llama-3.1-8B-Instruct Correctness")
 print(f"{'='*60}")
 print(f"  Prefill cosine:    {cos:.6f}")
 print(f"  Token match:       {matches}/{len(np_gen)}")
 print(f"  Mean decode cos:   {np.mean(cosines):.4f}")
 
 if cos > 0.99 and matches >= 18:
-    print(f"\n  ✓ IMPLEMENTATION IS CORRECT — quality issues are model behavior, not bugs")
+    print("\n  ✓ IMPLEMENTATION IS CORRECT — quality issues are model behavior, not bugs")
 elif cos > 0.95:
-    print(f"\n  ⚠ MARGINAL — precision degradation detected, but may be within tolerance")
+    print("\n  ⚠ MARGINAL — precision degradation detected, but may be within tolerance")
 else:
-    print(f"\n  ✗ BUG DETECTED — significant divergence between numpy and TT-NN")
+    print("\n  ✗ BUG DETECTED — significant divergence between numpy and TT-NN")
 
 ttnn.close_device(device)
 print("\nDone!")

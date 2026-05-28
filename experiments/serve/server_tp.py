@@ -28,7 +28,6 @@ import sys
 import time
 import socket
 import json
-import signal
 import importlib.util
 import contextlib
 
@@ -157,17 +156,17 @@ def _profile_scope(state, name: str):
 
 def bootstrap(state: MeshServerState):
     """Stage A: open mesh + set fabric + load sharded weights + tokenizer."""
-    print(f"[bootstrap] importing ttnn + torch + numpy…", flush=True)
+    print("[bootstrap] importing ttnn + torch + numpy…", flush=True)
     import numpy as np
     import torch
     import ttnn
     from huggingface_hub import hf_hub_download
     from transformers import AutoTokenizer
 
-    print(f"[bootstrap] setting fabric_config = FABRIC_1D…", flush=True)
+    print("[bootstrap] setting fabric_config = FABRIC_1D…", flush=True)
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
 
-    print(f"[bootstrap] opening (1, 4) mesh device…", flush=True)
+    print("[bootstrap] opening (1, 4) mesh device…", flush=True)
     state.mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 4))
     print(f"  ✓ mesh {state.mesh.get_num_devices()} chips", flush=True)
 
@@ -197,12 +196,12 @@ def bootstrap(state: MeshServerState):
     print(f"  ✓ cfg: {cfg}", flush=True)
     print(f"  ✓ num_layers: {state.num_layers}", flush=True)
 
-    print(f"[bootstrap] loading tokenizer…", flush=True)
+    print("[bootstrap] loading tokenizer…", flush=True)
     state.tok = AutoTokenizer.from_pretrained(MODEL_ID)
-    print(f"  ✓ tokenizer", flush=True)
+    print("  ✓ tokenizer", flush=True)
 
     # === Stage B: load + shard all layer weights ===
-    print(f"[bootstrap] importing 91f kernels + TP relayout helpers…", flush=True)
+    print("[bootstrap] importing 91f kernels + TP relayout helpers…", flush=True)
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "experiments"))
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "experiments", "utils"))
     spec = importlib.util.spec_from_file_location(
@@ -212,8 +211,7 @@ def bootstrap(state: MeshServerState):
     state._91f = _91f
     from full_layer_tp_probe import (
         relayout_in_proj, relayout_conv,
-        N_K_HEADS, N_V_HEADS, K_DIM, V_DIM, KERNEL, KEY_DIM, VAL_DIM, CONV_DIM,
-        NCHIPS,
+        N_V_HEADS, K_DIM, V_DIM, KERNEL, CONV_DIM,
     )
     from tp_attn_traced_probe import (
         relayout_attn_qkv, relayout_o,
@@ -345,7 +343,7 @@ def bootstrap(state: MeshServerState):
     print(f"[bootstrap] all {state.num_layers} layers loaded in {time.time() - t_load_start:.0f}s", flush=True)
 
     # === Stage B (cont): embed, lm_head, final_norm — replicated ===
-    print(f"[bootstrap] loading embed + lm_head + final_norm + RoPE tables…", flush=True)
+    print("[bootstrap] loading embed + lm_head + final_norm + RoPE tables…", flush=True)
     # Reuse 91l's loader (used by single-chip server too)
     spec2 = importlib.util.spec_from_file_location(
         "_91l", os.path.join(PROJECT_ROOT, "experiments", "91l_fp32_residual_generate.py"))
@@ -448,7 +446,7 @@ def bootstrap(state: MeshServerState):
                                    ttnn.ShardOrientation.ROW_MAJOR)
     state.paged_write_mem_cfg = ttnn.MemoryConfig(
         ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
-    print(f"  ✓ paged_write mem_cfg cached", flush=True)
+    print("  ✓ paged_write mem_cfg cached", flush=True)
     # paged_fused_update_cache requires K/V input tensors to occupy disjoint
     # L1 core ranges. Keep this separate from the production single-writer
     # config, which intentionally uses one core and remains the default path.
@@ -467,7 +465,7 @@ def bootstrap(state: MeshServerState):
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec_k)
         state.fused_paged_write_mem_cfg_v = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec_v)
-        print(f"  ✓ fused paged_write disjoint K/V mem_cfg cached", flush=True)
+        print("  ✓ fused paged_write disjoint K/V mem_cfg cached", flush=True)
     else:
         print(f"  ! fused paged_write disjoint mem_cfg unavailable for grid "
               f"{compute_grid.x}x{compute_grid.y}", flush=True)
@@ -488,7 +486,7 @@ def bootstrap(state: MeshServerState):
         fp32_dest_acc_en=False,
         packer_l1_acc=False,
     )
-    print(f"  ✓ paged SDPA program_config + compute_kernel_config cached", flush=True)
+    print("  ✓ paged SDPA program_config + compute_kernel_config cached", flush=True)
 
     # Pre-allocated input buffers for trace-compatible decode.
     # These are READ by forward_token_tp_inner (which is the trace target).
@@ -524,11 +522,11 @@ def bootstrap(state: MeshServerState):
         torch.tensor([[0]], dtype=torch.int32),
         dtype=ttnn.uint32, device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
-    print(f"  ✓ input buffers pre-allocated (x_buf, cur_pos_buf, cos_buf, sin_buf, "
-          f"tok_buf, rot_idxs_buf)",
+    print("  ✓ input buffers pre-allocated (x_buf, cur_pos_buf, cos_buf, sin_buf, "
+          "tok_buf, rot_idxs_buf)",
           flush=True)
 
-    print(f"[bootstrap] STAGE B COMPLETE — all weights + state buffers on mesh.", flush=True)
+    print("[bootstrap] STAGE B COMPLETE — all weights + state buffers on mesh.", flush=True)
 
 
 # ============================================================================
@@ -693,7 +691,7 @@ def _deltanet_step_tp_from_inproj(state, x_residual_tt, all_tt, dn, cfg,
     """
     import ttnn
     from full_layer_tp_probe import (
-        N_K_HEADS, N_V_HEADS, K_DIM, V_DIM, CONV_DIM_CHIP, KEY_DIM_CHIP, VAL_DIM_CHIP,
+        K_DIM, V_DIM, CONV_DIM_CHIP, KEY_DIM_CHIP, VAL_DIM_CHIP,
         NK_PER_CHIP, NV_PER_CHIP, N_REP, EPS,
     )
 
@@ -1089,7 +1087,6 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
     """
     import ttnn
     import torch
-    import numpy as np
     from full_layer_tp_probe import (
         IN_PROJ_OUT_CHIP, EPS, CONV_DIM_CHIP, VAL_DIM_CHIP, NV_PER_CHIP,
         NK_PER_CHIP, K_DIM, V_DIM, KEY_DIM_CHIP, N_REP, NCHIPS,
@@ -1486,8 +1483,6 @@ def gated_attn_step_tp(state, x_tt, attn, cur_pos_tt, cur_pos, cos_tt, sin_tt, c
     (no comm during SDPA). Only out_proj + residual all_reduce.
     """
     import ttnn
-    import torch
-    import numpy as np
     HIDDEN = cfg['hidden']
     HEAD_DIM = cfg['head_dim']
     N_Q = cfg['n_q_heads']
@@ -2001,7 +1996,7 @@ def _reset_state_buffers(state):
     buffers stay at their allocated addresses (the trace was captured
     against those addresses).
     """
-    import ttnn, torch, numpy as np
+    import ttnn, torch
     from full_layer_tp_probe import N_V_HEADS, K_DIM, V_DIM, CONV_DIM
     cfg = state.cfg
     mesh = state.mesh
@@ -2050,7 +2045,7 @@ def _ensure_decode_trace(state):
     import ttnn
     if state.trace_id is not None:
         return
-    print(f"[trace] warmup + capture decode trace…", flush=True)
+    print("[trace] warmup + capture decode trace…", flush=True)
     import time as _time
     t0 = _time.time()
     # Warmup eager — JIT all kernels for the inner forward
@@ -4729,7 +4724,6 @@ def handle_profile_decode_tp_ops(state: MeshServerState, args: dict) -> dict:
     eagerly with TTNN calls monkey-patched inside this process.
     """
     import time as _time
-    import types
     import ttnn
 
     prompt = args.get("prompt", "The capital of France is")
@@ -5084,7 +5078,6 @@ def handle_probe_deltanet_recurrence_matmul_tp(state: MeshServerState, args: dic
 
 def handle_probe_deltanet_native_gdn_real_tensors_tp(state: MeshServerState, args: dict) -> dict:
     """Validate native Qwen36 GDN recurrence on real resident server tensors."""
-    import numpy as np
     import torch
     import ttnn
     from full_layer_tp_probe import (
@@ -7416,8 +7409,6 @@ def handle_generate_tp(state: MeshServerState, args: dict):
     Now uses TRACED forward (P14 unblocked). On first call: warmup + capture.
     Subsequent calls reuse the trace via execute_trace.
     """
-    import numpy as np
-    import torch
     import ttnn
     import time as _time
 

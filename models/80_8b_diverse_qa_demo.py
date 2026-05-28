@@ -295,8 +295,8 @@ prompts = [
 ]
 
 print(f"\n{'='*70}")
-print(f"Experiment 80: Llama-3.1-8B-Instruct on Blackhole P150")
-print(f"Decoding: Greedy (argmax)")
+print("Experiment 80: Llama-3.1-8B-Instruct on Blackhole P150")
+print("Decoding: Greedy (argmax)")
 print(f"{'='*70}")
 
 results = []
@@ -310,7 +310,7 @@ for category, prompt in prompts:
 
 # Summary
 print(f"\n{'='*70}")
-print(f"SUMMARY")
+print("SUMMARY")
 print(f"{'='*70}")
 print(f"{'Category':<14} {'Tokens':>6} {'tok/s':>6} {'EOS':>4}")
 print(f"{'-'*14} {'-'*6} {'-'*6} {'-'*4}")
@@ -325,8 +325,8 @@ avg_tps = np.mean([r['decode_tok_per_sec'] for _, _, r in results])
 print(f"\nTotal tokens generated: {total_tokens}")
 print(f"All hit EOS naturally: {all_eos}")
 print(f"Average decode speed: {avg_tps:.0f} tok/s")
-print(f"Model: Llama-3.1-8B-Instruct (bf16, 32 layers, 8B params)")
-print(f"Device: Tenstorrent Blackhole P150 (450 GB/s DRAM BW)")
+print("Model: Llama-3.1-8B-Instruct (bf16, 32 layers, 8B params)")
+print("Device: Tenstorrent Blackhole P150 (450 GB/s DRAM BW)")
 print(f"Ceiling: 28 tok/s | Efficiency: {avg_tps/28*100:.0f}%")
 
 ttnn.close_device(device)

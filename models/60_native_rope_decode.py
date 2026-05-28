@@ -444,9 +444,9 @@ print(f"\n  Native text:  {tokenizer.decode(gen_native)[:200]}")
 print(f"  RotMat text:  {tokenizer.decode(gen_rm)[:200]}")
 print(f"  Token match:  {gen_native == gen_rm}")
 
-print(f"\n  Comparison timeline:")
-print(f"    53e  bf16+rotmat:   7.6ms/tok (132 tok/sec)")
-print(f"    57c  bf8+rotmat:    7.4ms/tok (134 tok/sec)")
+print("\n  Comparison timeline:")
+print("    53e  bf16+rotmat:   7.6ms/tok (132 tok/sec)")
+print("    57c  bf8+rotmat:    7.4ms/tok (134 tok/sec)")
 print(f"    60   bf8+native:    {avg_native:.1f}ms/tok ({1000/avg_native:.0f} tok/sec)")
 
 ttnn.close_device(device)

@@ -184,7 +184,7 @@ def _stream_generate(server_cmd: str, payload: dict, *, prompt: str) -> None:
         print(f"  paged: max_pos={final['max_pos']}, block_size={final.get('block_size')}")
     print(f"  total wall: {final.get('total_ms', 0):.1f} ms")
     if final.get('stopped_on_eos'):
-        print(f"  (stopped on EOS)")
+        print("  (stopped on EOS)")
 
 
 def cmd_generate(args):

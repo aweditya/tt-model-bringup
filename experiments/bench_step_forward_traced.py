@@ -26,7 +26,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
@@ -133,7 +132,7 @@ def main():
     log(f"  execute_trace ms: mean {ts.mean():7.3f}  median {np.median(ts):7.3f}  "
         f"min {ts.min():.3f}  max {ts.max():.3f}  std {ts.std():.3f}")
     log(f"  per-token: {ts.mean():.2f} ms/tok TRACE")
-    log(f"  generated text:")
+    log("  generated text:")
     log(f"  {text!r}")
     log(f"  token sequence (first {len(generated)}):")
     log(f"  {generated}")

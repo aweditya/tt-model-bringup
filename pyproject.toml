@@ -23,3 +23,27 @@ dependencies = [
 
 # uv-managed, no PyPI publishing.
 # `[build-system]` intentionally omitted (uv init --no-package).
+
+[dependency-groups]
+# Dev tooling — `uv sync` installs these; CI + pre-commit use them.
+dev = [
+    "ruff>=0.14.0",
+    "pre-commit>=4.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Lint only the curated, maintained tree. archive/ + pjrt_plugin/ are retired;
+# experiments/utils/ is a probe dumping-ground pending archive triage (M3).
+extend-exclude = ["archive", "scratch", "pjrt_plugin", "experiments/utils", "experiments/tt_jax"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = [
+    "E701", "E702", "E401",  # compact one-line statements — deliberate research style
+    "E402",                  # late imports (after sys.path setup) are intentional here
+    "E722",                  # bare except in probe/bench code
+    "E731", "E741",          # lambda-assign / ambiguous single-char name — minor
+    "E501",                  # line length is the formatter's job; long comments are fine
+]

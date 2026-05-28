@@ -148,7 +148,6 @@ def main():
     # owned_decay_gate, which is numerically ~equal but not bit-identical — at
     # pos 0 (widest entropy) the tiny diff flips argmax. For an apples-to-apples
     # gate, run the reference with the same manual math.
-    import numpy as np
     # CB uses manual decay/gate; recurrence is manual by default, owned_gdn under
     # --owned-gdn (the batched kernel, debug_mode=10). Match the prod reference's
     # recurrence so the comparison is apples-to-apples.

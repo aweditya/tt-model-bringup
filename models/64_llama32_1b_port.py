@@ -390,17 +390,17 @@ sustained = trace_times[1:] if len(trace_times) > 1 else trace_times
 avg = np.mean(sustained) * 1000
 
 print(f"\n{'='*60}")
-print(f"RESULTS: Llama-3.2-1B on Blackhole P150")
+print("RESULTS: Llama-3.2-1B on Blackhole P150")
 print(f"{'='*60}")
 print(f"  Architecture: {n_layers} layers, {hidden} hidden, {n_q_heads} Q heads, {n_kv_heads} KV heads")
-print(f"  Parameters: ~1.24B")
+print("  Parameters: ~1.24B")
 print(f"  Upload: {dt_upload*1000:.0f}ms")
 print(f"  Prefill: {t_prefill*1000:.0f}ms")
 print(f"  Traced decode: {avg:.1f}ms/tok ({1000/avg:.1f} tok/sec)")
 print(f"  Tokens generated: {len(trace_times)}")
 print(f"  Text: {text}")
-print(f"\n  Comparison:")
-print(f"    Qwen2.5-0.5B: 7.1ms/tok (140 tok/sec) — 24 layers, 896 hidden")
+print("\n  Comparison:")
+print("    Qwen2.5-0.5B: 7.1ms/tok (140 tok/sec) — 24 layers, 896 hidden")
 print(f"    Llama-3.2-1B: {avg:.1f}ms/tok ({1000/avg:.0f} tok/sec) — 16 layers, 2048 hidden")
 
 ttnn.close_device(device)

@@ -2,7 +2,6 @@
 """Minimal CLI for server_35b.py — status / generate_35b / shutdown."""
 import argparse
 import json
-import os
 import socket
 import sys
 from pathlib import Path

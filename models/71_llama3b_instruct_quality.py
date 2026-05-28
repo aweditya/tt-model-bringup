@@ -462,9 +462,9 @@ print(f"\n  Cosine similarity: {cosine:.6f}")
 print(f"  Top-1 match: {top1_match}")
 print(f"  Top-5 overlap: {top5_match}/5")
 if cosine < 0.99:
-    print(f"  WARNING: Below 0.99 threshold!")
+    print("  WARNING: Below 0.99 threshold!")
 else:
-    print(f"  PASS: Precision validated")
+    print("  PASS: Precision validated")
 
 
 # ── Test 2: Token-by-token match (first 10 numpy decode tokens) ──
@@ -505,20 +505,20 @@ print("TEST 3: Generation quality")
 print(f"{'='*60}")
 
 print(f"\n  GREEDY ({len(greedy_tokens)} tokens, {avg_ms:.1f}ms/tok = {1000/avg_ms:.0f} tok/sec):")
-print(f"  ---")
+print("  ---")
 for line in greedy_text.split('\n'):
     print(f"  {line}")
-print(f"  ---")
+print("  ---")
 
 # Sampled generation
 sampled_tokens, sampled_times, _ = generate(tokens, args.tokens, mode="sample", temperature=0.6, top_k=50)
 sampled_text = tokenizer.decode(sampled_tokens, skip_special_tokens=True)
 
 print(f"\n  SAMPLED ({len(sampled_tokens)} tokens, temp=0.6, top_k=50):")
-print(f"  ---")
+print("  ---")
 for line in sampled_text.split('\n'):
     print(f"  {line}")
-print(f"  ---")
+print("  ---")
 
 
 # ── Test 4: Multiple prompts ──
@@ -544,7 +544,7 @@ for prompt in test_prompts:
 
 # ── Summary ──
 print(f"\n{'='*60}")
-print(f"SUMMARY: Llama-3.2-3B-Instruct on Blackhole")
+print("SUMMARY: Llama-3.2-3B-Instruct on Blackhole")
 print(f"{'='*60}")
 print(f"  Cosine (numpy vs TT-NN): {cosine:.6f}")
 print(f"  Token match (first 10): {match_count}/10")

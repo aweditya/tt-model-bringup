@@ -132,7 +132,7 @@ def main():
     except Exception as e:
         log(f"fabric config warning: {e}")
 
-    log(f"opening (1,4) mesh on qb1")
+    log("opening (1,4) mesh on qb1")
     mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 4))
     try:
         log(f"shapes per chip: HIDDEN={HIDDEN}, "

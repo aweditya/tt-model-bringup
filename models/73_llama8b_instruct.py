@@ -379,13 +379,13 @@ for prompt, max_tok in test_prompts:
     avg_ms = np.mean(sustained) * 1000 if sustained else 0
 
     print(f"  Tokens: {len(gen)}, Speed: {avg_ms:.1f}ms/tok ({1000/avg_ms:.0f} tok/sec)")
-    print(f"  ---")
+    print("  ---")
     for line in text.split('\n')[:20]:
         print(f"  {line}")
-    print(f"  ---")
+    print("  ---")
 
 print(f"\n{'='*60}")
-print(f"SUMMARY: Llama-3.1-8B-Instruct on Blackhole P150")
+print("SUMMARY: Llama-3.1-8B-Instruct on Blackhole P150")
 print(f"{'='*60}")
 print(f"  Architecture: {n_layers} layers, {hidden} hidden, {n_q_heads}Q/{n_kv_heads}KV, head_dim={head_dim}")
 print(f"  Upload: {dt_upload:.0f}s")

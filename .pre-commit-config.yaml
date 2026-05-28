@@ -1,0 +1,17 @@
+# Run `uv run pre-commit install` once to enable. Hooks act on staged files,
+# so the formatter lands incrementally (no big-bang reformat of the frozen
+# servers). Config (rules, excludes, line length) lives in pyproject.toml.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.0
+    hooks:
+      - id: ruff          # lint, autofix the safe rules
+        args: [--fix]
+      - id: ruff-format   # format touched files only
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=2048]   # weights/traces don't belong in git

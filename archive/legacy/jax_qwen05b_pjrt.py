@@ -63,7 +63,6 @@ sys.path.insert(0, PJRT_DIR)
 
 import jax
 import jax.numpy as jnp
-import jax._src.interpreters.mlir as jax_mlir
 
 if not args.no_pjrt:
     import jax_plugins.tt as tt_plugin
@@ -107,7 +106,6 @@ print("\nLoading Qwen2.5-0.5B weights...")
 from safetensors import safe_open
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
-import torch  # only for the safetensors read; we go straight to numpy
 
 model_path = hf_hub_download("Qwen/Qwen2.5-0.5B", "model.safetensors")
 weights = {}
@@ -604,7 +602,7 @@ if step_times:
           f"{p50:.1f} ms p50, {p90:.1f} ms p90 ({len(sustained)} steps)")
     print(f"  Throughput: {tps:.1f} tok/sec")
     print(f"  Cold first step: {cold_ms:.0f} ms (compile + trace capture)")
-    print(f"  Reference (native ttnn exp 60): ~7.0 ms/tok, 142 tok/s")
+    print("  Reference (native ttnn exp 60): ~7.0 ms/tok, 142 tok/s")
     print(f"  Speed ratio vs native: {tps / 142:.2f}x")
 else:
     print("  No sustained-decode timings (gen too short).")
