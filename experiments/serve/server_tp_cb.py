@@ -122,6 +122,7 @@ def setup_cb_state(state, B, blocks_per_seq=None):
     state.cb_rot_idxs_buf = ttnn.from_torch(
         torch.zeros(B, 1, dtype=torch.int32), layout=ttnn.ROW_MAJOR_LAYOUT,
         dtype=ttnn.uint32, device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    setup_cb_write_mem_cfg(state)  # B-core HEIGHT_SHARDED L1 for paged KV writes
     return state
 
 
@@ -277,6 +278,159 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     res = ttnn.add(x_tt, reduced)
     ttnn.deallocate(reduced)
     return res
+
+
+def gated_attn_step_batched(state, x_tt, attn, li, cos_tt, sin_tt, cfg):
+    """Batched gated attention. x_tt [B,HIDDEN]; cos/sin [B,ROTARY_DIM].
+    Per-slot KV in state.cb_kv[li], per-slot pos in state.cb_cur_pos_buf,
+    page table state.cb_page_table_tt. Mirrors server_tp.gated_attn_step_tp
+    with leading B. All primitives validated (RoPE broadcast + paged
+    write/read isolations). Returns [B,HIDDEN] residual-added output."""
+    B = state.cb_B
+    HIDDEN = cfg['hidden']
+    HEAD_DIM = cfg['head_dim']
+    N_Q = cfg['n_q_heads']; N_KV = cfg['n_kv_heads']
+    ROTARY_DIM = int(HEAD_DIM * cfg['partial_rotary_factor'])
+    NQ_PER_CHIP = N_Q // 4
+    NKV_PER_CHIP = N_KV // 4
+    QG_DIM_CHIP = 2 * NQ_PER_CHIP * HEAD_DIM
+    KV_DIM_CHIP = NKV_PER_CHIP * HEAD_DIM
+    EPS = 1e-6
+    TILE_H = 32
+    assert NKV_PER_CHIP == 1, "paged SDPA per-chip assumes 1 KV head"
+    half = ROTARY_DIM // 2
+    kv = state.cb_kv[li]
+
+    h_tt = _rms_norm_manual(x_tt, attn['input_norm'], EPS, HIDDEN)
+    all_tt = ttnn.linear(h_tt, attn['w_qkv'])           # [B, QG+2KV]
+    ttnn.deallocate(h_tt)
+    qg = ttnn.slice(all_tt, [0, 0], [B, QG_DIM_CHIP])
+    k_flat = ttnn.slice(all_tt, [0, QG_DIM_CHIP], [B, QG_DIM_CHIP + KV_DIM_CHIP])
+    v_flat = ttnn.slice(all_tt, [0, QG_DIM_CHIP + KV_DIM_CHIP],
+                        [B, QG_DIM_CHIP + 2 * KV_DIM_CHIP])
+    ttnn.deallocate(all_tt)
+    qg = ttnn.reshape(qg, [B, NQ_PER_CHIP, 2 * HEAD_DIM])
+    q_tt = ttnn.slice(qg, [0, 0, 0], [B, NQ_PER_CHIP, HEAD_DIM])
+    gate_tt = ttnn.slice(qg, [0, 0, HEAD_DIM], [B, NQ_PER_CHIP, 2 * HEAD_DIM])
+    ttnn.deallocate(qg)
+    k_tt = ttnn.reshape(k_flat, [B, NKV_PER_CHIP, HEAD_DIM]); ttnn.deallocate(k_flat)
+    v_tt = ttnn.reshape(v_flat, [B, NKV_PER_CHIP, HEAD_DIM]); ttnn.deallocate(v_flat)
+
+    q_tt = _rms_norm_manual(q_tt, attn['q_norm'], EPS, HEAD_DIM)
+    k_tt = _rms_norm_manual(k_tt, attn['k_norm'], EPS, HEAD_DIM)
+
+    cos_b = ttnn.reshape(cos_tt, [B, 1, ROTARY_DIM])
+    sin_b = ttnn.reshape(sin_tt, [B, 1, ROTARY_DIM])
+    def rope_b(t, n_heads):
+        rot = ttnn.slice(t, [0, 0, 0], [B, n_heads, ROTARY_DIM])
+        passthru = ttnn.slice(t, [0, 0, ROTARY_DIM], [B, n_heads, HEAD_DIM])
+        x1 = ttnn.slice(rot, [0, 0, 0], [B, n_heads, half])
+        x2 = ttnn.slice(rot, [0, 0, half], [B, n_heads, ROTARY_DIM])
+        neg_x2 = ttnn.neg(x2)
+        rotated = ttnn.add(ttnn.mul(rot, cos_b),
+                           ttnn.mul(ttnn.concat([neg_x2, x1], dim=-1), sin_b))
+        out = ttnn.concat([rotated, passthru], dim=-1)
+        ttnn.deallocate(rot); ttnn.deallocate(passthru); ttnn.deallocate(x1)
+        ttnn.deallocate(neg_x2); ttnn.deallocate(rotated)
+        return out
+    q_r = rope_b(q_tt, NQ_PER_CHIP); ttnn.deallocate(q_tt)
+    k_r = rope_b(k_tt, NKV_PER_CHIP); ttnn.deallocate(k_tt)
+    ttnn.deallocate(cos_b); ttnn.deallocate(sin_b)
+
+    # Paged KV write: input [1, B, TILE_H, HEAD_DIM] height-sharded on B cores.
+    def shard_write(t):  # t [B, NKV=1, HEAD_DIM]
+        t4 = ttnn.reshape(t, [1, B, 1, HEAD_DIM])
+        t4 = ttnn.pad(t4, [[0, 0], [0, 0], [0, TILE_H - 1], [0, 0]], value=0.0)
+        return ttnn.to_memory_config(t4, state.cb_write_mem_cfg)
+    k_sh = shard_write(k_r); v_sh = shard_write(v_r)
+    ttnn.experimental.paged_update_cache(kv['kc'], k_sh,
+                                         update_idxs_tensor=state.cb_cur_pos_buf,
+                                         page_table=state.cb_page_table_tt)
+    ttnn.experimental.paged_update_cache(kv['vc'], v_sh,
+                                         update_idxs_tensor=state.cb_cur_pos_buf,
+                                         page_table=state.cb_page_table_tt)
+    ttnn.deallocate(k_sh); ttnn.deallocate(v_sh)
+    ttnn.deallocate(v_r)   # v_r written to cache; q_r is the query, kept
+
+    # Paged SDPA decode + gate + out_proj + residual (q_r is the query).
+    return _attn_finish(state, x_tt, q_r, gate_tt, kv, attn, B, NQ_PER_CHIP, HEAD_DIM)
+
+
+def _attn_finish(state, x_tt, q_r, gate_tt, kv, attn, B, NQ_PER_CHIP, HEAD_DIM):
+    q_sdpa = ttnn.reshape(q_r, [1, B, NQ_PER_CHIP, HEAD_DIM])
+    ttnn.deallocate(q_r)
+    attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+        q_sdpa, kv['kc'], kv['vc'],
+        cur_pos_tensor=state.cb_cur_pos_buf,
+        page_table_tensor=state.cb_page_table_tt,
+        program_config=state.paged_sdpa_progcfg,
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+    )
+    ttnn.deallocate(q_sdpa)
+    attn_ph = ttnn.reshape(attn_out, [B, NQ_PER_CHIP, HEAD_DIM])
+    ttnn.deallocate(attn_out)
+    gated = ttnn.mul(attn_ph, ttnn.sigmoid(gate_tt))
+    ttnn.deallocate(attn_ph); ttnn.deallocate(gate_tt)
+    flat = ttnn.reshape(gated, [B, NQ_PER_CHIP * HEAD_DIM])
+    ttnn.deallocate(gated)
+    partial = ttnn.linear(flat, attn['w_o'])
+    ttnn.deallocate(flat)
+    reduced = _tp_all_reduce(state, partial)
+    ttnn.deallocate(partial)
+    res = ttnn.add(x_tt, reduced)
+    ttnn.deallocate(reduced)
+    return res
+
+
+def setup_cb_write_mem_cfg(state):
+    """Build the B-core HEIGHT_SHARDED L1 mem config for paged KV writes
+    (validated in cb_paged_update_cache_batch_isolation.py)."""
+    B = state.cb_B
+    HEAD_DIM = state.cfg['head_dim']
+    grid = state.mesh.compute_with_storage_grid_size()
+    shard_grid = ttnn.num_cores_to_corerangeset(B, grid, row_wise=True)
+    shard_spec = ttnn.ShardSpec(shard_grid, [32, HEAD_DIM], ttnn.ShardOrientation.ROW_MAJOR)
+    state.cb_write_mem_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
+
+
+def forward_batch_tp_inner(state, return_logits=False):
+    """Batched decode forward over B slots. Reads cb_tok_buf [B,1],
+    cb_cur_pos_buf [B], cb_rot_idxs_buf [B,1]. Returns per-slot argmax [B]."""
+    cfg = state.cfg
+    HIDDEN = cfg['hidden']
+    B = state.cb_B
+    embed_out = ttnn.embedding(state.cb_tok_buf, state.embed_tt,
+                               layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    x_tt = ttnn.reshape(embed_out, [B, HIDDEN])
+    cos_raw = ttnn.embedding(state.cb_rot_idxs_buf, state.cos_table_tt,
+                             layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    sin_raw = ttnn.embedding(state.cb_rot_idxs_buf, state.sin_table_tt,
+                             layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    cos_tt = ttnn.reshape(cos_raw, [B, state.rotary_dim])
+    sin_tt = ttnn.reshape(sin_raw, [B, state.rotary_dim])
+    for li, layer in enumerate(state.layers):
+        if layer['type'] == 'linear_attention':
+            x_tt = deltanet_step_batched(state, x_tt, layer['dn'], li, cfg)
+        else:
+            x_tt = gated_attn_step_batched(state, x_tt, layer['attn'], li, cos_tt, sin_tt, cfg)
+        x_tt = base.mlp_step_tp(state, x_tt, layer['mlp'])  # shape-agnostic
+    x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
+    # P22 vocab-sharded LM head + on-device argmax, batched over B. Mirrors
+    # server_tp.forward_token_tp_inner:1742-1748 with leading B.
+    sharded = ttnn.linear(x_tt, state.lm_head_tt)        # [B, VOCAB_PAD/NCHIPS]/chip
+    ttnn.deallocate(x_tt)
+    gathered = ttnn.all_gather(sharded, dim=-1)           # [B, VOCAB_PAD] replicated
+    ttnn.deallocate(sharded)
+    sliced = ttnn.slice(gathered, [0, 0], [B, state.vocab_size])
+    ttnn.deallocate(gathered)
+    rm = ttnn.untilize(sliced, use_multicore=True)
+    ttnn.deallocate(sliced)
+    if return_logits:
+        return rm
+    argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
+    ttnn.deallocate(rm)
+    return argmax_tt
 
 
 if __name__ == "__main__":
