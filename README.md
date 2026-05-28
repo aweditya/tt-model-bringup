@@ -15,6 +15,23 @@ GitHub: `aweditya/tt-model-bringup`.
 
 ---
 
+## Quickstart
+
+On a host with Tenstorrent P150s and a tt-metal build (see [Setup](#setup)):
+
+```bash
+git clone https://github.com/aweditya/tt-model-bringup.git ~/tt-xla && cd ~/tt-xla
+make setup                              # uv sync — Python deps into .venv
+# (one-time: build tt-metal + owned_ops kernels + set HF_TOKEN — see Setup)
+make run PY=experiments/cb_validate_27b.py     # run a script on the TT host
+```
+
+`make help` lists targets. Device runs go through `scripts/run_remote.sh`
+(the single source of truth for the ttnn env + mesh reset); set `TT_HOST=qb2`
+to target the 4-chip box. `make dr PY=...` deploys then runs (the edit loop).
+
+---
+
 ## Host matrix
 
 There are two reference hosts; the right host to use depends on the demo.
