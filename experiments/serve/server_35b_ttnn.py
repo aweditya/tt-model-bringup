@@ -1564,6 +1564,36 @@ def step_forward_ttnn(state, tok_id, pos, capture=None):
     return int(next_id_t.flatten()[0].item())
 
 
+def step_forward_ttnn_topk(state, tok_id, pos, k):
+    """A009: eager forward returning top-K logits + indices for host-side
+    sampling (DRY + repetition_penalty). Sets state.sampler_topk temporarily
+    so step_forward_inner returns (top_vals, top_idxs) instead of argmax.
+
+    Returns (top_vals_np [K], top_idxs_np [K]) — both 1-D, dtype fp32/int32.
+    Reading is per-chip [1, K] but since lm_head is replicated all chips
+    have the same top-K — we take chip 0.
+    """
+    prev = getattr(state, "sampler_topk", 0)
+    state.sampler_topk = k
+    try:
+        update_input_buffers(state, tok_id, pos)
+        top_vals_tt, top_idxs_tt = step_forward_inner(state)
+        # Readback per chip — replicated, so take chip 0.
+        top_vals = ttnn.to_torch(
+            top_vals_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        ).float().numpy()
+        top_idxs = ttnn.to_torch(
+            top_idxs_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        ).int().numpy()
+        ttnn.deallocate(top_vals_tt); ttnn.deallocate(top_idxs_tt)
+        # Flatten and take first K from chip-0 view.
+        top_vals = top_vals.reshape(-1)[:k]
+        top_idxs = top_idxs.reshape(-1)[:k]
+        return top_vals, top_idxs
+    finally:
+        state.sampler_topk = prev
+
+
 def step_forward_inner(state, capture=None):
     """Trace-friendly forward step: reads ONLY from pre-allocated buffers
     (state.tok_buf, state.rot_idxs_buf) and per-layer weights. No host writes
@@ -1629,6 +1659,18 @@ def step_forward_inner(state, capture=None):
     ttnn.deallocate(h_norm)
     if capture is not None:
         capture["logits"] = _ttnn_to_numpy_replicated(logits, state.mesh).reshape(-1)
+
+    # A009 sampler hook: if state.sampler_topk is set (>0), return top-K
+    # logits + indices so a host-side sampler (DRY + repetition_penalty)
+    # can fix the greedy mode collapse at long context. Otherwise unchanged:
+    # on-device argmax + 8-byte readback (fast path).
+    sampler_topk = int(getattr(state, "sampler_topk", 0) or 0)
+    if sampler_topk > 0:
+        # ttnn.topk needs TILE_LAYOUT for the logits. Returns top values
+        # and indices over the last dim. Replicated across mesh.
+        top_vals, top_idxs = ttnn.topk(logits, k=sampler_topk, dim=-1)
+        ttnn.deallocate(logits)
+        return (top_vals, top_idxs)
 
     # On-device argmax requires ROW_MAJOR input (multicore argmax constraint).
     logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)

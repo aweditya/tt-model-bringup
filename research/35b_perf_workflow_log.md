@@ -205,6 +205,49 @@ Opens A009 — separate workflow iteration to fix L=100 needle retrieval
 in the production server. Likely involves the chat template path, the
 greedy decode mode, and/or 24-token decode budget being too tight.
 
+### A009 — DRY+rep_penalty top-K sampler (in progress 2026-05-27)
+
+Hypothesis: bf16 + greedy creates a fixed-point on "the" at long context.
+Sampling with DRY + repetition_penalty breaks the fixed point. Memory
+[feedback_drift_dry_rep_penalty] reports this fix +57% coherent chars
+on 27B.
+
+Implementation (server_35b_ttnn.py additions):
+  - step_forward_inner: optional `state.sampler_topk = K` returns
+    (top_vals_tt, top_idxs_tt) instead of argmax_tt. Default 0 = unchanged.
+  - step_forward_ttnn_topk(state, tok_id, pos, k) — readback variant.
+  - DRY+rep_penalty implementation: experiments/needle_haystack_35b_dry_isolation.py
+    lifts the logic from server.py:1286-1423 but operates on top-K only.
+
+Step 3 isolation results (L=100 needle haystack, K=64,
+rep_penalty=1.1, dry_multiplier=0.8):
+
+| Variant | First 24 tok of decode | Grade |
+|---|---|---|
+| greedy + chat-template (baseline) | `'The question is the the the the the...'` | N (mode collapse) |
+| **DRY + chat-template** | `'The question appears to be a fragment or incomplete statement. It does not provide sufficient information to answer any specific question.<\|im_end\|>'` | **N (mode collapse FIXED, but no needle)** |
+| DRY + raw text (no chat) | `'<think>\n<think>\nHere\'s a thinking process: 1. Analyze User Input: - The user provided a prompt that says "You are you"...'` | N (model hallucinates input — Qwen is chat-trained) |
+
+**DRY did its job.** Output is grammatical English, properly terminated,
+attempts to reason. The needle isn't retrieved because the model says
+"the question is a fragment" — it doesn't see the needle in the middle
+of the prompt. This matches the pre-existing 35B autoregressive drift
+documented at `[feedback_35b_a3b_l32_dn_decode_drift]`: L32 DN cos drops
+0.9995 → 0.9311 at pos 1. Mid-prompt context is corrupted by the time
+the question is reached.
+
+**Status: partial ship.** DRY top-K sampler gives a real win (coherent
+long-context text generation), but does NOT fix the needle-retrieval
+gap. The deeper drift issue is A010 territory.
+
+Performance cost of the sampler readback (K=64): ~180 ms/tok added
+(200 ms greedy -> 380 ms sampler) — top-K of 152064 vocab requires the
+ttnn.topk op + small payload readback. Trace-incompatible unless we
+also capture the topk into the trace.
+
+Pending: cosine ladder vs HF needle100 oracle to verify A002/A003/A004/
+A008 didn't move the drift cliff EARLIER than pre-session baseline.
+
 ### A007 — h in L1 for batched MoE gate_up (REJECTED 2026-05-27)
 
 tt-perf-report's specific advice on the dominant matmul: "place input 0
