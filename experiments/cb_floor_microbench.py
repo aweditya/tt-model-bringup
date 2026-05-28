@@ -90,6 +90,23 @@ def main():
     ar_ms = time_traced(lambda: cb._tp_all_reduce(state, ar_in))
     log(f"  all_reduce[1,{HIDDEN}] : {ar_ms*1000:7.2f} us   (×128/step = {ar_ms*128:6.2f} ms)")
     log(f"  collectives total      : {ar_ms*128:6.2f} ms   of the ~63 ms floor")
+
+    # ATTACK: can the M=1 GEMV beat the 46%-of-peak default? Try core_grid +
+    # a 1D mcast program config (the GEMV-appropriate config). Baseline gate=above.
+    log(f"=== matmul-config tuning on the gate GEMV (default ~{gate_ms*1000:.1f} us) ===")
+    grid = mesh.compute_with_storage_grid_size()
+    for name, mk in [
+        (f"core_grid {grid.x}x{grid.y}",
+         lambda: ttnn.linear(h, wg, activation="silu",
+                             core_grid=ttnn.CoreGrid(x=grid.x, y=grid.y))),
+        ("core_grid 8x8",
+         lambda: ttnn.linear(h, wg, activation="silu", core_grid=ttnn.CoreGrid(x=8, y=8))),
+    ]:
+        try:
+            ms = time_traced(mk)
+            log(f"  {name:18s}: {ms*1000:7.2f} us   ({gate_ms/ms:.2f}x vs default)")
+        except Exception as e:
+            log(f"  {name:18s}: unsupported ({type(e).__name__}: {str(e)[:80]})")
     log("  → if collectives are large → fuse all_reduce into out-proj (rs_matmul);")
     log("    if MLP matmuls ≫ their bf8 BW floor → core_grid tuning (A004 lever).")
 

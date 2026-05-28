@@ -746,3 +746,22 @@ secondary lever (fuse all_reduce into out-proj, rs_matmul).
 GOTCHA (cost a 55-min hang): a `from_torch` (host→device transfer) INSIDE a
 `begin/end_trace_capture` region HANGS — host transfers can't be captured.
 Pre-allocate all inputs before capture; only ttnn device ops inside build_fn.
+
+## Floor ATTACK result — MLP matmul is at the P150 M=1 GEMV ceiling (2026-05-28)
+
+Tested core_grid tuning on the gate GEMV: default 121.4 µs, full grid 11×10
+119.6 µs (1.01×, default already uses all 110 cores), 8×8 135.7 µs (0.89×,
+slower). **No win** — the M=1 GEMV is already at its P150 practical ceiling
+(46% of peak BW). Matrix-vector products are latency/overhead-bound at M=1 and
+can't saturate DRAM BW; consistent with feedback_dram_sharded_mlp_probe (DRAM-
+shard NEGATIVE). The "2× headroom vs theoretical peak" is NOT achievable.
+
+**Floor conclusion:** the ~63 ms B-independent floor is dominated by
+weight-streaming matmuls (MLP 23 + DN ~10) that are at the M=1 GEMV ceiling, so
+the floor is near the practical hardware limit for this implementation. The
+remaining levers are modest/harder: (1) collectives fusion (7 ms / 11% — fuse
+all_reduce into out-proj, rs_matmul); (2) higher B amortizes the floor further
+(slope is now 0.71 ms/seq; B≈110 → ~780 tok/s, capped by the SDPA core limit).
+The big throughput lever was the conv (2.85×); the floor is approaching the
+P150 ceiling. Next-highest-value work is productionization (chunked prefill,
+sampling, OpenAI endpoint) and/or pushing B toward the SDPA core cap.
