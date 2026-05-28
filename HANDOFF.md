@@ -89,10 +89,17 @@ tile rows). **All in `experiments/serve/server_tp_cb.py`** (imports production
   compute; crossover B≈17; aggregate **asymptote ~232 tok/s**). DN here is
   MANUAL recurrence (owned_gdn is B=1-only) — a batched owned-GDN kernel is the
   lever to raise the ceiling.
-- **NEXT**: CB2 (ragged per-slot lengths — primitives already isolated:
-  `cur_pos=-1` skip + per-slot page tables) → CB3 (Orca iteration-level
-  scheduler + block manager). Orchestration, no remaining device-correctness
-  risk. The throughput proof is done; a real server needs the scheduler.
+- **CB2 DONE** — ragged per-slot positions + mid-batch admission
+  (`cb_validate_ragged.py` PASS). `cb_reset_slots()` clears only the admitted
+  slot's DN state (Mamba-style reuse); KV self-overwrites (cur_pos-bounded).
+- **CB3 DONE** — Orca iteration-level scheduler (`experiments/serve/cb_scheduler.py`).
+  5 reqs / 2 slots all bit-identical to standalone greedy refs, eager AND
+  `--trace` (traced ~85 ms/iter @ B=2 vs ~252 eager). Admit/advance/evict +
+  queueing all correct. **CB1–CB4 complete: a correct, production-speed
+  vLLM-style continuous-batching system for 27B.**
+- **NEXT (perf/productionization, not correctness)**: chunked prefill (currently
+  one-token/step); sampling (DRY/rep-penalty) vs greedy; OpenAI endpoint (user
+  deferred); batched owned-GDN kernel to lift the ~232 tok/s compute ceiling.
 
 ## Hardware ceiling (the actual target)
 
