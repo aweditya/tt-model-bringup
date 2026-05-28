@@ -591,3 +591,31 @@ diagnosis `feedback_conv1d_diagnosis`: 65% sum-reduce, 21% state mgmt, 13% mul;
 owned_decay_gate kernel exists but decay/gate is tiny ([B,NV] scalars), so low
 value. Next profile: within-DN vector-op attribution (skip conv / qk-norm /
 out-gate) to rank the targets before the next fused kernel.
+
+## DNK-G3b — within-DN ranking: conv1d is 71.8% of DN (2026-05-28)
+
+`cb_profile_dn.py` (DN-only forward, skip one sub-op, traced, B=32, owned_gdn):
+
+| DN sub-op | cost (48 layers) | % of DN-only (152.7 ms) |
+|-----------|------------------|--------------------------|
+| **conv1d**    | **109.70 ms** | **71.8%** |
+| recurrence (owned_gdn) | 13.16 ms | 8.6% |
+| q/k L2-norm   | 0.51 ms | 0.3% |
+| output RMSNorm gate | 0.26 ms | 0.2% |
+
+**conv1d dominates the DN cost by far** (~2.3 ms/layer at B=32). Almost
+certainly the K=4→32 TILE-padding tax: the conv builds `conv_input [B, CONV_DIM_
+CHIP, K=4]` and in TILE layout K=4 pads to 32, so the concat/mul/sum/silu/slice
+all process 8× the logical data. CONV_DIM_CHIP≈2560 → [32,2560,32-padded] ≈ 5 MB
+of mostly-padding traffic per layer.
+
+**Next lever = kill the conv K-padding.** Two paths:
+1. ttnn reformulation (no kernel): shift-and-accumulate —
+   `out = Σ_k w[:,k] · window_k` as 4 muls + 3 adds on [B, CONV_DIM_CHIP] tiles
+   (no K dim → no padding), state = 3 separate [B,C] columns. (Old
+   `feedback_conv1d_circular_buffer` said slice-shift failed at B=1 single-chip;
+   re-attempt given the quantified 72% cost + batched context.)
+2. custom conv1d kernel (depthwise 3-tap), like owned_gdn.
+
+Potential: if conv 109→~20 ms, DN-only 152→63 ms, full step ~190→~100 ms →
+B=32 ~168→~320 tok/s (≈2×). Highest-value remaining lever by far.

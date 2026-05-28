@@ -219,6 +219,11 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     HIDDEN = cfg['hidden']
     CONV_K = cfg['conv_kernel']
     slot = state.cb_dn[li]
+    # cb_dn_skip: profiling-only set ({'conv','qknorm','recur','outgate'}); a
+    # skipped sub-op is replaced by a shape-valid passthrough (TIMING ablation —
+    # corrupts values, used only to rank the DN vector ops). Default empty → no
+    # change. Used by cb_profile_dn.py.
+    dn_skip = getattr(state, 'cb_dn_skip', None) or set()
 
     # 1. pre-norm + in_proj (matmul batches over leading B)
     h_tt = _rms_norm_manual(x_tt, dn['input_norm'], EPS, HIDDEN)
@@ -235,22 +240,25 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     ttnn.deallocate(all_tt)
 
     # 4. conv1d: window = [conv_st (B,CONV,K-1) | cur (B,CONV,1)] → mul w_conv → sum → silu
-    cur_col = ttnn.reshape(mixed_qkv, [B, CONV_DIM_CHIP, 1])
-    ttnn.deallocate(mixed_qkv)
-    conv_input = ttnn.concat([slot['conv_st'], cur_col], dim=-1)   # [B,CONV,K]
-    ttnn.deallocate(cur_col)
-    # w_conv is [CONV_DIM_CHIP, K]; reshape to [1,CONV,K] to broadcast over B.
-    # VIEW of the persistent weight — do NOT deallocate (view-decay rule:
-    # freeing the view frees dn['w_conv'], crashing the next step).
-    w_conv_b = ttnn.reshape(dn['w_conv'], [1, CONV_DIM_CHIP, CONV_K])
-    conv_prod = ttnn.mul(conv_input, w_conv_b)
-    conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))              # [B,CONV]
-    ttnn.deallocate(conv_prod)
-    # new conv state = last K-1 columns
-    conv_state_new = ttnn.slice(conv_input, [0, 0, 1], [B, CONV_DIM_CHIP, CONV_K])
-    ttnn.deallocate(conv_input)
-    ttnn.copy(conv_state_new, slot['conv_st'])  # commit per-slot conv state
-    ttnn.deallocate(conv_state_new)
+    if 'conv' in dn_skip:
+        conv_out = mixed_qkv  # passthrough (skip window mul/sum/silu + state commit)
+    else:
+        cur_col = ttnn.reshape(mixed_qkv, [B, CONV_DIM_CHIP, 1])
+        ttnn.deallocate(mixed_qkv)
+        conv_input = ttnn.concat([slot['conv_st'], cur_col], dim=-1)   # [B,CONV,K]
+        ttnn.deallocate(cur_col)
+        # w_conv is [CONV_DIM_CHIP, K]; reshape to [1,CONV,K] to broadcast over B.
+        # VIEW of the persistent weight — do NOT deallocate (view-decay rule:
+        # freeing the view frees dn['w_conv'], crashing the next step).
+        w_conv_b = ttnn.reshape(dn['w_conv'], [1, CONV_DIM_CHIP, CONV_K])
+        conv_prod = ttnn.mul(conv_input, w_conv_b)
+        conv_out = ttnn.silu(ttnn.sum(conv_prod, dim=-1))              # [B,CONV]
+        ttnn.deallocate(conv_prod)
+        # new conv state = last K-1 columns
+        conv_state_new = ttnn.slice(conv_input, [0, 0, 1], [B, CONV_DIM_CHIP, CONV_K])
+        ttnn.deallocate(conv_input)
+        ttnn.copy(conv_state_new, slot['conv_st'])  # commit per-slot conv state
+        ttnn.deallocate(conv_state_new)
 
     # 5. q/k/v head slices on last dim
     q_flat = ttnn.slice(conv_out, [0, 0], [B, KEY_DIM_CHIP])
@@ -269,9 +277,10 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     ttnn.deallocate(q_flat); ttnn.deallocate(k_flat); ttnn.deallocate(v_flat)
 
     # 6. QK L2-norm (rms_norm over last dim; rank-agnostic over leading B,NV)
-    EPS_RMS = EPS / K_DIM
-    q = _rms_norm_manual(q, dn['q_l2_scale'], EPS_RMS, K_DIM)
-    k = _rms_norm_manual(k, dn['k_l2_scale'], EPS_RMS, K_DIM)
+    if 'qknorm' not in dn_skip:
+        EPS_RMS = EPS / K_DIM
+        q = _rms_norm_manual(q, dn['q_l2_scale'], EPS_RMS, K_DIM)
+        k = _rms_norm_manual(k, dn['k_l2_scale'], EPS_RMS, K_DIM)
 
     # 7. decay/gate (manual path). a_tt/b_tt [B,NV]; dt_bias/A_log [NV] → [1,NV]
     dt_bias_b = ttnn.reshape(dn['dt_bias'], [1, NV_PER_CHIP])
@@ -288,7 +297,13 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     ttnn.deallocate(a_tt); ttnn.deallocate(b_tt)
 
     # 8. recurrence — manual (validated bit-exact) OR batched owned_gdn kernel.
-    if getattr(state, 'cb_dn_recurrence_mode', 'manual') == 'owned_gdn':
+    if 'recur' in dn_skip:
+        # passthrough: materialize out from v (independent copy) and skip the
+        # recurrence. mul(v,1.0) so the downstream dealloc(out) is safe.
+        out = ttnn.reshape(ttnn.mul(v, 1.0), [B, VAL_DIM_CHIP])
+        ttnn.deallocate(decay); ttnn.deallocate(beta)
+        ttnn.deallocate(q); ttnn.deallocate(k); ttnn.deallocate(v)
+    elif getattr(state, 'cb_dn_recurrence_mode', 'manual') == 'owned_gdn':
         # FOLD batch into slots (each slot's recurrence is independent) and call
         # the owned-GDN fused kernel with debug_mode=10 (batched-safe two-CB
         # output; see experiments/kernel_patches/qwen36_gdn_decode_owned/). The
@@ -333,8 +348,11 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     # then * silu(z), matching production deltanet_step_tp lines 820-826.
     out_ph = ttnn.reshape(out, [B, NV_PER_CHIP, V_DIM])
     ttnn.deallocate(out)
-    out_normed = _rms_norm_manual(out_ph, dn['linear_attn_norm'], EPS, V_DIM)
-    ttnn.deallocate(out_ph)
+    if 'outgate' in dn_skip:
+        out_normed = out_ph  # passthrough (skip output RMSNorm)
+    else:
+        out_normed = _rms_norm_manual(out_ph, dn['linear_attn_norm'], EPS, V_DIM)
+        ttnn.deallocate(out_ph)
     z_ph = ttnn.reshape(z_tt, [B, NV_PER_CHIP, V_DIM])
     ttnn.deallocate(z_tt)
     silu_z = ttnn.silu(z_ph)
