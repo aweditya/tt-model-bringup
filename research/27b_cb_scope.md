@@ -172,3 +172,40 @@ ttnn build. The remaining work — threading B through forward_token_tp_inner
 Recommended approach: parallel batched path (new module / new functions),
 B=1 validated bit-identical to production before B>1, production B=1
 server untouched (zero regression risk). Then CB3 Orca scheduler on top.
+
+## CB1/CB2 build status (2026-05-27)
+
+`experiments/serve/server_tp_cb.py` — imports production server_tp.py
+(untouched), redefines the batched forward. DONE so far:
+
+- **setup_cb_state(state, B)**: per-slot page tables into a shared block
+  pool (B × blocks_per_seq), per-attn-layer batched KV caches, per-DN-layer
+  batched ssm [B,NV,K,V] + conv [B,CONV,K-1] state, batched input buffers.
+- **update_input_buffers_batched** + **cb_reset_states**.
+- **deltanet_step_batched**: full batched DN, manual recurrence, VERIFIED
+  line-by-line vs production (caught + fixed a per-head-norm bug). Reads/
+  commits per-slot conv+ssm state.
+
+REMAINING for the first runnable B=1 milestone:
+
+1. **gated_attn_step_batched** — two fiddly bits needing device iteration:
+   - **RoPE broadcast**: cos/sin are now [B, ROTARY_DIM]; must broadcast
+     over the head axis → reshape to [B, 1, ROTARY_DIM] vs production's
+     [1, ROTARY_DIM] over [n_heads, HEAD_DIM]. Get the rank/broadcast right.
+   - **paged_update_cache WRITE at B>1**: paged SDPA READ at B>1 is
+     validated (cb_paged_sdpa_batch_isolation.py), but the WRITE uses
+     HEIGHT_SHARDED L1 mem configs built at bootstrap for B=1 specific core
+     grids (server_tp.py:1556-1579). The B-slot sharded write is the one
+     genuinely-entangled piece — isolate it in the server context (CB2)
+     OR validate it via the B=1 forward gate first (B=1 reuses the proven
+     config) then generalize to B>1.
+2. **forward_batch_tp_inner**: embed [B], cos/sin lookup [B], layer loop
+   (deltanet_step_batched / gated_attn_step_batched + base.mlp_step_tp,
+   which is shape-agnostic), final norm, lm_head, per-slot argmax.
+3. **cb_validate_27b.py**: gate ladder — (a) B=1 batched == production B=1
+   bit-identical, (b) B=8 identical-slots == B=1, (c) B=8 different slots
+   each match its own B=1 reference.
+
+The B=1-identical gate (3a) is the key checkpoint: it validates the entire
+batched plumbing against the proven production path at B=1 before any B>1
+shape risk. Run it before trusting any B>1 number.
