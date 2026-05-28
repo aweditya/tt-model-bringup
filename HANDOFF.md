@@ -97,9 +97,20 @@ tile rows). **All in `experiments/serve/server_tp_cb.py`** (imports production
   untouched. CB uses it via `cb_dn_recurrence_mode="owned_gdn"`. Bit-identical to
   prod at B=1; traced **B=32 168 tok/s (+11.7%), B=64 208 tok/s (+13.5%)**;
   asymptote ~232→~277 tok/s. **B=64 = 16.1× the B=1 prod 12.96 tok/s.**
-- **NEXT lever past ~277**: the surrounding DN matmuls (in_proj/out_proj),
-  conv1d, q/k+output norms, decay/gate — all scale with B; owned_gdn only fuses
-  the recurrence. Plus productionization (chunked prefill, sampling, endpoint).
+- **Conv1d shift-accumulate DONE** — profiling found conv1d = 71.8% of the DN
+  cost (the K=4→32 tile-padding tax). Reformulated as shift-accumulate on 3
+  padding-free [B,C] state columns (`cb_conv_mode="shiftacc"`): **B=32
+  168→376.92 tok/s (2.24×), B=64 208→593.12 (2.85×)**; step-slope 3.6→0.71
+  ms/seq, asymptote ~277→~1400. **B=64 = 593 tok/s = 45.8× the B=1 prod 12.96.**
+  Long-context **needle test (`cb_needle.py`, through cb_scheduler) PASSES**
+  (retrieves the code verbatim at L=200 + L=500) — the fast conv is functionally
+  long-context-correct despite a 0.9995 logit-cosine. `cb_conv_mode` default
+  "kdim" (bit-identical reference); shiftacc opt-in (needle-validated).
+- **Kernel methodology**: `research/kernel_design_worksheet.md` (fill-before-code
+  + step-0 "do you even need a kernel?") + `research/kernel_dataflow_representation.md`
+  (TDG). The conv win came from worksheet step 0 — op-level reformulation, no kernel.
+- **NEXT lever past ~593**: the 62.6 ms B-independent floor (2×64 all-reduces,
+  248K-vocab lm_head); plus productionization (chunked prefill, sampling, endpoint).
 - **CB2 DONE** — ragged per-slot positions + mid-batch admission
   (`cb_validate_ragged.py` PASS). `cb_reset_slots()` clears only the admitted
   slot's DN state (Mamba-style reuse); KV self-overwrites (cur_pos-bounded).
