@@ -18,7 +18,7 @@ bury**. Persona: lean 10x engineer; no code bloat; comments to-the-point.
   `load_embed_lm_head_weights`. Hardcoded `experiments/<name>.py` paths.
 - **Run-validate every refactor step** (user: "make sure it runs"). Structural
   moves: prove no active importer breaks (grep). server_tp.py edits: qb2/qb1
-  bootstrap + Paris canary (`make run PY=experiments/cb_validate_27b.py`).
+  bootstrap + Paris canary (`make run PY=experiments/cb/validate/forward.py`).
 - **No /tmp. Remote device exec only (ssh qb1/qb2). Frequent commits.**
 - **`git mv` segfaults on large arg lists** in this shell — use a per-file
   `while read` loop. A crash can leave a stale `.git/index.lock` — verify no git
@@ -75,15 +75,24 @@ tt-xla/
   one-liners and would be a huge, hard-to-review, risky diff across the frozen
   servers. Formatting lands incrementally via pre-commit on touched files; do a
   scoped sweep later if desired. So CI does NOT run `ruff format --check`.
-- **M3 finish — PARTLY DONE**: archived `jax_qwen05b_*` (9) + `qwen05b_*` (2) →
-  `archive/legacy/` (no active importers; done during M2 to clear lint). STILL
-  PENDING: rename `cb_*` suite to verb_noun (e.g. validate_forward / bench_decode
-  / profile_dn / needle_haystack); their `PROJECT_ROOT =
-  Path(__file__).resolve().parents[1]` + `sys.path.insert(.../experiments/serve)`
-  assumes top-level — fix `parents[N]` if moved into a subdir, and update
-  scripts/deploy.sh defaults. Archive `experiments/tt_jax/` + `pjrt_plugin/` →
-  archive/legacy/. Run-validate imports. (NOTE: when files leave
-  `experiments/utils`, they re-enter the ruff lint scope — re-run `make lint`.)
+- **M3 finish — MOSTLY DONE**: archived `jax_qwen05b_*` (9) + `qwen05b_*` (2) →
+  `archive/legacy/` (M2). **cb_* suite reorganized into `experiments/cb/`
+  subdirs** (user chose subdirs): validate/{forward,ragged}, bench/{throughput,
+  trace}, profile/{blocks,dn,dn_matmul,floor}, isolate/{dn_recurrence,paged_sdpa,
+  paged_update_cache,owned_gdn,conv_reform}, needle.py. The 9 path-using scripts
+  now find repo root via a depth-independent finder (walk parents for the
+  `experiments/serve` dir — present on rsync targets, unlike pyproject.toml)
+  instead of magic `parents[1]`; the 5 isolation scripts are
+  self-contained (no edit). deploy.sh + Makefile PY default repointed.
+  `cb_scheduler.py` stays in serve/ (it's a module). STILL PENDING: archive
+  `experiments/tt_jax/` + `pjrt_plugin/` → archive/legacy/ (need user OK on
+  pjrt — it's the founding backend). (NOTE: when files leave `experiments/utils`,
+  they re-enter ruff scope — re-run `make lint`.)
+  **DEFERRED to M6 (docs):** stale run-command examples in the 14 cb file
+  docstrings, server_tp_cb.py's internal `cb_*.py` comment pointers, and the
+  ~30 historical refs in `research/27b_cb_scope.md` — the scripts RUN correctly
+  via `make run PY=experiments/cb/.../X.py`; only the in-file examples are stale.
+  Also LEFTOVER from M3.0: p22 probe's hardcoded old-91l path.
 - **M4 lean code + comments — PENDING (canary-gated)**: `# GOTCHA:` convention
   for load-bearing comments (view-decay, +1 RMSNorm, K-broadcast RoPE, bf16-KV —
   the HANDOFF must-keeps); delete narrative/debug-log comments. Excise dead debug
@@ -106,6 +115,6 @@ tt-xla/
 ## HOW TO CONTINUE
 `git checkout chore/maintainability`. Pick the next PENDING phase. M2 is the
 safe next (no device). The untangle (M3.0) + M4 server_tp.py edits need the
-device canary — run `make run PY=experiments/cb_validate_27b.py` (expects
+device canary — run `make run PY=experiments/cb/validate/forward.py` (expects
 logit_cos≈1.0 vs prod) after each. Commit per phase. Tooling reference: see the
 companion `kernel_design_worksheet.md` for the TT hard constraints.

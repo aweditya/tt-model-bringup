@@ -2,7 +2,7 @@
 # Host targets run on the Tenstorrent box ($(TT_HOST), default qb1) over ssh;
 # the device env block + mesh reset live in scripts/run_remote.sh.
 TT_HOST ?= qb1
-PY      ?= experiments/cb_validate_27b.py   # script for `make run` / `make dr`
+PY      ?= experiments/cb/validate/forward.py   # script for `make run` / `make dr`
 
 .PHONY: help setup lint fmt deploy run dr reset
 help:  ## list targets

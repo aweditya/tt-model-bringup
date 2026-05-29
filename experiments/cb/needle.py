@@ -28,7 +28,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
 sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 
 import server_tp as base       # noqa: E402

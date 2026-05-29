@@ -12,10 +12,13 @@ HOST="${TT_HOST:-qb1}"
 if [[ "$#" -eq 0 ]]; then
   set -- experiments/serve/server_tp.py experiments/serve/server_tp_cb.py \
          experiments/serve/ondevice_27b.py experiments/serve/generate_27b.py \
-         experiments/serve/cb_scheduler.py experiments/cb_validate_27b.py \
-         experiments/cb_bench_trace.py experiments/cb_needle.py
+         experiments/serve/cb_scheduler.py experiments/cb/validate/forward.py \
+         experiments/cb/bench/trace.py experiments/cb/needle.py
 fi
+# -R (relative) recreates the repo-relative dir structure on the host, so newly
+# nested paths (e.g. experiments/cb/validate/forward.py) don't need the remote
+# dirs to pre-exist.
 for p in "$@"; do
-  rsync -az "$p" "$HOST:~/tt-xla/$p"
+  rsync -azR "$p" "$HOST:~/tt-xla/"
 done
 echo "deployed ${#} path(s) to $HOST:~/tt-xla/"

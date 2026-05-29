@@ -74,12 +74,12 @@ tile rows). **All in `experiments/serve/server_tp_cb.py`** (imports production
 `server_tp.py`, which stays byte-for-byte pristine). Full scope + numbers:
 `research/27b_cb_scope.md`.
 
-- **CB1 DONE** — batched forward bit-identical to production. `cb_validate_27b.py`
+- **CB1 DONE** — batched forward bit-identical to production. `cb/validate/forward.py`
   PASS: per-position logit_cos=1.0, B=4/32 identical slots, B=4 distinct-slot
   isolation (per-slot KV+DN state). Root cause that blocked it: view-decay
   (`ttnn.slice`/`reshape` return VIEWS; deallocating the source corrupts them —
   masked at pos 0). See `feedback_ttnn_slice_view_decay`.
-- **CB4 DONE — TRACED throughput measured** (`cb_bench_trace.py`):
+- **CB4 DONE — TRACED throughput measured** (`cb/bench/trace.py`):
 
   | B  | ms/step | agg tok/s | × |
   |----|---------|-----------|---|
@@ -104,7 +104,7 @@ tile rows). **All in `experiments/serve/server_tp_cb.py`** (imports production
   padding-free [B,C] state columns (`cb_conv_mode="shiftacc"`): **B=32
   168→376.92 tok/s (2.24×), B=64 208→593.12 (2.85×)**; step-slope 3.6→0.71
   ms/seq, asymptote ~277→~1400. **B=64 = 593 tok/s = 45.8× the B=1 prod 12.96.**
-  Long-context **needle test (`cb_needle.py`, through cb_scheduler) PASSES**
+  Long-context **needle test (`cb/needle.py`, through cb_scheduler) PASSES**
   (retrieves the code verbatim at L=200 + L=500) — the fast conv is functionally
   long-context-correct despite a 0.9995 logit-cosine. `cb_conv_mode` default
   "kdim" (bit-identical reference); shiftacc opt-in (needle-validated).
@@ -114,7 +114,7 @@ tile rows). **All in `experiments/serve/server_tp_cb.py`** (imports production
 - **NEXT lever past ~593**: the 62.6 ms B-independent floor (2×64 all-reduces,
   248K-vocab lm_head); plus productionization (chunked prefill, sampling, endpoint).
 - **CB2 DONE** — ragged per-slot positions + mid-batch admission
-  (`cb_validate_ragged.py` PASS). `cb_reset_slots()` clears only the admitted
+  (`cb/validate/ragged.py` PASS). `cb_reset_slots()` clears only the admitted
   slot's DN state (Mamba-style reuse); KV self-overwrites (cur_pos-bounded).
 - **CB3 DONE** — Orca iteration-level scheduler (`experiments/serve/cb_scheduler.py`).
   5 reqs / 2 slots all bit-identical to standalone greedy refs, eager AND

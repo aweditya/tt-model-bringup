@@ -23,7 +23,7 @@ On a host with Tenstorrent P150s and a tt-metal build (see [Setup](#setup)):
 git clone https://github.com/aweditya/tt-model-bringup.git ~/tt-xla && cd ~/tt-xla
 make setup                              # uv sync — Python deps into .venv
 # (one-time: build tt-metal + owned_ops kernels + set HF_TOKEN — see Setup)
-make run PY=experiments/cb_validate_27b.py     # run a script on the TT host
+make run PY=experiments/cb/validate/forward.py   # run a script on the TT host
 ```
 
 `make help` lists targets. Device runs go through `scripts/run_remote.sh`
