@@ -15,6 +15,9 @@ Eras (by leading number, roughly chronological):
   SDPA decode, trace-bucketed scaling.
 - **91k–91x — Qwen3.6-27B bringup debug**: per-layer HF-reference diffs,
   substep dumps, lm-head inspection, fp32 probes used to root-cause drift.
+- **`legacy/` — the founding JAX/PJRT backend** (pre-pivot): `pjrt_plugin/`
+  (custom PJRT plugin compiling JAX→ttnn), `tt_jax/`, and the `jax_qwen05b_*`
+  probes. Retained in case the JAX-backend direction is revisited.
 
 Multi-model bringup *results* (Llama 1B/3B/8B, SmolLM3, Qwen ports, MoE) and the
 load-bearing weight loaders are **not** here — see the active tree / README.

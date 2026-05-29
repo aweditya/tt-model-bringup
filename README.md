@@ -6,8 +6,8 @@ model graphs plus custom owned_* compute kernels.
 > **Pivot note.** This repo was originally scoped as a JAX/XLA PJRT backend
 > (hence the legacy `tt-xla` directory name). The work pivoted to direct
 > TT-Metal model bringup + custom compute kernels for Qwen3.6 on Tenstorrent
-> Blackhole. The PJRT plugin sources under `pjrt_plugin/` are retained for
-> reference but are not on the active path. Current production:
+> Blackhole. The PJRT plugin sources under `archive/legacy/pjrt_plugin/` are
+> retained for reference but are not on the active path. Current production:
 > Qwen3.6-27B on qb2 4× P150 mesh @ 12.93 tok/s with custom `owned_gdn` and
 > `owned_decay_gate` kernels. Upcoming: Qwen3.6-35B-A3B MoE bringup.
 
