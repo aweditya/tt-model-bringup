@@ -4,7 +4,7 @@
 TT_HOST ?= qb1
 PY      ?= experiments/cb/validate/forward.py   # script for `make run` / `make dr`
 
-.PHONY: help setup lint fmt deploy run dr reset
+.PHONY: help setup lint fmt deploy run dr reset kernels
 help:  ## list targets
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed -E 's/:.*## / — /' | sort
 
@@ -28,3 +28,6 @@ dr:  ## deploy default code then run PY on the TT host (edit -> dr loop)
 
 reset:  ## reset the TT mesh (recover wedged fabric)
 	ssh $(TT_HOST) 'tt-smi -r 0,1,2,3'
+
+kernels:  ## install owned_ops kernels into tt-metal on the host: make kernels [OPS="--all"]
+	ssh $(TT_HOST) 'cd ~/tt-xla && bash scripts/build_owned_ops.sh $(OPS)'

@@ -127,9 +127,17 @@ tt-xla/
   doc's *folder-reorg* section (scratch/, experiments/utils/archive/) predates the
   actual M3.1/M3.2 layout (top-level `archive/` + `models/`) — follow the real
   layout for structure; only mine it for the de-bloat/flag specifics.
-- **M5 kernels installable — PENDING**: organize owned_ops/ + kernel_patches/
-  under `kernels/`; one `install_kernels.py` (+ Makefile target) integrating into
-  tt-metal; README on the JIT-vs-rebuild model + per-kernel commit flow.
+- **M5 kernels installable — DONE.** Did NOT move owned_ops/kernel_patches to a
+  top-level `kernels/` (README + comments reference `experiments/owned_ops/`
+  paths; each op dir is already self-contained with integrate_into_ttmetal.py +
+  INTEGRATION.md + sources.cmake — moving is churn for no real gain). Delivered
+  the missing pieces: `scripts/build_owned_ops.sh` (orchestrator — the documented
+  README TODO; loops the per-op integrate scripts + rebuilds ttnn + refreshes the
+  .so; default = the 2 prod ops, `--all`/`--dry-run`/`--no-build` flags),
+  `experiments/owned_ops/README.md` (op index + the owned-op-rebuild vs
+  kernel-patch-JIT distinction), corrected the main README (it falsely claimed
+  all 8 ops are "required for production" — only `gdn_decode_owned` +
+  `decay_gate_decode_owned` are runtime-called), `make kernels` target.
 - **M6 docs — PENDING**: CONTRIBUTING.md (ssh/env/commit workflow); index the
   78 research + 73 wiki docs; consolidate research/27b_cb_scope.md → an
   architecture overview. Keep HANDOFF.md as "read first".

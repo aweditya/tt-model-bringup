@@ -70,24 +70,19 @@ use `build_Release`.
 
 ### 2. Build owned_ops kernels
 
-Each custom kernel under `experiments/owned_ops/<name>/` ships an
-`INTEGRATION.md` plus an `integrate_into_ttmetal.py` script. Run the
-integration step for every kernel, then **rebuild `ttnn`** so the new C++
-ops are registered.
+The 27B serving path calls two custom TT-NN ops (`qwen36_gdn_decode_owned`,
+`qwen36_decay_gate_decode_owned`). Install them into your tt-metal checkout and
+rebuild `ttnn` with the orchestrator — **run it on the TT host**:
 
-Kernels currently shipped (all required for production decode):
+```bash
+scripts/build_owned_ops.sh            # install the 2 production ops + rebuild ttnn
+scripts/build_owned_ops.sh --all      # install every owned op (matches qb1/qb2)
+scripts/build_owned_ops.sh --dry-run  # preview the source changes
+```
 
-- `experiments/owned_ops/qwen36_gdn_decode_owned/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_prediction/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_delta/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_decay_state/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_outer_update/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_output/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_decay_gate_decode_owned/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_conv1d_decode_owned/INTEGRATION.md`
-
-> **TODO (follow-up PR):** `scripts/build_owned_ops.sh` will loop over all
-> eight kernels and rebuild `ttnn` once at the end.
+See [`experiments/owned_ops/README.md`](experiments/owned_ops/README.md) for the
+full op index (GDN sub-ops, experimental kernels, the JIT compute-kernel patch
+that needs no rebuild) and each op's `INTEGRATION.md` for its validation gate.
 
 ### 3. Install Python dependencies with `uv`
 
