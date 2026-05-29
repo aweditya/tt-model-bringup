@@ -134,6 +134,23 @@ HF where the stub tracks it, there's a real bug → per-layer hidden ladder at t
 worst position to localize DN-layer vs attn-layer. (HF 27B oracle: see the cosine-
 ladder / needle harnesses; build a per-position HF logit ref if none exists.)
 
+## S1a FUNCTIONAL GATE — PASS (2026-05-28)
+
+`cb/validate/prefill_generate.py` (prefill 2 ways → decode 40, same decode path):
+- stub-prefill→decode: coherent but **loops** back to repeat the prompt.
+- chunked-prefill→decode: `"…The city of Paris is located in the northern part of
+  France, in the Paris Basin, on the banks of the river Seine. The city is divided
+  into…"` — **coherent, factually correct, no loop** (arguably better than the stub).
+
+Confirms the diagnosis: chunked prefill produces a good (better) KV/DN state; the
+cosine-vs-stub failure was the stub being a poor (bf16-noisy) reference. **S1a
+forward validated** (coherent generation + 1.35× TTFT @ L=29; more @ L=32 Neumann).
+
+**Remaining for S1a:** wire `forward_prefill_chunked_tp` behind a default-OFF flag
+in `forward_prefill_tp_inner` (additive, zero prod risk) — but first validate the
+non-capture last-row return (`ttnn.slice` row-major) since the functional gate used
+the capture path. Then S1b (full Neumann win at L=32) + S2 (CB integration).
+
 ## Constraints / gotchas
 - Chunk size = 32 (the validated cap). Prompt > 32 → multiple chunks.
 - bf16 prefill drift: B3 SDPA (HiFi2, no fp32_dest_acc) is the fix
