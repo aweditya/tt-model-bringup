@@ -1969,6 +1969,27 @@ def forward_prefill_tp_inner(state, prompt_ids, capture_logits=False):
     return last_logits_tt
 
 
+def _prefill_dn_chunked_blocks(state, x_seq_tt, dn, cfg, L, C=32):
+    """S1b: block-chunked DeltaNet prefill. Process L positions in C-token blocks
+    via deltanet_chunked_neumann_tp (Neumann recurrence) instead of its
+    per-position fallback for L>C. Correct because the chunked DN threads BOTH its
+    recurrence state (dn['ssm']) and conv1d state (dn['conv_st'], updated in-place
+    per position, server_tp.py:1176) across calls — so sequential 32-blocks see the
+    prior block's tail. The last ragged block (<C) uses the op's own per-position
+    fallback. Block slices are 32-aligned (tile-aligned views); we never dealloc a
+    view or the source mid-loop (view-decay safety)."""
+    import ttnn
+    if L <= C:
+        return deltanet_chunked_neumann_tp(state, x_seq_tt, dn, cfg, L)
+    HIDDEN = cfg['hidden']
+    outs = []
+    for start in range(0, L, C):
+        blen = min(C, L - start)
+        x_block = ttnn.slice(x_seq_tt, [start, 0], [start + blen, HIDDEN])
+        outs.append(deltanet_chunked_neumann_tp(state, x_block, dn, cfg, blen))
+    return ttnn.concat(outs, dim=0)
+
+
 def forward_prefill_chunked_tp(state, prompt_ids, capture_logits=False):
     """S1a chunked prefill (Phase B.2): process the whole prompt in ONE parallel
     pass instead of looping single-token decode per position. Additive sister to
@@ -2018,7 +2039,7 @@ def forward_prefill_chunked_tp(state, prompt_ids, capture_logits=False):
 
     for layer in state.layers:
         if layer['type'] == 'linear_attention':
-            x_tt = deltanet_chunked_neumann_tp(state, x_tt, layer['dn'], cfg, seq_len)
+            x_tt = _prefill_dn_chunked_blocks(state, x_tt, layer['dn'], cfg, seq_len)
         else:
             x_tt = gated_attn_step_prefill_tp(state, x_tt, layer['attn'],
                                               cos_seq_tt, sin_seq_tt, cfg, seq_len)

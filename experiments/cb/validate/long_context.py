@@ -103,6 +103,17 @@ def main():
     stub_txt = tokenizer.decode(_decode(state, int(np.argmax(stub[-1])), L, args.decode))
     log(f"stub    answer: {stub_txt!r}  -> needle {'FOUND' if NEEDLE in stub_txt else 'MISSING'}")
 
+    # 4. TTFT (sync-bounded prefill time, no logit readback): S1b block-Neumann DN
+    #    should beat the stub's L single-token steps by more than S1a's attn-only win.
+    base._reset_state_buffers(state)
+    t0 = time.time(); base.forward_prefill_tp_inner(state, ids); ttnn.synchronize_device(state.mesh)
+    t_stub = time.time() - t0
+    base._reset_state_buffers(state)
+    t0 = time.time(); base.forward_prefill_chunked_tp(state, ids); ttnn.synchronize_device(state.mesh)
+    t_chk = time.time() - t0
+    log(f"TTFT (L={L}): stub {t_stub * 1000:8.1f} ms | chunked {t_chk * 1000:8.1f} ms "
+        f"({t_stub / t_chk:.2f}x)")
+
     log(f"=== verdict: {'PASS' if (nc_ok and chk_found) else 'CHECK'} "
         f"(non-capture path {'OK' if nc_ok else 'BAD'}; chunked needle "
         f"{'retrieved' if chk_found else 'MISSING'}) ===")

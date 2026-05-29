@@ -78,10 +78,14 @@ prefill-attn does causal-within-chunk only. So split S1:
   (c) `gated_attn_step_prefill_tp` writes cache at pos [0,L) (assumes fresh seq at
   pos 0) — fine for B=1 prefill; (d) keep B3 SDPA (bf16 prefill drift). Gate:
   per-position logit cosine vs `forward_prefill_tp_inner` stub + TTFT, on qb1.
-- **S1b — true C=32 chunked DN (Phase B.3).** Chunk the prompt into 32s so DN uses
-  the fast Neumann path (S threads across chunks). Needs a multi-*query* paged SDPA
-  (chunk N attends to prefix 0..N·32−1) — ISOLATE + validate that primitive first
-  (project methodology). Bigger; after S1a lands.
+- **S1b — block-chunked DeltaNet (Neumann/32-block) — DONE (qb1, 2026-05-28).**
+  Recon corrected the earlier framing: NO multi-query paged SDPA needed — the
+  whole-prompt attention already handles long L (S1a). S1b just runs the DN in
+  32-token Neumann blocks for L>32 (`_prefill_dn_chunked_blocks`) instead of the
+  per-position fallback. Correct because `deltanet_chunked_neumann_tp` threads both
+  `dn['ssm']` and `dn['conv_st']` (updated in-place per position, server_tp.py:1176)
+  across calls. **Validated (long_context.py, L=137): needle retrieved + TTFT stub
+  31997 ms → chunked 12573 ms = 2.54×** (S1a was attn-only 1.35× at short L).
 - **S2 — CB integration.** On admit, prefill the request's prompt in C=32 chunks
   into its slot's KV + DN state (a per-request prefill phase), then it joins the
   decode rotation. Scheduler PREFILL status: "prefill in chunks" not "1 tok/iter".
