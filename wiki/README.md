@@ -1,6 +1,7 @@
-# TT-XLA Learning Wiki
+# Learning Wiki
 
-Practice-exam-style Q&A entries for learning Tenstorrent hardware and JAX/XLA backend development.
+Practice-exam-style Q&A entries for learning Tenstorrent Blackhole hardware and
+TT-Metal LLM bringup (with some JAX/XLA-backend history from the project's origins).
 
 ## Structure
 
