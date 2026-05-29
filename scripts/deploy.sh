@@ -11,6 +11,7 @@ set -euo pipefail
 HOST="${TT_HOST:-qb1}"
 if [[ "$#" -eq 0 ]]; then
   set -- experiments/serve/server_tp.py experiments/serve/server_tp_cb.py \
+         experiments/serve/ondevice_27b.py experiments/serve/generate_27b.py \
          experiments/serve/cb_scheduler.py experiments/cb_validate_27b.py \
          experiments/cb_bench_trace.py experiments/cb_needle.py
 fi

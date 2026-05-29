@@ -66,23 +66,15 @@ import ttnn
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 
-# Reuse 91f's production kernels (all 7 bug fixes baked in)
-import importlib.util
-_spec = importlib.util.spec_from_file_location(
-    "_91f", os.path.expanduser("~/tt-xla/experiments/91f_qwen36_27b_full_ondevice.py"))
-_91f = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_91f)
+# Reuse the on-device 27B kernels + embed/lm_head loader. Run this demo via
+# `python -m experiments.demo_qwen36_27b` from the repo root.
+from experiments.serve import generate_27b as _91l
+from experiments.serve import ondevice_27b as _91f
 deltanet_step_ondevice = _91f.deltanet_step_ondevice
 gated_attn_step_ondevice = _91f.gated_attn_step_ondevice
 mlp_step_ondevice = _91f.mlp_step_ondevice
 load_layer_weights_all = _91f.load_layer_weights_all
 upload = _91f.upload
-
-# Reuse 91l's embed/lm_head loader
-_spec2 = importlib.util.spec_from_file_location(
-    "_91l", os.path.expanduser("~/tt-xla/experiments/91l_fp32_residual_generate.py"))
-_91l = importlib.util.module_from_spec(_spec2)
-_spec2.loader.exec_module(_91l)
 load_embed_lm_head_weights = _91l.load_embed_lm_head_weights
 
 MODEL_ID = "Qwen/Qwen3.6-27B"

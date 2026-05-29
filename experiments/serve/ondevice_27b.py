@@ -14,8 +14,8 @@ After this passes cosine, the path through layers 0-3 has:
   - Zero numpy on the forward path
   - Numpy used ONLY for: weight upload (one-time) + reference comparison
 
-Run on qb2:
-    cd ~/tt-xla && HF_HOME=$HOME/tt-xla/.cache/hf .venv/bin/python experiments/91f_qwen36_27b_full_ondevice.py
+Run on qb2 (from the repo root):
+    cd ~/tt-xla && HF_HOME=$HOME/tt-xla/.cache/hf .venv/bin/python -m experiments.serve.ondevice_27b
 """
 import os, sys, json
 import numpy as np

@@ -19,7 +19,7 @@ Status of build (2026-05-13):
 Reuses the validated probes:
   - experiments/utils/full_layer_tp_probe.py — relayout_in_proj/_conv, deltanet_tp, mlp_tp
   - experiments/utils/tp_attn_traced_probe.py — attn_tp_forward + relayout_attn_qkv/_o
-  - experiments/91f_qwen36_27b_full_ondevice.py — load_layer_weights_all (real weights)
+  - experiments/serve/ondevice_27b.py — load_layer_weights_all (real weights)
 
 Protocol shared with single-chip server: experiments/serve/protocol.py
 """
@@ -28,7 +28,6 @@ import sys
 import time
 import socket
 import json
-import importlib.util
 import contextlib
 
 # Stage A: device init only. Bigger imports gated to bootstrap to keep cold startup fast.
@@ -201,13 +200,10 @@ def bootstrap(state: MeshServerState):
     print("  ✓ tokenizer", flush=True)
 
     # === Stage B: load + shard all layer weights ===
-    print("[bootstrap] importing 91f kernels + TP relayout helpers…", flush=True)
+    print("[bootstrap] importing on-device 27B kernels + TP relayout helpers…", flush=True)
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "experiments"))
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "experiments", "utils"))
-    spec = importlib.util.spec_from_file_location(
-        "_91f", os.path.join(PROJECT_ROOT, "experiments", "91f_qwen36_27b_full_ondevice.py"))
-    _91f = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(_91f)
+    from experiments.serve import ondevice_27b as _91f   # was the 91f importlib hack
     state._91f = _91f
     from full_layer_tp_probe import (
         relayout_in_proj, relayout_conv,
@@ -344,11 +340,8 @@ def bootstrap(state: MeshServerState):
 
     # === Stage B (cont): embed, lm_head, final_norm — replicated ===
     print("[bootstrap] loading embed + lm_head + final_norm + RoPE tables…", flush=True)
-    # Reuse 91l's loader (used by single-chip server too)
-    spec2 = importlib.util.spec_from_file_location(
-        "_91l", os.path.join(PROJECT_ROOT, "experiments", "91l_fp32_residual_generate.py"))
-    _91l = importlib.util.module_from_spec(spec2)
-    spec2.loader.exec_module(_91l)
+    # Reuse generate_27b's embed/lm_head loader (shared with the single-chip server).
+    from experiments.serve import generate_27b as _91l
     embed_weights = _91l.load_embed_lm_head_weights()
     state.embed_np = embed_weights['embed']
     state.final_norm_tt = upload_replicated(embed_weights['final_norm'])
@@ -370,7 +363,7 @@ def bootstrap(state: MeshServerState):
           flush=True)
     # P22 (validated 2026-05-14, .cache/p22_vocab_sharded_lm_head/results.json):
     # shard lm_head along vocab axis. Weight is pre-transposed [HIDDEN, VOCAB_PADDED]
-    # (91l_fp32_residual_generate.py:82) so dim=1 is the vocab dim. Per-chip slab
+    # (generate_27b.load_embed_lm_head_weights) so dim=1 is the vocab dim. Per-chip slab
     # is [HIDDEN=5120, VOCAB_PADDED/NCHIPS=62080], which is tile-aligned.
     # Forward emits the argmax on device (saves ~35 ms/tok readback).
     NCHIPS = state.mesh.get_num_devices()

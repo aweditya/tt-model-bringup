@@ -42,14 +42,28 @@ tt-xla/
 - **M3.1 archive learning — DONE** (`19894b8`): 105 probes → archive/ + index.
 - **M3.2 surface/archive — DONE** (`fd0ef38`): 10 → models/, 68 → archive/bringup/,
   README links fixed. experiments/ root 221→38 .py.
-- **M3.0 untangle 91f/91l — PENDING (device-gated; user chose this).**
-  Extract `load_layer_weights_all` (+ helpers server_tp uses via `_91f.`) and
-  `load_embed_lm_head_weights` (from `_91l.`) into `experiments/serve/weights.py`;
-  repoint server_tp to `from weights import ...`, delete the `importlib` dance;
-  then archive 91f/91l. VALIDATE: qb2 (or qb1) server bootstrap + the cb_validate
-  Paris/logit canary. First: `grep -nE "_91f\.|_91l\." experiments/serve/server_tp.py`
-  for the full used-symbol set (server_35b_ttnn.py may load its own — out of 27B scope).
-- **M2 CI/ruff — DONE** (commit pending below): ruff lint config in pyproject
+- **M3.0 untangle 91f/91l — DONE (device-validated on qb1).** Reality was deeper
+  than "2 loaders": `91f` is a shared on-device op LIBRARY (upload, hifi4,
+  mlp/deltanet/gated_attn step ops + load_layer_weights_all) used by BOTH
+  `server_tp.py` and `server.py`; the importlib hack existed only because the
+  filenames started with a digit. Fix: `git mv` to valid module names in serve/
+  (`91f_…`→`serve/ondevice_27b.py`, `91l_…`→`serve/generate_27b.py`) and replace
+  every `importlib.spec_from_file_location` with `from experiments.serve import
+  ondevice_27b as _91f` (the package-import form the servers already use for
+  `protocol`, since they launch as `-m experiments.serve.server_tp` from repo
+  root — bare `import` would NOT resolve). Kept the `state._91f`/`_91l`
+  attributes so all 50+ `_91f.<sym>` call sites are untouched. Repointed:
+  server_tp, server (incl. its now-`importlib.reload`-based `handle_reload_kernels`,
+  dropped `_load_kernel_module` + `_91F/L_PATH`), generate_27b's own internal 91f
+  load, demo_qwen36_27b (now run via `-m experiments.demo_qwen36_27b`). Added
+  `serve/import_smoke.py` (mesh-free package-import smoke) + the two modules to
+  deploy.sh. VALIDATED: `run_remote.sh --no-reset -m experiments.serve.import_smoke`
+  on qb1 → "IMPORT SMOKE OK". NOT archived (they're the live library). LEFTOVER:
+  `experiments/utils/p22_vocab_sharded_lm_head_probe.py` still hardcodes the old
+  91l path (utils is pending archive triage; remote-only probe — fix when triaged).
+  Old `91f_…`/`91l_…` files may still exist on remote hosts from prior rsyncs
+  (orphaned, harmless; a clean redeploy / `--delete` removes them).
+- **M2 CI/ruff — DONE** (commit `c38a939`): ruff lint config in pyproject
   (select E+F; ignore the compact-style E7xx/E4xx + E501; exclude archive/scratch/
   pjrt_plugin/experiments/utils/tt_jax), `[dependency-groups].dev` (ruff,
   pre-commit), `.pre-commit-config.yaml` (ruff + ruff-format incremental + safety

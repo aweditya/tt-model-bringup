@@ -15,9 +15,9 @@ Modes:
 The bf16 baseline ran with this exact same prompt; outputs are stored
 under ~/tt-xla/.cache/b8_diagnostics.json for direct comparison.
 
-Run on qb2:
+Run on qb2 (from the repo root):
     cd ~/tt-xla && HF_HOME=$HOME/tt-xla/.cache/hf .venv/bin/python \
-        experiments/91l_fp32_residual_generate.py --mode diagnose
+        -m experiments.serve.generate_27b --mode diagnose
 """
 import os, sys, json, time, gc, argparse
 import numpy as np
@@ -29,12 +29,8 @@ from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from transformers import AutoTokenizer
 
-# Reuse the now-fp32-aware kernels from 91f (typecasts around SDPA were added)
-import importlib.util
-_spec = importlib.util.spec_from_file_location(
-    "_91f", os.path.expanduser("~/tt-xla/experiments/91f_qwen36_27b_full_ondevice.py"))
-_91f = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_91f)
+# Reuse the now-fp32-aware on-device kernels (typecasts around SDPA were added).
+from experiments.serve import ondevice_27b as _91f
 deltanet_step_ondevice = _91f.deltanet_step_ondevice
 gated_attn_step_ondevice = _91f.gated_attn_step_ondevice
 mlp_step_ondevice = _91f.mlp_step_ondevice

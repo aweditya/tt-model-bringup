@@ -7,7 +7,6 @@ a Unix socket and get one JSON response per connection.
 import argparse
 import gc
 import importlib
-import importlib.util
 import json
 import os
 import socket
@@ -25,8 +24,6 @@ MODEL_ID = "Qwen/Qwen3.6-27B"
 EPS = 1e-6
 MAX_POS = 256
 HF_HIDDEN_PATH = os.path.expanduser("~/tt-xla/.cache/hf_per_layer_hidden_states.npz")
-_91F_PATH = os.path.expanduser("~/tt-xla/experiments/91f_qwen36_27b_full_ondevice.py")
-_91L_PATH = os.path.expanduser("~/tt-xla/experiments/91l_fp32_residual_generate.py")
 
 
 class ServerState:
@@ -79,14 +76,6 @@ class ServerState:
         }
 
 
-def _load_kernel_module(path: str, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def bootstrap(state: ServerState, mock: bool, device_id: int) -> None:
     state.mock = mock
     state.device_id = device_id
@@ -102,8 +91,10 @@ def bootstrap(state: ServerState, mock: bool, device_id: int) -> None:
     from huggingface_hub import hf_hub_download
     from transformers import AutoTokenizer
 
-    state._91f = _load_kernel_module(_91F_PATH, "_91f")
-    state._91l = _load_kernel_module(_91L_PATH, "_91l")
+    from experiments.serve import generate_27b as _91l
+    from experiments.serve import ondevice_27b as _91f
+    state._91f = _91f
+    state._91l = _91l
     upload = state._91f.upload
     load_layer_weights_all = state._91f.load_layer_weights_all
     load_embed_lm_head_weights = state._91l.load_embed_lm_head_weights
@@ -228,20 +219,18 @@ def handle_status(state: ServerState, args: dict) -> dict:
 
 
 def handle_reload_kernels(state: ServerState, args: dict) -> dict:
-    """Re-exec the kernel modules from disk; never cache function refs.
+    """Reload the on-device kernel modules from disk; never cache function refs.
 
-    importlib.reload doesn't work with spec_from_file_location-loaded
-    modules (no findable spec for the synthetic name). We re-run the
-    loader instead — state._91f gets a fresh module object pointing at
-    the same name in sys.modules, and per-call dereference
-    (state._91f.deltanet_step_ondevice) picks up the new code.
+    Per-call dereference (state._91f.deltanet_step_ondevice) picks up the new
+    code after reload. Reload ondevice_27b before generate_27b, since the latter
+    imports the former at module top.
     """
     reloaded = []
     if state._91f is not None:
-        state._91f = _load_kernel_module(_91F_PATH, "_91f")
+        importlib.reload(state._91f)
         reloaded.append("_91f")
     if state._91l is not None:
-        state._91l = _load_kernel_module(_91L_PATH, "_91l")
+        importlib.reload(state._91l)
         reloaded.append("_91l")
     return {"ok": True, "reloaded_modules": reloaded}
 
