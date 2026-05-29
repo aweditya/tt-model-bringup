@@ -9,7 +9,8 @@ model graphs plus custom owned_* compute kernels.
 > Blackhole. The PJRT plugin sources under `archive/legacy/pjrt_plugin/` are
 > retained for reference but are not on the active path. Current production:
 > Qwen3.6-27B on qb2 4× P150 mesh @ 12.93 tok/s with custom `owned_gdn` and
-> `owned_decay_gate` kernels. Upcoming: Qwen3.6-35B-A3B MoE bringup.
+> `owned_decay_gate` kernels; Qwen3.6-35B-A3B MoE bringup is underway (see
+> `HANDOFF.md`).
 
 GitHub: `aweditya/tt-model-bringup`.
 
@@ -62,11 +63,8 @@ export ARCH_NAME=blackhole
 The exact `TT_BUILD_DIR` name depends on which CMake preset you ran
 (`./build_metal.sh` defaults to `build_Release` on Blackhole; profiler
 builds produce `build_tracy_gcc12_nodist`). Both qb1 and qb2 currently
-use `build_Release`.
-
-> **TODO (follow-up PR):** pin a known-good `tt-metal` SHA here. Today's
-> `ttnn` build on qb2 is the reference; the SHA will be captured by a
-> `scripts/setup.sh` aggregator in the next reproducibility PR.
+use `build_Release`. (A known-good `tt-metal` SHA is not yet pinned — the
+current qb1/qb2 `ttnn` build is the reference.)
 
 ### 2. Build owned_ops kernels
 
@@ -243,14 +241,12 @@ with the qb1 single-chip baseline (5.19 tok/s in the QK-rms_norm-shipped
 memory note). Both servers had been bootstrapped before measurement, so
 the numbers reflect steady-state traced decode (not cold-start).
 
-### Legacy 8B-era demos (re-verified on qb1, 2026-05-21)
+### Legacy multi-model demos
 
-`REPRODUCE.md` documents six experiments from the pre-pivot Llama /
-Qwen2.5 era. All six were authored on the now-deprecated `ssh tenstorrent`
-host (per `CLAUDE.md` non-negotiable #4) and were **re-verified on qb1**
-on 2026-05-21 against the current `~/tt-xla/.venv` install
-(`torch==2.11.0+cu130`, `ttnn==0.69.0`, firmware 19.6.0). All six PASS
-within 2-7% of the historical baselines:
+Smaller models brought up before the Qwen3.6 pivot (Llama 1B/3B/8B, SmolLM3,
+Qwen2.5/3-small), re-verified on qb1 2026-05-21 within 2-7% of baseline. Index:
+[`models/`](models/README.md); run recipes: `REPRODUCE.md` (stop the prod server
+first so device 0 is free).
 
 | Script | Baseline | qb1 (2026-05-21) |
 |--------|----------|------------------|
@@ -260,27 +256,6 @@ within 2-7% of the historical baselines:
 | `models/73_llama8b_instruct.py`   |  19 tok/s | **19 tok/s**    |
 | `models/76b_8b_correctness_check.py` | cos > 0.997, 8/8 | cos **0.997327**, **8/8** |
 | `models/80_8b_diverse_qa_demo.py` | 18 tok/s, 9/10 EOS | **18 tok/s, 9/10 EOS** |
-
-See `REPRODUCE.md` for the run recipe (stop the prod `serve.sh` first
-so device 0 is free), and `~/tt-xla/.cache/legacy_demos_2026_05_21/`
-on qb1 for the captured stdout logs. The fresh public-clone setup
-recipe (Setup steps 3+4 above) was also re-verified the same day:
-anonymous `git clone` → `uv sync` →
-`uv pip install -e $TT_METAL_HOME --no-build-isolation` produces a
-working `.venv/` with `ttnn==0.69.0`, and the fresh-clone
-`experiments.serve.client generate` talks cleanly to the persistent
-qb1 prod server's Unix socket and decodes 16 tokens at 5.12 tok/s.
-
-### Experienced-user shortcut
-
-If you already have a working `.venv/` on qb1/qb2 with `torch`,
-`transformers`, `huggingface_hub`, `safetensors`, and `numpy` installed,
-you can skip the `uv sync` step in Setup. The serve scripts only need
-`$VENV_PY` to point at an executable Python interpreter (default
-`$PROJECT_ROOT/.venv/bin/python`); they do **not** invoke `uv`
-themselves. Both Demo A and Demo B above were measured on hosts whose
-`.venv/` pre-dates the new `pyproject.toml` and they ran without any
-`uv sync` step.
 
 ---
 
@@ -314,21 +289,8 @@ predecessor qb1 single-chip probe lives in
   ```bash
   export HF_HOME=/path/with/space/.cache/hf
   ```
-- **First cold weight download is slow.** ~6 minutes on qb2 — this is the
-  HuggingFace cold-cache hit, not a project bug. A
-  `scripts/prefetch_weights.py` helper will be added in a follow-up PR.
+- **First cold weight download is slow.** ~6 minutes on qb2 — the HuggingFace
+  cold-cache hit, not a project bug.
 - **Legacy 8B-era notes (Llama-3.1-8B, Llama-3.2-1B/3B, Qwen2.5-0.5B).**
   See `REPRODUCE.md`. Those experiments pre-date the Qwen3.6-27B pivot
   and are kept for historical reference only.
-
----
-
-## Follow-up PRs (per `research/repro_packaging_plan_2026_05_21.md`)
-
-- `scripts/setup.sh` — preflight + `uv sync` aggregator.
-- `scripts/build_owned_ops.sh` — loop owned_ops integration + rebuild ttnn.
-- `scripts/prefetch_weights.py` — `snapshot_download(Qwen/Qwen3.6-27B)` to
-  `$HF_HOME` for offline bootstrap.
-- Pin `tt-metal` SHA in `docs/SETUP.md`.
-- De-hardcode `~/tt-xla` paths in `experiments/serve/server.py` and
-  `server_tp.py`.
