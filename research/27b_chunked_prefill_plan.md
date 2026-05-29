@@ -108,6 +108,32 @@ via stub) vs chunked-DN-only (attn per-position), or a per-layer hidden ladder a
 pos 21, to localize. Also re-run at L=32 to exercise the Neumann chunked-DN path.
 Then fix, re-gate, wire behind a flag in `forward_prefill_tp_inner`.
 
+## S1a drift isolation (2026-05-28) — the decode-stub is the wrong reference
+
+Sweep L∈{8,16,29,32} (one bootstrap): worst_cos 0.986(L8) → 0.960(L16) → 0.631(L29)
+→ 0.516(L32); worst always at a LATE position; **all lengths fail, both DN paths
+(Neumann + fallback)**. So it's accumulation-with-L, not a fallback-only bug.
+
+Read of `gated_attn_step_prefill_tp` (1750): structurally correct — pre-norm, QKV,
+q/k-norm, rotate-half RoPE with per-pos cos/sin, paged_fill_cache, causal SDPA
+(scale 1/√head_dim, B3 kernel cfg), sigmoid output-gate, out_proj+all_reduce+
+residual. Mirrors the decode path; no obvious logic bug.
+
+**Reframe:** the chunked DN (`deltanet_chunked_neumann_tp`) is an independently-
+validated, *different + more-accurate* formulation ("chunked DN strictly wins at
+seq≤32", [[feedback-v4-chunked-dn-seq32-shipped]]); the single-token stub is itself
+bf16-noisy (documented single-token-prefill drift, [[feedback-bf16-prefill-drift-cliff]]).
+So chunked-vs-stub per-position cosine conflates "bug" with "different-by-design,"
+and that difference compounds in the recurrent DN state → late-position drift.
+
+**Corrected gate (next):** compare chunked prefill to **HF (ground truth)** per
+position, OR functionally — chunked-prefill → decode N tokens, check coherent +
+matches production generation. If chunked tracks HF as well as / better than the
+stub, S1a is correct (the stub gate was just too strict). If chunked diverges from
+HF where the stub tracks it, there's a real bug → per-layer hidden ladder at the
+worst position to localize DN-layer vs attn-layer. (HF 27B oracle: see the cosine-
+ladder / needle harnesses; build a per-position HF logit ref if none exists.)
+
 ## Constraints / gotchas
 - Chunk size = 32 (the validated cap). Prompt > 32 → multiple chunks.
 - bf16 prefill drift: B3 SDPA (HiFi2, no fp32_dest_acc) is the fix
