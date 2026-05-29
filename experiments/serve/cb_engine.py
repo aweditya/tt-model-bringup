@@ -61,12 +61,16 @@ class RequestHandle:
 class CBEngine:
     """Thread-safe front end to the CB scheduler. One owned thread runs the loop."""
 
-    def __init__(self, state, slots, max_new_cap, eos_id, use_trace=True, idle_sleep=0.001):
+    def __init__(self, state, slots, max_new_cap, eos_id, use_trace=True,
+                 sampling=False, idle_sleep=0.001):
         self.state = state
         self.slots = slots
         self.max_new_cap = int(max_new_cap)
         self.eos_id = eos_id
         self.use_trace = use_trace
+        # sampling=True → eager per-slot temp/top-p/top-k (the chat-API mode);
+        # sampling=False → greedy argmax trace (P0 fast path). See Scheduler.
+        self.sampling = sampling
         self.idle_sleep = idle_sleep
 
         self._inbound = queue.Queue()      # (ext_rid, prompt, max_new, out_q)
@@ -92,15 +96,23 @@ class CBEngine:
             raise self._err
         return self
 
-    def submit(self, prompt_ids, max_new=None):
+    def submit(self, prompt_ids, max_new=None, sampling=None):
+        """sampling: None → greedy; else {temperature, top_p, top_k, seed}.
+        temperature<=0 is normalised to greedy. Requires the engine to have been
+        built with sampling=True."""
         if self._stop.is_set():
             raise RuntimeError("engine is stopping; not accepting new requests")
+        if sampling is not None:
+            if not self.sampling:
+                raise RuntimeError("engine was not built with sampling=True")
+            if sampling.get("temperature", 0.0) <= 0.0:
+                sampling = None  # greedy
         mn = self.max_new_cap if max_new is None else min(int(max_new), self.max_new_cap)
         with self._idlock:
             rid = self._next_id
             self._next_id += 1
         q = queue.Queue()
-        self._inbound.put((rid, [int(t) for t in prompt_ids], mn, q))
+        self._inbound.put((rid, [int(t) for t in prompt_ids], mn, sampling, q))
         return RequestHandle(rid, q, len(prompt_ids))
 
     def cancel(self, rid):
@@ -116,7 +128,8 @@ class CBEngine:
     def _run(self):
         try:
             self._sched = Scheduler(self.state, self.slots, self.max_new_cap,
-                                    self.eos_id, use_trace=self.use_trace)
+                                    self.eos_id, use_trace=self.use_trace,
+                                    sampling=self.sampling)
         except BaseException as e:  # surface bootstrap/capture failure to start()
             self._err = e
             self.started.set()
@@ -145,10 +158,10 @@ class CBEngine:
     def _drain_inbound(self):
         while True:
             try:
-                ext, prompt, mn, q = self._inbound.get_nowait()
+                ext, prompt, mn, sampling, q = self._inbound.get_nowait()
             except queue.Empty:
                 return
-            sched_rid = self._sched.submit(prompt)
+            sched_rid = self._sched.submit(prompt, sampling=sampling)
             self._meta[sched_rid] = {"ext": ext, "q": q, "max_new": mn, "sent": 0}
             self._ext_to_sched[ext] = sched_rid
 

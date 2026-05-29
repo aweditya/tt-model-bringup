@@ -77,9 +77,22 @@ resume prefill optimization (S2).
   6 concurrent clients → each stream == its B=1 greedy ref; cancel mid-flight →
   `cancelled` + freed slot recycles correctly; per-request max_new exact; clean
   start/stop, no wedge.
-- **P1 — Per-request sampling in CB.** Per-slot logits/top-k from the batched
-  forward; engine samples per slot. **Gate:** per-slot sampling correctness +
-  readback cost; greedy unchanged.
+- **P1 — Per-request sampling in CB. DONE (2026-05-29).** Engine grew a
+  construction-time `sampling=False|True` mode (de-risked: no mixing eager
+  forwards with execute_trace; no unproven two-trace gamble). `sampling=False`
+  keeps the P0 argmax-trace fast path byte-identical. `sampling=True` runs the
+  eager logits forward (`forward_batch_tp_inner(return_logits=True)` already
+  existed → `[B,vocab]` replicated) each step; greedy slots take host argmax,
+  sampled slots use `_sample_from_logits` with their own seeded rng (reused
+  from `server_tp`). Wired through `Scheduler.submit(prompt, sampling=…)` +
+  `CBEngine.submit(…, sampling=…)`; greedy-via-host-argmax is exact. **Gate
+  PASS** (`experiments/cb/validate/engine_sampling.py`, qb1, 4 slots): (A)
+  greedy-via-sampling-engine == device-argmax ref exactly; (B) mixed batch:
+  greedy slots unaffected, sampled seeds differ + coherent; (C) determinism
+  (same seed → identical). **Measured cost**: ~318 ms/eager-step at B≤4 (vs
+  ~106 ms traced in P0; ~3× per-step penalty, mostly Python dispatch + ~15 MB
+  [B,vocab] readback at B=32). A traced-logits fast path is a deferred perf
+  increment (revisit if P5 shows it matters at production B).
 - **P2 — Async OpenAI API over the engine.** Re-point `openai_endpoint` (or a new
   `serve/cb_api.py`) at `cb_engine`; SSE, cancellation, sampling, stop, usage.
   **Gate:** concurrent OpenAI clients (real chat), correctness + streaming.

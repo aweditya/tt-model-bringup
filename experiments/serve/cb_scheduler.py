@@ -85,17 +85,22 @@ def greedy_ref(state, prompt, max_new, eos_id):
 class Scheduler:
     """Orca iteration-level scheduler over a fixed pool of B slots."""
 
-    def __init__(self, state, B, max_new, eos_id, use_trace=False):
+    def __init__(self, state, B, max_new, eos_id, use_trace=False, sampling=False):
         self.state = state
         self.B = B
         self.max_new = max_new
         self.eos_id = eos_id
         self.use_trace = use_trace
+        # sampling mode runs the eager logits forward every step (per-slot host
+        # temp/top-p/top-k) — no trace (mixing eager forwards with execute_trace
+        # is unsafe, and greedy stays the traced argmax fast path when
+        # sampling=False). See research/production_server_plan.md P1.
+        self.sampling = sampling
         self._trace_id = None
         self._argmax_handle = None
         cb.setup_cb_state(state, B)
         cb.cb_reset_states(state)
-        if use_trace:
+        if use_trace and not sampling:
             self._capture_trace()
         self.slots = [None] * B          # slot -> request id or None
         self.waiting = deque()           # request ids
@@ -125,11 +130,18 @@ class Scheduler:
             ttnn.release_trace(self.state.mesh, self._trace_id)
             self._trace_id = None
 
-    def submit(self, prompt):
+    def submit(self, prompt, sampling=None):
+        """sampling: None → greedy (argmax); else a dict
+        {temperature, top_p, top_k, seed}. Only honoured in sampling mode."""
         rid = self._next_id; self._next_id += 1
+        rng = None
+        if sampling is not None:
+            import numpy as np
+            rng = np.random.default_rng(sampling.get('seed'))
         self.reqs[rid] = {
             'id': rid, 'prompt': [int(t) for t in prompt], 'gen': [],
             'cur_pos': 0, 'next_tok': int(prompt[0]), 'status': 'WAIT', 'slot': None,
+            'sampling': sampling, 'rng': rng,
         }
         self.waiting.append(rid)
         return rid
@@ -181,7 +193,9 @@ class Scheduler:
             if rid is not None:
                 r = self.reqs[rid]
                 toks[s] = r['next_tok']; curs[s] = r['cur_pos']
-        if self.use_trace:
+        if self.sampling:
+            out = self._step_sampled(toks, curs)
+        elif self.use_trace:
             import ttnn
             cb.update_input_buffers_batched(self.state, toks, curs)
             ttnn.execute_trace(self.state.mesh, self._trace_id, cq_id=0, blocking=False)
@@ -209,6 +223,30 @@ class Scheduler:
                     r['cur_pos'] += 1
                     r['next_tok'] = o
         return active
+
+    def _step_sampled(self, toks, curs):
+        """Eager logits forward + per-slot host sampling. Greedy slots (sampling
+        is None) take the host argmax — identical token to the device argmax,
+        same logits. Sampled slots use their own seeded rng."""
+        import ttnn
+        cb.update_input_buffers_batched(self.state, toks, curs)
+        rm = cb.forward_batch_tp_inner(self.state, return_logits=True)  # [B, vocab] replicated
+        t = ttnn.to_torch(rm, mesh_composer=ttnn.ConcatMeshToTensor(self.state.mesh, dim=0))
+        ttnn.deallocate(rm)
+        logits = t[:self.B].float().numpy()
+        out = [DUMMY_TOK] * self.B
+        for s in range(self.B):
+            rid = self.slots[s]
+            if rid is None:
+                continue
+            sp = self.reqs[rid]['sampling']
+            if sp is None:
+                out[s] = int(logits[s].argmax())
+            else:
+                out[s] = base._sample_from_logits(
+                    logits[s], sp.get('temperature', 1.0), sp.get('top_p', 1.0),
+                    sp.get('top_k', 0), self.reqs[rid]['rng'])
+        return out
 
     def run(self, max_iters=10000):
         it = 0
