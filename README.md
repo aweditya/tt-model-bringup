@@ -90,7 +90,9 @@ uv sync
 
 This reads `pyproject.toml` + `uv.lock` and provisions `.venv/` with the
 pinned versions of `torch`, `transformers`, `huggingface_hub`,
-`safetensors`, and `numpy`.
+`safetensors`, `numpy`, plus ttnn's pure-Python runtime deps (`loguru`,
+`pandas`, `seaborn`, `graphviz`, `pyyaml`, `click`, `networkx`,
+`ml_dtypes`) declared so `uv sync` doesn't strip them from the venv.
 
 **You must then install `ttnn` (Tenstorrent's Python runtime) into the
 same venv** — `pyproject.toml` cannot pin it because it has no PyPI

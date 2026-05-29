@@ -5,8 +5,10 @@ description = "Tenstorrent Blackhole LLM bringup (Qwen3.6-family) — direct TT-
 readme = "README.md"
 requires-python = ">=3.10"
 
-# TT-NN (ttnn) is installed separately via Tenstorrent's tt-metal source build.
-# See README.md "Setup" section for the build flow; pin SHA TBD.
+# TT-NN (ttnn) is installed separately via Tenstorrent's tt-metal source build
+# (see README.md "Setup"). Its pure-Python *runtime* deps are declared below so
+# `uv sync` doesn't strip them from device-host venvs. The vendored `tracy`
+# package (tt-metal/tools/tracy) is NOT on PyPI — see README for the copy step.
 dependencies = [
     # Core ML stack — torch is CPU-only here; device tensors come from ttnn.
     "torch>=2.11.0",
@@ -19,6 +21,19 @@ dependencies = [
     "huggingface-hub>=1.10.0",
     "transformers>=5.5.0",
     "safetensors>=0.7.0",
+
+    # ttnn runtime deps — pinned to match tt-metal/pyproject.toml's `ttnn`
+    # project at install time. Without these declared, `uv sync` prunes them
+    # from the venv (they were installed by tt-metal's build flow), breaking
+    # `import ttnn` on the device host (loguru, then tracy → pandas, etc.).
+    "loguru>=0.6.0",
+    "networkx>=3.1",
+    "graphviz>=0.20.3",
+    "pyyaml>=5.4",
+    "click>=8.1.7",
+    "pandas>=2.0.3",
+    "seaborn>=0.13.2",
+    "ml_dtypes",
 ]
 
 # uv-managed, no PyPI publishing.
