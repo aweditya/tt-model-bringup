@@ -8,10 +8,6 @@ A/B vs `"pattern_a_batched"` for trace-clean production).
 See HANDOFF.md for perf numbers + hardware-ceiling context. Sharding:
 DN on V-head, attn on Q-head, MoE on intermediate dim.
 """
-import json
-import os
-import signal
-import socket
 import sys
 import time
 from pathlib import Path
@@ -23,7 +19,6 @@ from transformers import AutoConfig, AutoTokenizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
-import protocol as P  # noqa: E402
 
 import ttnn  # noqa: E402
 
@@ -761,7 +756,6 @@ def attn_forward_ttnn_sdpa(h_tt, w, mesh, cos_tt, sin_tt, state, sub_capture=Non
     the SAME (kc, vc) tensors that came in — paged_update_cache mutates them
     in place, so callers can ignore the returned value.
     """
-    L = None  # layer index unknown here; state holds caches per layer, attached at call site
     # The caller (layer_forward_ttnn) passes the per-layer kv_cache via state's
     # kv_caches_tt[L]. Here we receive the kc/vc as a paired tuple via state.
     # By contract, attn_forward_ttnn (the dispatcher) sets state._current_kv_cache
@@ -1872,7 +1866,7 @@ def main():
         out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
     ).float().numpy()[0]
     print(f"  out norm: {np.linalg.norm(out_np):.4f} (shape {out_np.shape})")
-    print(f"  ✓ on-device MoE block (routed + shared) works on (1,4) mesh")
+    print("  ✓ on-device MoE block (routed + shared) works on (1,4) mesh")
 
     # DN smoke (placeholder — projections + out_proj, no conv/recurrence yet)
     if state.layer_types[0] == "linear_attention":
@@ -1894,7 +1888,7 @@ def main():
             dn_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
         ).float().numpy()[0]
         print(f"  DN out norm: {np.linalg.norm(dn_out_np):.4f} (shape {dn_out_np.shape})")
-        print(f"  ✓ on-device DN with recurrence works")
+        print("  ✓ on-device DN with recurrence works")
 
     # Attention smoke on layer 3 (first full_attention layer)
     attn_layer_idx = None
@@ -1917,11 +1911,11 @@ def main():
                 attn_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
             ).float().numpy()[0]
             print(f"  Attn out norm: {np.linalg.norm(attn_out_np):.4f} (shape {attn_out_np.shape})")
-            print(f"  ✓ on-device attention plumbing works")
+            print("  ✓ on-device attention plumbing works")
             attn_smoke_ok = True
         except Exception as e:
             print(f"  ⚠ attention manual smoke failed: {type(e).__name__}: {str(e).splitlines()[0][:200]}")
-            print(f"    (manual path is not the production hot path — production uses SDPA + owned kernels)")
+            print("    (manual path is not the production hot path — production uses SDPA + owned kernels)")
             try:
                 ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
             except Exception:
@@ -1952,11 +1946,11 @@ def main():
             layer_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
         ).float().numpy()[0]
         print(f"  Layer 0 out norm: {np.linalg.norm(layer_out_np):.4f}")
-        print(f"  ✓ on-device full layer (DN + MoE + residuals + 2 layernorms) works")
+        print("  ✓ on-device full layer (DN + MoE + residuals + 2 layernorms) works")
         layer_smoke_ok = True
     except Exception as e:
         print(f"  ⚠ layer 0 composed smoke failed: {type(e).__name__}: {str(e).splitlines()[0][:200]}")
-        print(f"    (layer_forward_ttnn uses legacy MoE keys; production hot path uses pattern_a_batched)")
+        print("    (layer_forward_ttnn uses legacy MoE keys; production hot path uses pattern_a_batched)")
 
     # Deallocate single-layer smoke leftovers so step_forward_ttnn starts clean
     ttnn.deallocate(h_tt)
@@ -1981,7 +1975,7 @@ def main():
     t1 = time.time()
     tok_text = state.tokenizer.decode([next_id])
     print(f"  next_id={next_id} text={tok_text!r}  (took {(t1-t0)*1000:.1f} ms)")
-    print(f"  ✓ FULL on-device step_forward_ttnn works end-to-end")
+    print("  ✓ FULL on-device step_forward_ttnn works end-to-end")
 
     ttnn.close_mesh_device(state.mesh)
     ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)

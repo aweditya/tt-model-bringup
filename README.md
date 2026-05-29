@@ -6,12 +6,29 @@ model graphs plus custom owned_* compute kernels.
 > **Pivot note.** This repo was originally scoped as a JAX/XLA PJRT backend
 > (hence the legacy `tt-xla` directory name). The work pivoted to direct
 > TT-Metal model bringup + custom compute kernels for Qwen3.6 on Tenstorrent
-> Blackhole. The PJRT plugin sources under `pjrt_plugin/` are retained for
-> reference but are not on the active path. Current production:
+> Blackhole. The PJRT plugin sources under `archive/legacy/pjrt_plugin/` are
+> retained for reference but are not on the active path. Current production:
 > Qwen3.6-27B on qb2 4× P150 mesh @ 12.93 tok/s with custom `owned_gdn` and
 > `owned_decay_gate` kernels. Upcoming: Qwen3.6-35B-A3B MoE bringup.
 
 GitHub: `aweditya/tt-model-bringup`.
+
+---
+
+## Quickstart
+
+On a host with Tenstorrent P150s and a tt-metal build (see [Setup](#setup)):
+
+```bash
+git clone https://github.com/aweditya/tt-model-bringup.git ~/tt-xla && cd ~/tt-xla
+make setup                              # uv sync — Python deps into .venv
+# (one-time: build tt-metal + owned_ops kernels + set HF_TOKEN — see Setup)
+make run PY=experiments/cb/validate/forward.py   # run a script on the TT host
+```
+
+`make help` lists targets. Device runs go through `scripts/run_remote.sh`
+(the single source of truth for the ttnn env + mesh reset); set `TT_HOST=qb2`
+to target the 4-chip box. `make dr PY=...` deploys then runs (the edit loop).
 
 ---
 
@@ -53,24 +70,19 @@ use `build_Release`.
 
 ### 2. Build owned_ops kernels
 
-Each custom kernel under `experiments/owned_ops/<name>/` ships an
-`INTEGRATION.md` plus an `integrate_into_ttmetal.py` script. Run the
-integration step for every kernel, then **rebuild `ttnn`** so the new C++
-ops are registered.
+The 27B serving path calls two custom TT-NN ops (`qwen36_gdn_decode_owned`,
+`qwen36_decay_gate_decode_owned`). Install them into your tt-metal checkout and
+rebuild `ttnn` with the orchestrator — **run it on the TT host**:
 
-Kernels currently shipped (all required for production decode):
+```bash
+scripts/build_owned_ops.sh            # install the 2 production ops + rebuild ttnn
+scripts/build_owned_ops.sh --all      # install every owned op (matches qb1/qb2)
+scripts/build_owned_ops.sh --dry-run  # preview the source changes
+```
 
-- `experiments/owned_ops/qwen36_gdn_decode_owned/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_prediction/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_delta/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_decay_state/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_outer_update/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_gdn_output/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_decay_gate_decode_owned/INTEGRATION.md`
-- `experiments/owned_ops/qwen36_conv1d_decode_owned/INTEGRATION.md`
-
-> **TODO (follow-up PR):** `scripts/build_owned_ops.sh` will loop over all
-> eight kernels and rebuild `ttnn` once at the end.
+See [`experiments/owned_ops/README.md`](experiments/owned_ops/README.md) for the
+full op index (GDN sub-ops, experimental kernels, the JIT compute-kernel patch
+that needs no rebuild) and each op's `INTEGRATION.md` for its validation gate.
 
 ### 3. Install Python dependencies with `uv`
 
@@ -242,12 +254,12 @@ within 2-7% of the historical baselines:
 
 | Script | Baseline | qb1 (2026-05-21) |
 |--------|----------|------------------|
-| `experiments/60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** |
-| `experiments/64_llama32_1b_port.py`    |  78 tok/s | **78.6 tok/s**  |
-| `experiments/67_llama32_3b_port.py`    |  34 tok/s | **33.7 tok/s**  |
-| `experiments/73_llama8b_instruct.py`   |  19 tok/s | **19 tok/s**    |
-| `experiments/76b_8b_correctness_check.py` | cos > 0.997, 8/8 | cos **0.997327**, **8/8** |
-| `experiments/80_8b_diverse_qa_demo.py` | 18 tok/s, 9/10 EOS | **18 tok/s, 9/10 EOS** |
+| `models/60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** |
+| `models/64_llama32_1b_port.py`    |  78 tok/s | **78.6 tok/s**  |
+| `models/67_llama32_3b_port.py`    |  34 tok/s | **33.7 tok/s**  |
+| `models/73_llama8b_instruct.py`   |  19 tok/s | **19 tok/s**    |
+| `models/76b_8b_correctness_check.py` | cos > 0.997, 8/8 | cos **0.997327**, **8/8** |
+| `models/80_8b_diverse_qa_demo.py` | 18 tok/s, 9/10 EOS | **18 tok/s, 9/10 EOS** |
 
 See `REPRODUCE.md` for the run recipe (stop the prod `serve.sh` first
 so device 0 is free), and `~/tt-xla/.cache/legacy_demos_2026_05_21/`

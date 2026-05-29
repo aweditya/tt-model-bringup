@@ -17,8 +17,6 @@ server_tp.py). Endpoints:
 
 Run via `experiments/serve/scripts/serve_35b.sh start`.
 """
-import json
-import os
 import signal
 import socket
 import sys

@@ -98,7 +98,7 @@ def main():
             f"delta {ts_default.mean()-ts_10x11.mean():.4f} ms")
         log(f"speedup 8x8:   {ts_default.mean()/ts_8x8.mean():.2f}x  "
             f"delta {ts_default.mean()-ts_8x8.mean():.4f} ms")
-        log(f"per-token (lm_head called 1x): same as per-call delta")
+        log("per-token (lm_head called 1x): same as per-call delta")
 
         ttnn.deallocate(h_tt); ttnn.deallocate(w_tt)
     finally:

@@ -95,7 +95,7 @@ def analyze(path: str) -> None:
     print(f"  collapse char pos:    {collapse}")
     print(f"  approx coherent chars: {collapse if collapse < len(body) else 'no collapse detected'}")
     print(f"  n_generated_tokens:   {n_gen}   ms/tok={ms_per_tok}   tok/s={tps}")
-    print(f"  --- first 300 chars of body ---")
+    print("  --- first 300 chars of body ---")
     print(body[:300].replace("\n", "\\n"))
     print(f"  --- chars around collapse [{max(0, collapse-50)}:{collapse+50}] ---")
     if collapse < len(body):

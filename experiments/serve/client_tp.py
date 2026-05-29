@@ -104,7 +104,7 @@ def cmd_probe_dn_op_isolation_tp(args):
     if data.get("error"):
         print(f"ERROR: {data['error']}", file=sys.stderr); sys.exit(4)
     print(f"seq_len={data['seq_len']}")
-    print(f"\nresults (each op tested with all_reduce-output-slice as input):")
+    print("\nresults (each op tested with all_reduce-output-slice as input):")
     for r in data["results"]:
         ok = r.get("result") == "OK"
         marker = "[PASS]" if ok else f"[{r.get('result')}]"
@@ -118,7 +118,7 @@ def cmd_probe_dn_source_isolation_tp(args):
     if data.get("error"):
         print(f"ERROR: {data['error']}", file=sys.stderr); sys.exit(4)
     print(f"seq_len={data['seq_len']}")
-    print(f"\nresults:")
+    print("\nresults:")
     for r in data["results"]:
         ok = r.get("result") == "OK"
         marker = "[PASS]" if ok else f"[{r.get('result')}]"
@@ -141,21 +141,21 @@ def cmd_probe_slice_write_round_trip(args):
             print(f"VERDICT: {data['verdict']}", file=sys.stderr)
         sys.exit(4)
     print(f"seq_len={data['seq_len']} hidden={data['hidden']}")
-    print(f"\nslice_write per-pos:")
+    print("\nslice_write per-pos:")
     for r in data["write_results"]:
         status = "OK" if r["ok"] else f"FAIL ({r.get('error', '?')})"
         print(f"  pos {r['pos']}: wrote {r['wrote_value']}  → {status}")
-    print(f"\nROW_MAJOR readback:")
+    print("\nROW_MAJOR readback:")
     for r in data["rowmajor_readback"]:
-        status = "OK" if r.get("ok") else f"FAIL"
+        status = "OK" if r.get("ok") else "FAIL"
         print(f"  pos {r['pos']}: expected={r['expected']:.1f}  mean={r.get('mean', float('nan')):.4f}  "
               f"min={r.get('min', float('nan')):.4f}  max={r.get('max', float('nan')):.4f}  {status}")
-    print(f"\nTILE_LAYOUT readback (after to_layout convert):")
+    print("\nTILE_LAYOUT readback (after to_layout convert):")
     if data.get("tile_convert_error"):
         print(f"  to_layout failed: {data['tile_convert_error']}")
     else:
         for r in data["tile_readback"]:
-            status = "OK" if r.get("ok") else f"FAIL"
+            status = "OK" if r.get("ok") else "FAIL"
             print(f"  pos {r['pos']}: expected={r['expected']:.1f}  mean={r.get('mean', float('nan')):.4f}  "
                   f"min={r.get('min', float('nan')):.4f}  max={r.get('max', float('nan')):.4f}  {status}")
     print(f"\nrowmajor_pass={data['rowmajor_pass']}  tile_pass={data['tile_pass']}")
@@ -174,7 +174,7 @@ def cmd_probe_multirow_construct_vs_per_position(args):
         sys.exit(4)
     print(f"seq_len={data['seq_len']}  raw_embed_shape={data.get('batched_embed_raw_shape')}  "
           f"reshaped_to={data.get('batched_reshaped_to')}")
-    print(f"\nper-row cosine (batched_construct vs per_position_embed):")
+    print("\nper-row cosine (batched_construct vs per_position_embed):")
     for r in data["per_row"]:
         print(f"  pos {r['pos']}: cos={r['cos']:.6f}  max_abs_diff={r['max_abs_diff']:.6e}")
     print(f"\nmin_cos={data['min_cos']:.6f}  max_cos={data['max_cos']:.6f}  "
@@ -231,7 +231,7 @@ def cmd_probe_ccl_equivalence_tp(args):
     expected = data.get("expected_value")
     topology = data.get("topology", "?")
     print(f"nchips={nchips}  topology={topology}  expected (all-reduced) value: {expected}")
-    print(f"\nResults per (shape, path):")
+    print("\nResults per (shape, path):")
     print(f"  {'shape':<12} {'path':<12} {'cos':<10} {'maxabs':<10} {'per_chip_means':<40} {'ms':<8} verdict")
     for shape_key in sorted(data["results"].keys()):
         for path, r in data["results"][shape_key].items():
@@ -647,7 +647,7 @@ def cmd_generate_tp(args):
           f"{final.get('tok_per_sec', 0):.2f} tok/s")
     print(f"  total wall: {final.get('total_ms', 0):.1f} ms")
     if final.get('stopped_on_eos'):
-        print(f"  (stopped on EOS)")
+        print("  (stopped on EOS)")
 
 
 def main():

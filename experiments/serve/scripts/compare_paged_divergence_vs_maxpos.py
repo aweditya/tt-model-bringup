@@ -16,7 +16,6 @@ Run on qb1:
 import json
 import socket
 import sys
-from pathlib import Path
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)

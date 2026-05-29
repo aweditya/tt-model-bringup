@@ -8,7 +8,6 @@ client send() helper, and asserts the wire protocol round-trips correctly.
 Run:
     cd ~/tt-xla && python -m experiments.serve.tests.test_protocol_mock
 """
-import json
 import os
 import signal
 import subprocess
@@ -65,7 +64,7 @@ def main():
         st = C.send("status", {})
         _assert(st.get("loaded") is True, f"status.loaded == True (got {st})")
         _assert(st.get("mock") is True, f"status.mock == True (got {st})")
-        _assert(st.get("num_layers") == 0, f"status.num_layers == 0 (mock)")
+        _assert(st.get("num_layers") == 0, "status.num_layers == 0 (mock)")
         _assert("uptime_sec" in st, "status has uptime_sec")
 
         rs = C.send("reset_state", {})

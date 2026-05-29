@@ -64,26 +64,17 @@ sys.path.insert(0, os.path.expanduser("~"))
 import torch
 import ttnn
 from huggingface_hub import hf_hub_download
-from safetensors import safe_open
 from transformers import AutoTokenizer
 
-# Reuse 91f's production kernels (all 7 bug fixes baked in)
-import importlib.util
-_spec = importlib.util.spec_from_file_location(
-    "_91f", os.path.expanduser("~/tt-xla/experiments/91f_qwen36_27b_full_ondevice.py"))
-_91f = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_91f)
+# Reuse the on-device 27B kernels + embed/lm_head loader. Run this demo via
+# `python -m experiments.demo_qwen36_27b` from the repo root.
+from experiments.serve import generate_27b as _91l
+from experiments.serve import ondevice_27b as _91f
 deltanet_step_ondevice = _91f.deltanet_step_ondevice
 gated_attn_step_ondevice = _91f.gated_attn_step_ondevice
 mlp_step_ondevice = _91f.mlp_step_ondevice
 load_layer_weights_all = _91f.load_layer_weights_all
 upload = _91f.upload
-
-# Reuse 91l's embed/lm_head loader
-_spec2 = importlib.util.spec_from_file_location(
-    "_91l", os.path.expanduser("~/tt-xla/experiments/91l_fp32_residual_generate.py"))
-_91l = importlib.util.module_from_spec(_spec2)
-_spec2.loader.exec_module(_91l)
 load_embed_lm_head_weights = _91l.load_embed_lm_head_weights
 
 MODEL_ID = "Qwen/Qwen3.6-27B"
@@ -147,7 +138,7 @@ def main():
     # --------------------------------------------------------
     # Tokenizer, embed, lm_head
     # --------------------------------------------------------
-    print(f"\n[1/4] Loading tokenizer + embedding + lm_head…")
+    print("\n[1/4] Loading tokenizer + embedding + lm_head…")
     tok = AutoTokenizer.from_pretrained(MODEL_ID)
     eweights = load_embed_lm_head_weights()
     embed_np = eweights['embed']
@@ -291,15 +282,15 @@ def main():
         print(f"  decode:  {r['decode_sec']:.1f}s ({r['decode_tps']:.2f} tok/s, "
               f"{1000/r['decode_tps']:.0f} ms/tok)")
         print(f"  first token: {r['first_token_id']}  →  {r['first_token_str']!r}")
-        print(f"\n  ┌──────────────────────────────")
+        print("\n  ┌──────────────────────────────")
         for line in r['text'].split("\n"):
             print(f"  │ {line}")
-        print(f"  └──────────────────────────────")
+        print("  └──────────────────────────────")
 
     # --------------------------------------------------------
     # Sanity check
     # --------------------------------------------------------
-    print(f"\n[4/4] Branch III correctness sanity check…")
+    print("\n[4/4] Branch III correctness sanity check…")
     paris_ok = None
     if not args.skip_sanity:
         sanity = next((r for r in results if r['prompt'] == SANITY_PROMPT), None)
@@ -311,13 +302,13 @@ def main():
             print(f"  {status}  Canonical Q: '{SANITY_PROMPT}' → first token "
                   f"{sanity['first_token_str']!r} (expected {SANITY_FIRST_TOKEN!r})")
             if not paris_ok:
-                print(f"  ⚠ Branch III correctness regression — check git log and "
-                      f"compare against research/branchIII_complete.md")
+                print("  ⚠ Branch III correctness regression — check git log and "
+                      "compare against research/branchIII_complete.md")
 
     # --------------------------------------------------------
     # Summary
     # --------------------------------------------------------
-    print(f"\n" + "=" * 64)
+    print("\n" + "=" * 64)
     print(f"Performance summary across {len(results)} prompt(s):")
     print(f"  avg prefill: {np.mean([r['prefill_tps'] for r in results]):.2f} tok/s")
     print(f"  avg decode:  {np.mean([r['decode_tps'] for r in results]):.2f} tok/s "

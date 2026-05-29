@@ -32,13 +32,13 @@ The Qwen3.6-27B single-chip port. Experiments numbered `91X_*` where X is a-t:
 | `91_qwen36_27b_weight_skeleton.py` | B'1 | Memory budget + layer-type pattern verification |
 | `91b_qwen36_27b_numpy_ref.py` | B'2 | Pure-numpy fp32 reference for first 2 layers (deprecated — see `wiki/seven_bugs_case_studies.md` for why) |
 | `91c-91e_qwen36_27b_*.py` | B'3-B'5 | Layer-by-layer ttnn bringup; cosines against numpy ref (false-positive validation, see seven_bugs) |
-| `91f_qwen36_27b_full_ondevice.py` | B'6 | **Production kernels.** `deltanet_step_ondevice`, `gated_attn_step_ondevice`, `mlp_step_ondevice`. All 7 bug fixes live here. |
+| `serve/ondevice_27b.py` (was `91f_…`) | B'6 | **Production kernels.** `deltanet_step_ondevice`, `gated_attn_step_ondevice`, `mlp_step_ondevice`. All 7 bug fixes live here. Imported by both servers. |
 | `91g_qwen36_27b_full_model.py` | B'7 | Full 64-layer forward (correctness check) |
 | `91h_qwen36_27b_generate.py` | B'8 | First end-to-end greedy generation; revealed the FR fixed-point |
 | `91i_shape_preflight.py` | B'8.5 | Validate shapes in 30s before paying 10-min weight load |
 | `91j_decode_diagnostics.py` | B'8.5 | Hidden-state norm capture across decode steps |
 | `91k_fp32_api_probe.py` | B'9 prep | Verify ttnn rms_norm/linear/add accept fp32 |
-| `91l_fp32_residual_generate.py` | B'9 | **Production generation script.** fp32 residual stream + all 7 bug fixes. |
+| `serve/generate_27b.py` (was `91l_…`) | B'9 | **Production generation script.** fp32 residual stream + all 7 bug fixes; exports `load_embed_lm_head_weights`. |
 | `91n_lm_head_inspection.py` | B'9 | lm_head + embed stats audit |
 | `91o_hf_reference_layer0.py` | B'9.5 | First HF oracle: layer 0 cosine vs HF |
 | `91p_ttnn_layer0_vs_hf.py` | B'9.5 | Layer-0 ttnn validation with `--weight-dtype` CLI |
@@ -51,7 +51,7 @@ To run the production generation:
 ```bash
 cd ~/tt-xla
 HF_HOME=$HOME/tt-xla/.cache/hf .venv/bin/python \
-    experiments/91l_fp32_residual_generate.py --tokens 60
+    -m experiments.serve.generate_27b --tokens 60
 ```
 
 ## Older models (still useful for reference)

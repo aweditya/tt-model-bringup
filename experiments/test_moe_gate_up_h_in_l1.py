@@ -162,7 +162,7 @@ def main():
             sp = base / ts.mean()
             log(f"  {name:18s} mean {ts.mean():7.4f} ms  speedup {sp:.2f}x  "
                 f"delta {base-ts.mean():+.4f}")
-        log(f"\n  per-token (x40 layers × 2 matmuls each = 80):")
+        log("\n  per-token (x40 layers × 2 matmuls each = 80):")
         best = min(ts_l1.mean(), ts_l1_out_l1.mean(), ts_cast.mean())
         log(f"    DRAM baseline {base*80:.1f} ms/tok (-) — at 110 cores")
         log(f"    best L1       {best*80:.1f} ms/tok  delta {(base-best)*80:+.1f}")

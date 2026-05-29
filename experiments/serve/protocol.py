@@ -2,8 +2,8 @@
 import json
 import os
 import socket
-from dataclasses import dataclass, asdict
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 # Resolve repo root from this file's location so a fresh clone at any path
 # works without hardcoding. Prod (~/tt-xla/) lands on ~/tt-xla/.cache/... —
