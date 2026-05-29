@@ -68,10 +68,15 @@ resume prefill optimization (S2).
    TTFT + decode latency p50/p99, request/error counts. Structured logs.
 
 ## Staged plan (each stage = a validated increment, committed)
-- **P0 — Engine module.** Factor `serving_demo`'s engine into `serve/cb_engine.py`:
-  a clean class with `submit(req) -> stream`, `cancel(rid)`, lifecycle
-  (start/stop), thread-safe queues, greedy first. **Gate:** concurrent submit +
-  per-slot isolation + EOS + cancel (functional, qb1).
+- **P0 — Engine module. DONE (2026-05-29).** `serve/cb_engine.py`: `CBEngine`
+  (device-owning thread runs the scheduler loop: drain inbound → drain cancels →
+  step → stream) + `RequestHandle.tokens()`; thread-safe `submit(prompt,max_new)`
+  / `cancel(rid)` / `start()` / `stop()`; greedy. Added `Scheduler.cancel(rid)`
+  (frees slot; next `_admit` resets DN state — same path as eviction, no device
+  op). **Gate PASS** (`experiments/cb/validate/engine.py`, qb1 traced, 4 slots):
+  6 concurrent clients → each stream == its B=1 greedy ref; cancel mid-flight →
+  `cancelled` + freed slot recycles correctly; per-request max_new exact; clean
+  start/stop, no wedge.
 - **P1 — Per-request sampling in CB.** Per-slot logits/top-k from the batched
   forward; engine samples per slot. **Gate:** per-slot sampling correctness +
   readback cost; greedy unchanged.
