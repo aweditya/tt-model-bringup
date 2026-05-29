@@ -58,6 +58,26 @@ prefill-attn does causal-within-chunk only. So split S1:
   logits. Attn becomes ONE SDPA instead of L steps (the win); DN is per-position
   for L>32 (chunked only ≤32). **Gate:** last-pos logit cosine vs single-token stub
   (≥0.99) + TTFT speedup, on qb1. Flag into `forward_prefill_tp_inner`.
+  **Executable recipe** (additive `forward_prefill_chunked_tp(state, prompt_ids,
+  capture_logits=False)`, place after the stub ~1963):
+  1. Multi-pos embed (mirror `update_input_buffers`/`forward_token_tp_inner`):
+     `tok=[prompt_ids]` `[1,L]` uint32 → `ttnn.embedding(tok, embed_tt, TILE,
+     DRAM)` → reshape `[L,HIDDEN]`; `pos=[0..L-1]` `[1,L]` → embed `cos_table_tt`/
+     `sin_table_tt` → reshape `[L, rotary_dim]`.
+  2. Layer loop: `linear_attention` → `deltanet_chunked_neumann_tp(state,x,dn,
+     cfg,L)`; else `gated_attn_step_prefill_tp(state,x,attn,cos_seq,sin_seq,cfg,L)`;
+     then `mlp_step_tp(state,x,mlp)`. Then `_rms_norm_manual(x, final_norm_tt, 1e-6,
+     HIDDEN)`.
+  3. capture_logits: LM head (linear→all_gather→slice→untilize) over ALL L rows →
+     `to_torch(ConcatMeshToTensor dim=0)[:L]` → `[L,vocab]`. Production: last-pos
+     logits.
+  **HAZARDS to validate (isolate first, don't guess):** (a) last-row slice
+  `x[L-1:L]` → `[1,HIDDEN]` is a sub-tile/view-decay hazard
+  [[feedback-ttnn-slice-view-decay]] — prefer LM-head-over-all-rows-then-take-last,
+  or verify the slice; (b) `ttnn.embedding([1,L])` output shape on-device;
+  (c) `gated_attn_step_prefill_tp` writes cache at pos [0,L) (assumes fresh seq at
+  pos 0) — fine for B=1 prefill; (d) keep B3 SDPA (bf16 prefill drift). Gate:
+  per-position logit cosine vs `forward_prefill_tp_inner` stub + TTFT, on qb1.
 - **S1b — true C=32 chunked DN (Phase B.3).** Chunk the prompt into 32s so DN uses
   the fast Neumann path (S threads across chunks). Needs a multi-*query* paged SDPA
   (chunk N attends to prefix 0..N·32−1) — ISOLATE + validate that primitive first
