@@ -75,6 +75,28 @@ make run PY=models/80_8b_diverse_qa_demo.py    # or: scripts/run_remote.sh model
 See [`models/README.md`](models/README.md) for the full demo index. (The
 production Qwen3.6-27B/35B path lives in `experiments/serve/`, not here.)
 
+### Custom TT-NN kernels
+
+We also built fused TT-NN ops for the Qwen3.6 GatedDeltaNet path; the two
+production ones are what the 27B server calls at runtime. Install with
+`scripts/build_owned_ops.sh` (see [`experiments/owned_ops/README.md`](experiments/owned_ops/README.md));
+each op ships an `INTEGRATION.md` with its validation gate + a `test_*.py`.
+
+| Kernel | Role | Gate (BF16 ladder vs CPU oracle) |
+|---|---|---|
+| `qwen36_gdn_decode_owned` | **Production** — fused GatedDeltaNet decode recurrence | state/out PCC > 0.9999 |
+| `qwen36_decay_gate_decode_owned` | **Production** — fused decay/gate (+2.5% tok/s) | PCC > 0.9999 |
+| `qwen36_gdn_{delta,prediction,decay_state,outer_update,output}` | GDN sub-ops (decomposed bring-up) | PCC > 0.9999 |
+| `qwen36_conv1d_decode_owned` | experimental conv1d decode | — |
+| `qwen36_moe_ffn_decode_owned` | in progress (35B MoE FFN) | — |
+
+Run a gate (stop the prod server first so device 0 is free):
+
+```bash
+scripts/run_remote.sh experiments/owned_ops/qwen36_gdn_decode_owned/test_qwen36_gdn_decode_owned.py \
+  --device-id 0 --key-dim 128 --value-dim 128 --max-abs-diff-threshold 0.001
+```
+
 ## Device Configuration
 
 All experiments use **device 0 only**. If you have multiple devices, no changes needed — we explicitly open device 0.
