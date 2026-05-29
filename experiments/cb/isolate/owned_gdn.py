@@ -22,7 +22,7 @@ Run on qb1:
     TT_BUILD_DIR=$TT_METAL_HOME/build_Release ARCH_NAME=blackhole \\
     PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_owned_gdn_batch_isolation.py
+    .venv/bin/python -u experiments/cb/isolate/owned_gdn.py
 """
 from __future__ import annotations
 

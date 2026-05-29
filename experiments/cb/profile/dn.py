@@ -13,7 +13,7 @@ Run on qb1:
     TT_BUILD_DIR=$TT_METAL_HOME/build_Release ARCH_NAME=blackhole \\
     PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_profile_dn.py --batch 32 --steps 50 --owned-gdn
+    .venv/bin/python -u experiments/cb/profile/dn.py --batch 32 --steps 50 --owned-gdn
 """
 from __future__ import annotations
 

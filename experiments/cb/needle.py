@@ -18,7 +18,7 @@ Run on qb1:
     TT_METAL_HOME=$HOME/tenstorrent/tt-metal TT_BUILD_DIR=$TT_METAL_HOME/build_Release \\
     ARCH_NAME=blackhole PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_needle.py --length 200 --frac 0.5 --conv kdim
+    .venv/bin/python -u experiments/cb/needle.py --length 200 --frac 0.5 --conv kdim
 """
 from __future__ import annotations
 

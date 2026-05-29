@@ -15,7 +15,7 @@ Run on qb1:
     TT_BUILD_DIR=$TT_METAL_HOME/build_Release ARCH_NAME=blackhole \\
     PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_dn_matmul_microbench.py --batches 1,32,64
+    .venv/bin/python -u experiments/cb/profile/dn_matmul.py --batches 1,32,64
 """
 from __future__ import annotations
 

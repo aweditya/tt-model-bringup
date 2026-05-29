@@ -21,7 +21,7 @@ Run on qb1:
     TT_BUILD_DIR=$TT_METAL_HOME/build_Release ARCH_NAME=blackhole \\
     PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_profile_blocks.py --batches 1,32 --steps 50
+    .venv/bin/python -u experiments/cb/profile/blocks.py --batches 1,32 --steps 50
 """
 from __future__ import annotations
 

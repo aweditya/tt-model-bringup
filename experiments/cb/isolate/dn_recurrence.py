@@ -29,7 +29,7 @@ Run on qb1:
     ARCH_NAME=blackhole \\
     PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_dn_recurrence_batch_isolation.py
+    .venv/bin/python -u experiments/cb/isolate/dn_recurrence.py
 """
 from __future__ import annotations
 

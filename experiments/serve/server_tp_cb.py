@@ -9,14 +9,14 @@ slots. server_tp.py is untouched (zero regression risk).
 Design (vLLM, adopted — not reinvented):
   - PagedAttention: per-slot page tables into a shared physical block pool
     (CB2). Batched paged SDPA decode (validated:
-    cb_paged_sdpa_batch_isolation.py).
+    cb/isolate/paged_sdpa.py).
   - DeltaNet recurrence: per-slot recurrent + conv state, manual recurrence
-    (validated to batch bit-exact: cb_dn_recurrence_batch_isolation.py).
+    (validated to batch bit-exact: cb/isolate/dn_recurrence.py).
     Owned_gdn kernel is B=1-only, so CB uses the manual path.
   - Dense MLP: shape-agnostic in the leading dim — reuse base mlp_step_tp.
   - Empty slots: cur_pos=-1 → paged SDPA skips them; we ignore their output.
 
-Validation ladder (run via cb_validate_27b.py):
+Validation ladder (run via cb/validate/forward.py):
   1. B=1 batched forward bit-identical to server_tp B=1 forward.
   2. B>1 all-identical-slots match B=1.
   3. B>1 different slots each match its own B=1 reference.
@@ -223,7 +223,7 @@ def deltanet_step_batched(state, x_tt, dn, li, cfg):
     # cb_dn_skip: profiling-only set ({'conv','qknorm','recur','outgate'}); a
     # skipped sub-op is replaced by a shape-valid passthrough (TIMING ablation —
     # corrupts values, used only to rank the DN vector ops). Default empty → no
-    # change. Used by cb_profile_dn.py.
+    # change. Used by cb/profile/dn.py.
     dn_skip = getattr(state, 'cb_dn_skip', None) or set()
 
     # 1. pre-norm + in_proj (matmul batches over leading B)
@@ -503,7 +503,7 @@ def _attn_finish(state, x_tt, q_r, gate_tt, kv, attn, B, NQ_PER_CHIP, HEAD_DIM):
 
 def setup_cb_write_mem_cfg(state):
     """Build the B-core HEIGHT_SHARDED L1 mem config for paged KV writes
-    (validated in cb_paged_update_cache_batch_isolation.py)."""
+    (validated in cb/isolate/paged_update_cache.py)."""
     B = state.cb_B
     HEAD_DIM = state.cfg['head_dim']
     grid = state.mesh.compute_with_storage_grid_size()
@@ -530,7 +530,7 @@ def forward_batch_tp_inner(state, return_logits=False):
     sin_tt = ttnn.reshape(sin_raw, [B, state.rotary_dim])
     # cb_skip_blocks: profiling-only set ({'dn','attn','mlp'}); a skipped block
     # is a no-op (x passes through). Default empty → zero behaviour change. Used
-    # by cb_profile_blocks.py to attribute per-token compute via trace timing.
+    # by cb/profile/blocks.py to attribute per-token compute via trace timing.
     skip = getattr(state, 'cb_skip_blocks', None) or set()
     for li, layer in enumerate(state.layers):
         if layer['type'] == 'linear_attention':
@@ -560,5 +560,5 @@ def forward_batch_tp_inner(state, return_logits=False):
 
 
 if __name__ == "__main__":
-    print("server_tp_cb is a library module. Run cb_validate_27b.py to test.",
+    print("server_tp_cb is a library module. Run cb/validate/forward.py to test.",
           flush=True)

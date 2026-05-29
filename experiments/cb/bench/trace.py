@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CB4 — TRACED batched decode: correctness + throughput at fixed B.
 
-Eager batching is ~free (cb_bench_throughput.py: B=32 step only +2.5% vs B=1),
+Eager batching is ~free (cb/bench/throughput.py: B=32 step only +2.5% vs B=1),
 but eager is dispatch-bound (~252 ms/step). Tracing amortizes per-op Python
 dispatch so per-step time drops toward pure compute. This captures one decode
 trace of the batched forward at a fixed B (vLLM CUDA-graph pattern) and:
@@ -23,7 +23,7 @@ Run on qb1:
     TT_BUILD_DIR=$TT_METAL_HOME/build_Release ARCH_NAME=blackhole \\
     PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_bench_trace.py --batches 1,8,32 --steps 50
+    .venv/bin/python -u experiments/cb/bench/trace.py --batches 1,8,32 --steps 50
 """
 from __future__ import annotations
 

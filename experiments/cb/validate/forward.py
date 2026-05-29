@@ -18,7 +18,7 @@ Run on qb1:
     ARCH_NAME=blackhole \\
     PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_validate_27b.py --max-pos 6
+    .venv/bin/python -u experiments/cb/validate/forward.py --max-pos 6
 """
 from __future__ import annotations
 

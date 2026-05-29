@@ -22,7 +22,7 @@ Run on qb1:
     ARCH_NAME=blackhole \\
     PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_bench_throughput.py --batches 1,8,32 --steps 30
+    .venv/bin/python -u experiments/cb/bench/throughput.py --batches 1,8,32 --steps 30
 """
 from __future__ import annotations
 

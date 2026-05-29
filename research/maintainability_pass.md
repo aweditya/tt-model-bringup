@@ -138,9 +138,13 @@ tt-xla/
   kernel-patch-JIT distinction), corrected the main README (it falsely claimed
   all 8 ops are "required for production" — only `gdn_decode_owned` +
   `decay_gate_decode_owned` are runtime-called), `make kernels` target.
-- **M6 docs — PENDING**: CONTRIBUTING.md (ssh/env/commit workflow); index the
-  78 research + 73 wiki docs; consolidate research/27b_cb_scope.md → an
-  architecture overview. Keep HANDOFF.md as "read first".
+- **M6 docs — DONE**: `CONTRIBUTING.md` (repo map, dev loop, the 8 non-negotiables,
+  the server canary gate, how-to-add-a-kernel, code style); `research/README.md`
+  (lean index — living docs + subdirs, not all 79 enumerated); HANDOFF stays
+  read-first. **Deferred polish CLEARED**: fixed the stale `experiments/cb_*.py`
+  run-examples in all 14 moved cb scripts + the cross-refs, and the 7 stale
+  `cb_*.py` comment pointers in server_tp_cb.py. (Left research/27b_cb_scope.md's
+  ~30 historical refs as-is — it's a point-in-time log, like git history.)
 
 ## HOW TO CONTINUE
 `git checkout chore/maintainability`. Pick the next PENDING phase. M2 is the

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CB2 isolation — batched paged_update_cache WRITE (the last fiddly primitive).
 
-paged SDPA READ at B>1 is validated (cb_paged_sdpa_batch_isolation.py). The
+paged SDPA READ at B>1 is validated (cb/isolate/paged_sdpa.py). The
 WRITE is the remaining unknown: paged_update_cache wants input
 [1, B, 1[32], head_dim] HEIGHT_SHARDED on B cores, with update_idxs [B] +
 page_table [B, blocks_per_seq]. The production B=1 path shards on 1 core
@@ -20,7 +20,7 @@ Run on qb1:
     ARCH_NAME=blackhole \\
     PYTHONPATH=$TT_METAL_HOME/ttnn \\
     LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-    .venv/bin/python -u experiments/cb_paged_update_cache_batch_isolation.py
+    .venv/bin/python -u experiments/cb/isolate/paged_update_cache.py
 """
 from __future__ import annotations
 
