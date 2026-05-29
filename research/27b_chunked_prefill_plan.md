@@ -105,6 +105,25 @@ prefill-attn does causal-within-chunk only. So split S1:
     Gate: `cb_scheduler` functional + `cb/needle.py` + realistic multi-req TTFT.
   Multi-session effort. Simpler alt productionization if deprioritized: sampling
   (temp/top-p), OpenAI-compatible endpoint.
+
+  **S2a deep recon (2026-05-29) — TWO hard blockers, confirming "major effort":**
+  - **Attn:** CB uses `paged_scaled_dot_product_attention_decode` — a **1-query**
+    paged SDPA per slot (server_tp_cb.py ~486). Chunked prefill (C queries over slot
+    s's paged prefix) needs a **multi-query paged SDPA** — a new primitive to
+    isolate+validate first (the very thing S1b turned out NOT to need; S2 does).
+    Fallback: loop the decode SDPA C times (defeats the chunking win).
+  - **Conv:** CB conv = shift-accumulate `conv_cols` (3 per-step shift columns,
+    server_tp_cb.py ~284), inherently sequential per slot. Block-Neumann needs a
+    parallel conv1d or dual-state buffering — not a drop-in.
+  - The recurrence (`ssm [B,NV,K,V]`) + RoPE + paged KV write ARE per-slot-indexable
+    (`cb_cur_pos_buf[s]`, `cb_page_table_tt[s]`) → a single slot's prefill CAN target
+    its slabs. So the blockers are specifically (a) multi-query paged SDPA and
+    (b) the shiftacc conv.
+  **Two viable approaches:** (1) CB-native chunked prefill = build both primitives
+  (big, isolate-first each); (2) **state transplant** — run the working single-seq
+  S1a/S1b chunked prefill (global state), then copy/convert into slot s (kdim→shiftacc
+  conv conversion + global-KV→slot-s-paged-blocks transplant). (2) may be the lower-
+  risk path. Either is a focused multi-session sub-project.
 - **S3 — mixed continuous prefill (optional, defer).** vLLM-style interleave
   prefill chunks with decode tokens in one batched forward. More complex; only if
   S2's prefill-then-decode phasing isn't enough.
