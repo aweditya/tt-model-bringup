@@ -1941,6 +1941,12 @@ def forward_prefill_tp_inner(state, prompt_ids, capture_logits=False):
     if seq_len > MAX_POS:
         raise ValueError(f"prompt_ids len {seq_len} > MAX_POS {MAX_POS}")
 
+    # S1a: opt-in whole-prompt chunked prefill (default OFF → prod path unchanged).
+    # Returns production-equivalent last-position logits; functionally validated
+    # (coherent generation). See research/27b_chunked_prefill_plan.md.
+    if getattr(state, "prefill_chunked", False) and not capture_logits:
+        return forward_prefill_chunked_tp(state, prompt_ids)
+
     VOCAB = state.vocab_size
     if capture_logits:
         logits_arr = np.empty((seq_len, VOCAB), dtype=np.float32)
