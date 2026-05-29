@@ -1941,6 +1941,12 @@ def forward_prefill_tp_inner(state, prompt_ids, capture_logits=False):
     if seq_len > MAX_POS:
         raise ValueError(f"prompt_ids len {seq_len} > MAX_POS {MAX_POS}")
 
+    # S1a: opt-in whole-prompt chunked prefill (default OFF → prod path unchanged).
+    # Returns production-equivalent last-position logits; functionally validated
+    # (coherent generation). See research/27b_chunked_prefill_plan.md.
+    if getattr(state, "prefill_chunked", False) and not capture_logits:
+        return forward_prefill_chunked_tp(state, prompt_ids)
+
     VOCAB = state.vocab_size
     if capture_logits:
         logits_arr = np.empty((seq_len, VOCAB), dtype=np.float32)
@@ -1961,6 +1967,74 @@ def forward_prefill_tp_inner(state, prompt_ids, capture_logits=False):
         return logits_arr
     ttnn.synchronize_device(state.mesh)
     return last_logits_tt
+
+
+def forward_prefill_chunked_tp(state, prompt_ids, capture_logits=False):
+    """S1a chunked prefill (Phase B.2): process the whole prompt in ONE parallel
+    pass instead of looping single-token decode per position. Additive sister to
+    forward_prefill_tp_inner (the stub), which is left untouched.
+
+    Per layer: deltanet_chunked_neumann_tp (chunked Neumann for L<=32, per-position
+    fallback above) for DeltaNet; gated_attn_step_prefill_tp (one causal SDPA +
+    paged_fill_cache over the whole prompt) for attention; mlp_step_tp (leading-dim
+    agnostic) for MLP. LM head runs over all L rows — avoids a sub-tile last-row
+    slice in TILE layout (view-decay); the last row is taken in row-major.
+
+    capture_logits=True -> [seq_len, VOCAB] fp32 numpy (per-position, for the cosine
+    gate vs the stub). False -> last-position logits (row-major [1, VOCAB]).
+    Assumes a fresh sequence at positions 0..L-1 (reset state buffers first).
+    """
+    import ttnn
+    import torch
+    cfg = state.cfg
+    HIDDEN = cfg['hidden']
+    seq_len = len(prompt_ids)
+    if not (1 <= seq_len <= MAX_POS):
+        raise ValueError(f"prompt_ids len {seq_len} out of range [1, {MAX_POS}]")
+    mesh = state.mesh
+
+    # Multi-position embed + RoPE rows (mirror forward_token_tp_inner's single-pos
+    # path, but for L positions; fresh sequence => positions 0..L-1).
+    tok_tt = ttnn.from_torch(
+        torch.tensor([list(prompt_ids)], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    x_tt = ttnn.reshape(
+        ttnn.embedding(tok_tt, state.embed_tt, layout=ttnn.TILE_LAYOUT,
+                       memory_config=ttnn.DRAM_MEMORY_CONFIG),
+        [seq_len, HIDDEN])
+    pos_tt = ttnn.from_torch(
+        torch.tensor([list(range(seq_len))], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    cos_seq_tt = ttnn.reshape(
+        ttnn.embedding(pos_tt, state.cos_table_tt, layout=ttnn.TILE_LAYOUT,
+                       memory_config=ttnn.DRAM_MEMORY_CONFIG),
+        [seq_len, state.rotary_dim])
+    sin_seq_tt = ttnn.reshape(
+        ttnn.embedding(pos_tt, state.sin_table_tt, layout=ttnn.TILE_LAYOUT,
+                       memory_config=ttnn.DRAM_MEMORY_CONFIG),
+        [seq_len, state.rotary_dim])
+
+    for layer in state.layers:
+        if layer['type'] == 'linear_attention':
+            x_tt = deltanet_chunked_neumann_tp(state, x_tt, layer['dn'], cfg, seq_len)
+        else:
+            x_tt = gated_attn_step_prefill_tp(state, x_tt, layer['attn'],
+                                              cos_seq_tt, sin_seq_tt, cfg, seq_len)
+        x_tt = mlp_step_tp(state, x_tt, layer['mlp'])
+    x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
+
+    # Vocab-sharded LM head over all L rows (mirror forward_token_tp_inner).
+    sharded = ttnn.linear(x_tt, state.lm_head_tt)
+    gathered = ttnn.all_gather(sharded, dim=-1)
+    sliced = ttnn.slice(gathered, [0, 0], [seq_len, state.vocab_size])
+    rm_logits = ttnn.untilize(sliced, use_multicore=True)
+    ttnn.synchronize_device(mesh)
+    if capture_logits:
+        arr = ttnn.to_torch(rm_logits, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
+        return arr[:seq_len].float().cpu().numpy().reshape(seq_len, state.vocab_size)
+    return ttnn.slice(rm_logits, [seq_len - 1, 0], [seq_len, state.vocab_size])
 
 
 # --- Handlers -----------------------------------------------------------------
