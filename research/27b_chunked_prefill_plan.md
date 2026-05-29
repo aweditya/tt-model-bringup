@@ -86,11 +86,25 @@ prefill-attn does causal-within-chunk only. So split S1:
   `dn['ssm']` and `dn['conv_st']` (updated in-place per position, server_tp.py:1176)
   across calls. **Validated (long_context.py, L=137): needle retrieved + TTFT stub
   31997 ms → chunked 12573 ms = 2.54×** (S1a was attn-only 1.35× at short L).
-- **S2 — CB integration.** On admit, prefill the request's prompt in C=32 chunks
-  into its slot's KV + DN state (a per-request prefill phase), then it joins the
-  decode rotation. Scheduler PREFILL status: "prefill in chunks" not "1 tok/iter".
-  **Gate:** `cb/validate/forward.py` + `cb/needle.py` (long-context) + realistic
-  TTFT/task-time numbers.
+- **S2 — CB integration (NEXT; substantial — recon'd 2026-05-29).** On admit,
+  prefill the request's prompt in 32-blocks into its slot's state, then it joins
+  the decode rotation (prefill-then-admit; avoids vLLM mixed-batching). **Real
+  challenges (why it's not a 1-liner):**
+  - CB per-slot state is `state.cb_dn[li] = {'ssm':[B,NV,K,V], 'conv_cols': 3×[B,C]}`
+    (server_tp_cb.py:180) — **shift-accumulate conv**, whereas S1's chunked DN
+    (`deltanet_chunked_neumann_tp`) uses the **kdim conv (`dn['conv_st']`)**.
+    Representation mismatch → can't just point the S1 chunked prefill at a CB slot.
+  - Per-slot targeting: write `cb_dn[li]['ssm'][s]` + `conv_cols[s]` + slot-s paged
+    KV (slot page table, batch_idx). CB batched ops are `[B,1-pos]`; chunked prefill
+    is `[1-slot, C-pos]`.
+  - **S2a:** a CB-native single-slot block-chunked prefill (32-block Neumann over the
+    CB shiftacc conv + per-slot ssm; write slot-s paged KV). Gate: chunked-prefill
+    slot s → decode == CB 1-tok/iter prefill → decode (functional/needle, not
+    weak-ref cosine — [[validate-against-ground-truth-not-a-weaker-tt-path]]).
+  - **S2b:** scheduler — on admit call the CB chunked prefill, then DECODE rotation.
+    Gate: `cb_scheduler` functional + `cb/needle.py` + realistic multi-req TTFT.
+  Multi-session effort. Simpler alt productionization if deprioritized: sampling
+  (temp/top-p), OpenAI-compatible endpoint.
 - **S3 — mixed continuous prefill (optional, defer).** vLLM-style interleave
   prefill chunks with decode tokens in one batched forward. More complex; only if
   S2's prefill-then-decode phasing isn't enough.
