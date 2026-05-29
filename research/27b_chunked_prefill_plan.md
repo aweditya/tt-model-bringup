@@ -91,6 +91,23 @@ prefill-attn does causal-within-chunk only. So split S1:
   prefill chunks with decode tokens in one batched forward. More complex; only if
   S2's prefill-then-decode phasing isn't enough.
 
+## S1a first qb1 result (2026-05-28) — runs + faster, FAILS correctness gate
+
+`forward_prefill_chunked_tp` works end-to-end (after fixing `from_torch device=mesh`
+on the embed indices — the validator caught it). vs the single-token stub on a
+29-token prompt: **26/29 argmax match**, most pos cos > 0.97, but **worst cos 0.631
+@ pos 21** + last-pos (28) argmax flip (198→561) → gate (≥0.99) FAILS. **TTFT
+6965→5142 ms = 1.35×** (modest: L=29 ∉ {4,8,16,32} so DN took the per-position
+fallback — only attn parallelized; need L=32 for the Neumann win + a bigger speedup).
+
+**Next (isolate the divergence, don't guess):** the only chunked-vs-stub deltas at
+L=29 are (a) attn = one causal SDPA over the chunk vs N per-position decode SDPAs,
+and (b) the DN per-position *fallback* (`_deltanet_step_tp_from_inproj` loop, maybe
+a sliced-in_proj view-decay) vs `deltanet_step_tp`. Bisect: chunked-attn-only (DN
+via stub) vs chunked-DN-only (attn per-position), or a per-layer hidden ladder at
+pos 21, to localize. Also re-run at L=32 to exercise the Neumann chunked-DN path.
+Then fix, re-gate, wire behind a flag in `forward_prefill_tp_inner`.
+
 ## Constraints / gotchas
 - Chunk size = 32 (the validated cap). Prompt > 32 → multiple chunks.
 - bf16 prefill drift: B3 SDPA (HiFi2, no fp32_dest_acc) is the fix
