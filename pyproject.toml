@@ -24,6 +24,14 @@ dependencies = [
 # uv-managed, no PyPI publishing.
 # `[build-system]` intentionally omitted (uv init --no-package).
 
+[project.optional-dependencies]
+# `uv sync --extra serve` — only needed to run the OpenAI HTTP endpoint
+# (experiments/serve/openai_endpoint.py); the model server itself needs neither.
+serve = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+
 [dependency-groups]
 # Dev tooling — `uv sync` installs these; CI + pre-commit use them.
 dev = [

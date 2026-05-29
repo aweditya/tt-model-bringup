@@ -259,6 +259,27 @@ first so device 0 is free).
 
 ---
 
+## OpenAI-compatible endpoint
+
+A host-side HTTP proxy (`experiments/serve/openai_endpoint.py`) exposes
+`/v1/chat/completions` + `/v1/completions` over the persistent TP server (greedy
+by default; `temperature`/`top_p`/`top_k` use the server's sampler). On the TT host:
+
+```bash
+bash experiments/serve/scripts/serve_tp.sh start      # the model server (~17 min bootstrap)
+uv sync --extra serve                                 # fastapi + uvicorn
+uv run --extra serve uvicorn experiments.serve.openai_endpoint:app --host 0.0.0.0 --port 8000
+# then, e.g.:
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"capital of France?"}],"temperature":0.7,"stream":true}'
+```
+
+It applies the model's chat template to `messages`, forwards `generate_tp` over the
+Unix socket, and streams OpenAI SSE (or returns one JSON for `stream:false`). The
+translation helpers are unit-tested (`experiments/serve/tests/test_openai_endpoint.py`).
+
+---
+
 ## Long context
 
 As of 2026-05-21, the qb2 4-chip TP path is validated at **L=4000** with
