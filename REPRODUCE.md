@@ -8,18 +8,17 @@
 
 ## Tested Environment
 
+Tenstorrent QuietBox (4× Blackhole P150), firmware 19.6.0. Software versions:
+
 ```
-Host OS:        Ubuntu 22.04.5 LTS (x86_64)
-CPU:            AMD Ryzen 9 5900X 12-Core
-RAM:            54 GB
-Python:         3.10.12
-TT-NN:          0.69.0
-TT-SMI:         5.0.0
-PyTorch:        2.11.0+cpu
-NumPy:          1.26.4
-Safetensors:    0.7.0
+Python:          3.10.12
+TT-NN:           0.69.0
+TT-SMI:          5.0.0
+PyTorch:         2.11.0
+NumPy:           1.26.4
+Safetensors:     0.7.0
 HuggingFace Hub: 1.10.1
-Transformers:   5.5.3
+Transformers:    5.5.3
 ```
 
 ## Setup
