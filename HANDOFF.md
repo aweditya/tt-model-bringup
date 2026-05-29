@@ -1,6 +1,6 @@
 # HANDOFF — read top to bottom (replaces the 900-line version, see `git log HANDOFF.md` for the old narrative)
 
-> **Active work (2026-05-27): maintainability pass on branch `chore/maintainability`** (not merged). Living plan + how to continue: [`research/maintainability_pass.md`](research/maintainability_pass.md). Perf/correctness work below is paused, not abandoned.
+> **Status (2026-05-28):** the maintainability pass (M1–M6) is **merged to `main`** (`research/maintainability_pass.md`) — repo is lean + clone-and-run (`make setup`/`run`/`deploy`, ruff+CI, `CONTRIBUTING.md`). Next: **productionization, starting with chunked prefill** (plan + WIP on branch `feature/chunked-prefill`). The 27B/35B perf state below is current.
 
 ## What this project is
 
@@ -204,17 +204,7 @@ gate → integrate → tracy re-profile → commit. No projection without measur
 - Don't compare to 27B → cite the BW ceiling above.
 - Don't propose changes without a tracy/tt-perf-report number → re-run `bash experiments/utils/run_tracy_probe.sh experiments/utils/tracy_profile_one_moe.py` first.
 
-## Recent commits (newest first, last 10)
+## Recent work
 
-```
-4d8eabc  cleanup plan + profiling quick-ref + tracy probe targets batched
-b5d3364  milestones doc — batched-traced 146 ms/tok is the new floor
-961ce7f  Pattern A BATCHED works: 267 ms/tok eager = 3.74 tok/s
-e8fcfc1  profiling-cheatsheet.md + run_tracy_probe.sh
-ae9b591  tt-perf-report wired up — matmul is 99.7% dispatch-bound
-3ebb0b2  isolated batched-matmul suite — 9 variants tested in 5s
-3b1457f  batched matmul WIP — three ttnn-op constraints, parked
-4cac36a  FULL-STEP TRACE WORKS — 308 ms/tok measured
-5fe966e  B17-D + DN state in-place — all trace blockers removed
-5f4cff8  --moe-mode flag + Pattern A end-to-end correctness PASS
-```
+Run `git log --oneline -20` for the latest. (This block used to be hand-maintained
+and drifted; don't re-add it.)

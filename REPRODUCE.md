@@ -1,4 +1,4 @@
-# Reproducing TT-XLA Experiments
+# Reproducing tt-model-bringup demos
 
 ## Hardware Requirements
 
@@ -8,18 +8,17 @@
 
 ## Tested Environment
 
+Tenstorrent QuietBox (4× Blackhole P150), firmware 19.6.0. Software versions:
+
 ```
-Host OS:        Ubuntu 22.04.5 LTS (x86_64)
-CPU:            AMD Ryzen 9 5900X 12-Core
-RAM:            54 GB
-Python:         3.10.12
-TT-NN:          0.68.0
-TT-SMI:         5.0.0
-PyTorch:        2.11.0+cpu
-NumPy:          1.26.4
-Safetensors:    0.7.0
+Python:          3.10.12
+TT-NN:           0.69.0
+TT-SMI:          5.0.0
+PyTorch:         2.11.0
+NumPy:           1.26.4
+Safetensors:     0.7.0
 HuggingFace Hub: 1.10.1
-Transformers:   5.5.3
+Transformers:    5.5.3
 ```
 
 ## Setup
@@ -31,8 +30,9 @@ Follow [Tenstorrent's installation guide](https://github.com/tenstorrent/tt-meta
 ### 2. Install Python dependencies
 
 ```bash
-pip install -r requirements.txt
+make setup            # uv sync (the standard path; see README Setup)
 ```
+(`requirements.txt` is retained for legacy `pip install -r` workflows.)
 
 ### 3. Verify device access
 
@@ -50,10 +50,10 @@ export HF_TOKEN=your_token_here
 
 ## Running Experiments
 
-Each experiment is a self-contained Python script:
+Each demo is a self-contained script under `models/` (run from the repo root):
 
 ```bash
-python3 experiments/80_8b_diverse_qa_demo.py
+make run PY=models/80_8b_diverse_qa_demo.py    # or: scripts/run_remote.sh models/<file>.py
 ```
 
 ### Key experiments to reproduce
@@ -63,24 +63,39 @@ python3 experiments/80_8b_diverse_qa_demo.py
 > demos below have been re-verified on qb1 (single P150) as of 2026-05-21.
 > See [Re-verified on qb1 (2026-05-21)](#re-verified-on-qb1-2026-05-21).
 
-| Experiment | What It Tests | Expected Time |
+| Demo | What It Tests | Expected Time |
 |-----------|---------------|---------------|
-| `60_native_rope_decode.py` | Qwen2.5-0.5B at 140 tok/s | ~2 min |
-| `64_llama32_1b_port.py` | Llama-3.2-1B at 78 tok/s | ~3 min |
-| `67_llama32_3b_port.py` | Llama-3.2-3B at 34 tok/s | ~5 min |
-| `73_llama8b_instruct.py` | Llama-3.1-8B at 19 tok/s | ~8 min |
-| `76b_8b_correctness_check.py` | 8B correctness validation | ~14 min |
-| `80_8b_diverse_qa_demo.py` | 8B Q&A demo (10 categories) | ~6 min |
+| `models/60_native_rope_decode.py` | Qwen2.5-0.5B at 140 tok/s | ~2 min |
+| `models/64_llama32_1b_port.py` | Llama-3.2-1B at 78 tok/s | ~3 min |
+| `models/67_llama32_3b_port.py` | Llama-3.2-3B at 34 tok/s | ~5 min |
+| `models/73_llama8b_instruct.py` | Llama-3.1-8B at 19 tok/s | ~8 min |
+| `models/76b_8b_correctness_check.py` | 8B correctness validation | ~14 min |
+| `models/80_8b_diverse_qa_demo.py` | 8B Q&A demo (10 categories) | ~6 min |
 
-### Experiment numbering
+See [`models/README.md`](models/README.md) for the full demo index. (The
+production Qwen3.6-27B/35B path lives in `experiments/serve/`, not here.)
 
-- `01-05`: JAX/XLA fundamentals (no device needed)
-- `06-20`: TT-NN basics, first models via Jaxpr interpreter
-- `21-45`: Direct TT-NN path, Qwen2.5-0.5B optimization
-- `46-62`: Quality validation, quantization, performance tuning
-- `63-73`: Multi-model ports (1B, 3B, 8B)
-- `74-80`: Quality investigation, sampling strategies
-- Suffix `b`, `c`, `d`: Variants of the same experiment
+### Custom TT-NN kernels
+
+We also built fused TT-NN ops for the Qwen3.6 GatedDeltaNet path; the two
+production ones are what the 27B server calls at runtime. Install with
+`scripts/build_owned_ops.sh` (see [`experiments/owned_ops/README.md`](experiments/owned_ops/README.md));
+each op ships an `INTEGRATION.md` with its validation gate + a `test_*.py`.
+
+| Kernel | Role | Gate (BF16 ladder vs CPU oracle) |
+|---|---|---|
+| `qwen36_gdn_decode_owned` | **Production** — fused GatedDeltaNet decode recurrence | state/out PCC > 0.9999 |
+| `qwen36_decay_gate_decode_owned` | **Production** — fused decay/gate (+2.5% tok/s) | PCC > 0.9999 |
+| `qwen36_gdn_{delta,prediction,decay_state,outer_update,output}` | GDN sub-ops (decomposed bring-up) | PCC > 0.9999 |
+| `qwen36_conv1d_decode_owned` | experimental conv1d decode | — |
+| `qwen36_moe_ffn_decode_owned` | in progress (35B MoE FFN) | — |
+
+Run a gate (stop the prod server first so device 0 is free):
+
+```bash
+scripts/run_remote.sh experiments/owned_ops/qwen36_gdn_decode_owned/test_qwen36_gdn_decode_owned.py \
+  --device-id 0 --key-dim 128 --value-dim 128 --max-abs-diff-threshold 0.001
+```
 
 ## Device Configuration
 
@@ -107,7 +122,7 @@ Decode speed should be within 10% of reported numbers, depending on:
 
 ### Correctness
 
-Run `76b_8b_correctness_check.py` to verify:
+Run `models/76b_8b_correctness_check.py` to verify:
 - Prefill cosine similarity vs numpy float32: expect >0.997
 - Token match over 8 greedy steps: expect 8/8
 
@@ -135,12 +150,12 @@ afterwards via `bash experiments/serve/scripts/serve.sh {stop,start}`.
 
 | Demo | Baseline | qb1 (2026-05-21) | Notes |
 |------|----------|------------------|-------|
-| `60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** | Qwen2.5-0.5B, native RoPE path |
-| `64_llama32_1b_port.py` | 78 tok/s | **78.6 tok/s** | "The capital of France is Paris" verbatim |
-| `67_llama32_3b_port.py` | 34 tok/s | **33.7 tok/s** | Unsloth shard mirror (meta-llama needs HF auth) |
-| `73_llama8b_instruct.py` | 19 tok/s | **19 tok/s** | All 5 prompts complete; mostly coherent |
-| `76b_8b_correctness_check.py` | cos > 0.997, 8/8 tokens | cos **0.997327**, **8/8** | Per-step cos 0.981-0.996; EOS at step 6 |
-| `80_8b_diverse_qa_demo.py` | 10 prompts, 18 tok/s | **18 tok/s, 9/10 EOS** | 403 tokens total; Code-gen prompt hit max-tokens |
+| `models/60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** | Qwen2.5-0.5B, native RoPE path |
+| `models/64_llama32_1b_port.py` | 78 tok/s | **78.6 tok/s** | "The capital of France is Paris" verbatim |
+| `models/67_llama32_3b_port.py` | 34 tok/s | **33.7 tok/s** | Unsloth shard mirror (meta-llama needs HF auth) |
+| `models/73_llama8b_instruct.py` | 19 tok/s | **19 tok/s** | All 5 prompts complete; mostly coherent |
+| `models/76b_8b_correctness_check.py` | cos > 0.997, 8/8 tokens | cos **0.997327**, **8/8** | Per-step cos 0.981-0.996; EOS at step 6 |
+| `models/80_8b_diverse_qa_demo.py` | 10 prompts, 18 tok/s | **18 tok/s, 9/10 EOS** | 403 tokens total; Code-gen prompt hit max-tokens |
 
 Logs are in `~/tt-xla/.cache/legacy_demos_2026_05_21/` on qb1.
 
@@ -180,12 +195,12 @@ parallel check.
 
 | Demo | qb1 baseline (2026-05-21) | qb2 fresh-clone (2026-05-22) | Notes |
 |------|----------------------------|------------------------------|-------|
-| `60_native_rope_decode.py` | 142.2 tok/s | **142.5 tok/s** | identical within run-to-run jitter |
-| `64_llama32_1b_port.py` | 78.6 tok/s | **78.4 tok/s** | |
-| `67_llama32_3b_port.py` | 33.7 tok/s | **34 tok/s** | |
-| `73_llama8b_instruct.py` | 19 tok/s | **19 tok/s** | |
-| `76b_8b_correctness_check.py` | cos 0.997327 | **cos 0.997327** | bit-identical |
-| `80_8b_diverse_qa_demo.py` | 18 tok/s | **16 tok/s (59% efficiency)** | within 2 tok/s; thermal/load variance |
+| `models/60_native_rope_decode.py` | 142.2 tok/s | **142.5 tok/s** | identical within run-to-run jitter |
+| `models/64_llama32_1b_port.py` | 78.6 tok/s | **78.4 tok/s** | |
+| `models/67_llama32_3b_port.py` | 33.7 tok/s | **34 tok/s** | |
+| `models/73_llama8b_instruct.py` | 19 tok/s | **19 tok/s** | |
+| `models/76b_8b_correctness_check.py` | cos 0.997327 | **cos 0.997327** | bit-identical |
+| `models/80_8b_diverse_qa_demo.py` | 18 tok/s | **16 tok/s (59% efficiency)** | within 2 tok/s; thermal/load variance |
 | Demo A — `server.py` + `client generate` | 5.14 tok/s (README) | 4.01 tok/s cold / 4.03 tok/s warm | first-run, fewer warm passes |
 | Demo B — `server_tp.py` + `client_tp generate_tp` | 12.98 tok/s (README) | **13.01 tok/s warm** | matched prod baseline 12.93 tok/s |
 | MoE smoke on qb1 (`decode_smoke_35b_ttnn.py`) | 480 ms/tok pre-trace (`feedback_b16_coherent_text_on_device.md`) | 522 ms/tok pre-trace, ` Paris` prediction + 24-tok coherent continuation | qb1 host since 35B weights cached there |
