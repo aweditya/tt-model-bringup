@@ -41,9 +41,11 @@ def _cos(a, b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-pos", type=int, default=32,
-                    help="prompt token count (<=32 powers-of-2 hit the chunked-DN Neumann path)")
+    ap.add_argument("--lens", default="8,16,29,32",
+                    help="comma list of prompt token counts to sweep; powers of 2 hit "
+                         "the chunked-DN Neumann path, others the per-position fallback")
     args = ap.parse_args()
+    lens = [int(x) for x in args.lens.split(",")]
 
     log("bootstrap production 27B server (server_tp)…")
     state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
@@ -52,47 +54,36 @@ def main():
     state.deltanet_recurrence_mode = "manual"  # qb1 baseline; the chunked path uses Neumann
 
     prompt = ("The capital of France is the city of Paris, which has long been a "
-              "center of art, science, philosophy, and political history in Europe.")
-    prompt_ids = tok.encode(prompt)[:args.max_pos]
-    L = len(prompt_ids)
-    log(f"prompt_ids ({L} tok): {prompt_ids}")
+              "center of art, science, philosophy, and political history in Europe, "
+              "drawing scholars and travelers from every corner of the wider world for "
+              "many centuries of recorded human civilization and culture.")
+    all_ids = tok.encode(prompt)
+    log(f"prompt has {len(all_ids)} tokens; sweeping lens={lens}")
 
-    log("=== reference: forward_prefill_tp_inner (single-token stub) ===")
-    base._reset_state_buffers(state)
-    ref = base.forward_prefill_tp_inner(state, prompt_ids, capture_logits=True)  # [L, vocab]
-    ref_ids = ref.argmax(axis=-1).tolist()
-
-    log("=== chunked: forward_prefill_chunked_tp (whole-prompt parallel) ===")
-    base._reset_state_buffers(state)
-    chk = base.forward_prefill_chunked_tp(state, prompt_ids, capture_logits=True)  # [L, vocab]
-    chk_ids = chk.argmax(axis=-1).tolist()
-
-    worst = 1.0
-    for pos in range(L):
-        c = _cos(ref[pos], chk[pos])
-        worst = min(worst, c)
-        flag = "=" if ref_ids[pos] == chk_ids[pos] else "DIFF"
-        log(f"  pos {pos:2d}: logit_cos={c:.6f}  argmax ref={ref_ids[pos]} chunked={chk_ids[pos]} {flag}")
-    n_match = sum(int(a == b) for a, b in zip(ref_ids, chk_ids))
-    cos_ok = worst >= 0.99
-    log(f"  worst-position logit_cos = {worst:.6f}  | argmax match {n_match}/{L}")
-
-    log("=== TTFT (sync-bounded forward time, no logit readback) ===")
-    try:
-        import ttnn
+    rows = []
+    for L in lens:
+        if L > len(all_ids):
+            log(f"  L={L}: skip (prompt too short)")
+            continue
+        ids = all_ids[:L]
         base._reset_state_buffers(state)
-        t0 = time.time(); base.forward_prefill_tp_inner(state, prompt_ids); ttnn.synchronize_device(state.mesh)
-        t_stub = time.time() - t0
+        ref = base.forward_prefill_tp_inner(state, ids, capture_logits=True)
         base._reset_state_buffers(state)
-        t0 = time.time(); base.forward_prefill_chunked_tp(state, prompt_ids); ttnn.synchronize_device(state.mesh)
-        t_chk = time.time() - t0
-        log(f"  stub    prefill ({L} tok): {t_stub * 1000:8.1f} ms")
-        log(f"  chunked prefill ({L} tok): {t_chk * 1000:8.1f} ms   ({t_stub / t_chk:.2f}x)")
-    except Exception as e:
-        log(f"  TTFT timing skipped (err: {e!r})")
+        chk = base.forward_prefill_chunked_tp(state, ids, capture_logits=True)
+        ref_ids = ref.argmax(axis=-1).tolist(); chk_ids = chk.argmax(axis=-1).tolist()
+        coss = [_cos(ref[p], chk[p]) for p in range(L)]
+        worst = min(coss); wpos = int(np.argmin(coss))
+        nmatch = sum(int(a == b) for a, b in zip(ref_ids, chk_ids))
+        path = "Neumann" if L in (4, 8, 16, 32) else "per-pos fallback"
+        last = "=" if ref_ids[-1] == chk_ids[-1] else "DIFF"
+        log(f"  L={L:3d} [{path:16s}]: worst_cos={worst:.4f} @pos{wpos}  "
+            f"argmax {nmatch}/{L}  last-pos {last}")
+        rows.append((L, path, worst, nmatch))
 
-    log(f"=== verdict: {'PASS' if cos_ok else 'FAIL'} "
-        f"(chunked prefill vs single-token stub, cosine gate >= 0.99) ===")
+    log("=== summary (gate: worst_cos >= 0.99) ===")
+    for L, path, worst, nmatch in rows:
+        log(f"  L={L:3d} [{path:16s}]: {'PASS' if worst >= 0.99 else 'FAIL'}  "
+            f"worst_cos={worst:.4f}  argmax {nmatch}/{L}")
 
 
 if __name__ == "__main__":
