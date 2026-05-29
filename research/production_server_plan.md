@@ -93,9 +93,25 @@ resume prefill optimization (S2).
   ~106 ms traced in P0; ~3× per-step penalty, mostly Python dispatch + ~15 MB
   [B,vocab] readback at B=32). A traced-logits fast path is a deferred perf
   increment (revisit if P5 shows it matters at production B).
-- **P2 — Async OpenAI API over the engine.** Re-point `openai_endpoint` (or a new
-  `serve/cb_api.py`) at `cb_engine`; SSE, cancellation, sampling, stop, usage.
-  **Gate:** concurrent OpenAI clients (real chat), correctness + streaming.
+- **P2 — Async OpenAI API over the engine. DONE (2026-05-29).** New
+  `serve/cb_api.py` in the SAME process as the device-owning engine: a
+  closure-over-`state` FastAPI app whose handlers `submit()` to the engine and
+  bridge the blocking token queue to async SSE via `loop.run_in_executor`. On
+  client disconnect, Starlette cancels the SSE generator → `CancelledError` →
+  `engine.cancel(rid)` → slot recycles (CB2 admission). Reuses the unit-tested
+  pure helpers from `openai_endpoint`. (Design note: `request: Request` is not
+  used — FastAPI 0.13x stopped auto-injecting Request, treats it as a query
+  param; closure-over-state is the durable pattern.) A unit-level routing probe
+  `experiments/serve/tests/test_cb_api_routing.py` (TestClient + fake engine,
+  no device) catches signature/parsing bugs in milliseconds, complementing the
+  qb1 e2e validator. **Gate PASS** (`experiments/cb/validate/engine_api.py`,
+  qb1, 4 slots, sampling-mode engine): (a) non-stream /v1/chat/completions 200
+  with correct OpenAI body + usage; (b) SSE streaming — 18 events, role +
+  finish + [DONE], streamed text bit-identical to non-stream; (c) 6 concurrent
+  /v1/completions vs serial refs — **each==ref=6/6**, all 6 distinct, 13.15s
+  through 4 slots — HTTP layer multiplexes the engine with zero crosstalk;
+  (d) cancel-on-disconnect — partial SSE, slot recycled, post-cancel request
+  matches. Clean lifecycle, no wedge.
 - **P3 — Lifecycle + robustness.** `serve_cb.sh`; readiness/health; SIGTERM drain
   + clean mesh close; backpressure (429); validation; error isolation. **Gate:**
   shutdown clean (no wedge) + chaos (disconnects, bad requests, queue-full).
