@@ -151,6 +151,22 @@ in `forward_prefill_tp_inner` (additive, zero prod risk) — but first validate 
 non-capture last-row return (`ttnn.slice` row-major) since the functional gate used
 the capture path. Then S1b (full Neumann win at L=32) + S2 (CB integration).
 
+## S1a COMPLETE (2026-05-28) — correct, chat-usable, wired in
+
+- Functional gate PASS (coherent generation, better than the looping stub).
+- Long-context gate PASS (`cb/validate/long_context.py`): L=137 needle prompt →
+  chunked prefill **retrieves the code `7X9Q2` verbatim**; non-capture return path
+  validated (first-token capture==non-capture). Stub retrieves it too.
+- Wired in: `forward_prefill_tp_inner` delegates to `forward_prefill_chunked_tp`
+  when `state.prefill_chunked` is set (default OFF → prod unchanged).
+- TTFT: **1.35× @ L=29**; at long L the win is attn-only (DN is per-position
+  fallback >32), so the big long-context speedup is **S1b** (Neumann/chunked DN).
+
+**Next:** S1b (chunk the prompt into 32s so DN uses the fast Neumann path — needs a
+multi-query paged SDPA over the prefix) for the long-context TTFT win; then S2 (CB
+integration — the original "realistic task times" goal). Merge S1a (validated,
+additive, default-off) first.
+
 ## Constraints / gotchas
 - Chunk size = 32 (the validated cap). Prompt > 32 → multiple chunks.
 - bf16 prefill drift: B3 SDPA (HiFi2, no fp32_dest_acc) is the fix
