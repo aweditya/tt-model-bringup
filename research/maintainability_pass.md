@@ -93,7 +93,29 @@ tt-xla/
   ~30 historical refs in `research/27b_cb_scope.md` — the scripts RUN correctly
   via `make run PY=experiments/cb/.../X.py`; only the in-file examples are stale.
   Also LEFTOVER from M3.0: p22 probe's hardcoded old-91l path.
-- **M4 lean code + comments — PENDING (canary-gated)**: `# GOTCHA:` convention
+- **M4 server_tp.py de-bloat — DONE (canary PASS on qb1).** Surprise: the
+  audit's headline targets (dead prefill variants ~1300 lines + dead flags
+  force_composite_ccl/use_chunked_dn/deltanet_conv1d_mode) were ALREADY removed in
+  the prior MoE cleanup (file was 7897, not the audit's 9258). Remaining bloat was
+  24 retired `probe_*` HANDLERS (~4872 lines) interleaved with prod
+  `handle_generate_tp` + kept `cosine_ladder`/`profile_decode`/`bench` handlers +
+  shared helpers. Removed via a new reviewed tool `scripts/strip_functions.py`
+  (AST line-range deletion, dry-run default, refuses on missing/dup) — deleted the
+  24 probe handlers + 4 now-orphaned probe-only helpers (122 lines; kept
+  `_read_argmax_id` (used at runtime) + `_profile_category`/`_summarize_profile_records`
+  (used by profile_decode)). Trimmed HANDLERS dict to the 6 live commands
+  (status/generate_tp/bench_decode_tp_components/profile_decode_tp_ops/
+  cosine_ladder_tp/shutdown). **server_tp.py 7897 → 2903 lines.** Verified: 0
+  remaining `handle_probe_` refs, 0 real deleted-helper refs (1 was a dict-key
+  false positive), ruff-clean, imports clean on qb1 (HANDLERS builds, mesh-free).
+  CANARY PASS (qb1, forward.py --max-pos 6, manual DN): bootstrap loaded all 64
+  layers; gate ladder verdict PASS — 3a CB-B=1 vs prod-B=1 logit_cos=1.000000
+  (bit-identical), 3b identical-slot + 3c distinct-slot isolation PASS. The
+  4994-line deletion left the prod forward path bit-identical.
+  NOTE: kept `collective_mode`/`rope_mode`/`deltanet_decay_mode` (live multi-valued
+  flags, not dead). The original M4 comment-discipline (`# GOTCHA:` convention,
+  narrative-comment trimming) is now a smaller follow-up.
+- **M4 (orig) lean code + comments — PENDING (canary-gated)**: `# GOTCHA:` convention
   for load-bearing comments (view-decay, +1 RMSNorm, K-broadcast RoPE, bf16-KV —
   the HANDOFF must-keeps); delete narrative/debug-log comments. Excise dead debug
   blocks + unused probe endpoints from server_tp.py (7913 lines), each gated by
