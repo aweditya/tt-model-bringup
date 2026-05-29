@@ -2625,11 +2625,101 @@ def handle_profile_decode_tp_ops(state: MeshServerState, args: dict) -> dict:
 
 
 
+def _sample_from_logits(logits, temperature, top_p, top_k, rng):
+    """Host-side temperature + top-k + top-p (nucleus) sampling from 1-D logits.
+    Returns a token id. temperature<=0 never reaches here (greedy = traced argmax)."""
+    import numpy as np
+    lg = logits.astype(np.float64) / max(temperature, 1e-6)
+    if top_k and 0 < top_k < lg.size:
+        lg[lg < np.partition(lg, -top_k)[-top_k]] = -np.inf
+    lg -= lg.max()
+    p = np.exp(lg); p /= p.sum()
+    if 0.0 < top_p < 1.0:
+        order = np.argsort(p)[::-1]
+        keep = order[:np.searchsorted(np.cumsum(p[order]), top_p) + 1]
+        masked = np.zeros_like(p); masked[keep] = p[keep]
+        p = masked / masked.sum()
+    return int(rng.choice(p.size, p=p))
+
+
+def _generate_sampled_tp(state, prompt, prompt_ids, max_tokens, chunk_size,
+                         temperature, top_p, top_k, seed):
+    """Sampling generate (temperature>0): non-traced forward returning logits +
+    host-side temp/top-p/top-k sampling. Additive sister to the greedy traced path
+    (left untouched). Same streamed chunk format. Slower (per-step logits readback,
+    no trace) — sampling is a quality feature, not the perf path."""
+    import ttnn
+    import numpy as np
+    import time as _time
+    rng = np.random.default_rng(seed)
+
+    def _read(rm):
+        t = ttnn.to_torch(rm, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+        return t.float().numpy().reshape(-1)[:state.vocab_size]
+
+    _reset_state_buffers(state)
+    t0 = _time.time()
+    last_rm = None
+    for pos, tid in enumerate(prompt_ids):
+        update_input_buffers(state, tid, pos)
+        last_rm = forward_token_tp_inner(state, return_logits=True)
+    ttnn.synchronize_device(state.mesh)
+    prefill_ms = (_time.time() - t0) * 1000.0
+    logits = _read(last_rm); ttnn.deallocate(last_rm)
+
+    generated_ids, decode_times = [], []
+    cur_pos = len(prompt_ids)
+    eos_id = getattr(state.tok, "eos_token_id", None)
+    text_so_far, pending, stopped_on_eos = "", [], False
+
+    def _flush():
+        return {
+            "token_text": "".join(p["token_text"] for p in pending),
+            "token_ids": [p["token_id"] for p in pending],
+            "tok_idx_start": pending[0]["tok_idx"],
+            "tok_idx_end": pending[-1]["tok_idx"],
+        }
+
+    for step in range(max_tokens):
+        next_id = _sample_from_logits(logits, temperature, top_p, top_k, rng)
+        generated_ids.append(next_id)
+        new_text = state.tok.decode(generated_ids, skip_special_tokens=True)
+        delta = new_text[len(text_so_far):]; text_so_far = new_text
+        pending.append({"token_id": next_id, "token_text": delta, "tok_idx": step})
+        if len(pending) >= chunk_size:
+            yield _flush(); pending = []
+        if eos_id is not None and next_id == eos_id:
+            stopped_on_eos = True; break
+        td0 = _time.time()
+        update_input_buffers(state, next_id, cur_pos)
+        rm = forward_token_tp_inner(state, return_logits=True)
+        ttnn.synchronize_device(state.mesh)
+        logits = _read(rm); ttnn.deallocate(rm)
+        decode_times.append((_time.time() - td0) * 1000.0); cur_pos += 1
+
+    if pending:
+        yield _flush()
+    total_ms = (_time.time() - t0) * 1000.0
+    ms_per_tok = (sum(decode_times) / len(decode_times)) if decode_times else float("nan")
+    yield {
+        "_final": True, "prompt": prompt, "generated_text": text_so_far,
+        "full_text": prompt + text_so_far, "prompt_ids": list(prompt_ids),
+        "generated_ids": generated_ids, "n_prompt_tokens": len(prompt_ids),
+        "n_generated_tokens": len(generated_ids), "prefill_ms": prefill_ms,
+        "total_ms": total_ms, "ms_per_tok": ms_per_tok,
+        "tok_per_sec": 1000.0 / ms_per_tok if ms_per_tok > 0 else 0.0,
+        "stopped_on_eos": stopped_on_eos,
+        "sampling": {"temperature": temperature, "top_p": top_p, "top_k": top_k, "seed": seed},
+        "multi_chip": True,
+    }
+
+
 def handle_generate_tp(state: MeshServerState, args: dict):
     """Multi-chip TP generate — streams by default (mirrors server.py UX).
 
-    Now uses TRACED forward (P14 unblocked). On first call: warmup + capture.
-    Subsequent calls reuse the trace via execute_trace.
+    Greedy by default (TRACED forward, P14; warmup+capture on first call, then
+    execute_trace). With temperature>0 it delegates to the non-traced sampling
+    path (_generate_sampled_tp); the greedy traced path below is unchanged.
     """
     import ttnn
     import time as _time
@@ -2653,6 +2743,15 @@ def handle_generate_tp(state: MeshServerState, args: dict):
     if len(prompt_ids) + max_tokens > cap:
         yield {"_final": True,
                "error": f"prompt_len {len(prompt_ids)} + max_tokens {max_tokens} > MAX_POS {cap}"}
+        return
+
+    # Sampling path (temperature>0): non-traced logits + host sampling. Greedy
+    # (default temperature=0) falls through to the traced argmax path below.
+    temperature = float(args.get("temperature", 0.0))
+    if temperature > 0.0:
+        yield from _generate_sampled_tp(
+            state, prompt, prompt_ids, max_tokens, chunk_size, temperature,
+            float(args.get("top_p", 1.0)), int(args.get("top_k", 0)), args.get("seed"))
         return
 
     # Ensure trace is captured (one-time, ~85ms + 2 warmup forwards)
