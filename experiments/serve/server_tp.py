@@ -1992,7 +1992,7 @@ def forward_prefill_chunked_tp(state, prompt_ids, capture_logits=False):
     tok_tt = ttnn.from_torch(
         torch.tensor([list(prompt_ids)], dtype=torch.int32),
         layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+        device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
     x_tt = ttnn.reshape(
         ttnn.embedding(tok_tt, state.embed_tt, layout=ttnn.TILE_LAYOUT,
                        memory_config=ttnn.DRAM_MEMORY_CONFIG),
@@ -2000,7 +2000,7 @@ def forward_prefill_chunked_tp(state, prompt_ids, capture_logits=False):
     pos_tt = ttnn.from_torch(
         torch.tensor([list(range(seq_len))], dtype=torch.int32),
         layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+        device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
     cos_seq_tt = ttnn.reshape(
         ttnn.embedding(pos_tt, state.cos_table_tt, layout=ttnn.TILE_LAYOUT,
                        memory_config=ttnn.DRAM_MEMORY_CONFIG),
