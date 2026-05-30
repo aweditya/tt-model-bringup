@@ -257,5 +257,5 @@ The C' branch performance target (267 ms/tok at MAX_POS=256) is at the unpaged c
 - `experiments/.refs/tt-metal/models/tt_transformers/tt/attention.py:705-717` (real-model paged decode call)
 - `experiments/.refs/tt-metal/models/tt_transformers/tests/test_attention.py:118-144` (page-table construction)
 - `research/kernel_profile_qb2_20260513.json` (observed failure)
-- `research/paged_sdpa_decode_usage.md` (companion: usage detail and risk list)
+- `research/archive/paged_sdpa_decode_usage.md` (companion: usage detail and risk list)
 - Memory: `feedback_paged_sdpa_decode_works_at_32k.md`, `feedback_sdpa_decode_max_pos_256_cliff.md`

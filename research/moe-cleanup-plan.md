@@ -186,7 +186,7 @@ is unambiguous.
    (different algorithm, different upload, different host-readback profile).
    `pattern_a` was only a stepping stone. Before deleting, run
    `test_pattern_a_moe_tt.py` one final time as topk-vs-batched and capture
-   the cos in `research/35b_moe_pattern_a_batched_status.md`.
+   the cos in `research/archive/35b_moe_pattern_a_batched_status.md`.
 
 2. **Helper extraction (`_moe_router_topk`, `_moe_shared_expert`)
    risks subtle ordering changes** (e.g. dealloc timing of `h_tt`). Mitigation:

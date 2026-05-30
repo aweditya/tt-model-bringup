@@ -1,230 +1,172 @@
-# Reproducing tt-model-bringup demos
+# Reproducing tt-model-bringup
 
-## Hardware Requirements
+## Hardware
 
-- **Tenstorrent Blackhole P150** (or compatible Blackhole device)
-- 64 GB system RAM (8B models use ~15 GB for weights + ~10 GB for KV caches)
-- AMD or Intel x86_64 CPU
+- Tenstorrent Blackhole P150 (or compatible Blackhole device).
+- For 27B / 35B: 4× P150 in a (1, 4) mesh; both `qb1` and `qb2` have working
+  `FABRIC_1D`.
+- For the legacy 8B-era demos: single P150, ≥ 64 GB system RAM.
 
-## Tested Environment
+## Tested environment
 
-Tenstorrent QuietBox (4× Blackhole P150), firmware 19.6.0. Software versions:
+Tenstorrent QuietBox (4× Blackhole P150), firmware 19.6.0.
 
-```
-Python:          3.10.12
-TT-NN:           0.69.0
-TT-SMI:          5.0.0
-PyTorch:         2.11.0
-NumPy:           1.26.4
-Safetensors:     0.7.0
-HuggingFace Hub: 1.10.1
-Transformers:    5.5.3
-```
+| Component | Version |
+|---|---|
+| Python | 3.10.12 |
+| TT-NN | 0.69.0 |
+| TT-SMI | 5.0.0 |
+| KMD | 2.8.0 |
+| PyTorch | 2.11.0 (qb1 prod) / 2.12.0 (fresh `uv sync`) |
+| NumPy | 1.26.4 |
+| Safetensors | 0.7.0 |
+| HuggingFace Hub | 1.10.1 |
+| Transformers | 5.5.3 |
+| tt-metal SHA | see [`tt-metal-sha.txt`](tt-metal-sha.txt) |
 
 ## Setup
 
-### 1. Install TT-Metal / TT-NN
-
-Follow [Tenstorrent's installation guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md) for your device.
-
-### 2. Install Python dependencies
-
 ```bash
-make setup            # uv sync (the standard path; see README Setup)
+git clone https://github.com/aweditya/tt-model-bringup.git ~/tt-xla && cd ~/tt-xla
+make setup            # uv sync (legacy: pip install -r requirements.txt)
+make install-ttnn     # editable ttnn from $TT_METAL_HOME (on the TT host)
+make check            # sanity-check setup (no device open)
+make kernels          # build the owned_ops custom kernels
 ```
-(`requirements.txt` is retained for legacy `pip install -r` workflows.)
 
-### 3. Verify device access
+Set `HF_TOKEN` (or `hf auth login`) for HuggingFace model access. See
+README §Setup for the full env block.
+
+Device-access smoke (one-liner; useful when debugging TT-NN install):
 
 ```bash
 python3 -c "import ttnn; d = ttnn.open_device(0); print('OK:', d.compute_with_storage_grid_size()); ttnn.close_device(d)"
 ```
 
-### 4. HuggingFace model access
+## Reproduce — chat server (Qwen3.6-27B CB, canonical chat path)
 
-Models are downloaded automatically via `huggingface_hub`. Set `HF_TOKEN` if you need authenticated access:
-
-```bash
-export HF_TOKEN=your_token_here
-```
-
-## Running Experiments
-
-Each demo is a self-contained script under `models/` (run from the repo root):
+On the TT host:
 
 ```bash
-make run PY=models/80_8b_diverse_qa_demo.py    # or: scripts/run_remote.sh models/<file>.py
+bash experiments/serve/scripts/serve_cb.sh start   # ~6 min bootstrap; /health → 503 until ready
+bash experiments/serve/scripts/serve_cb.sh status
 ```
 
-### Key experiments to reproduce
+Once `/health` returns 200, hit the OpenAI-compatible endpoint:
 
-> Note: the original `tenstorrent` host these experiments were authored on has
-> been replaced by **qb1** and **qb2** — both 4× P150 Blackhole hosts. All
-> demos below have been re-verified on qb1 (single P150) as of 2026-05-21.
-> See [Re-verified on qb1 (2026-05-21)](#re-verified-on-qb1-2026-05-21).
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hi! What can you do?"}],"max_tokens":200}'
+```
 
-| Demo | What It Tests | Expected Time |
-|-----------|---------------|---------------|
-| `models/60_native_rope_decode.py` | Qwen2.5-0.5B at 140 tok/s | ~2 min |
-| `models/64_llama32_1b_port.py` | Llama-3.2-1B at 78 tok/s | ~3 min |
-| `models/67_llama32_3b_port.py` | Llama-3.2-3B at 34 tok/s | ~5 min |
-| `models/73_llama8b_instruct.py` | Llama-3.1-8B at 19 tok/s | ~8 min |
-| `models/76b_8b_correctness_check.py` | 8B correctness validation | ~14 min |
-| `models/80_8b_diverse_qa_demo.py` | 8B Q&A demo (10 categories) | ~6 min |
+See README §"Chat server (production)" for streaming, sampling, `/metrics`,
+and load-test (`experiments/cb/load/concurrent_chat.py`) examples.
 
-See [`models/README.md`](models/README.md) for the full demo index. (The
-production Qwen3.6-27B/35B path lives in `experiments/serve/`, not here.)
+P5 SLO (qb1, 8 clients × 60 s, 2026-05-30): 0 errors / 36 requests /
+15 tok/s aggregate / TTFT p99 = 176 ms.
 
-### Custom TT-NN kernels
+## Reproduce — single-seq TP server (Qwen3.6-27B, frozen prod reference)
 
-We also built fused TT-NN ops for the Qwen3.6 GatedDeltaNet path; the two
-production ones are what the 27B server calls at runtime. Install with
-`scripts/build_owned_ops.sh` (see [`experiments/owned_ops/README.md`](experiments/owned_ops/README.md));
-each op ships an `INTEGRATION.md` with its validation gate + a `test_*.py`.
+```bash
+bash experiments/serve/scripts/serve_tp.sh start   # ~17 min bootstrap
+uv run python -m experiments.serve.client_tp status
+uv run python -m experiments.serve.client_tp generate_tp \
+    --prompt "The capital of France is" --max-tokens 32
+bash experiments/serve/scripts/serve_tp.sh stop    # graceful drain
+```
 
-| Kernel | Role | Gate (BF16 ladder vs CPU oracle) |
+Steady-state: **12.93 tok/s** on qb2 (`num_links=2` all_reduce + `owned_gdn` +
+`owned_decay_gate`). Bootstrap time and graceful-stop matter — see
+README §Troubleshooting.
+
+## Reproduce — single P150 server (Qwen3.6-27B, single-chip)
+
+```bash
+bash experiments/serve/scripts/serve.sh start      # ~11 min bootstrap
+uv run python -m experiments.serve.client status
+uv run python -m experiments.serve.client generate \
+    --prompt "The capital of France is" --max-tokens 32
+bash experiments/serve/scripts/serve.sh stop
+```
+
+Steady-state: **5.14 tok/s** on qb1.
+
+Both servers generate `Paris.\n\n<think>...</think>\n\nThat is correct. Paris is
+the capital and most populous city of France.` at `max_tokens=32`.
+
+## Reproduce — legacy multi-model demos (single P150)
+
+The prod server holds device 0 — stop it first.
+
+```bash
+bash experiments/serve/scripts/serve.sh stop       # or serve_tp.sh stop on qb2
+make run PY=models/80_8b_diverse_qa_demo.py        # or scripts/run_remote.sh models/<file>.py
+bash experiments/serve/scripts/serve.sh start      # restart after
+```
+
+| Demo | What it tests | Expected | qb1 (2026-05-21) |
+|---|---|---|---|
+| `models/60_native_rope_decode.py` | Qwen2.5-0.5B native RoPE decode | 140 tok/s | **142.2 tok/s** |
+| `models/64_llama32_1b_port.py` | Llama-3.2-1B greedy decode | 78 tok/s | **78.6 tok/s** |
+| `models/67_llama32_3b_port.py` | Llama-3.2-3B (Unsloth shard mirror) | 34 tok/s | **33.7 tok/s** |
+| `models/73_llama8b_instruct.py` | Llama-3.1-8B instruct decode | 19 tok/s | **19 tok/s** |
+| `models/76b_8b_correctness_check.py` | 8B correctness vs numpy fp32 | cos > 0.997, 8/8 | **cos 0.997327, 8/8** |
+| `models/80_8b_diverse_qa_demo.py` | 8B 10-category Q&A | 18 tok/s, 9/10 EOS | **18 tok/s, 9/10 EOS** |
+
+Fresh-clone validation (qb2, 2026-05-22): all six PASS within 2-7 % of baseline;
+Demo A `client generate` 4.01 tok/s cold, Demo B `client_tp generate_tp` 13.01 tok/s.
+
+## Reproduce — owned_ops kernel gates
+
+Each owned op ships an `INTEGRATION.md` with the validation gate and a
+`test_*.py`. Two production ops (BF16 ladder vs CPU oracle):
+
+| Kernel | Role | Gate |
 |---|---|---|
-| `qwen36_gdn_decode_owned` | **Production** — fused GatedDeltaNet decode recurrence | state/out PCC > 0.9999 |
-| `qwen36_decay_gate_decode_owned` | **Production** — fused decay/gate (+2.5% tok/s) | PCC > 0.9999 |
-| `qwen36_gdn_{delta,prediction,decay_state,outer_update,output}` | GDN sub-ops (decomposed bring-up) | PCC > 0.9999 |
-| `qwen36_conv1d_decode_owned` | experimental conv1d decode | — |
-| `qwen36_moe_ffn_decode_owned` | in progress (35B MoE FFN) | — |
+| `qwen36_gdn_decode_owned` | Production fused GatedDeltaNet decode recurrence | state/out PCC > 0.9999 |
+| `qwen36_decay_gate_decode_owned` | Production fused decay/gate (+2.5 % tok/s) | PCC > 0.9999 |
 
-Run a gate (stop the prod server first so device 0 is free):
+Run a gate (stop the prod server so device 0 is free):
 
 ```bash
 scripts/run_remote.sh experiments/owned_ops/qwen36_gdn_decode_owned/test_qwen36_gdn_decode_owned.py \
   --device-id 0 --key-dim 128 --value-dim 128 --max-abs-diff-threshold 0.001
 ```
 
-## Device Configuration
+See [`experiments/owned_ops/README.md`](experiments/owned_ops/README.md) for the
+full op index.
 
-All experiments use **device 0 only**. If you have multiple devices, no changes needed — we explicitly open device 0.
+## Device configuration
 
-Compute kernel config is set to HiFi4 (highest precision):
+All single-P150 experiments use device 0 only.
+Compute kernel config:
 
 ```python
 hifi4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     fp32_dest_acc_en=True,
-    math_approx_mode=False
+    math_approx_mode=False,
 )
 ```
 
-## Verifying Results
+This is HiFi4 + `fp32_dest_acc_en` on every matmul (the 91f recipe). Mixing
+fidelities corrupts ops silently on Blackhole.
 
-### Performance
+## Verifying results
 
-Decode speed should be within 10% of reported numbers, depending on:
-- System load and memory bandwidth availability
-- TT-NN version (kernel implementations may change)
-- Thermal throttling
-
-### Correctness
-
-Run `models/76b_8b_correctness_check.py` to verify:
-- Prefill cosine similarity vs numpy float32: expect >0.997
-- Token match over 8 greedy steps: expect 8/8
+- **Performance** — decode speed should be within 10 % of reported numbers
+  (system load, TT-NN version drift, thermal throttling).
+- **Correctness** — `models/76b_8b_correctness_check.py` expects prefill cosine
+  similarity vs numpy fp32 > 0.997 and 8 / 8 token match over 8 greedy steps.
 
 ## Troubleshooting
 
-**"Device not found"**: Ensure the Blackhole device is detected (`lspci | grep Tenstorrent`).
-
-**"Out of memory"**: 8B models need ~25 GB device DRAM. Ensure no other processes are using the device.
-
-**"Firmware version mismatch"**: Update TT firmware via `tt-smi -r 0` or follow TT-Metal docs.
-
-**Slow model download**: Models download from HuggingFace on first run. The 8B model is ~15 GB across 4 shards.
-
-## Re-verified on qb1 (2026-05-21)
-
-The original `tenstorrent` host is gone; the project now runs on two Blackhole
-hosts (qb1 + qb2, each with 4× P150). qb1 was used as the single-P150
-substrate for re-running all six legacy 8B-era demos against the current
-TT-NN install (firmware 19.6.0, KMD 2.8.0, TT-SMI 5.0.0, Python 3.10.12 in
-`~/tt-xla/.venv`).
-
-All six PASS, with numbers within 2-7% of the historical baselines. The
-persistent Qwen3.6-27B prod server was stopped for the run and restarted
-afterwards via `bash experiments/serve/scripts/serve.sh {stop,start}`.
-
-| Demo | Baseline | qb1 (2026-05-21) | Notes |
-|------|----------|------------------|-------|
-| `models/60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** | Qwen2.5-0.5B, native RoPE path |
-| `models/64_llama32_1b_port.py` | 78 tok/s | **78.6 tok/s** | "The capital of France is Paris" verbatim |
-| `models/67_llama32_3b_port.py` | 34 tok/s | **33.7 tok/s** | Unsloth shard mirror (meta-llama needs HF auth) |
-| `models/73_llama8b_instruct.py` | 19 tok/s | **19 tok/s** | All 5 prompts complete; mostly coherent |
-| `models/76b_8b_correctness_check.py` | cos > 0.997, 8/8 tokens | cos **0.997327**, **8/8** | Per-step cos 0.981-0.996; EOS at step 6 |
-| `models/80_8b_diverse_qa_demo.py` | 10 prompts, 18 tok/s | **18 tok/s, 9/10 EOS** | 403 tokens total; Code-gen prompt hit max-tokens |
-
-Logs are in `~/tt-xla/.cache/legacy_demos_2026_05_21/` on qb1.
-
-### Running on the new hosts
-
-The serve scripts (`experiments/serve/scripts/serve.sh`) own chips 0-3 on
-qb1 during normal operation. To rerun any of these legacy demos:
-
-```bash
-# On qb1, stop the prod server first (chip 0 is needed):
-bash ~/tt-xla/experiments/serve/scripts/serve.sh stop
-
-# Run a demo (uses device 0 only):
-cd ~/tt-xla && source .venv/bin/activate
-python3 experiments/64_llama32_1b_port.py
-
-# Restart the prod server (~11 min bootstrap):
-bash ~/tt-xla/experiments/serve/scripts/serve.sh start
-```
-
-The venv ships TT-NN as a pip-installed package (no `LD_LIBRARY_PATH` or
-`PYTHONPATH` manipulation needed). The only relevant exported env vars are
-`HF_HOME` and `TTNN_CACHE_DIR` (set in `~/.bashrc`).
-
-qb2 is an alternative single-chip substrate if qb1 is busy; same recipe but
-the server there is `server_tp.py` (4-chip TP) so chip 0 is also held — stop
-it via `serve_tp.sh stop` first if you need it.
-
-## Fresh-clone validated on qb2 (2026-05-22)
-
-End-to-end test of the "anyone can clone this repo and run it" path:
-`git clone https://github.com/aweditya/tt-model-bringup.git
-~/tt-model-bringup-fresh` on qb2, `uv sync`, `uv pip install -e
-$TT_METAL_HOME --no-build-isolation`, then ran the same 6 legacy demos +
-Demo A (single-chip 27B) + Demo B (4-chip TP 27B) + the qb1 MoE smoke as a
-parallel check.
-
-| Demo | qb1 baseline (2026-05-21) | qb2 fresh-clone (2026-05-22) | Notes |
-|------|----------------------------|------------------------------|-------|
-| `models/60_native_rope_decode.py` | 142.2 tok/s | **142.5 tok/s** | identical within run-to-run jitter |
-| `models/64_llama32_1b_port.py` | 78.6 tok/s | **78.4 tok/s** | |
-| `models/67_llama32_3b_port.py` | 33.7 tok/s | **34 tok/s** | |
-| `models/73_llama8b_instruct.py` | 19 tok/s | **19 tok/s** | |
-| `models/76b_8b_correctness_check.py` | cos 0.997327 | **cos 0.997327** | bit-identical |
-| `models/80_8b_diverse_qa_demo.py` | 18 tok/s | **16 tok/s (59% efficiency)** | within 2 tok/s; thermal/load variance |
-| Demo A — `server.py` + `client generate` | 5.14 tok/s (README) | 4.01 tok/s cold / 4.03 tok/s warm | first-run, fewer warm passes |
-| Demo B — `server_tp.py` + `client_tp generate_tp` | 12.98 tok/s (README) | **13.01 tok/s warm** | matched prod baseline 12.93 tok/s |
-| MoE smoke on qb1 (`decode_smoke_35b_ttnn.py`) | 480 ms/tok pre-trace (`feedback_b16_coherent_text_on_device.md`) | 522 ms/tok pre-trace, ` Paris` prediction + 24-tok coherent continuation | qb1 host since 35B weights cached there |
-
-Total wall: ~75 min of qb2 prod-downtime (legacy batch 23 min + Demo A
-bootstrap+smoke 14 min + Demo B bootstrap+smoke 13 min + prod
-cold-restart 17 min, plus tt-smi resets). Logs in
-`~/tt-model-bringup-fresh/.cache/sanity_2026_05_22/` on qb2 and
-`~/tt-xla/.cache/sanity_2026_05_22/` on qb1.
-
-### Fresh-clone bugs found and fixed
-
-- **`experiments/serve/protocol.py` + `experiments/serve/server_tp.py`
-  hardcoded PROJECT_ROOT to `~/tt-xla/`.** A fresh clone at any other path
-  wrote `server.sock` / `server.pid` / `server_tp.sock` to the legacy dir
-  while the client looked in the fresh dir → "No such file or directory".
-  Fixed by deriving PROJECT_ROOT from `__file__` (commit `b17d33e`). No
-  prod behavior change since `~/tt-xla/experiments/serve/...` still
-  resolves to `~/tt-xla/`.
-- **`serve.sh stop` / `serve_tp.sh stop` rely on a `.pid` file the python
-  server writes after bootstrap.** During the Demo A → Demo B transition,
-  this means `stop` may report "not running" before the server has
-  actually died. If you then start the next server, you race the TLB
-  cleanup of the prior one and crash with `tt_tlb_alloc failed -12`.
-  Recovery: `tt-smi -r 0,1,2,3`. Workaround until both bugs above are
-  cleaned up: SIGTERM by pgrep, wait, verify pgrep is empty, then start
-  the next server.
+- **Device not found** — confirm with `lspci | grep Tenstorrent`.
+- **Out of memory** — 8B models need ~25 GB device DRAM; no other processes on
+  the device.
+- **Firmware mismatch** — `tt-smi -r 0` or follow TT-Metal docs.
+- **Slow model download** — first run downloads weights from HuggingFace
+  (8B ~15 GB across 4 shards; 27B cold ~6 min on qb2).
+- **Server hangs / fabric wedged after a hard-kill** — `tt-smi -r 0,1,2,3` then
+  restart. Always prefer the script's `stop` over `kill -9`.

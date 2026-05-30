@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B Implementation Plan (MoE bringup on qb2 (1,4) P150)
 
 Date: 2026-05-19. Companion to `research/qwen36_30b_a3b_bringup_research.md`
-(architectural survey) and `research/owned_gdn_diagnosis_2026_05_18.md`
+(architectural survey) and `research/archive/owned_gdn_diagnosis_2026_05_18.md`
 (canonical gate-trail pattern). This is a *planning* document. No code runs
 here; the next agent picks this up and starts at the day-1 checklist at the
 bottom.
@@ -190,7 +190,7 @@ then design the owned kernel from a known-correct reference.
 ## 5. Staged validation gates (G0 → G5)
 
 Same gate ladder as owned_gdn / owned_decay_gate
-(`research/owned_gdn_diagnosis_2026_05_18.md`).
+(`research/archive/owned_gdn_diagnosis_2026_05_18.md`).
 
 | Gate | Scope | Artifact | Pass criterion |
 |---|---|---|---|
@@ -316,7 +316,7 @@ projection is 25-40 tok/s. Do not cite this as a measurement.
 
 ## 10. Day-1 checklist for the next agent picking this up
 
-1. **Re-read this doc end-to-end, plus `research/owned_gdn_diagnosis_2026_05_18.md`
+1. **Re-read this doc end-to-end, plus `research/archive/owned_gdn_diagnosis_2026_05_18.md`
    for the gate-trail pattern, plus `experiments/91w_qwen36_27b_dn_attn_numpy_oracle.py`
    (or whatever the current 27B numpy oracle file is) as the G0 template.**
 2. **Download Qwen3.6-35B-A3B weights to qb2** (`huggingface-cli download

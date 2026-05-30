@@ -1,16 +1,14 @@
 # tt-model-bringup
 
 Tenstorrent Blackhole LLM bringup for the Qwen3.6 family — direct TT-Metal
-model graphs plus custom owned_* compute kernels.
+model graphs plus custom `owned_*` compute kernels. Production paths:
+Qwen3.6-27B dense on (1, 4) P150 mesh; Qwen3.6-35B-A3B MoE in-progress
+(see [`HANDOFF.md`](HANDOFF.md)).
 
-> **Pivot note.** This repo was originally scoped as a JAX/XLA PJRT backend
-> (hence the legacy `tt-xla` directory name). The work pivoted to direct
-> TT-Metal model bringup + custom compute kernels for Qwen3.6 on Tenstorrent
-> Blackhole. The PJRT plugin sources under `archive/legacy/pjrt_plugin/` are
-> retained for reference but are not on the active path. Current production:
-> Qwen3.6-27B on qb2 4× P150 mesh @ 12.93 tok/s with custom `owned_gdn` and
-> `owned_decay_gate` kernels; Qwen3.6-35B-A3B MoE bringup is underway (see
-> `HANDOFF.md`).
+> The repo was originally scoped as a JAX/XLA PJRT backend (hence the legacy
+> `tt-xla` directory name). The pivoted work targets TT-Metal directly; the
+> PJRT plugin sources live in `archive/legacy/pjrt_plugin/` and are not on the
+> active path.
 
 GitHub: `aweditya/tt-model-bringup`.
 
@@ -40,18 +38,13 @@ to target the 4-chip box. `make dr PY=...` deploys then runs (the edit loop).
 
 ## Host matrix
 
-There are two reference hosts. Both have working inter-chip fabric and can run
-either demo; the split below is operational — keep qb2's TP server up as the
-"production" path and use qb1 for experimentation.
-
 | Host  | Hardware                | Inter-chip fabric    | Use it for                                |
 |-------|-------------------------|----------------------|-------------------------------------------|
 | `qb1` | 4× Blackhole P150       | **FABRIC_1D** ✓      | Experimental TP / CB / new kernels        |
 | `qb2` | 4× Blackhole P150       | **FABRIC_1D** ✓      | Production Demo B (single-seq TP serve)   |
 
-qb1's fabric works as of **2026-05-21**; both single-chip and multi-chip
-workloads run there. Earlier versions of this README claimed "no fabric on qb1"
-— stale; ignore.
+Both hosts can run either demo. Operational split: keep qb2's TP server up as
+the production path; use qb1 for experimentation.
 
 ---
 
@@ -60,31 +53,27 @@ workloads run there. Earlier versions of this README claimed "no fabric on qb1"
 ### 1. Build TT-Metal from source
 
 Follow [Tenstorrent's TT-Metal install guide](https://github.com/tenstorrent/tt-metal/blob/main/INSTALLING.md)
-for Blackhole. Once the build completes, export:
+for Blackhole. Export:
 
 ```bash
 export TT_METAL_HOME=$HOME/tenstorrent/tt-metal
-export TT_BUILD_DIR=$TT_METAL_HOME/build_Release   # or your build variant (e.g. build_tracy_gcc12_nodist)
+export TT_BUILD_DIR=$TT_METAL_HOME/build_Release   # or build_tracy_gcc12_nodist for profiler builds
 export ARCH_NAME=blackhole
 ```
 
-The exact `TT_BUILD_DIR` name depends on which CMake preset you ran
-(`./build_metal.sh` defaults to `build_Release` on Blackhole; profiler
-builds produce `build_tracy_gcc12_nodist`). Both qb1 and qb2 currently
-use `build_Release`.
+`build_metal.sh` defaults to `build_Release` on Blackhole; both qb1 and qb2 use
+`build_Release`.
 
-**tt-metal SHA pin**: this repo targets the tt-metal SHA in
-[`tt-metal-sha.txt`](tt-metal-sha.txt) (the build qb1 + qb2 run). The
-owned_ops integrate scripts (`experiments/owned_ops/*/integrate_into_ttmetal.py`)
-are layout-sensitive; on a mismatched tt-metal SHA, `scripts/build_owned_ops.sh`
-prints a loud warning and the patches may fail to apply. After checking out
-tt-metal, verify with `git -C $TT_METAL_HOME rev-parse HEAD`.
+**tt-metal SHA pin**: this repo targets the SHA in [`tt-metal-sha.txt`](tt-metal-sha.txt)
+(the build qb1 + qb2 run). The owned_ops integrate scripts
+(`experiments/owned_ops/*/integrate_into_ttmetal.py`) are layout-sensitive;
+`scripts/build_owned_ops.sh` warns loudly on a SHA mismatch.
 
 ### 2. Build owned_ops kernels
 
 The 27B serving path calls two custom TT-NN ops (`qwen36_gdn_decode_owned`,
 `qwen36_decay_gate_decode_owned`). Install them into your tt-metal checkout and
-rebuild `ttnn` with the orchestrator — **run it on the TT host**:
+rebuild `ttnn` with the orchestrator — run it on the TT host:
 
 ```bash
 scripts/build_owned_ops.sh            # install the 2 production ops + rebuild ttnn
@@ -102,66 +91,57 @@ that needs no rebuild) and each op's `INTEGRATION.md` for its validation gate.
 uv sync
 ```
 
-This reads `pyproject.toml` + `uv.lock` and provisions `.venv/` with the
-pinned versions of `torch`, `transformers`, `huggingface_hub`,
-`safetensors`, `numpy`, plus ttnn's pure-Python runtime deps (`loguru`,
-`pandas`, `seaborn`, `graphviz`, `pyyaml`, `click`, `networkx`,
-`ml_dtypes`) declared so `uv sync` doesn't strip them from the venv.
+Reads `pyproject.toml` + `uv.lock`, provisions `.venv/` with pinned versions of
+`torch`, `transformers`, `huggingface_hub`, `safetensors`, `numpy`, plus ttnn's
+pure-Python runtime deps (`loguru`, `pandas`, `seaborn`, `graphviz`, `pyyaml`,
+`click`, `networkx`, `ml_dtypes`).
 
-**You must then install `ttnn` (Tenstorrent's Python runtime) into the
-same venv** — `pyproject.toml` cannot pin it because it has no PyPI
-release. Use the wrapper script (does the editable install + copies the
-vendored `tracy` tooling into site-packages):
+Then install `ttnn` (Tenstorrent's Python runtime) into the same venv — it has
+no PyPI release. Use the wrapper script:
 
 ```bash
 make install-ttnn        # or: bash scripts/install_ttnn.sh
 ```
 
-`install_ttnn.sh` passes `--no-deps` so tt-metal's pyproject does NOT
-shadow the `torch` / `transformers` / `numpy` pins from `uv.lock`. It
-finishes by printing `ttnn.__file__` plus the two owned-op availability
-checks (`qwen36_gdn_decode_owned`, `qwen36_decay_gate_decode_owned`).
+`install_ttnn.sh` passes `--no-deps` so tt-metal's pyproject does NOT shadow
+the `torch` / `transformers` / `numpy` pins from `uv.lock`. It finishes by
+printing `ttnn.__file__` plus the two owned-op availability checks
+(`qwen36_gdn_decode_owned`, `qwen36_decay_gate_decode_owned`).
 
 Re-run `make install-ttnn` after any `uv sync` (which prunes unmanaged
 packages) or after rebuilding tt-metal.
 
-**Then sanity-check the whole setup before booting the server:**
+Sanity-check the whole setup before booting the server:
 
 ```bash
 make check        # or: bash scripts/check_setup.sh
 ```
 
-Verifies the venv, the tt-metal SHA pin, ttnn imports, the owned kernels
-are built in, `tt-smi` sees the devices, and `Qwen/Qwen3.6-27B` is
-reachable. No device is opened — safe to run anytime.
+Verifies the venv, the tt-metal SHA pin, ttnn imports, the owned kernels are
+built in, `tt-smi` sees the devices, and `Qwen/Qwen3.6-27B` is reachable.
+No device is opened — safe to run anytime.
 
-Verified 2026-05-21 on qb1: a fresh `uv sync` resolves to
-`torch==2.12.0+cu130` (qb1 prod runs `torch==2.11.0+cu130`); the prebuilt
-`ttnn==0.69.0` C extension imports cleanly against both — no torch ABI
-break across that minor bump.
+Verified torch ABI: a fresh `uv sync` resolves to `torch==2.12.0+cu130` while
+qb1 prod runs `torch==2.11.0+cu130`; the prebuilt `ttnn==0.69.0` C extension
+imports cleanly against both.
 
 ### 4. Configure HuggingFace access (HF_TOKEN)
 
-You need a HuggingFace token to download the Qwen3.6 weights — bootstrap
-dies in `AutoTokenizer.from_pretrained("Qwen/Qwen3.6-27B")` without it.
-qb1 and qb2 currently have **no token configured**, and the first cold
-download is rate-limited on the anonymous path.
+You need a HuggingFace token to download the Qwen3.6 weights — bootstrap dies
+in `AutoTokenizer.from_pretrained("Qwen/Qwen3.6-27B")` without it.
 
-You have two equivalent options. Pick one.
+Pick one of two options:
 
-**Option A — `hf auth login` (recommended).**
-The `hf` CLI ships as part of the `huggingface_hub` Python package, so
-it is installed automatically by `uv sync`. No extra install step is
-needed. (Note: `huggingface-cli` is the legacy name and is deprecated as
-of `huggingface_hub` ≥1.10 — `hf` is its drop-in replacement.)
+**Option A — `hf auth login` (recommended).** The `hf` CLI ships as part of
+`huggingface_hub` (installed by `uv sync`). `huggingface-cli` is the legacy
+name and is deprecated as of `huggingface_hub` ≥ 1.10.
 
 ```bash
 uv sync
 uv run hf auth login    # writes ~/.cache/huggingface/token
 ```
 
-`transformers` and `huggingface_hub` both auto-detect that token; no
-environment variable is required afterwards.
+`transformers` and `huggingface_hub` auto-detect that token; no env var needed.
 
 **Option B — `.env` file with `HF_TOKEN`.**
 
@@ -171,7 +151,7 @@ cp .env.example .env
 ```
 
 Then `source .env` (or use your shell's auto-loader) before running
-`serve.sh` / `serve_tp.sh`.
+`serve.sh` / `serve_tp.sh` / `serve_cb.sh`.
 
 ---
 
@@ -194,8 +174,8 @@ uv run python -m experiments.serve.client generate \
 bash experiments/serve/scripts/serve.sh stop
 ```
 
-Reference: `experiments/serve/scripts/serve.sh`,
-`experiments/serve/server.py`, `experiments/serve/client.py`.
+Reference: `experiments/serve/scripts/serve.sh`, `experiments/serve/server.py`,
+`experiments/serve/client.py`.
 
 ## Demo B — 4× P150 Tensor-Parallel on qb2
 
@@ -219,17 +199,17 @@ bash experiments/serve/scripts/serve_tp.sh stop
 Reference: `experiments/serve/scripts/serve_tp.sh`,
 `experiments/serve/server_tp.py`, `experiments/serve/client_tp.py`.
 
-Steady-state throughput on qb2 as of 2026-05-20: **12.93 tok/s** with
-`num_links=2` all_reduce + `owned_gdn` + `owned_decay_gate` kernels.
+Steady-state throughput on qb2: **12.93 tok/s** with `num_links=2` all_reduce +
+`owned_gdn` + `owned_decay_gate` kernels.
 
 ---
 
 ## Verified demos
 
-End-to-end client runs against the persistent servers on 2026-05-21,
-prompt `"The capital of France is"`, `--max-tokens 32`. Both demos
-generate the literal token `Paris` and continue coherently into a
-`<think>...</think>` block followed by a short factual answer.
+End-to-end client runs against the persistent servers, prompt
+`"The capital of France is"`, `--max-tokens 32`. Both demos generate the literal
+token `Paris` and continue coherently into a `<think>...</think>` block followed
+by a short factual answer.
 
 | Demo | Host | Prefill | Decode | Total wall |
 |------|------|---------|--------|------------|
@@ -260,21 +240,15 @@ Demo B first 32 generated tokens (qb2):
 That is correct. **Paris** is the capital and most populous city of France. It is located in the north-central part
 ```
 
-Demo B's measured 12.98 tok/s matches the 2026-05-20 steady-state
-12.93 tok/s within run-to-run variance. Demo A's 5.14 tok/s is consistent
-with the qb1 single-chip baseline (5.19 tok/s in the QK-rms_norm-shipped
-memory note). Both servers had been bootstrapped before measurement, so
-the numbers reflect steady-state traced decode (not cold-start).
-
 ### Legacy multi-model demos
 
 Smaller models brought up before the Qwen3.6 pivot (Llama 1B/3B/8B, SmolLM3,
-Qwen2.5/3-small), re-verified on qb1 2026-05-21 within 2-7% of baseline. Index:
-[`models/`](models/README.md); run recipes: `REPRODUCE.md` (stop the prod server
-first so device 0 is free).
+Qwen2.5/3-small), re-verified on qb1 within 2-7% of baseline. Index:
+[`models/`](models/README.md); run recipes: [`REPRODUCE.md`](REPRODUCE.md)
+(stop the prod server first so device 0 is free).
 
-| Script | Baseline | qb1 (2026-05-21) |
-|--------|----------|------------------|
+| Script | Baseline | qb1 |
+|--------|----------|------|
 | `models/60_native_rope_decode.py` | 140 tok/s | **142.2 tok/s** |
 | `models/64_llama32_1b_port.py`    |  78 tok/s | **78.6 tok/s**  |
 | `models/67_llama32_3b_port.py`    |  34 tok/s | **33.7 tok/s**  |
@@ -385,26 +359,24 @@ Kept as the frozen production reference; use `cb_api.py` for new work.
 
 ## Long context
 
-As of 2026-05-21, the qb2 4-chip TP path is validated at **L=4000** with
-**verbatim 8-char needle-haystack retrieval** at all needle positions
-(0.25/0.5/0.75 frac), using the B3 HiFi2 SDPA recipe. Sweep history:
-L=460 (6/6), L=1024 (6/6), L=1990 (6/6), L=4000 (3/3), L=8000 (in
-flight). Probe: `experiments/utils/needle_haystack_qb2_tp.py` (the
-predecessor qb1 single-chip probe lives in
-`experiments/utils/archive/needle_haystack_b3_probe.py`).
+The qb2 4-chip TP path is validated to **L=4000** with verbatim 8-char
+needle-haystack retrieval at all needle positions (0.25 / 0.5 / 0.75 frac),
+using the B3 HiFi2 SDPA recipe. Sweep coverage: L=460 / 1024 / 1990 / 4000.
+Probe: `experiments/utils/needle_haystack_qb2_tp.py` (the predecessor qb1
+single-chip probe lives in `experiments/utils/archive/needle_haystack_b3_probe.py`).
 
 ---
 
 ## Troubleshooting
 
-- **Server hangs or fabric is wedged after a hard-kill.** Reset the
-  devices and retry:
+- **Server hangs or fabric is wedged after a hard-kill.** Reset the devices
+  and retry:
   ```bash
   tt-smi -r 0,1,2,3
   bash experiments/serve/scripts/serve_tp.sh start
   ```
-  Always prefer `serve_tp.sh stop` (graceful socket shutdown) over
-  `kill -9` — hard-killing a mesh process can leave qb2 fabric wedged.
+  Always prefer `serve_tp.sh stop` (graceful socket shutdown) over `kill -9` —
+  hard-killing a mesh process can leave qb2 fabric wedged.
 - **`AutoTokenizer.from_pretrained` fails with 401.** No HF token. See
   "Configure HuggingFace access" above.
 - **`HF_HOME` fills up `$HOME`.** Override:
@@ -413,6 +385,6 @@ predecessor qb1 single-chip probe lives in
   ```
 - **First cold weight download is slow.** ~6 minutes on qb2 — the HuggingFace
   cold-cache hit, not a project bug.
-- **Legacy 8B-era notes (Llama-3.1-8B, Llama-3.2-1B/3B, Qwen2.5-0.5B).**
-  See `REPRODUCE.md`. Those experiments pre-date the Qwen3.6-27B pivot
-  and are kept for historical reference only.
+- **Legacy 8B-era notes (Llama-3.1-8B, Llama-3.2-1B/3B, Qwen2.5-0.5B).** See
+  [`REPRODUCE.md`](REPRODUCE.md). These experiments pre-date the Qwen3.6-27B
+  pivot and are kept for historical reference only.
