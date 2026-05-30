@@ -299,14 +299,12 @@ As of 2026-05-21, the qb2 4-chip TP path is validated at **L=4000** with
 L=460 (6/6), L=1024 (6/6), L=1990 (6/6), L=4000 (3/3), L=8000 (in
 flight). Probe: `experiments/utils/needle_haystack_qb2_tp.py` (the
 predecessor qb1 single-chip probe lives in
-`experiments/utils/needle_haystack_b3_probe.py`).
+`experiments/utils/archive/needle_haystack_b3_probe.py`).
 
 ---
 
 ## Troubleshooting
 
-- **`server_tp.sh start` hangs on qb1.** qb1 has no inter-chip fabric.
-  Use qb2 for any multi-chip workload.
 - **Server hangs or fabric is wedged after a hard-kill.** Reset the
   devices and retry:
   ```bash

@@ -16,9 +16,9 @@ python3 ~/tt-xla/experiments/owned_ops/qwen36_gdn_decode_owned/integrate_into_tt
 Build and refresh the source-package extensions:
 
 ```bash
-cmake --build ~/tenstorrent/tt-metal/build_tracy_gcc12_nodist --target ttnn -j8
-cp ~/tenstorrent/tt-metal/build_tracy_gcc12_nodist/ttnn/_ttnn.so ~/tenstorrent/tt-metal/ttnn/ttnn/_ttnn.so
-cp ~/tenstorrent/tt-metal/build_tracy_gcc12_nodist/ttnn/_ttnncpp.so ~/tenstorrent/tt-metal/ttnn/ttnn/_ttnncpp.so
+cmake --build ~/tenstorrent/tt-metal/build_Release --target ttnn -j8
+cp ~/tenstorrent/tt-metal/build_Release/ttnn/_ttnn.so ~/tenstorrent/tt-metal/ttnn/ttnn/_ttnn.so
+cp ~/tenstorrent/tt-metal/build_Release/ttnn/_ttnncpp.so ~/tenstorrent/tt-metal/ttnn/ttnn/_ttnncpp.so
 ```
 
 When validating against the rebuilt source tree on qb2, set:

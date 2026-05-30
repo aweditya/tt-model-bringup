@@ -70,14 +70,10 @@ def main():
     print(f"real vocab tile-aligned: {'OK' if VOCAB % 32 == 0 else 'NOT TILE-ALIGNED'} ({VOCAB} / 32 = {VOCAB // 32})")
 
     print("\n[1] Loading real Qwen3.6-27B lm_head weight from HF…")
-    # Use the same loader as 91l_fp32_residual_generate.py — returns pre-transposed [HIDDEN, VOCAB]
-    sys.path.insert(0, "/home/aditya/tt-xla/experiments")
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "_91l", "/home/aditya/tt-xla/experiments/91l_fp32_residual_generate.py")
-    _91l = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(_91l)
-    embed_weights = _91l.load_embed_lm_head_weights()
+    # `load_embed_lm_head_weights` was previously at experiments/91l_fp32_residual_generate.py;
+    # M3 renamed/moved it into experiments/serve/generate_27b.py (same function, same return shape).
+    from experiments.serve.generate_27b import load_embed_lm_head_weights
+    embed_weights = load_embed_lm_head_weights()
     W_np = embed_weights['lm_head']  # [HIDDEN, VOCAB_PADDED] fp32 (already transposed)
     assert W_np.shape == (HIDDEN, VOCAB_PADDED), f"unexpected lm_head shape {W_np.shape}"
     print(f"  ✓ lm_head shape: {W_np.shape}  range=[{W_np.min():.3f}, {W_np.max():.3f}]")
