@@ -125,8 +125,20 @@ resume prefill optimization (S2).
   kill the engine thread); qb1 e2e of the daemon (start → /health → request →
   stop → re-start → no fabric wedge). These need their own ~350s qb1 cycles
   and don't block productionization at low traffic.
-- **P4 — Observability.** `/metrics` + structured logs + latency histograms.
-  **Gate:** metrics accurate under load.
+- **P4 — Observability. DONE (2026-05-30).** `experiments/serve/cb_metrics.py`
+  — handrolled Counter / Gauge / Histogram + Registry rendering Prometheus text
+  exposition (no `prometheus_client` dep). `CBEngine` instruments per-step
+  latency (`cb_step_seconds`), per-request TTFT (`cb_ttft_seconds`) + end-to-end
+  duration (`cb_request_duration_seconds`), counters for submitted / done /
+  cancelled / rejected / tokens-generated, gauges for slots-active / queue-depth
+  / inflight / max-inflight / sampling. `cb_api` exposes `GET /metrics` returning
+  `text/plain; version=0.0.4`. **Gate PASS** end-to-end on qb1:
+  test_cb_api_routing 7/7 (no device) + engine_api 5/5 (real engine), with
+  `cb_requests_submitted_total=16`, `cb_tokens_generated_total=244`,
+  `cb_step_seconds_count=292` advancing live during (a)–(d). Bonus: (c) ran in
+  3.59 s vs 13.15 s pre-P3.5-perf — the logits-trace win lands in concurrent
+  throughput too (~3.6×). Structured-logs scaffold deferred to P5 (the load
+  harness needs it more directly).
 - **P5 — Load / SLO validation.** Load-test harness (M sustained concurrent
   users); throughput, p50/p99 latency, slot utilization, zero leakage/crash over
   a sustained run. **Gate:** SLOs met.

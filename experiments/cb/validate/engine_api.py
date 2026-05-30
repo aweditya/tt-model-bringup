@@ -75,6 +75,29 @@ def _get(path: str) -> tuple[int, dict]:
     return resp.status, (json.loads(raw) if raw else {})
 
 
+def _get_text(path: str) -> tuple[int, str]:
+    conn = http.client.HTTPConnection(HOST, PORT, timeout=5.0)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    raw = resp.read().decode("utf-8")
+    conn.close()
+    return resp.status, raw
+
+
+def _metric_value(body: str, name: str) -> float:
+    """Extract a metric value by name from Prometheus text exposition."""
+    for line in body.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split()
+        if parts and parts[0] == name and len(parts) >= 2:
+            try:
+                return float(parts[1])
+            except ValueError:
+                continue
+    return 0.0
+
+
 def _stream(path: str, body: dict, partial_max: int | None = None) -> list[dict]:
     """POST and parse SSE `data:` events line-by-line. If partial_max is set,
     close after that many events (used to test cancel-on-disconnect)."""
@@ -258,9 +281,29 @@ def _run_tests(engine, server, server_thread):
     log(f"  post-cancel request: status={status2} matches (a): {content2 == text_a}")
     log(f"  (d) {'OK' if d_ok else 'FAIL'}")
 
-    ok = a_ok and b_ok and c_ok and d_ok
+    # (e) /metrics — Prometheus text exposition with real counters/histograms
+    # advanced by the tests above (P4 + audit-P0#4 bootstrap regression smoke).
+    log("--- (e) /metrics shape + non-zero counters ---")
+    status_m, body_m = _get_text("/metrics")
+    has_shape = all(s in body_m for s in (
+        "# TYPE cb_requests_submitted_total counter",
+        "# TYPE cb_step_seconds histogram",
+        "# TYPE cb_engine_slots_total gauge",
+        'cb_step_seconds_bucket{le="+Inf"}',
+        "cb_step_seconds_count",
+    ))
+    # at least N tokens generated + N submits across (a)(b)(c)(d).
+    submitted = _metric_value(body_m, "cb_requests_submitted_total")
+    tokens = _metric_value(body_m, "cb_tokens_generated_total")
+    step_count = _metric_value(body_m, "cb_step_seconds_count")
+    e_ok = status_m == 200 and has_shape and submitted >= 10 and tokens >= 50 and step_count >= 10
+    log(f"  status={status_m} submitted={submitted} tokens={tokens} step_count={step_count}")
+    log(f"  (e) {'OK' if e_ok else 'FAIL'}")
+
+    ok = a_ok and b_ok and c_ok and d_ok and e_ok
     log(f"\n=== verdict: {'PASS' if ok else 'FAIL'} ===")
-    log(f"  (a) non-stream={a_ok}  (b) SSE-stream={b_ok}  (c) concurrent={c_ok}  (d) cancel={d_ok}")
+    log(f"  (a) non-stream={a_ok}  (b) SSE-stream={b_ok}  (c) concurrent={c_ok}  "
+        f"(d) cancel={d_ok}  (e) metrics={e_ok}")
     if not ok:
         raise SystemExit(1)
 

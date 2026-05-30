@@ -43,6 +43,12 @@ class _FakeEngine:
         self.slots = 4
         self.sampling = True
         self._rid = 0
+        # mimic the real engine's `metrics` registry so /metrics is exercised.
+        from cb_metrics import Registry
+        self.metrics = Registry()
+        self.metrics.counter("cb_requests_submitted_total", "fake")
+        self.metrics.gauge("cb_engine_slots_total", "fake", fn=lambda: self.slots)
+        self.metrics.histogram("cb_step_seconds", "fake")
 
     def submit(self, prompt_ids, max_new=None, sampling=None):
         self._rid += 1
@@ -134,7 +140,23 @@ def main():
     print(f"backpressure: {r.status_code} {r.text[:120]}")
     assert r.status_code == 429, f"backpressure: expected 429, got {r.status_code} {r.text}"
 
-    print("test_cb_api_routing: 6/6 PASS")
+    # 7. /metrics renders Prometheus text exposition; check required shape.
+    # Restore a working engine so /metrics 200s.
+    state["engine"] = _FakeEngine()
+    r = c.get("/metrics")
+    assert r.status_code == 200, f"/metrics: {r.status_code} {r.text}"
+    assert r.headers.get("content-type", "").startswith("text/plain"), r.headers
+    body = r.text
+    for needle in ("# HELP cb_requests_submitted_total",
+                   "# TYPE cb_requests_submitted_total counter",
+                   "# TYPE cb_engine_slots_total gauge",
+                   "# TYPE cb_step_seconds histogram",
+                   "cb_step_seconds_bucket{le=\"+Inf\"}",
+                   "cb_step_seconds_count"):
+        assert needle in body, f"/metrics missing {needle!r}\n--- body ---\n{body}"
+    print(f"metrics: {len(body.splitlines())} lines OK")
+
+    print("test_cb_api_routing: 7/7 PASS")
 
 
 if __name__ == "__main__":

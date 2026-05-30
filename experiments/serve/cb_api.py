@@ -70,7 +70,7 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None):
     access. The caller MUST populate `state["engine"]`, `state["tok"]`,
     `state["eos_id"]` before requests are served."""
     from fastapi import FastAPI
-    from fastapi.responses import JSONResponse, StreamingResponse
+    from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
     app = FastAPI(title="tt-model-bringup CB OpenAI API", lifespan=lifespan)
 
@@ -81,6 +81,17 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None):
             return JSONResponse(status_code=503, content={"ok": False, "ready": False})
         return {"ok": True, "ready": True, "model": model_id,
                 "slots": eng.slots, "sampling": eng.sampling}
+
+    @app.get("/metrics")
+    def metrics():
+        """Prometheus text exposition (text/plain; version=0.0.4). Engine-owned
+        registry; gauges sampled at scrape time."""
+        eng = state.get("engine")
+        if eng is None:
+            return PlainTextResponse("# engine not ready\n", status_code=503,
+                                     media_type="text/plain; version=0.0.4")
+        return PlainTextResponse(eng.metrics.format_prometheus(),
+                                 media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
     def models():

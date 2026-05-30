@@ -29,6 +29,7 @@ from pathlib import Path
 PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
 sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 
+from cb_metrics import Registry  # noqa: E402
 from cb_scheduler import Scheduler  # noqa: E402
 
 
@@ -79,7 +80,7 @@ class CBEngine:
         )
         self.idle_sleep = idle_sleep
 
-        self._inbound = queue.Queue()      # (ext_rid, prompt, max_new, out_q)
+        self._inbound = queue.Queue()      # (ext_rid, prompt, max_new, sampling, submit_time, out_q)
         self._cancel_q = queue.Queue()     # ext_rid
         self._idlock = threading.Lock()
         self._next_id = 0
@@ -90,8 +91,48 @@ class CBEngine:
         self._sched = None
 
         # engine-thread-only:
-        self._meta = {}            # sched_rid -> {ext, q, max_new, sent}
+        self._meta = {}            # sched_rid -> {ext, q, max_new, sent, submit_time, first_tok_time}
         self._ext_to_sched = {}    # ext_rid -> sched_rid
+
+        # ---- P4 metrics (Prometheus text format via /metrics) ----
+        self.metrics = Registry()
+        M = self.metrics
+        self.m_submitted = M.counter("cb_requests_submitted_total",
+                                      "Requests accepted onto the engine queue.")
+        self.m_done = M.counter("cb_requests_done_total",
+                                 "Requests that completed (eos/max_new).")
+        self.m_cancelled = M.counter("cb_requests_cancelled_total",
+                                      "Requests cancelled (client disconnect or per-req cap).")
+        self.m_rejected = M.counter("cb_requests_rejected_total",
+                                     "Requests rejected by backpressure (max_inflight reached).")
+        self.m_tokens = M.counter("cb_tokens_generated_total",
+                                   "Tokens emitted to client streams.")
+        self.m_step_seconds = M.histogram("cb_step_seconds",
+                                           "Wall time of one scheduler step (one batched forward).")
+        self.m_ttft_seconds = M.histogram("cb_ttft_seconds",
+                                           "Time-to-first-token from submit() to first stream emit.")
+        self.m_request_seconds = M.histogram("cb_request_duration_seconds",
+                                              "End-to-end request wall time (submit() to done/cancel).")
+        M.gauge("cb_engine_slots_total", "Configured CB scheduler slots.",
+                fn=lambda: self.slots)
+        M.gauge("cb_engine_slots_active",
+                "Slots currently holding an in-flight request.",
+                fn=lambda: 0 if self._sched is None
+                else sum(1 for s in self._sched.slots if s is not None))
+        M.gauge("cb_engine_queue_depth",
+                "Inbound + waiting depth (admitted/queued, not yet active).",
+                fn=lambda: self._inbound.qsize() + (
+                    0 if self._sched is None else len(self._sched.waiting)))
+        M.gauge("cb_engine_inflight",
+                "Total in-flight (queued + active); compare to cb_engine_max_inflight.",
+                fn=lambda: self._inbound.qsize() + (
+                    0 if self._sched is None else (len(self._sched.waiting) + len(self._meta))))
+        M.gauge("cb_engine_max_inflight",
+                "Backpressure cap; 0 = unlimited.",
+                fn=lambda: self.max_inflight or 0)
+        M.gauge("cb_engine_sampling",
+                "1 if engine is in sampling mode (eager/logits-trace), else 0.",
+                fn=lambda: 1.0 if self.sampling else 0.0)
 
     # ---- public API (any thread) ----
     def start(self):
@@ -115,13 +156,15 @@ class CBEngine:
             if sampling.get("temperature", 0.0) <= 0.0:
                 sampling = None  # greedy
         if self._inflight_sem is not None and not self._inflight_sem.acquire(blocking=False):
+            self.m_rejected.inc()
             raise queue.Full(f"engine in-flight cap reached (max_inflight={self.max_inflight})")
         mn = self.max_new_cap if max_new is None else min(int(max_new), self.max_new_cap)
         with self._idlock:
             rid = self._next_id
             self._next_id += 1
         q = queue.Queue()
-        self._inbound.put((rid, [int(t) for t in prompt_ids], mn, sampling, q))
+        self._inbound.put((rid, [int(t) for t in prompt_ids], mn, sampling, time.time(), q))
+        self.m_submitted.inc()
         return RequestHandle(rid, q, len(prompt_ids))
 
     def cancel(self, rid):
@@ -159,7 +202,9 @@ class CBEngine:
             if self._stop.is_set() and not have_work and self._inbound.empty():
                 break
             if have_work:
+                t0 = time.perf_counter()
                 sched.step()
+                self.m_step_seconds.observe(time.perf_counter() - t0)
                 self._stream()
             else:
                 time.sleep(self.idle_sleep)
@@ -167,11 +212,12 @@ class CBEngine:
     def _drain_inbound(self):
         while True:
             try:
-                ext, prompt, mn, sampling, q = self._inbound.get_nowait()
+                ext, prompt, mn, sampling, submit_t, q = self._inbound.get_nowait()
             except queue.Empty:
                 return
             sched_rid = self._sched.submit(prompt, sampling=sampling)
-            self._meta[sched_rid] = {"ext": ext, "q": q, "max_new": mn, "sent": 0}
+            self._meta[sched_rid] = {"ext": ext, "q": q, "max_new": mn, "sent": 0,
+                                      "submit_time": submit_t, "first_tok_time": None}
             self._ext_to_sched[ext] = sched_rid
 
     def _drain_cancels(self):
@@ -187,22 +233,31 @@ class CBEngine:
             m = self._meta.pop(sched_rid)
             self._ext_to_sched.pop(ext, None)
             m["q"].put(("cancelled", None))
+            self.m_cancelled.inc()
+            self.m_request_seconds.observe(time.time() - m["submit_time"])
             if self._inflight_sem is not None:
                 self._inflight_sem.release()
 
     def _stream(self):
         sched = self._sched
+        now = time.time()
         for sched_rid in list(self._meta.keys()):
             m = self._meta[sched_rid]
             r = sched.reqs[sched_rid]
             gen = r["gen"]
             while m["sent"] < len(gen) and m["sent"] < m["max_new"]:
+                if m["sent"] == 0:
+                    m["first_tok_time"] = now
+                    self.m_ttft_seconds.observe(now - m["submit_time"])
                 m["q"].put(("tok", gen[m["sent"]]))
                 m["sent"] += 1
+                self.m_tokens.inc()
             if r["status"] == "DONE" or m["sent"] >= m["max_new"]:
                 if r["status"] != "DONE":   # per-request cap before global cap
                     sched.cancel(sched_rid)
                 m["q"].put(("done", None))
+                self.m_done.inc()
+                self.m_request_seconds.observe(now - m["submit_time"])
                 self._meta.pop(sched_rid, None)
                 self._ext_to_sched.pop(m["ext"], None)
                 if self._inflight_sem is not None:
