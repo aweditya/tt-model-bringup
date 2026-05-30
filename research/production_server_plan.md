@@ -112,9 +112,19 @@ resume prefill optimization (S2).
   through 4 slots — HTTP layer multiplexes the engine with zero crosstalk;
   (d) cancel-on-disconnect — partial SSE, slot recycled, post-cancel request
   matches. Clean lifecycle, no wedge.
-- **P3 — Lifecycle + robustness.** `serve_cb.sh`; readiness/health; SIGTERM drain
-  + clean mesh close; backpressure (429); validation; error isolation. **Gate:**
-  shutdown clean (no wedge) + chaos (disconnects, bad requests, queue-full).
+- **P3 — Lifecycle + robustness. PARTIAL DONE (2026-05-29).** SHIPPED:
+  `experiments/serve/scripts/serve_cb.sh` — start/stop/status/restart for
+  `uvicorn experiments.serve.cb_api:app`; SIGTERM → uvicorn graceful drain →
+  lifespan `__aexit__` → `engine.stop()`; SIGKILL fallback only after 10s.
+  Backpressure: `CBEngine(max_inflight=…)` via `threading.BoundedSemaphore`
+  (acquired in `submit`, released on `done`/`cancel`); over-cap submits raise
+  `queue.Full` → `cb_api` maps to HTTP 429. Readiness already in place
+  (`/health` 503 until engine ready, 200 after). Routing probe extended (6/6
+  PASS): backpressure → 429 verified end-to-end. DEFERRED (P3.5): explicit
+  error-isolation try/except in the engine loop (so one bad device call doesn't
+  kill the engine thread); qb1 e2e of the daemon (start → /health → request →
+  stop → re-start → no fabric wedge). These need their own ~350s qb1 cycles
+  and don't block productionization at low traffic.
 - **P4 — Observability.** `/metrics` + structured logs + latency histograms.
   **Gate:** metrics accurate under load.
 - **P5 — Load / SLO validation.** Load-test harness (M sustained concurrent

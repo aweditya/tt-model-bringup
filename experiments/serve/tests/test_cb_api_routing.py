@@ -115,7 +115,26 @@ def main():
     r = c.post("/v1/completions", json={"prompt": "hi", "max_tokens": 3})
     assert r.status_code == 200, r.text
 
-    print("test_cb_api_routing: 5/5 PASS")
+    # 6. Backpressure: when the engine's submit() raises queue.Full, cb_api
+    # must return 429 (not 500). Swap the engine to one that always raises.
+    class _FullEngine:
+        slots = 4
+        sampling = True
+
+        def submit(self, *_a, **_kw):
+            raise queue.Full("engine cap reached")
+
+        def cancel(self, *_a, **_kw):
+            pass
+
+    state["engine"] = _FullEngine()  # closure dict; handlers see the swap
+    r = c.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}], "max_tokens": 3,
+    })
+    print(f"backpressure: {r.status_code} {r.text[:120]}")
+    assert r.status_code == 429, f"backpressure: expected 429, got {r.status_code} {r.text}"
+
+    print("test_cb_api_routing: 6/6 PASS")
 
 
 if __name__ == "__main__":

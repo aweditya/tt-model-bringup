@@ -62,7 +62,7 @@ class CBEngine:
     """Thread-safe front end to the CB scheduler. One owned thread runs the loop."""
 
     def __init__(self, state, slots, max_new_cap, eos_id, use_trace=True,
-                 sampling=False, idle_sleep=0.001):
+                 sampling=False, max_inflight=None, idle_sleep=0.001):
         self.state = state
         self.slots = slots
         self.max_new_cap = int(max_new_cap)
@@ -71,6 +71,12 @@ class CBEngine:
         # sampling=True → eager per-slot temp/top-p/top-k (the chat-API mode);
         # sampling=False → greedy argmax trace (P0 fast path). See Scheduler.
         self.sampling = sampling
+        # Backpressure: cap on total in-flight requests (queued+active). When at
+        # cap, submit() raises queue.Full → API maps to HTTP 429. Default unlimited.
+        self.max_inflight = max_inflight
+        self._inflight_sem = (
+            threading.BoundedSemaphore(max_inflight) if max_inflight else None
+        )
         self.idle_sleep = idle_sleep
 
         self._inbound = queue.Queue()      # (ext_rid, prompt, max_new, out_q)
@@ -99,7 +105,8 @@ class CBEngine:
     def submit(self, prompt_ids, max_new=None, sampling=None):
         """sampling: None → greedy; else {temperature, top_p, top_k, seed}.
         temperature<=0 is normalised to greedy. Requires the engine to have been
-        built with sampling=True."""
+        built with sampling=True. Raises queue.Full if over max_inflight; the API
+        layer maps that to HTTP 429."""
         if self._stop.is_set():
             raise RuntimeError("engine is stopping; not accepting new requests")
         if sampling is not None:
@@ -107,6 +114,8 @@ class CBEngine:
                 raise RuntimeError("engine was not built with sampling=True")
             if sampling.get("temperature", 0.0) <= 0.0:
                 sampling = None  # greedy
+        if self._inflight_sem is not None and not self._inflight_sem.acquire(blocking=False):
+            raise queue.Full(f"engine in-flight cap reached (max_inflight={self.max_inflight})")
         mn = self.max_new_cap if max_new is None else min(int(max_new), self.max_new_cap)
         with self._idlock:
             rid = self._next_id
@@ -178,6 +187,8 @@ class CBEngine:
             m = self._meta.pop(sched_rid)
             self._ext_to_sched.pop(ext, None)
             m["q"].put(("cancelled", None))
+            if self._inflight_sem is not None:
+                self._inflight_sem.release()
 
     def _stream(self):
         sched = self._sched
@@ -194,3 +205,5 @@ class CBEngine:
                 m["q"].put(("done", None))
                 self._meta.pop(sched_rid, None)
                 self._ext_to_sched.pop(m["ext"], None)
+                if self._inflight_sem is not None:
+                    self._inflight_sem.release()

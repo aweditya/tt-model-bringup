@@ -137,6 +137,8 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None):
 
         try:
             handle = eng.submit(prompt_ids, max_new=max_tokens, sampling=sampling)
+        except queue.Full as e:
+            return JSONResponse(status_code=429, content={"error": str(e)})
         except RuntimeError as e:
             return JSONResponse(status_code=503, content={"error": str(e)})
         cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
