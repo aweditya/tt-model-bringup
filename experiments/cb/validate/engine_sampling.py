@@ -86,7 +86,7 @@ def main():
 
     eng = CBEngine(state, slots=4, max_new_cap=256, eos_id=eos_id, sampling=True)
     eng.start()
-    log("=== engine up: 4 slots, SAMPLING mode (eager logits) ===")
+    log("=== engine up: 4 slots, SAMPLING mode (logits trace) ===")
 
     # (A) greedy through the sampling engine == device-argmax ref
     log("--- (A) greedy via sampling engine == device-argmax ref ---")
@@ -128,7 +128,7 @@ def main():
     # eager cost note: 4 slots × NEW tok in dt → per-(active-step) wall time
     steps = max(NEW + max(len(p) for p in pid), 1)
     log(f"  [cost] mixed batch (B≤4): {sum(len(x) for x in o)} tok / {dt:.2f}s "
-        f"≈ {dt / steps * 1000:.0f} ms/eager-step (incl. [B,vocab] readback)")
+        f"≈ {dt / steps * 1000:.0f} ms/step (incl. [B,vocab] readback + host sample)")
 
     eng.stop()
     log("=== engine stopped cleanly ===")

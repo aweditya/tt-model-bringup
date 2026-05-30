@@ -91,16 +91,22 @@ class Scheduler:
         self.max_new = max_new
         self.eos_id = eos_id
         self.use_trace = use_trace
-        # sampling mode runs the eager logits forward every step (per-slot host
-        # temp/top-p/top-k) — no trace (mixing eager forwards with execute_trace
-        # is unsafe, and greedy stays the traced argmax fast path when
-        # sampling=False). See research/production_server_plan.md P1.
+        # sampling mode: per-slot host temp/top-p/top-k each step.
+        #   sampling=False, use_trace=True  → argmax trace (P0 fast path).
+        #   sampling=True,  use_trace=True  → logits trace (same forward, stops
+        #     one op earlier; greedy slots take host argmax, sampled slots
+        #     sample on the host). ~3× faster than the eager-logits fallback.
+        #   sampling=True,  use_trace=False → eager logits forward each step
+        #     (slow; kept for non-traced testing).
+        # The two trace modes never coexist (one engine = one mode), so there's
+        # no "mixing eager forwards with execute_trace" hazard either way.
         self.sampling = sampling
         self._trace_id = None
         self._argmax_handle = None
+        self._logits_handle = None
         cb.setup_cb_state(state, B)
         cb.cb_reset_states(state)
-        if use_trace and not sampling:
+        if use_trace:
             self._capture_trace()
         self.slots = [None] * B          # slot -> request id or None
         self.waiting = deque()           # request ids
@@ -111,17 +117,24 @@ class Scheduler:
         """Capture the batched forward once (CB4 pattern). step() then replays
         via execute_trace at ~compute speed. Admission (cb_reset_slots) and
         update_input_buffers run eager BETWEEN execute_trace calls — they mutate
-        the persistent buffers in-place, which the next replay reads."""
+        the persistent buffers in-place, which the next replay reads. In sampling
+        mode the trace returns logits [B,vocab] instead of argmax [B,1]; the
+        per-slot host argmax/sample loop in _step_sampled reads that handle."""
         import ttnn
         st = self.state
         for i in range(2):  # JIT warmup (capture-during-JIT hangs on Blackhole)
             cb.update_input_buffers_batched(st, [DUMMY_TOK] * self.B, [i] * self.B)
-            am = cb.forward_batch_tp_inner(st); ttnn.deallocate(am)
+            out = cb.forward_batch_tp_inner(st, return_logits=self.sampling)
+            ttnn.deallocate(out)
         ttnn.synchronize_device(st.mesh)
         cb.update_input_buffers_batched(st, [DUMMY_TOK] * self.B, [2] * self.B)
         self._trace_id = ttnn.begin_trace_capture(st.mesh, cq_id=0)
-        self._argmax_handle = cb.forward_batch_tp_inner(st)
+        handle = cb.forward_batch_tp_inner(st, return_logits=self.sampling)
         ttnn.end_trace_capture(st.mesh, self._trace_id, cq_id=0)
+        if self.sampling:
+            self._logits_handle = handle
+        else:
+            self._argmax_handle = handle
         cb.cb_reset_states(st)  # clean slate after warmup dirtied the state
 
     def release(self):
@@ -225,14 +238,20 @@ class Scheduler:
         return active
 
     def _step_sampled(self, toks, curs):
-        """Eager logits forward + per-slot host sampling. Greedy slots (sampling
-        is None) take the host argmax — identical token to the device argmax,
-        same logits. Sampled slots use their own seeded rng."""
+        """Logits forward + per-slot host sampling. Greedy slots (sampling is
+        None) take the host argmax — identical token to the device argmax, same
+        logits. Sampled slots use their own seeded rng. When use_trace, replays
+        the captured logits trace (~3× faster than eager); otherwise eager."""
         import ttnn
         cb.update_input_buffers_batched(self.state, toks, curs)
-        rm = cb.forward_batch_tp_inner(self.state, return_logits=True)  # [B, vocab] replicated
+        if self.use_trace:
+            ttnn.execute_trace(self.state.mesh, self._trace_id, cq_id=0, blocking=False)
+            rm = self._logits_handle  # persistent trace handle — do NOT deallocate
+        else:
+            rm = cb.forward_batch_tp_inner(self.state, return_logits=True)
         t = ttnn.to_torch(rm, mesh_composer=ttnn.ConcatMeshToTensor(self.state.mesh, dim=0))
-        ttnn.deallocate(rm)
+        if not self.use_trace:
+            ttnn.deallocate(rm)
         logits = t[:self.B].float().numpy()
         out = [DUMMY_TOK] * self.B
         for s in range(self.B):

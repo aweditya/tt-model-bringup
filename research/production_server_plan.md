@@ -133,6 +133,19 @@ resume prefill optimization (S2).
 - **P6 — Deploy + docs.** README/CONTRIBUTING run guide, config, OpenAI client
   examples; the production server is the documented serving path.
 
+- **P3.5-perf — Logits trace for sampling mode. DONE (2026-05-30).** Captures a
+  single logits-returning trace when `sampling=True and use_trace=True`
+  (replaces the per-step eager forward). Same forward graph as the P0 argmax
+  trace, just stops one op earlier (`return_logits=True` was already plumbed
+  through `forward_batch_tp_inner`). Per-slot host argmax/sample loop unchanged.
+  The two trace modes never coexist (one engine = one mode), so there's no
+  eager-vs-trace interleave hazard. **Gate PASS** (re-ran
+  `engine_sampling.py`): (A) greedy-via-sampling-engine == device-argmax ref
+  exactly, (B) mixed batch (seeds differ + coherent), (C) determinism. **2.54×
+  faster** measured: `64 tok / 2.99s ≈ 125 ms/step` (P1 eager was 318 ms/step);
+  the remaining ~19 ms over P0's traced argmax (106 ms/step) is the [B,vocab]
+  readback + host sample, exactly as predicted.
+
 **Then:** resume **prefill optimization (S2)** — chunked prefill into CB slots for
 TTFT under load (multi-query paged SDPA + shiftacc conv; see
 `27b_chunked_prefill_plan.md`).
