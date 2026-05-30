@@ -23,9 +23,14 @@ On a host with Tenstorrent P150s and a tt-metal build (see [Setup](#setup)):
 ```bash
 git clone https://github.com/aweditya/tt-model-bringup.git ~/tt-xla && cd ~/tt-xla
 make setup                              # uv sync — Python deps into .venv
-# (one-time: build tt-metal + owned_ops kernels + set HF_TOKEN — see Setup)
-make run PY=experiments/cb/validate/forward.py   # run a script on the TT host
+make install-ttnn                       # editable ttnn from $TT_METAL_HOME
+make check                              # sanity-check the setup (no device open)
+make kernels                            # build the owned_ops custom kernels
+bash experiments/serve/scripts/serve_cb.sh start    # boot the chat server (~6 min)
 ```
+
+Then talk to it: `curl http://localhost:8000/v1/chat/completions ...`
+(see [Chat server](#chat-server-production) for full examples + OpenAI client).
 
 `make help` lists targets. Device runs go through `scripts/run_remote.sh`
 (the single source of truth for the ttnn env + mesh reset); set `TT_HOST=qb2`
@@ -279,24 +284,102 @@ first so device 0 is free).
 
 ---
 
-## OpenAI-compatible endpoint
+## Chat server (production)
 
-A host-side HTTP proxy (`experiments/serve/openai_endpoint.py`) exposes
-`/v1/chat/completions` + `/v1/completions` over the persistent TP server (greedy
-by default; `temperature`/`top_p`/`top_k` use the server's sampler). On the TT host:
+`experiments/serve/cb_api.py` is the production chat server: an
+OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/completions`,
+`/v1/models`, `/health`, `/metrics`) running in the **same process** as a
+continuous-batching engine (`experiments/serve/cb_engine.py`) over the
+validated Orca scheduler (CB1–CB4) and the logits-traced sampling-mode
+forward (~125 ms/step at B≤4 on qb1). Multi-client by design — concurrent
+requests share the engine's slots and are sampled per-request with their own
+`temperature` / `top_p` / `top_k` / `seed`. Slot is freed automatically on
+client disconnect (Starlette cancellation → `engine.cancel(rid)`).
+
+### Run it
+
+On the TT host (qb1 or qb2), after `make setup && make install-ttnn && make check`:
 
 ```bash
-bash experiments/serve/scripts/serve_tp.sh start      # the model server (~17 min bootstrap)
-uv sync --extra serve                                 # fastapi + uvicorn
-uv run --extra serve uvicorn experiments.serve.openai_endpoint:app --host 0.0.0.0 --port 8000
-# then, e.g.:
-curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"capital of France?"}],"temperature":0.7,"stream":true}'
+bash experiments/serve/scripts/serve_cb.sh start          # nohup uvicorn, logs in .cache/server_cb.log
+# bootstrap ~6 min; /health returns 503 until the engine is up
+bash experiments/serve/scripts/serve_cb.sh status         # shows /health code
+bash experiments/serve/scripts/serve_cb.sh stop           # SIGTERM → graceful drain → mesh release
 ```
 
-It applies the model's chat template to `messages`, forwards `generate_tp` over the
-Unix socket, and streams OpenAI SSE (or returns one JSON for `stream:false`). The
-translation helpers are unit-tested (`experiments/serve/tests/test_openai_endpoint.py`).
+Knobs (env): `TT_CB_PORT=8000`, `TT_CB_SLOTS=4`, `TT_CB_MAX_NEW=1024`,
+`TT_CB_MAX_INFLIGHT=64` (over-cap requests get HTTP 429).
+
+### Talk to it
+
+```bash
+# non-stream
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hi! What can you do?"}],"max_tokens":200}'
+
+# streaming SSE
+curl -N http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Write a haiku about silicon."}],"max_tokens":100,"stream":true}'
+
+# sampled (temperature>0 → per-request rng; pass seed for reproducibility)
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Pick a random fruit."}],"max_tokens":50,"temperature":0.8,"top_p":0.95,"seed":7}'
+```
+
+From the OpenAI Python client:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+r = client.chat.completions.create(
+    model="Qwen/Qwen3.6-27B",
+    messages=[{"role": "user", "content": "Hi! What can you do?"}],
+    max_tokens=300,
+)
+print(r.choices[0].message.content)
+```
+
+### Observability
+
+`GET /metrics` returns Prometheus text exposition: counters
+(`cb_requests_{submitted,done,cancelled,rejected}_total`,
+`cb_tokens_generated_total`), histograms (`cb_step_seconds`,
+`cb_ttft_seconds`, `cb_request_duration_seconds`), gauges
+(`cb_engine_{slots_total,slots_active,queue_depth,inflight,max_inflight,sampling}`).
+Scrape with any Prometheus-compatible tool; gauge values are sampled at scrape
+time.
+
+### Load test
+
+`experiments/cb/load/concurrent_chat.py` fires N concurrent SSE chat clients
+for `duration` seconds and reports aggregate tok/s, TTFT p50/p99, request-wall
+p50/p99, per-client fairness, and `/metrics` deltas:
+
+```bash
+.venv/bin/python -m experiments.cb.load.concurrent_chat \
+    --clients 8 --duration 60 --max-tokens 32 --sampling
+```
+
+P5 gate (2026-05-30, qb1, 8×60s): 0 errors / 36 requests / 15 tok/s aggregate
+/ **TTFT p99=176ms**.
+
+### Tests
+
+- `experiments/serve/tests/test_cb_api_routing.py` — pure routing probe with a
+  fake engine; runs in milliseconds, no device. **7/7 PASS**.
+- `experiments/cb/validate/engine.py` / `engine_sampling.py` / `engine_api.py`
+  — qb1 e2e validators for the engine + sampling + HTTP layer + /metrics.
+
+### Legacy proxy (frozen)
+
+`experiments/serve/openai_endpoint.py` is the older path: a host-side proxy
+that forwards `/v1/chat/completions` over the **Unix-socket TP server**
+(`experiments/serve/server_tp.py` started via
+`experiments/serve/scripts/serve_tp.sh`). Single-seq, no continuous batching.
+Kept as the frozen production reference; use `cb_api.py` for new work.
 
 ---
 
