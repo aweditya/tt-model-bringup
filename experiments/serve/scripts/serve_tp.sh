@@ -94,7 +94,11 @@ cmd_stop() {
 cmd_status() {
     if is_running; then
         local pid; pid=$(cat "$PID_FILE")
-        echo "running (pid $pid, socket $SOCK_FILE)"
+        if grep -q "^\[serve\] READY" "$LOG_FILE" 2>/dev/null; then
+            echo "running (pid $pid, socket $SOCK_FILE, READY)"
+        else
+            echo "running (pid $pid, socket $SOCK_FILE, still bootstrapping — wait for '[serve] READY' in $LOG_FILE)"
+        fi
     else
         echo "not running"
         if [ -f "$PID_FILE.launch" ]; then

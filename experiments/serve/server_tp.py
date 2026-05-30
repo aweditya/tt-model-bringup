@@ -3021,6 +3021,9 @@ def serve(state: MeshServerState):
     srv.listen(4)
     os.chmod(SOCKET_PATH, 0o600)
     print(f"[serve] listening on {SOCKET_PATH}", flush=True)
+    # Stable readiness marker — `serve_tp.sh status` (or any wait-for-ready
+    # loop) can grep $LOG_FILE for this exact line after the long bootstrap.
+    print("[serve] READY", flush=True)
 
     shutdown_requested = False
     import types as _types

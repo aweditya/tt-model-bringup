@@ -80,4 +80,25 @@ cmake --build "$BUILD_DIR" --target ttnn -j"$(nproc 2>/dev/null || echo 8)"
 # the rebuilt op (otherwise a stale wheel can shadow it).
 cp "$BUILD_DIR/ttnn/_ttnn.so"    "$TT_METAL/ttnn/ttnn/_ttnn.so"
 cp "$BUILD_DIR/ttnn/_ttnncpp.so" "$TT_METAL/ttnn/ttnn/_ttnncpp.so"
+
+# Sanity-print so the user sees IMMEDIATELY whether the just-installed op is
+# resolvable from Python — catches the "rebuild succeeded but a stale wheel in
+# the venv still shadows the source-package .so" failure mode the integrate
+# README warns about. Doesn't open a device.
+VENV_PY="${VENV_PY:-$REPO_ROOT/.venv/bin/python}"
+if [ -x "$VENV_PY" ]; then
+  echo ""
+  echo "=== verifying installed ops resolve from Python ==="
+  TT_METAL_HOME="$TT_METAL" \
+  PYTHONPATH="$TT_METAL/ttnn:${PYTHONPATH:-}" \
+  LD_LIBRARY_PATH="$TT_METAL/ttnn/ttnn:$BUILD_DIR/ttnn:$BUILD_DIR/lib:${LD_LIBRARY_PATH:-}" \
+  ARCH_NAME="${ARCH_NAME:-blackhole}" \
+  "$VENV_PY" - <<PYEOF
+import ttnn
+print(f"  ttnn at: {ttnn.__file__}")
+for op in "${ops[*]}".split():
+    ok = hasattr(ttnn.experimental, op)
+    print(f"  ttnn.experimental.{op}: {'OK' if ok else 'NOT FOUND (stale wheel shadowing?)'}")
+PYEOF
+fi
 echo "done — ${#ops[@]} op(s) installed + ttnn rebuilt"

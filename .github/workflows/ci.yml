@@ -21,3 +21,6 @@ jobs:
           uv python install 3.10.12
           uv run --python 3.10.12 --no-project python -m compileall -q \
             -x 'experiments/(utils|tt_jax)/|\.refs/' experiments models scripts
+      - name: Deploy-sync audit (catches deploy.sh forgetting an internal import)
+        run: |
+          uv run --python 3.10.12 --no-project python scripts/ci_check_deploy_sync.py
