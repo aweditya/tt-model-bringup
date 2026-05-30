@@ -10,10 +10,16 @@ set -euo pipefail
 
 HOST="${TT_HOST:-qb1}"
 if [[ "$#" -eq 0 ]]; then
-  set -- experiments/serve/server_tp.py experiments/serve/server_tp_cb.py \
-         experiments/serve/ondevice_27b.py experiments/serve/generate_27b.py \
-         experiments/serve/cb_scheduler.py experiments/cb/validate/forward.py \
-         experiments/cb/bench/trace.py experiments/cb/needle.py \
+  # Glob the whole active surface so a new file under serve/, cb/, or the
+  # serve scripts dir doesn't silently fall off `make dr`. Pre-glob caught us
+  # twice (full_layer_tp_probe, then the CB stack); the audit added a static
+  # check (scripts/ci_check_deploy_sync.py) but glob is the real fix.
+  set -- experiments/serve/*.py \
+         experiments/serve/scripts/*.sh \
+         experiments/cb/needle.py \
+         experiments/cb/validate/*.py \
+         experiments/cb/bench/*.py \
+         experiments/cb/load/*.py \
          experiments/utils/full_layer_tp_probe.py \
          experiments/utils/tp_attn_traced_probe.py
 fi

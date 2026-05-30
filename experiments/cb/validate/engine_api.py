@@ -270,7 +270,7 @@ def _run_tests(engine, server, server_thread):
         "max_tokens": 128, "stream": True,
     }, partial_max=3)
     log(f"  partial SSE events received: {len(partial)} (closed mid-stream)")
-    # give the server > DISCONNECT_POLL_S (+ drain margin) to process the cancel
+    # give the server > 1s (the _drain_handle poll period in cb_api) + drain margin
     time.sleep(1.5)
     status2, resp2 = _post("/v1/chat/completions", {
         "messages": [{"role": "user", "content": "The capital of France is"}],
