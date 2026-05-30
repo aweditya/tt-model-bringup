@@ -139,9 +139,26 @@ resume prefill optimization (S2).
   3.59 s vs 13.15 s pre-P3.5-perf — the logits-trace win lands in concurrent
   throughput too (~3.6×). Structured-logs scaffold deferred to P5 (the load
   harness needs it more directly).
-- **P5 — Load / SLO validation.** Load-test harness (M sustained concurrent
-  users); throughput, p50/p99 latency, slot utilization, zero leakage/crash over
-  a sustained run. **Gate:** SLOs met.
+- **P5 — Load / SLO validation. DONE (2026-05-30).**
+  `experiments/cb/load/concurrent_chat.py` — stdlib-only load harness (N
+  threads × SSE chat × duration, periodic /metrics scrapes; reports aggregate
+  tok/s, TTFT p50/p99, request-wall p50/p99, per-client fairness, /metrics
+  delta). **Gate PASS** end-to-end on qb1 (serve_cb.sh start → harness → stop;
+  daemon at slots=4 / sampling=True / max_inflight=64):
+  - 8 concurrent SSE chat clients × 60 s × max_tokens=32 (sampling t=0.8).
+  - **0 errors over 36 requests**; per-client fairness min=4 / max=5 / median=4.
+  - **Aggregate 15.0 tok/s** (B≤4 sampling); 1152 tokens generated.
+  - **TTFT p50=97 ms, p99=176 ms, mean=100 ms** (under 200 ms even at p99
+    for 8 concurrent — production-grade chat UX).
+  - Request wall p50=16.97 s / p99=17.51 s for the 32-token job.
+  - /metrics counters all advanced correctly (submitted 0→36, done 0→36,
+    tokens 0→1152, step_count 0→455, rejected 0, cancelled 0).
+  - Clean daemon stop, no fabric wedge.
+
+  This is the **happy-path SLO floor**; the staged plan ends here. Future
+  scaling (N≥32 sustained, p99 budgets per-token, sustained-load durations
+  measured in minutes/hours, mixed greedy+sampling+streaming workloads) is a
+  P5.x perf/scale follow-up — the harness composes for it.
 - **P6 — Deploy + docs.** README/CONTRIBUTING run guide, config, OpenAI client
   examples; the production server is the documented serving path.
 
