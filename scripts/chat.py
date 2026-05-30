@@ -17,6 +17,7 @@ In-chat commands (type at the > prompt):
   /top-k <int>          set top_k (sampling only; 0 = disabled)
   /seed <int>           set seed (sampling only; '' to clear)
   /max <int>            set max_tokens per turn
+  /continue             resume after a finish=length truncation
   /show                 print current params + history length
   /metrics              fetch and dump /metrics
   /help                 show this help
@@ -119,7 +120,7 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--top-k", type=int, default=0)
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--max", type=int, default=512, help="max_tokens per turn")
+    ap.add_argument("--max", type=int, default=1024, help="max_tokens per turn")
     args = ap.parse_args()
 
     params = {"temperature": args.temp, "top_p": args.top_p, "top_k": args.top_k,
@@ -137,6 +138,10 @@ def main():
     print(CYAN(f"[chat] {args.url} → {body}"))
     print(DIM(HELP))
 
+    CONTINUE_PROMPT = ("Continue your previous response from exactly where you "
+                       "left off. Do not restart, do not repeat any text, do not "
+                       "re-open the <think> block — just keep generating.")
+
     while True:
         try:
             user = input(BOLD("\n> ")).strip()
@@ -153,6 +158,10 @@ def main():
                 break
             elif cmd == "help":
                 print(DIM(HELP))
+            elif cmd == "continue":
+                # Pretend the user typed the continuation prompt; fall through
+                # to the normal turn-send path.
+                user = CONTINUE_PROMPT
             elif cmd == "new":
                 sys_msg = next((m for m in messages if m["role"] == "system"), None)
                 messages = [sys_msg] if sys_msg else []
@@ -180,7 +189,8 @@ def main():
                 print(DIM(_metrics(args.url)))
             else:
                 print(RED(f"[chat] unknown command /{cmd} — /help"))
-            continue
+            if cmd != "continue":
+                continue   # /continue falls through to the turn-send below
 
         # Send turn.
         messages.append({"role": "user", "content": user})
@@ -211,6 +221,9 @@ def main():
             tps = n_chunks / elapsed if elapsed > 0 else 0.0
             print(GREEN(f"\n[{n_chunks} chunks · {elapsed:.1f}s · {tps:.1f} chunk/s · "
                         f"TTFT {ttft*1000:.0f}ms · finish={finish}]"))
+            if finish == "length":
+                print(DIM(f"[chat] hit max_tokens={params['max_tokens']} — type /continue to "
+                          f"resume, or /max <n> to raise the cap"))
         else:
             # Roll back the failed user turn so /new isn't required.
             messages.pop()
