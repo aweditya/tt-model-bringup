@@ -155,10 +155,25 @@ resume prefill optimization (S2).
     tokens 0→1152, step_count 0→455, rejected 0, cancelled 0).
   - Clean daemon stop, no fabric wedge.
 
-  This is the **happy-path SLO floor**; the staged plan ends here. Future
-  scaling (N≥32 sustained, p99 budgets per-token, sustained-load durations
-  measured in minutes/hours, mixed greedy+sampling+streaming workloads) is a
-  P5.x perf/scale follow-up — the harness composes for it.
+  This was the happy-path SLO floor.
+
+- **P5.1 — N=32 scale validation. DONE (2026-05-30).** Same harness, daemon at
+  `TT_CB_SLOTS=32, sampling=True` (first time the logits trace is captured at
+  B=32 through the HTTP path end-to-end). 32 concurrent SSE clients × 60 s ×
+  max_tokens=32 (sampling t=0.8):
+  - 0 errors over 64 requests; per-client min=max=2 (perfect fairness).
+  - **TTFT p50=143 ms, p99=248 ms** — still under 250 ms at p99 with N=32
+    (vs P5's p99=176 ms at N=8). Production-grade chat UX at scale.
+  - Aggregate 23.6 tok/s vs P5's 15.0 (only ~1.6× for 8× the slots — per-step
+    cost at B=32 is ~830 ms vs B=4's ~125 ms; O(B) host-side work in the
+    sample loop / `[B,vocab]` readback becomes the dominant cost. A future
+    perf increment can amortize that with an on-device top-k or vectorising
+    the host sample loop).
+  - Request wall p50=41.8 s / p99=44.8 s for 32-token jobs (32 clients on 32
+    slots → first cohort, then queue; ~2 cohorts in 60 s as observed).
+  - /metrics counters advanced correctly: submitted 0→64, done 0→64, tokens
+    0→2048, step_count 0→106. 0 rejected, 0 cancelled.
+  - Clean daemon stop, no fabric wedge.
 - **P6 — Deploy + docs.** README/CONTRIBUTING run guide, config, OpenAI client
   examples; the production server is the documented serving path.
 
