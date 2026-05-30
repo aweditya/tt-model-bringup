@@ -21,6 +21,22 @@ OPS_DIR="$REPO_ROOT/experiments/owned_ops"
 TT_METAL="${TT_METAL:-$HOME/tenstorrent/tt-metal}"
 BUILD_DIR="${BUILD_DIR:-$TT_METAL/build_Release}"
 
+# Assert the tt-metal SHA matches what the integrate scripts were authored
+# against (the cmake patches are layout-sensitive). Warn rather than fail so
+# users can override after re-validation; bumping the pin lives in
+# tt-metal-sha.txt at the repo root.
+PINNED_SHA_FILE="$REPO_ROOT/tt-metal-sha.txt"
+if [[ -f "$PINNED_SHA_FILE" && -d "$TT_METAL/.git" ]]; then
+  PINNED_SHA="$(grep -E '^[0-9a-f]{40}$' "$PINNED_SHA_FILE" | head -1 || true)"
+  ACTUAL_SHA="$(git -C "$TT_METAL" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -n "$PINNED_SHA" && -n "$ACTUAL_SHA" && "$PINNED_SHA" != "$ACTUAL_SHA" ]]; then
+    echo "WARNING: tt-metal at $TT_METAL is at $ACTUAL_SHA" >&2
+    echo "         expected pinned $PINNED_SHA (see $PINNED_SHA_FILE)" >&2
+    echo "         owned_ops integrate patches may not apply cleanly." >&2
+    echo "" >&2
+  fi
+fi
+
 PROD_OPS=(qwen36_gdn_decode_owned qwen36_decay_gate_decode_owned)
 
 dry_run=0; no_build=0; all=0; ops=()

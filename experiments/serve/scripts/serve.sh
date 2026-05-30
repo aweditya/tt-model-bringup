@@ -35,7 +35,16 @@ cmd_start() {
     : > "$LOG_FILE"
     # setsid detaches from controlling terminal; nohup keeps it alive across
     # the parent shell exiting. PYTHONUNBUFFERED for prompt log flushing.
+    # Full TT env block — without these, `import ttnn` either fails or picks up
+    # a stale wheel silently. Mirrors scripts/run_remote.sh:22-28.
+    TT_METAL_HOME="${TT_METAL_HOME:-$HOME/tenstorrent/tt-metal}"
+    TT_BUILD_DIR="${TT_BUILD_DIR:-$TT_METAL_HOME/build_Release}"
     HF_HOME="${HF_HOME:-$CACHE_DIR/hf}" \
+    TT_METAL_HOME="$TT_METAL_HOME" \
+    TT_BUILD_DIR="$TT_BUILD_DIR" \
+    ARCH_NAME="${ARCH_NAME:-blackhole}" \
+    PYTHONPATH="$TT_METAL_HOME/ttnn:${PYTHONPATH:-}" \
+    LD_LIBRARY_PATH="$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib:${LD_LIBRARY_PATH:-}" \
     PYTHONUNBUFFERED=1 \
     nohup setsid "$VENV_PY" -m experiments.serve.server $EXTRA_ARGS \
         >> "$LOG_FILE" 2>&1 < /dev/null &

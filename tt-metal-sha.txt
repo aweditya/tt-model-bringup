@@ -1,0 +1,14 @@
+# Pinned tt-metal SHA — the build that qb1 + qb2 currently run, and that the
+# owned_ops integrate scripts (experiments/owned_ops/*/integrate_into_ttmetal.py)
+# expect the tt-metal source tree to match. The owned-op cmake patches are
+# layout-sensitive — any major tt-metal refactor will break `--all` /
+# `scripts/build_owned_ops.sh`.
+#
+# Bump this file when you cut over to a new tt-metal SHA (after re-validating the
+# owned_ops install + re-running experiments/cb/validate/forward.py end-to-end).
+#
+# Verify on a host: cd $TT_METAL_HOME && git rev-parse HEAD
+# Tag (informational):   git describe --tags --always --dirty
+
+cf7232ab47227167f091c3c3cf6fdbed63c8b51c
+v0.69.0

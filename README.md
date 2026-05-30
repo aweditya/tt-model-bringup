@@ -35,15 +35,18 @@ to target the 4-chip box. `make dr PY=...` deploys then runs (the edit loop).
 
 ## Host matrix
 
-There are two reference hosts; the right host to use depends on the demo.
+There are two reference hosts. Both have working inter-chip fabric and can run
+either demo; the split below is operational — keep qb2's TP server up as the
+"production" path and use qb1 for experimentation.
 
-| Host  | Hardware                | Inter-chip fabric | Use it for                                |
-|-------|-------------------------|-------------------|-------------------------------------------|
-| `qb1` | 4× Blackhole P150       | **No fabric**     | Demo A (single-chip serve)                |
-| `qb2` | 4× Blackhole P150       | **FABRIC_1D**     | Demo B (4-chip Tensor-Parallel serve)     |
+| Host  | Hardware                | Inter-chip fabric    | Use it for                                |
+|-------|-------------------------|----------------------|-------------------------------------------|
+| `qb1` | 4× Blackhole P150       | **FABRIC_1D** ✓      | Experimental TP / CB / new kernels        |
+| `qb2` | 4× Blackhole P150       | **FABRIC_1D** ✓      | Production Demo B (single-seq TP serve)   |
 
-Demo B (`server_tp.py`) calls `ttnn.set_fabric_config(FABRIC_1D)` during
-bootstrap and will **hang on qb1**. Stick to the matrix above.
+qb1's fabric works as of **2026-05-21**; both single-chip and multi-chip
+workloads run there. Earlier versions of this README claimed "no fabric on qb1"
+— stale; ignore.
 
 ---
 
@@ -63,8 +66,14 @@ export ARCH_NAME=blackhole
 The exact `TT_BUILD_DIR` name depends on which CMake preset you ran
 (`./build_metal.sh` defaults to `build_Release` on Blackhole; profiler
 builds produce `build_tracy_gcc12_nodist`). Both qb1 and qb2 currently
-use `build_Release`. (A known-good `tt-metal` SHA is not yet pinned — the
-current qb1/qb2 `ttnn` build is the reference.)
+use `build_Release`.
+
+**tt-metal SHA pin**: this repo targets the tt-metal SHA in
+[`tt-metal-sha.txt`](tt-metal-sha.txt) (the build qb1 + qb2 run). The
+owned_ops integrate scripts (`experiments/owned_ops/*/integrate_into_ttmetal.py`)
+are layout-sensitive; on a mismatched tt-metal SHA, `scripts/build_owned_ops.sh`
+prints a loud warning and the patches may fail to apply. After checking out
+tt-metal, verify with `git -C $TT_METAL_HOME rev-parse HEAD`.
 
 ### 2. Build owned_ops kernels
 

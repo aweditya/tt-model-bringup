@@ -162,6 +162,25 @@ def bootstrap(state: MeshServerState):
     from huggingface_hub import hf_hub_download
     from transformers import AutoTokenizer
 
+    # Owned-op availability check (fail-soft) — if the user's mode wants an
+    # owned kernel but `scripts/build_owned_ops.sh` was never run, fall back to
+    # the manual path with a loud warning instead of raising mid-token deep in
+    # the forward (which the user reads as "garbage output").
+    _owned_op = {
+        "owned_gdn":         "qwen36_gdn_decode_owned",
+        "owned_gdn_inplace": "qwen36_gdn_decode_owned",
+        "owned_decay_gate":  "qwen36_decay_gate_decode_owned",
+    }
+    _exp = getattr(ttnn, "experimental", object())
+    for _attr in ("deltanet_recurrence_mode", "deltanet_decay_gate_mode"):
+        _mode = getattr(state, _attr)
+        if _mode in _owned_op and not hasattr(_exp, _owned_op[_mode]):
+            print(f"\n[bootstrap] WARNING: ttnn.experimental.{_owned_op[_mode]} "
+                  f"not found — state.{_attr} flipped {_mode!r} → 'manual'.\n"
+                  f"            Run `bash scripts/build_owned_ops.sh` and rebuild "
+                  f"ttnn to get the owned kernel.\n", flush=True)
+            setattr(state, _attr, "manual")
+
     print("[bootstrap] setting fabric_config = FABRIC_1D…", flush=True)
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
 
