@@ -88,34 +88,28 @@ class MeshServerState:
         # 'w_dn': sharded DN weights (if dn), 'w_attn': sharded attn weights (if attn),
         # 'w_mlp': sharded MLP weights, 'state': sharded SSM/conv/KV buffers}
         self.layers = []
-        # Persistent traced graph (Stage D — P14 commit 2d30af7)
+        # Persistent traced graph + on-device argmax output handle
         self.trace_id = None
-        self.traced_logits_tt = None    # legacy field, retained for safety; unused after vocab-sharded LM head ship
-        self.traced_argmax_tt = None    # P22: on-device argmax output of forward_token_tp_inner
-        # P22: vocab-sharded LM head dimensions
-        self.vocab_size = None          # real vocab from state.embed_np.shape[0] (152064 for Qwen3.6)
-        self.vocab_padded = None        # padded vocab in lm_head weight (248320 for Qwen3.6)
-        # Pre-allocated input buffers (populated at bootstrap; updated per step
-        # via update_input_buffers using ttnn.copy_host_to_device_tensor)
-        self.x_buf = None                # legacy: kept allocated but no longer written per step (P25)
+        self.traced_argmax_tt = None
+        # Vocab dims: real vocab from state.embed_np.shape[0] (152064 for
+        # Qwen3.6); padded vocab in lm_head weight (248320).
+        self.vocab_size = None
+        self.vocab_padded = None
+        # Per-step HtoD write targets (allocated in bootstrap, written via
+        # ttnn.copy_host_to_device_tensor before each execute_trace).
         self.cur_pos_buf = None
-        self.cos_buf = None              # legacy
-        self.sin_buf = None              # legacy
-        self.tok_buf = None              # P25: [1,1] uint32 — current token id, sole per-step host write
-        self.rot_idxs_buf = None         # P25: [1,1] uint32 — current rotary index for cos/sin embedding lookup
+        self.tok_buf = None
+        self.rot_idxs_buf = None
         self.cos_all_np = None
         self.sin_all_np = None
         self.rotary_dim = None
-        # Paged KV cache shared state
+        # Paged KV cache + SDPA shared state
         self.page_table_tt = None
         self.paged_write_mem_cfg = None
         self.fused_paged_write_mem_cfg_k = None
         self.fused_paged_write_mem_cfg_v = None
-        # Paged SDPA configs (P18/P19 — see feedback_p19_chained_paged_sdpa.md)
         self.paged_sdpa_progcfg = None
         self.sdpa_compute_kernel_config = None
-        self.trace_x_buf = None
-        self.trace_logits_buf = None
         self.last_run = None
         # Experiment guard. Production default stays on the validated two-call
         # paged_update_cache path; probe endpoints may flip this temporarily.
@@ -400,9 +394,7 @@ def bootstrap(state: MeshServerState):
           f"lm_head sharded dim=1 (per-chip {state.vocab_padded // NCHIPS}; "
           f"vocab {state.vocab_size}/{state.vocab_padded})", flush=True)
 
-    # RoPE cos/sin tables — ROTARY_DIM-wide (V2 rotate-only path).
-    # Keep host arrays in state for per-step slicing (trace-compatible: we
-    # write the current row into state.cos_buf/sin_buf via copy_host_to_device).
+    # RoPE cos/sin tables — ROTARY_DIM-wide (rotate-only path).
     HEAD_DIM = cfg['head_dim']
     rotary_dim = int(HEAD_DIM * cfg['partial_rotary_factor'])
     half_rot = rotary_dim // 2
@@ -412,9 +404,8 @@ def bootstrap(state: MeshServerState):
     state.cos_all_np = np.concatenate([np.cos(ang), np.cos(ang)], axis=-1).astype(np.float32)
     state.sin_all_np = np.concatenate([np.sin(ang), np.sin(ang)], axis=-1).astype(np.float32)
     state.rotary_dim = rotary_dim
-    # Keep the device-resident extended table for the legacy eager path (slice
-    # at runtime by Python int). The traced path uses state.cos_buf/sin_buf
-    # populated outside the trace via copy_host_to_device.
+    # Device-resident extended table for the eager (non-traced) path — sliced
+    # at runtime by Python int.
     pad = HEAD_DIM - rotary_dim
     cos_ext = np.concatenate([state.cos_all_np, np.ones((MAX_POS, pad), dtype=np.float32)], axis=-1)
     sin_ext = np.concatenate([state.sin_all_np, np.zeros((MAX_POS, pad), dtype=np.float32)], axis=-1)
@@ -504,28 +495,12 @@ def bootstrap(state: MeshServerState):
     # These are READ by forward_token_tp_inner (which is the trace target).
     # They are UPDATED before each execute_trace via copy_host_to_device_tensor
     # — outside the captured region, so the writes don't violate trace semantics.
-    HIDDEN_DIM = cfg['hidden']
-    ROTARY_DIM = state.rotary_dim
-    state.x_buf = ttnn.from_torch(
-        torch.zeros(1, HIDDEN_DIM, dtype=torch.float32),
-        dtype=ttnn.bfloat16, device=state.mesh, layout=ttnn.TILE_LAYOUT,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
     state.cur_pos_buf = ttnn.from_torch(
         torch.tensor([0], dtype=torch.int32),
         device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
-    state.cos_buf = ttnn.from_torch(
-        torch.zeros(1, ROTARY_DIM, dtype=torch.float32),
-        dtype=ttnn.bfloat16, device=state.mesh, layout=ttnn.TILE_LAYOUT,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
-    state.sin_buf = ttnn.from_torch(
-        torch.zeros(1, ROTARY_DIM, dtype=torch.float32),
-        dtype=ttnn.bfloat16, device=state.mesh, layout=ttnn.TILE_LAYOUT,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
-    # P25: tiny index buffers — the ONLY per-step HtoD writes after the swap.
-    # tok_buf: [1,1] uint32, current token id (for ttnn.embedding token lookup).
-    # rot_idxs_buf: [1,1] uint32, current rotary index (for cos/sin lookup).
-    # Both shape [1,1] (not [1]) because ttnn.embedding wants idx ndim >= 2.
+    # Tiny index buffers — the ONLY per-step HtoD writes. Shape [1,1] (not [1])
+    # because ttnn.embedding requires idx ndim >= 2.
     state.tok_buf = ttnn.from_torch(
         torch.tensor([[0]], dtype=torch.int32),
         dtype=ttnn.uint32, device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT,
@@ -534,8 +509,7 @@ def bootstrap(state: MeshServerState):
         torch.tensor([[0]], dtype=torch.int32),
         dtype=ttnn.uint32, device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
-    print("  ✓ input buffers pre-allocated (x_buf, cur_pos_buf, cos_buf, sin_buf, "
-          "tok_buf, rot_idxs_buf)",
+    print("  ✓ input buffers pre-allocated (cur_pos_buf, tok_buf, rot_idxs_buf)",
           flush=True)
 
     print("[bootstrap] STAGE B COMPLETE — all weights + state buffers on mesh.", flush=True)
@@ -553,19 +527,7 @@ def bootstrap(state: MeshServerState):
 
 
 def _rms_norm_manual(x_tt, weight_tt, eps, dim_size):
-    """Mesh RMS norm.
-
-    P15 (2026-05-14): re-testing plain ttnn.rms_norm after the deallocate
-    discipline (faff42a) + paged refactor (4cd0ce1) + buffer pre-allocation
-    (1fabf07) all landed. The original wedge in feedback_p7_mlp_wedges_next_dn.md
-    may have been caused by intermediate buffer accumulation (the H2 we ruled
-    out at that time but the deallocate fix later confirmed was the real issue).
-    If plain rms_norm now works, drop in: 7 manual ops → 1 fused op × 305 calls/
-    token = ~18.3 ms/tok savings per Agent N's gap analysis (5a9808d).
-
-    Falls back to manual form if plain rms_norm wedges multi-step P6 — see
-    feedback_ttnn_fused_ops_gap_analysis.md.
-    """
+    """Mesh RMS norm — thin wrapper around ttnn.rms_norm."""
     import ttnn
     return ttnn.rms_norm(x_tt, weight=weight_tt, epsilon=eps)
 
@@ -573,88 +535,22 @@ def _rms_norm_manual(x_tt, weight_tt, eps, dim_size):
 def _tp_all_reduce(state: MeshServerState, partial):
     """All-reduce a row-parallel partial across the (1, 4) mesh.
 
-    DIAG (2026-05-20): when state.ccl_debug is True, prints partial shape +
-    memory_config + per-chip mean and chip0[0,0]. Use to compare prefill-path
-    vs decode-path partial values when CCL equivalence is known correct but
-    downstream cos != 0.999.
-
-    NOTE (B.2.2 wedge fix 2026-05-19): ttnn.all_reduce's output tensor can
-    enter a `DeallocatedTombStone` storage state because composite all_reduce
-    deallocates intermediates during execution, leaving shared ownership in
-    a zombie state. Decode paths never slice from all_reduce output so it
-    doesn't trigger; but prefill's per-position SLICE → deltanet_step_tp
-    chain hits Tensor::buffer()→DeviceStorage::get_mesh_buffer() validation
-    that silently hangs (99% CPU, no error) on the tombstone state.
-
-    Probe `probe_dn_source_isolation_tp` (commit 3822293) confirmed: linear /
-    embed / from_torch / slice_write outputs all work as DN input; only
-    all_reduce output wedges DN. Fix: ttnn.clone the result to force a fresh
-    Allocated storage, severing the tombstone link. Cost: one memory copy
-    per all_reduce call (~10KB at [1, HIDDEN], negligible; ~50KB at
-    [5, HIDDEN]).
-    """
+    `explicit_all_reduce` mode uses num_links=2 + Topology.Ring on the qb1/qb2
+    P150x4 mesh — 11.2% faster than num_links=1 at [1, 5120] bf16."""
     import ttnn
-
-    if getattr(state, 'ccl_debug', False):
-        _limit = getattr(state, 'ccl_debug_limit', 8)
-        _count = getattr(state, '_ccl_debug_count', 0)
-        if _count < _limit:
-            try:
-                _full = ttnn.to_torch(
-                    partial, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
-                ).float()
-                _H = _full.shape[-1] // 4
-                _per_chip_means = [round(float(_full[..., c*_H:(c+1)*_H].mean()), 6) for c in range(4)]
-                _per_chip_v0 = [round(float(_full[..., 0, c*_H]), 6) for c in range(4)]
-                _tag = getattr(state, 'ccl_debug_tag', 'ar')
-                print(f"[{_tag} call={_count}] shape={list(partial.shape)} "
-                      f"mem={partial.memory_config().memory_layout} "
-                      f"chip_means={_per_chip_means} "
-                      f"chip_v0={_per_chip_v0}", flush=True)
-            except Exception as _e:
-                print(f"[ar diag error] {_e!r}", flush=True)
-            state._ccl_debug_count = _count + 1
-
-    # Local helper to print OUTPUT after each path's all_reduce.
-    def _diag_output(_result, _path_name: str):
-        if getattr(state, 'ccl_debug', False):
-            _olim = getattr(state, 'ccl_debug_limit', 8)
-            _oc = getattr(state, '_ccl_out_count', 0)
-            if _oc < _olim:
-                try:
-                    _of = ttnn.to_torch(
-                        _result, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
-                    ).float()
-                    _OH = _of.shape[-1] // 4
-                    _ocv = [round(float(_of[..., 0, c*_OH]), 6) for c in range(4)]
-                    _ocm = [round(float(_of[..., 0, c*_OH:(c+1)*_OH].mean()), 6) for c in range(4)]
-                    _ocn = [round(float(_of[..., 0, c*_OH:(c+1)*_OH].norm()), 4) for c in range(4)]
-                    _otag = getattr(state, 'ccl_debug_tag', 'ar')
-                    print(f"[{_otag} OUT call={_oc} via={_path_name}] shape={list(_result.shape)} "
-                          f"chip_v0={_ocv} chip_means={_ocm} chip_norms={_ocn}", flush=True)
-                except Exception as _oe:
-                    print(f"[ar out diag err] {_oe!r}", flush=True)
-                state._ccl_out_count = _oc + 1
-        return _result
-
     if state.collective_mode == "explicit_all_reduce":
-        return _diag_output(ttnn.all_reduce(
+        return ttnn.all_reduce(
             partial,
             cluster_axis=1,
             memory_config=partial.memory_config(),
-            # P1 SHIPPED 2026-05-19: num_links=2 measured 11.2% faster than
-            # num_links=1 at [1, 5120] bf16 (probe_ccl_components_tp). BH
-            # P150x4 supports 2 eth links per axis.
-            # 2026-05-20: Topology.Ring on qb2 (validated via probe; 4 P150s
-            # physically wired as ring). Halves worst-case hop count for collectives.
             num_links=2,
             topology=ttnn.Topology.Ring,
-        ), "explicit_all_reduce")
+        )
     try:
-        return _diag_output(ttnn.all_reduce(partial), "default_all_reduce")
+        return ttnn.all_reduce(partial)
     except Exception:
         scattered = ttnn.reduce_scatter(partial, dim=1)
-        return _diag_output(ttnn.all_gather(scattered, dim=1), "fallback_RS+AG")
+        return ttnn.all_gather(scattered, dim=1)
 
 
 def deltanet_step_tp(state, x_tt, dn, cfg):
@@ -1454,36 +1350,7 @@ def mlp_step_tp(state, x_tt, mlp):
     ttnn.deallocate(h)
     reduced = _tp_all_reduce(state, partial)
     ttnn.deallocate(partial)
-    # B.2.2 Test 10: targeted residual-add diag — fires once per probe
-    _resid_dbg = getattr(state, 'debug_mlp_resid', False)
-    _resid_count = getattr(state, '_mlp_resid_count', 0)
-    if _resid_dbg and _resid_count < 2:
-        try:
-            _xt = ttnn.to_torch(
-                x_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
-            ).float()
-            _rd = ttnn.to_torch(
-                reduced, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
-            ).float()
-            _tg = getattr(state, '_debug_state_tag', 'dec')
-            print(f"  [{_tg} MLP RESID #{_resid_count}] x_tt.shape={list(x_tt.shape)} x_tt[0,0]={float(_xt[..., 0, 0]):.6f} x_tt.mc={x_tt.memory_config().memory_layout} "
-                  f"| reduced.shape={list(reduced.shape)} reduced[0,0]={float(_rd[..., 0, 0]):.6f} reduced.mc={reduced.memory_config().memory_layout}",
-                  flush=True)
-        except Exception as _re:
-            print(f"  [MLP resid diag pre err] {_re!r}", flush=True)
     out = ttnn.add(x_tt, reduced)
-    if _resid_dbg and _resid_count < 2:
-        try:
-            _ot = ttnn.to_torch(
-                out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
-            ).float()
-            _tg = getattr(state, '_debug_state_tag', 'dec')
-            print(f"  [{_tg} MLP RESID #{_resid_count}] out.shape={list(out.shape)} out[0,0]={float(_ot[..., 0, 0]):.6f} out.mc={out.memory_config().memory_layout} "
-                  f"(expected x_tt[0,0]+reduced[0,0])",
-                  flush=True)
-            state._mlp_resid_count = _resid_count + 1
-        except Exception as _re2:
-            print(f"  [MLP resid diag post err] {_re2!r}", flush=True)
     ttnn.deallocate(reduced)
     return out
 
@@ -1701,46 +1568,9 @@ def forward_token_tp_inner(state, return_logits: bool = False):
                                        state.cur_pos_buf,
                                        0,  # vestigial cur_pos int (paged path ignores it)
                                        cos_row_tt, sin_row_tt, cfg)
-        # B.2.2 Test 8: print x BEFORE MLP at L0 (single-shot, pos 0)
-        if _li == 0 and getattr(state, 'debug_layer_boundary', False):
-            _bm = getattr(state, '_pre_mlp_count', 0)
-            if _bm < 1:
-                try:
-                    _xpf = ttnn.to_torch(
-                        x_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
-                    ).float()
-                    _Hpm = _xpf.shape[-1] // 4
-                    _pv = [round(float(_xpf[..., 0, c*_Hpm]), 6) for c in range(4)]
-                    _pm = [round(float(_xpf[..., 0, c*_Hpm:(c+1)*_Hpm].mean()), 6) for c in range(4)]
-                    _pn = [round(float(_xpf[..., 0, c*_Hpm:(c+1)*_Hpm].norm()), 4) for c in range(4)]
-                    _ptg = getattr(state, '_debug_state_tag', 'dec')
-                    print(f"  [{_ptg} L0 pre-MLP x[0,:]] chip_v0={_pv} chip_means={_pm} chip_norms={_pn}",
-                          flush=True)
-                    state._pre_mlp_count = _bm + 1
-                except Exception as _e:
-                    print(f"  [decode L0 pre-MLP diag err] {_e!r}", flush=True)
         x_tt = mlp_step_tp(state, x_tt, layer['mlp'])
-        # B.2.2 Test 7: print x at layer-1 entry on first call only
-        if _li == 0 and getattr(state, 'debug_layer_boundary', False):
-            _lcount = getattr(state, '_layer_bd_count', 0)
-            if _lcount < 1:
-                try:
-                    _xf = ttnn.to_torch(
-                        x_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=1)
-                    ).float()
-                    _Hcc = _xf.shape[-1] // 4
-                    _cv = [round(float(_xf[..., 0, c*_Hcc]), 6) for c in range(4)]
-                    _cm = [round(float(_xf[..., 0, c*_Hcc:(c+1)*_Hcc].mean()), 6) for c in range(4)]
-                    _cn = [round(float(_xf[..., 0, c*_Hcc:(c+1)*_Hcc].norm()), 4) for c in range(4)]
-                    _tg = getattr(state, '_debug_state_tag', 'dec')
-                    print(f"  [{_tg} L1 entry x_after_L0[0,:]] chip_v0={_cv} chip_means={_cm} chip_norms={_cn}",
-                          flush=True)
-                    state._layer_bd_count = _lcount + 1
-                except Exception as _e:
-                    print(f"  [decode L1 entry diag err] {_e!r}", flush=True)
     x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
-    # P22 vocab-sharded LM head + on-device argmax (see Agent X's resolution at
-    # feedback_lm_head_argmax_unknown.md). Per-chip linear produces
+    # Vocab-sharded LM head + on-device argmax. Per-chip linear produces
     # [1, VOCAB_PADDED/NCHIPS] then all_gather replicates to [1, VOCAB_PADDED]
     # on every chip. Slice to real vocab, untilize for argmax compatibility,
     # then argmax. Result is small UINT32 tensor — tiny readback.
