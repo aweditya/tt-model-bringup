@@ -4,12 +4,18 @@
 TT_HOST ?= qb1
 PY      ?= experiments/cb/validate/forward.py   # script for `make run` / `make dr`
 
-.PHONY: help setup lint fmt deploy run dr reset kernels
+.PHONY: help setup lint fmt deploy run dr reset kernels check install-ttnn
 help:  ## list targets
 	@grep -hE '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed -E 's/:.*## / — /' | sort
 
 setup:  ## install Python deps into .venv via uv (does NOT build ttnn — see README)
 	uv sync
+
+install-ttnn:  ## install ttnn -e from $TT_METAL_HOME on the TT host (run after setup)
+	ssh $(TT_HOST) 'cd ~/tt-xla && bash scripts/install_ttnn.sh'
+
+check:  ## sanity-check the TT host setup (no device open): make check
+	ssh $(TT_HOST) 'cd ~/tt-xla && bash scripts/check_setup.sh'
 
 lint:  ## ruff lint (host-independent; never runs device code)
 	uvx ruff@0.14.0 check .

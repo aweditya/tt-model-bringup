@@ -105,21 +105,30 @@ pinned versions of `torch`, `transformers`, `huggingface_hub`,
 
 **You must then install `ttnn` (Tenstorrent's Python runtime) into the
 same venv** — `pyproject.toml` cannot pin it because it has no PyPI
-release. Use the editable install from your tt-metal checkout:
+release. Use the wrapper script (does the editable install + copies the
+vendored `tracy` tooling into site-packages):
 
 ```bash
-# build deps for ttnn's setup.py (one-time)
-uv pip install setuptools_scm
-
-# install ttnn + its runtime deps (loguru, pandas, seaborn, graphviz, ml-dtypes, tracy, …)
-uv pip install -e $TT_METAL_HOME --no-build-isolation
+make install-ttnn        # or: bash scripts/install_ttnn.sh
 ```
 
-The `-e` install registers a `ttnn` package in `.venv/lib/.../site-packages/`
-that points at `$TT_METAL_HOME/ttnn/ttnn/`. A bare `sys.path.insert(...,
-$TT_METAL_HOME/ttnn)` is **not** sufficient — ttnn's `__init__.py` imports
-the bundled `tracy` profiler module, which only ships via the
-`uv pip install -e .` path.
+`install_ttnn.sh` passes `--no-deps` so tt-metal's pyproject does NOT
+shadow the `torch` / `transformers` / `numpy` pins from `uv.lock`. It
+finishes by printing `ttnn.__file__` plus the two owned-op availability
+checks (`qwen36_gdn_decode_owned`, `qwen36_decay_gate_decode_owned`).
+
+Re-run `make install-ttnn` after any `uv sync` (which prunes unmanaged
+packages) or after rebuilding tt-metal.
+
+**Then sanity-check the whole setup before booting the server:**
+
+```bash
+make check        # or: bash scripts/check_setup.sh
+```
+
+Verifies the venv, the tt-metal SHA pin, ttnn imports, the owned kernels
+are built in, `tt-smi` sees the devices, and `Qwen/Qwen3.6-27B` is
+reachable. No device is opened — safe to run anytime.
 
 Verified 2026-05-21 on qb1: a fresh `uv sync` resolves to
 `torch==2.12.0+cu130` (qb1 prod runs `torch==2.11.0+cu130`); the prebuilt
