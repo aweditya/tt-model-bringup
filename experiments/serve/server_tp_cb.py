@@ -186,25 +186,31 @@ def cb_reset_slots(state, slot_ids):
 
 
 def cb_prefill_transplant(state, slot_s, L):
-    """S2.3 — copy POST-PREFILL production state into CB slot `slot_s`.
+    """S2.3+S2.6 — copy POST-PREFILL production state into CB slot `slot_s`,
+    entirely on-device (no host round-trip).
 
     Precondition: caller has just run S1a (`forward_prefill_chunked_tp`) +
     S1b chunked DN on a fresh `_reset_state_buffers(state)`, so the production
     per-layer state (attn['kc']/['vc'] paged blocks, dn['ssm'], dn['conv_st'])
-    now holds the prompt's full forward result.
+    holds the prompt's full forward result.
 
     Postcondition: CB slot `slot_s` of `cb_kv[li]` / `cb_dn[li]['ssm']` /
-    `cb_dn[li]['conv_cols']` matches the production state. Slot `slot_s`'s
-    `cb_cur_pos_buf` entry is set to L (next position to decode).
+    `cb_dn[li]['conv_cols']` matches the production state.
 
-    Mechanism: host round-trip. For each mesh-sharded device tensor:
-      - read via ConcatMeshToTensor on the sharded dim → full host tensor
-      - splice the production data into slot `slot_s`
-      - upload via ShardTensorToMesh on the same dim → each chip gets its slice
-
-    Compute is irrelevant (one-shot per admission), correctness rules.
+    Mechanism (on-device):
+      KV:  slice prod kc[0:n_used_blocks] → transpose to seq-major →
+           paged_fill_cache(cb_kv, src, cb_page_table_tt, batch_idx=slot_s).
+      DN ssm:  cb_ssm * keep4_mask + prod_ssm * slot4_mask, where keep4 is 1
+               on rows != slot_s and slot4 = 1 - keep4. Broadcast does the row
+               splice without a per-element scatter.
+      DN conv_cols[k]: same mask pattern with [B, 1] mask; prod_conv col k is
+                      sliced and reshaped to [1, CONV_DIM_CHIP] for broadcast.
+      cur_pos[slot_s] = L: still a small host hop (one int32 [B] tensor); the
+                          cost is negligible (<5 ms) and the read of other
+                          slots' positions must come from somewhere.
     """
-    from full_layer_tp_probe import NV_PER_CHIP, K_DIM, V_DIM, CONV_DIM_CHIP
+    import torch  # masks are constructed host-side
+    from full_layer_tp_probe import CONV_DIM_CHIP
     cfg = state.cfg
     mesh = state.mesh
     B = state.cb_B
@@ -214,69 +220,84 @@ def cb_prefill_transplant(state, slot_s, L):
     if n_used_blocks > blocks_per_seq:
         raise ValueError(f"prefill L={L} needs {n_used_blocks} blocks, "
                          f"slot has {blocks_per_seq}")
-    NKV = cfg['n_kv_heads']
     HEAD_DIM = cfg['head_dim']
-    N_V_TOTAL = NV_PER_CHIP * 4
-    CONV_DIM = CONV_DIM_CHIP * 4
+    NKV_PER_CHIP = cfg['n_kv_heads'] // 4
+    if NKV_PER_CHIP != 1:
+        raise NotImplementedError("on-device transplant assumes NKV_PER_CHIP=1 "
+                                  "(Qwen3.6-27B); >1 needs a different permute")
     CONV_K = cfg['conv_kernel']
+
+    # Splice masks: keep = 1 on rows != slot_s, slot = 1 only on row slot_s.
+    keep_h = torch.ones(B, dtype=torch.float32); keep_h[slot_s] = 0.0
+    slot_h = 1.0 - keep_h
+    keep4 = ttnn.from_torch(keep_h.reshape(B, 1, 1, 1), dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT, device=mesh,
+                            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    slot4 = ttnn.from_torch(slot_h.reshape(B, 1, 1, 1), dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT, device=mesh,
+                            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    keep2 = ttnn.from_torch(keep_h.reshape(B, 1), dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT, device=mesh,
+                            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    slot2 = ttnn.from_torch(slot_h.reshape(B, 1), dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT, device=mesh,
+                            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
 
     for li, layer in enumerate(state.layers):
         if layer['type'] == 'full_attention':
             attn = layer['attn']
             kv = state.cb_kv[li]
-            # Production cache layout: [NUM_BLOCKS, NKV, BLOCK_SIZE, HEAD_DIM]
-            # sharded on dim=1. Read full → take first n_used_blocks (slot 0's
-            # used range — production page table is contiguous 0..NUM_BLOCKS-1).
-            for src, dst in (('kc', 'kc'), ('vc', 'vc')):
-                prod_full = ttnn.to_torch(attn[src],
-                    mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=1)).float()
-                cb_full = ttnn.to_torch(kv[dst],
-                    mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=1)).float()
-                lo = slot_s * blocks_per_seq
-                cb_full[lo:lo + n_used_blocks] = prod_full[:n_used_blocks]
-                host = ttnn.from_torch(cb_full, dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT,
-                    mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=1))
-                ttnn.copy_host_to_device_tensor(host, kv[dst])
+            for key in ('kc', 'vc'):
+                # Production layout per chip: [NUM_BLOCKS, 1, BLOCK_SIZE, HEAD_DIM].
+                # Take first n_used_blocks (slot 0's populated range — prod page
+                # table is contiguous 0..NUM_BLOCKS-1 by construction).
+                src = ttnn.slice(attn[key], [0, 0, 0, 0],
+                                 [n_used_blocks, 1, BLOCK_SIZE, HEAD_DIM])
+                # paged_fill_cache wants [1, NKV_PER_CHIP, seq_len, HEAD_DIM].
+                # With NKV_PER_CHIP=1: swap blocks-dim and NKV-dim via transpose.
+                src_t = ttnn.transpose(src, 0, 1)        # [1, n_used, BLK, D]
+                src_seq = ttnn.reshape(src_t,
+                    [1, 1, n_used_blocks * BLOCK_SIZE, HEAD_DIM])
+                src_L = ttnn.slice(src_seq, [0, 0, 0, 0], [1, 1, L, HEAD_DIM])
+                ttnn.experimental.paged_fill_cache(kv[key], src_L,
+                                                   state.cb_page_table_tt,
+                                                   batch_idx=slot_s)
+                # Views: src_t/src_seq/src_L alias src — let scope free. src is
+                # independent of attn[key].
+                ttnn.deallocate(src_L)
+                ttnn.deallocate(src_seq)
+                ttnn.deallocate(src_t)
+                ttnn.deallocate(src)
         else:
             dn = layer['dn']
             slot = state.cb_dn[li]
-            # ssm: production [1, N_V_TOTAL, K, V] sharded dim=1 → CB
-            # [B, N_V_TOTAL, K, V] sharded dim=1; splice slot_s row.
-            prod_ssm_full = ttnn.to_torch(dn['ssm'],
-                mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=1)).float()
-            cb_ssm_full = ttnn.to_torch(slot['ssm'],
-                mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=1)).float()
-            assert prod_ssm_full.shape == (1, N_V_TOTAL, K_DIM, V_DIM), \
-                f"prod ssm shape {prod_ssm_full.shape}"
-            assert cb_ssm_full.shape == (B, N_V_TOTAL, K_DIM, V_DIM), \
-                f"cb ssm shape {cb_ssm_full.shape}"
-            cb_ssm_full[slot_s] = prod_ssm_full[0]
-            host = ttnn.from_torch(cb_ssm_full, dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT,
-                mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=1))
-            ttnn.copy_host_to_device_tensor(host, slot['ssm'])
-            # conv: production [CONV_DIM, K-1] sharded dim=0; CB conv_cols is
-            # K-1 separate [B, CONV_DIM] tensors sharded dim=1. Each column k
-            # of production conv_st maps to conv_cols[k] (oldest→newest).
-            prod_conv_full = ttnn.to_torch(dn['conv_st'],
-                mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)).float()
-            assert prod_conv_full.shape == (CONV_DIM, CONV_K - 1), \
-                f"prod conv shape {prod_conv_full.shape}"
+            # ssm splice: cb[!s] preserved, cb[s] := prod (broadcast over B).
+            masked_cb = ttnn.mul(slot['ssm'], keep4)            # [B,NV,K,V]
+            prod_at_slot = ttnn.mul(dn['ssm'], slot4)           # broadcasts [1,NV,K,V]×[B,1,1,1]
+            new_ssm = ttnn.add(masked_cb, prod_at_slot)
+            ttnn.copy(new_ssm, slot['ssm'])
+            ttnn.deallocate(new_ssm)
+            ttnn.deallocate(prod_at_slot)
+            ttnn.deallocate(masked_cb)
+            # conv splice: per col k, take prod_conv[:, k] → broadcast row.
             for k in range(CONV_K - 1):
-                cb_col_full = ttnn.to_torch(slot['conv_cols'][k],
-                    mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=1)).float()
-                assert cb_col_full.shape == (B, CONV_DIM), \
-                    f"cb conv_col[{k}] shape {cb_col_full.shape}"
-                cb_col_full[slot_s] = prod_conv_full[:, k]
-                host = ttnn.from_torch(cb_col_full, dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT,
-                    mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=1))
-                ttnn.copy_host_to_device_tensor(host, slot['conv_cols'][k])
+                prod_col = ttnn.slice(dn['conv_st'], [0, k],
+                                      [CONV_DIM_CHIP, k + 1])  # [C, 1]
+                prod_col_2d = ttnn.reshape(prod_col, [1, CONV_DIM_CHIP])
+                masked_c = ttnn.mul(slot['conv_cols'][k], keep2)
+                prod_at_c = ttnn.mul(prod_col_2d, slot2)        # [B, C] via broadcast
+                new_c = ttnn.add(masked_c, prod_at_c)
+                ttnn.copy(new_c, slot['conv_cols'][k])
+                ttnn.deallocate(new_c)
+                ttnn.deallocate(prod_at_c)
+                ttnn.deallocate(masked_c)
+                ttnn.deallocate(prod_col_2d)
+                ttnn.deallocate(prod_col)
 
-    # Set slot_s's cur_pos to L (next position to write). cb_cur_pos_buf is
-    # replicated [B] int32 — read first chip's view via ConcatMeshToTensor;
-    # caller can pass cur_positions= to skip the readback for live schedulers.
+    ttnn.deallocate(slot2); ttnn.deallocate(keep2)
+    ttnn.deallocate(slot4); ttnn.deallocate(keep4)
+
+    # cur_pos[slot_s] = L. Tiny tensor; read+write via the existing pattern.
     cur_full = ttnn.to_torch(state.cb_cur_pos_buf,
         mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)).int()[:B].clone()
     cur_full[slot_s] = L
