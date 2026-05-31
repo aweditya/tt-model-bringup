@@ -19,6 +19,7 @@ if [[ "$#" -eq 0 ]]; then
          experiments/cb/needle.py \
          experiments/cb/validate/*.py \
          experiments/cb/bench/*.py \
+         experiments/cb/isolate/*.py \
          experiments/cb/load/*.py \
          experiments/cb/profile/*.py \
          experiments/utils/full_layer_tp_probe.py \
