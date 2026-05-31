@@ -214,9 +214,11 @@ def _build_app_with_default_lifespan():
         max_new_cap = int(os.environ.get("TT_CB_MAX_NEW", "1024"))
         max_inflight = int(os.environ.get("TT_CB_MAX_INFLIGHT", "0")) or None
         topk_k = int(os.environ.get("TT_CB_TOPK_K", "0")) or None
+        chunked_prefill = os.environ.get("TT_CB_CHUNKED_PREFILL", "0") == "1"
         engine = CBEngine(st, slots=slots, max_new_cap=max_new_cap,
                           eos_id=eos_id, sampling=True,
-                          max_inflight=max_inflight, topk_k=topk_k).start()
+                          max_inflight=max_inflight, topk_k=topk_k,
+                          chunked_prefill=chunked_prefill).start()
         state["engine"] = engine
         state["tok"] = st.tok
         state["eos_id"] = eos_id

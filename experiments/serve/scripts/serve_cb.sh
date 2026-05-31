@@ -14,6 +14,10 @@
 #   TT_CB_MAX_INFLIGHT=64    queue+active in-flight cap (over-cap → HTTP 429)
 #   TT_CB_TOPK_K             (unset)=full-vocab logits trace (best at low B);
 #                            set to e.g. 128 to enable on-device top-k (best at B≥16)
+#   TT_CB_CHUNKED_PREFILL    0=admit via 1-tok/iter decode-loop prefill (default);
+#                            1=admit via S1a chunked prefill + on-device
+#                            transplant (S2). Wins at all L>=64 (~2-2.5x at
+#                            L=64-200, larger at long L).
 set -u
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/tt-xla}"
@@ -57,6 +61,7 @@ cmd_start() {
     TT_CB_MAX_NEW="${TT_CB_MAX_NEW:-1024}" \
     TT_CB_MAX_INFLIGHT="${TT_CB_MAX_INFLIGHT:-64}" \
     TT_CB_TOPK_K="${TT_CB_TOPK_K:-0}" \
+    TT_CB_CHUNKED_PREFILL="${TT_CB_CHUNKED_PREFILL:-0}" \
     nohup setsid "$VENV_PY" -m uvicorn experiments.serve.cb_api:app \
         --host "$HOST_ADDR" --port "$PORT" --lifespan on \
         >> "$LOG_FILE" 2>&1 < /dev/null &

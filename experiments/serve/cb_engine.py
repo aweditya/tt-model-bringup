@@ -63,7 +63,8 @@ class CBEngine:
     """Thread-safe front end to the CB scheduler. One owned thread runs the loop."""
 
     def __init__(self, state, slots, max_new_cap, eos_id, use_trace=True,
-                 sampling=False, max_inflight=None, topk_k=None, idle_sleep=0.001):
+                 sampling=False, max_inflight=None, topk_k=None,
+                 chunked_prefill=False, idle_sleep=0.001):
         self.state = state
         self.slots = slots
         self.max_new_cap = int(max_new_cap)
@@ -78,6 +79,12 @@ class CBEngine:
         # sampling=False → argmax trace (P0 fast path).
         self.sampling = sampling
         self.topk_k = int(topk_k) if topk_k else None
+        # chunked_prefill=True → admit via S1a chunked prefill + on-device
+        # transplant (S2); alternating PREFILL_ONLY / DECODE_ONLY steps. Wins
+        # over 1-tok/iter at all L >= ~64 (2-2.5x at L=64-200; bigger at
+        # longer L). Forces cb_conv_mode='kdim' inside the scheduler so the
+        # post-transplant decode math is bit-identical to S1a's path.
+        self.chunked_prefill = bool(chunked_prefill)
         # Backpressure: cap on total in-flight requests (queued+active). When at
         # cap, submit() raises queue.Full → API maps to HTTP 429. Default unlimited.
         self.max_inflight = max_inflight
@@ -193,7 +200,8 @@ class CBEngine:
         try:
             self._sched = Scheduler(self.state, self.slots, self.max_new_cap,
                                     self.eos_id, use_trace=self.use_trace,
-                                    sampling=self.sampling, topk_k=self.topk_k)
+                                    sampling=self.sampling, topk_k=self.topk_k,
+                                    chunked_prefill=self.chunked_prefill)
             # Attach sub-step histograms so _step_sampled can record the split.
             self._sched.m_device = self.m_step_device_seconds
             self._sched.m_sample = self.m_step_sample_seconds
