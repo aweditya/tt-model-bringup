@@ -48,6 +48,27 @@ sys.stderr.reconfigure(line_buffering=True)
 DUMMY_TOK = 0  # token fed to parked/FREE slots (output ignored)
 
 
+def _sample_from_topk(values, indices, sp, rng):
+    """Per-slot sample from a sorted top-K row (W2). `values`/`indices` are
+    1-D [K] arrays (largest first; ttnn.topk with sorted=True). Applies
+    user-requested top_k clip + top_p nucleus truncation in K-space, then
+    samples. Returns the vocab-space token id."""
+    import numpy as np
+    k_req = int(sp.get("top_k", 0) or 0)
+    k_eff = len(values) if k_req <= 0 else min(k_req, len(values))
+    v = values[:k_eff].astype(np.float64) / max(float(sp.get("temperature", 1.0)), 1e-6)
+    v -= v.max()
+    p = np.exp(v); p /= p.sum()
+    top_p = float(sp.get("top_p", 1.0))
+    if 0.0 < top_p < 1.0:
+        # values are already sorted desc → cumsum directly is the nucleus.
+        cum = np.cumsum(p)
+        keep = int(np.searchsorted(cum, top_p)) + 1
+        p = p[:keep]; p /= p.sum()
+    pick = int(rng.choice(len(p), p=p))
+    return int(indices[pick])
+
+
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -85,25 +106,32 @@ def greedy_ref(state, prompt, max_new, eos_id):
 class Scheduler:
     """Orca iteration-level scheduler over a fixed pool of B slots."""
 
-    def __init__(self, state, B, max_new, eos_id, use_trace=False, sampling=False):
+    def __init__(self, state, B, max_new, eos_id, use_trace=False, sampling=False,
+                 topk_k=None):
         self.state = state
         self.B = B
         self.max_new = max_new
         self.eos_id = eos_id
         self.use_trace = use_trace
         # sampling mode: per-slot host temp/top-p/top-k each step.
-        #   sampling=False, use_trace=True  → argmax trace (P0 fast path).
-        #   sampling=True,  use_trace=True  → logits trace (same forward, stops
-        #     one op earlier; greedy slots take host argmax, sampled slots
-        #     sample on the host). ~3× faster than the eager-logits fallback.
-        #   sampling=True,  use_trace=False → eager logits forward each step
-        #     (slow; kept for non-traced testing).
-        # The two trace modes never coexist (one engine = one mode), so there's
-        # no "mixing eager forwards with execute_trace" hazard either way.
+        #   sampling=False, use_trace=True             → argmax trace (P0 fast path).
+        #   sampling=True,  use_trace=True, topk_k=N   → topk trace (W2). N ~128
+        #     amortizes well at B>=16; ~6× total step at B=32 vs the logits
+        #     trace, but adds ~100ms of fixed device cost that HURTS at low B
+        #     (e.g. B=4 step grew 131→232ms in measurement).
+        #   sampling=True,  use_trace=True, topk_k=None → logits trace (P1/P3.5).
+        #     Per-slot numpy sample over full [B, vocab] readback. Best at low
+        #     B (solo chat); host loop dominates at high B.
+        #   sampling=True,  use_trace=False            → eager logits forward.
+        # The trace modes never coexist (one engine = one mode), so there's no
+        # "mixing eager forwards with execute_trace" hazard either way.
         self.sampling = sampling
+        self.topk_k = int(topk_k) if topk_k else None
         self._trace_id = None
         self._argmax_handle = None
         self._logits_handle = None
+        self._topk_values_handle = None
+        self._topk_indices_handle = None
         cb.setup_cb_state(state, B)
         cb.cb_reset_states(state)
         if use_trace:
@@ -114,24 +142,38 @@ class Scheduler:
         self._next_id = 0
 
     def _capture_trace(self):
-        """Capture the batched forward once (CB4 pattern). step() then replays
-        via execute_trace at ~compute speed. Admission (cb_reset_slots) and
-        update_input_buffers run eager BETWEEN execute_trace calls — they mutate
-        the persistent buffers in-place, which the next replay reads. In sampling
-        mode the trace returns logits [B,vocab] instead of argmax [B,1]; the
-        per-slot host argmax/sample loop in _step_sampled reads that handle."""
+        """Capture the batched forward once. step() then replays via
+        execute_trace at compute speed. Admission (cb_reset_slots) and
+        update_input_buffers run eager BETWEEN replays — they mutate the
+        persistent input buffers, which the next replay reads.
+
+        Three trace tails (one per engine mode):
+          sampling=False             → ttnn.argmax (returns [B,1]).
+          sampling=True,  topk_k=N   → ttnn.topk    (returns ([B,K], [B,K])).
+          sampling=True,  topk_k=None → logits      (returns [B, vocab])."""
         import ttnn
         st = self.state
+        if self.sampling and self.topk_k is not None:
+            kw = {"return_topk": self.topk_k}
+        elif self.sampling:
+            kw = {"return_logits": True}
+        else:
+            kw = {}
         for i in range(2):  # JIT warmup (capture-during-JIT hangs on Blackhole)
             cb.update_input_buffers_batched(st, [DUMMY_TOK] * self.B, [i] * self.B)
-            out = cb.forward_batch_tp_inner(st, return_logits=self.sampling)
-            ttnn.deallocate(out)
+            out = cb.forward_batch_tp_inner(st, **kw)
+            if isinstance(out, tuple):
+                for h in out: ttnn.deallocate(h)
+            else:
+                ttnn.deallocate(out)
         ttnn.synchronize_device(st.mesh)
         cb.update_input_buffers_batched(st, [DUMMY_TOK] * self.B, [2] * self.B)
         self._trace_id = ttnn.begin_trace_capture(st.mesh, cq_id=0)
-        handle = cb.forward_batch_tp_inner(st, return_logits=self.sampling)
+        handle = cb.forward_batch_tp_inner(st, **kw)
         ttnn.end_trace_capture(st.mesh, self._trace_id, cq_id=0)
-        if self.sampling:
+        if self.sampling and self.topk_k is not None:
+            self._topk_values_handle, self._topk_indices_handle = handle
+        elif self.sampling:
             self._logits_handle = handle
         else:
             self._argmax_handle = handle
@@ -238,22 +280,25 @@ class Scheduler:
         return active
 
     def _step_sampled(self, toks, curs):
-        """Logits forward + per-slot host sampling. Greedy slots (sampling is
-        None) take the host argmax — identical token to the device argmax, same
-        logits. Sampled slots use their own seeded rng. When use_trace, replays
-        the captured logits trace (~3× faster than eager); otherwise eager.
+        """Sampling-mode step. Dispatches to the topk path (W2 — opt-in via
+        topk_k) or the logits path (P3.5 default).
 
-        Times two sub-segments (CBEngine attaches the histograms): device =
-        execute_trace + to_torch + upcast (includes device sync, since to_torch
-        blocks); sample = the per-slot host argmax/sample loop. Lets us answer
-        the host-loop-vs-device question without Tracy."""
+        Times two sub-segments (cb_metrics histograms): device = execute_trace
+        + to_torch + upcast (includes device sync); sample = the per-slot host
+        sample loop. Lets us answer host-loop-vs-device at any B."""
+        if self.topk_k is not None:
+            return self._step_sampled_topk(toks, curs)
+        return self._step_sampled_logits(toks, curs)
+
+    def _step_sampled_logits(self, toks, curs):
+        """Logits trace + per-slot full-vocab sample. Best at low B (solo chat)."""
         import time
         import ttnn
         cb.update_input_buffers_batched(self.state, toks, curs)
         t0 = time.perf_counter()
         if self.use_trace:
             ttnn.execute_trace(self.state.mesh, self._trace_id, cq_id=0, blocking=False)
-            rm = self._logits_handle  # persistent trace handle — do NOT deallocate
+            rm = self._logits_handle
         else:
             rm = cb.forward_batch_tp_inner(self.state, return_logits=True)
         t = ttnn.to_torch(rm, mesh_composer=ttnn.ConcatMeshToTensor(self.state.mesh, dim=0))
@@ -261,12 +306,7 @@ class Scheduler:
             ttnn.deallocate(rm)
         logits = t[:self.B].float().numpy()
         t1 = time.perf_counter()
-        # W1: vectorised greedy argmax over [B, vocab] instead of B individual
-        # numpy argmax calls — one C call replaces the per-slot loop for the
-        # `sampling is None` branch. Numerically identical (argmax on the same
-        # rows). >50× per-slot for all-greedy batches; harmless overhead for
-        # all-sampled (~10 ms at B=32 vs the ~640 ms host sample loop).
-        argmax_all = logits.argmax(axis=-1)
+        argmax_all = logits.argmax(axis=-1)  # W1: one vectorised call for greedy slots
         out = [DUMMY_TOK] * self.B
         for s in range(self.B):
             rid = self.slots[s]
@@ -281,8 +321,44 @@ class Scheduler:
                     sp.get('top_k', 0), self.reqs[rid]['rng'])
         t2 = time.perf_counter()
         if hasattr(self, 'm_device'):
-            self.m_device.observe(t1 - t0)
-            self.m_sample.observe(t2 - t1)
+            self.m_device.observe(t1 - t0); self.m_sample.observe(t2 - t1)
+        return out
+
+    def _step_sampled_topk(self, toks, curs):
+        """W2: topk trace + per-slot sample over K. ~6× total step at B=32 vs
+        the logits path; HURTS at low B (~75% slower at B=4 — the topk op has
+        fixed device cost that only amortises at large B). Opt-in via topk_k."""
+        import time
+        import ttnn
+        cb.update_input_buffers_batched(self.state, toks, curs)
+        t0 = time.perf_counter()
+        if self.use_trace:
+            ttnn.execute_trace(self.state.mesh, self._trace_id, cq_id=0, blocking=False)
+            vals_h = self._topk_values_handle
+            idxs_h = self._topk_indices_handle
+        else:
+            vals_h, idxs_h = cb.forward_batch_tp_inner(self.state, return_topk=self.topk_k)
+        composer = ttnn.ConcatMeshToTensor(self.state.mesh, dim=0)
+        vals_t = ttnn.to_torch(vals_h, mesh_composer=composer)
+        idxs_t = ttnn.to_torch(idxs_h, mesh_composer=composer)
+        if not self.use_trace:
+            ttnn.deallocate(vals_h); ttnn.deallocate(idxs_h)
+        vals = vals_t[:self.B].float().numpy()    # [B, K]
+        idxs = idxs_t[:self.B].long().numpy()     # [B, K]
+        t1 = time.perf_counter()
+        out = [DUMMY_TOK] * self.B
+        for s in range(self.B):
+            rid = self.slots[s]
+            if rid is None:
+                continue
+            sp = self.reqs[rid]['sampling']
+            if sp is None:
+                out[s] = int(idxs[s, 0])  # topk is sorted; index 0 == argmax
+            else:
+                out[s] = _sample_from_topk(vals[s], idxs[s], sp, self.reqs[rid]['rng'])
+        t2 = time.perf_counter()
+        if hasattr(self, 'm_device'):
+            self.m_device.observe(t1 - t0); self.m_sample.observe(t2 - t1)
         return out
 
     def run(self, max_iters=10000):

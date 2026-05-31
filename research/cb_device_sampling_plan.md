@@ -60,21 +60,31 @@ For all-greedy batches (the historical default, plus the chat-API's `temp=0`
 requests) this turns 20 ms × B into ~10 ms total — already a >50× per-slot
 win.
 
-### W2 — on-device top-k (settles sampling too)
+### W2 — on-device top-k (settles sampling too) — SHIPPED (opt-in)
 
-Capture a second trace ending in `ttnn.topk(rm, k=K, dim=-1)` (K ≥ effective
-top-p, e.g. K=128). Readback shrinks `[B, vocab=248320]` → `[B, K=128]` —
-roughly 2000× less data. Per-slot sampling becomes a K-element argsort which
-is ~10 µs instead of ~20 ms — **a ~2000× per-slot win**.
+Replaced the W2-mode trace tail with `ttnn.topk(sliced, k=K, dim=-1,
+largest=True, sorted=True)` (operates on the tile-layout pre-untilize tensor —
+topk requires TILE). Returns `(values, indices)` of shape `[B, K]`. Per-slot
+host sampling runs over K elements (`_sample_from_topk`); greedy slots take
+`indices[s, 0]` (sorted=True → index 0 is the argmax).
 
-Risks: capturing two traces (argmax + topk-logits) is the gamble we ducked in
-P1; needs validation. `ttnn.topk` exists and was used in the older 35B-A3B
-work — check the existing call sites for the right config.
+**Measured at B=32** (32 clients × 30s × sampling, 143 steps observed):
+- Total step:   **263 ms** (was 778 ms before W2 → **2.96× faster**).
+- Device:       249 ms (was 124 ms — the topk op adds ~125 ms of device cost).
+- Sample loop:  **1.76 ms** (was 647 ms → **368× faster**).
+- Aggregate:    **~154 tok/s** (was 23.6 tok/s → **6.5× more throughput**).
 
-Predicted full step at B=32 after W2: 124 ms (device) + ~5 ms (top-k readback
-+ per-slot work) = **~130 ms / step**, vs current 778 ms — a **~6× total
-step speedup** at B=32. Aggregate throughput at B=32 would go from
-~40 tok/s → ~250 tok/s.
+**Measured at B=4**: 232 ms / step (was 131 ms → **77% slower**). The topk
+device op has fixed overhead that only amortises at large B.
+
+**Shipped as opt-in** via `topk_k` (default `None` keeps the W1/logits path
+that's best at low B). Engine: `CBEngine(..., topk_k=128)` enables W2. cb_api
+reads `TT_CB_TOPK_K` env var (unset / 0 = logits path; set to e.g. 128 = W2
+topk path). serve_cb.sh threads it through. The Scheduler captures whichever
+trace tail matches the mode; both paths validated by engine_sampling.py.
+
+Rule of thumb: solo chat / slots ≤ 8 → leave `TT_CB_TOPK_K` unset; production
+load / slots ≥ 16 → set `TT_CB_TOPK_K=128`.
 
 ### W3 — vectorise the sample math across slots
 

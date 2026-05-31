@@ -513,7 +513,7 @@ def setup_cb_write_mem_cfg(state):
         ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec)
 
 
-def forward_batch_tp_inner(state, return_logits=False):
+def forward_batch_tp_inner(state, return_logits=False, return_topk=None):
     """Batched decode forward over B slots. Reads cb_tok_buf [B,1],
     cb_cur_pos_buf [B], cb_rot_idxs_buf [B,1]. Returns per-slot argmax [B]."""
     cfg = state.cfg
@@ -551,7 +551,16 @@ def forward_batch_tp_inner(state, return_logits=False):
     sharded = ttnn.linear(x_tt, state.lm_head_tt)        # [B, VOCAB_PAD/NCHIPS]/chip
     ttnn.deallocate(x_tt)
     gathered = ttnn.all_gather(sharded, dim=-1)           # [B, VOCAB_PAD] replicated
-    sliced = ttnn.slice(gathered, [0, 0], [B, state.vocab_size])
+    sliced = ttnn.slice(gathered, [0, 0], [B, state.vocab_size])  # TILE layout
+    if return_topk is not None:
+        # W2: on-device top-k for sampling. Read back [B, K] instead of
+        # [B, vocab] (~2000× less data at K=128), so the per-slot host
+        # sample math runs over K elements not 248k. Sorted=True so index 0
+        # is the argmax (free greedy path). topk requires TILE layout — keep
+        # sliced (pre-untilize) for it.
+        top_vals, top_idxs = ttnn.topk(sliced, k=int(return_topk), dim=-1,
+                                        largest=True, sorted=True)
+        return (top_vals, top_idxs)
     rm = ttnn.untilize(sliced, use_multicore=True)
     if return_logits:
         return rm

@@ -212,8 +212,11 @@ def _build_app_with_default_lifespan():
         eos_id = int(eos_id) if eos_id is not None else -1
         slots = int(os.environ.get("TT_CB_SLOTS", "4"))
         max_new_cap = int(os.environ.get("TT_CB_MAX_NEW", "1024"))
+        max_inflight = int(os.environ.get("TT_CB_MAX_INFLIGHT", "0")) or None
+        topk_k = int(os.environ.get("TT_CB_TOPK_K", "0")) or None
         engine = CBEngine(st, slots=slots, max_new_cap=max_new_cap,
-                          eos_id=eos_id, sampling=True).start()
+                          eos_id=eos_id, sampling=True,
+                          max_inflight=max_inflight, topk_k=topk_k).start()
         state["engine"] = engine
         state["tok"] = st.tok
         state["eos_id"] = eos_id

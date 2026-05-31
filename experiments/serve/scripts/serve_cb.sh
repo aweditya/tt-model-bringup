@@ -12,6 +12,8 @@
 #   TT_CB_SLOTS=4            CB scheduler slots
 #   TT_CB_MAX_NEW=1024       per-request max_new_tokens cap
 #   TT_CB_MAX_INFLIGHT=64    queue+active in-flight cap (over-cap → HTTP 429)
+#   TT_CB_TOPK_K             (unset)=full-vocab logits trace (best at low B);
+#                            set to e.g. 128 to enable on-device top-k (best at B≥16)
 set -u
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/tt-xla}"
@@ -54,6 +56,7 @@ cmd_start() {
     TT_CB_SLOTS="${TT_CB_SLOTS:-4}" \
     TT_CB_MAX_NEW="${TT_CB_MAX_NEW:-1024}" \
     TT_CB_MAX_INFLIGHT="${TT_CB_MAX_INFLIGHT:-64}" \
+    TT_CB_TOPK_K="${TT_CB_TOPK_K:-0}" \
     nohup setsid "$VENV_PY" -m uvicorn experiments.serve.cb_api:app \
         --host "$HOST_ADDR" --port "$PORT" --lifespan on \
         >> "$LOG_FILE" 2>&1 < /dev/null &

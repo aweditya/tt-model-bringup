@@ -63,15 +63,21 @@ class CBEngine:
     """Thread-safe front end to the CB scheduler. One owned thread runs the loop."""
 
     def __init__(self, state, slots, max_new_cap, eos_id, use_trace=True,
-                 sampling=False, max_inflight=None, idle_sleep=0.001):
+                 sampling=False, max_inflight=None, topk_k=None, idle_sleep=0.001):
         self.state = state
         self.slots = slots
         self.max_new_cap = int(max_new_cap)
         self.eos_id = eos_id
         self.use_trace = use_trace
-        # sampling=True → eager per-slot temp/top-p/top-k (the chat-API mode);
-        # sampling=False → greedy argmax trace (P0 fast path). See Scheduler.
+        # sampling=True → per-slot host temp/top-p/top-k each step.
+        #   topk_k=None  → logits trace + full-vocab sample (default; best for
+        #                  low concurrency / solo chat at slots ≤ ~8).
+        #   topk_k=K     → W2 on-device top-k trace + per-slot K-elem sample
+        #                  (~6× total step at B=32; ~75% slower at B=4 — use
+        #                  when slots ≥ ~16). Typical K=128.
+        # sampling=False → argmax trace (P0 fast path).
         self.sampling = sampling
+        self.topk_k = int(topk_k) if topk_k else None
         # Backpressure: cap on total in-flight requests (queued+active). When at
         # cap, submit() raises queue.Full → API maps to HTTP 429. Default unlimited.
         self.max_inflight = max_inflight
@@ -187,7 +193,7 @@ class CBEngine:
         try:
             self._sched = Scheduler(self.state, self.slots, self.max_new_cap,
                                     self.eos_id, use_trace=self.use_trace,
-                                    sampling=self.sampling)
+                                    sampling=self.sampling, topk_k=self.topk_k)
             # Attach sub-step histograms so _step_sampled can record the split.
             self._sched.m_device = self.m_step_device_seconds
             self._sched.m_sample = self.m_step_sample_seconds
