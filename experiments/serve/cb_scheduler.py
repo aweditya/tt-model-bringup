@@ -107,12 +107,23 @@ class Scheduler:
     """Orca iteration-level scheduler over a fixed pool of B slots."""
 
     def __init__(self, state, B, max_new, eos_id, use_trace=False, sampling=False,
-                 topk_k=None):
+                 topk_k=None, chunked_prefill=False):
         self.state = state
         self.B = B
         self.max_new = max_new
         self.eos_id = eos_id
         self.use_trace = use_trace
+        # chunked_prefill: alternating PREFILL_ONLY / DECODE_ONLY scheduler pattern
+        # (TT vLLM convention; research/27b_chunked_prefill_prior_art.md). When a
+        # new request is admitted, the next step runs S1a chunked prefill on the
+        # production state + cb_prefill_transplant into the slot — one step
+        # regardless of L, instead of L decode steps. Other slots are paused
+        # during that one PREFILL step (matches TT vLLM "no mixed batches").
+        # Default OFF (existing 1-tok/iter decode-loop prefill behaviour).
+        self.chunked_prefill = bool(chunked_prefill)
+        if self.chunked_prefill:
+            state.cb_conv_mode = 'kdim'                  # bit-identical to prod
+            state.cb_dn_recurrence_mode = 'manual'       # ditto
         # sampling mode: per-slot host temp/top-p/top-k each step.
         #   sampling=False, use_trace=True             → argmax trace (P0 fast path).
         #   sampling=True,  use_trace=True, topk_k=N   → topk trace (W2). N ~128
@@ -215,6 +226,41 @@ class Scheduler:
             cb.cb_reset_slots(self.state, admitted)  # fresh DN state for new seqs
         return admitted
 
+    def _step_prefill_chunked(self):
+        """PREFILL_ONLY step (TT vLLM pattern): chunked prefill ONE waiting
+        request via S1a + transplant. The slot is admitted and put directly into
+        DECODE state with the prefill's first generated token. Returns True if a
+        request was prefilled this step; False if there was nothing to prefill.
+        """
+        # Find one waiting request + a free slot.
+        rid = None; slot = None
+        for s in range(self.B):
+            if self.slots[s] is None and self.waiting:
+                rid = self.waiting.popleft(); slot = s
+                break
+        if rid is None:
+            return False
+        r = self.reqs[rid]
+        import numpy as np, ttnn
+        cb.cb_reset_slots(self.state, [slot])
+        base._reset_state_buffers(self.state)  # clears prod state for new prefill
+        cap = base.forward_prefill_chunked_tp(self.state, r['prompt'],
+                                              capture_logits=True)
+        ttnn.synchronize_device(self.state.mesh)
+        first_tok = int(np.argmax(cap[-1]))
+        cb.cb_prefill_transplant(self.state, slot, len(r['prompt']))
+        ttnn.synchronize_device(self.state.mesh)
+        # Slot is now in DECODE state with one generated token.
+        self.slots[slot] = rid
+        r['slot'] = slot
+        r['cur_pos'] = len(r['prompt'])
+        r['next_tok'] = first_tok
+        r['gen'] = [first_tok]
+        r['status'] = 'DECODE'
+        # Re-check finish (handles max_new=1 / EOS-as-first-tok edge cases).
+        self._finish(r, slot, first_tok)
+        return True
+
     def _finish(self, r, s, last_out):
         done = (len(r['gen']) >= self.max_new) or (last_out == self.eos_id)
         if done:
@@ -240,7 +286,23 @@ class Scheduler:
         return True
 
     def step(self):
-        """One scheduler iteration = one batched forward. Returns #active slots."""
+        """One scheduler iteration. Returns #active slots.
+
+        Two modes:
+         - chunked_prefill=True: when any request is waiting AND any slot is
+           free, run a PREFILL_ONLY step (S1a chunked prefill + transplant for
+           ONE request). Otherwise run a DECODE_ONLY step on the active slots.
+           Matches TT vLLM scheduler (research/27b_chunked_prefill_prior_art.md).
+         - chunked_prefill=False: original behaviour — admit into slots and
+           advance ALL slots one token per iteration through the decode forward
+           (the waiting request's prompt is consumed one tok/iter through the
+           same forward; the slot transitions to DECODE on the last prompt
+           token).
+        """
+        if self.chunked_prefill:
+            if self.waiting and any(s is None for s in self.slots):
+                self._step_prefill_chunked()
+                return sum(1 for s in self.slots if s is not None)
         self._admit()
         toks, curs = [DUMMY_TOK] * self.B, [0] * self.B
         for s in range(self.B):
