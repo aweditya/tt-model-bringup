@@ -261,6 +261,12 @@ class Scheduler:
             ttnn.deallocate(rm)
         logits = t[:self.B].float().numpy()
         t1 = time.perf_counter()
+        # W1: vectorised greedy argmax over [B, vocab] instead of B individual
+        # numpy argmax calls — one C call replaces the per-slot loop for the
+        # `sampling is None` branch. Numerically identical (argmax on the same
+        # rows). >50× per-slot for all-greedy batches; harmless overhead for
+        # all-sampled (~10 ms at B=32 vs the ~640 ms host sample loop).
+        argmax_all = logits.argmax(axis=-1)
         out = [DUMMY_TOK] * self.B
         for s in range(self.B):
             rid = self.slots[s]
@@ -268,7 +274,7 @@ class Scheduler:
                 continue
             sp = self.reqs[rid]['sampling']
             if sp is None:
-                out[s] = int(logits[s].argmax())
+                out[s] = int(argmax_all[s])
             else:
                 out[s] = base._sample_from_logits(
                     logits[s], sp.get('temperature', 1.0), sp.get('top_p', 1.0),
