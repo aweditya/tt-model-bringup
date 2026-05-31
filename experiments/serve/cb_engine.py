@@ -109,6 +109,12 @@ class CBEngine:
                                    "Tokens emitted to client streams.")
         self.m_step_seconds = M.histogram("cb_step_seconds",
                                            "Wall time of one scheduler step (one batched forward).")
+        # Sub-step split (sampling mode only — populated by _step_sampled). Lets
+        # us answer "host-loop vs device" at any B without re-running Tracy.
+        self.m_step_device_seconds = M.histogram("cb_step_device_seconds",
+            "Step time spent in device forward + readback (execute_trace -> to_torch -> upcast).")
+        self.m_step_sample_seconds = M.histogram("cb_step_sample_seconds",
+            "Step time spent in the per-slot host sample/argmax loop after readback.")
         self.m_ttft_seconds = M.histogram("cb_ttft_seconds",
                                            "Time-to-first-token from submit() to first stream emit.")
         self.m_request_seconds = M.histogram("cb_request_duration_seconds",
@@ -182,6 +188,9 @@ class CBEngine:
             self._sched = Scheduler(self.state, self.slots, self.max_new_cap,
                                     self.eos_id, use_trace=self.use_trace,
                                     sampling=self.sampling)
+            # Attach sub-step histograms so _step_sampled can record the split.
+            self._sched.m_device = self.m_step_device_seconds
+            self._sched.m_sample = self.m_step_sample_seconds
         except BaseException as e:  # surface bootstrap/capture failure to start()
             self._err = e
             self.started.set()

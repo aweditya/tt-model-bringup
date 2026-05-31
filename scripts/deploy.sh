@@ -20,6 +20,7 @@ if [[ "$#" -eq 0 ]]; then
          experiments/cb/validate/*.py \
          experiments/cb/bench/*.py \
          experiments/cb/load/*.py \
+         experiments/cb/profile/*.py \
          experiments/utils/full_layer_tp_probe.py \
          experiments/utils/tp_attn_traced_probe.py
 fi

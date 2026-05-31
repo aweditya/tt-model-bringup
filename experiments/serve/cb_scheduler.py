@@ -241,9 +241,16 @@ class Scheduler:
         """Logits forward + per-slot host sampling. Greedy slots (sampling is
         None) take the host argmax — identical token to the device argmax, same
         logits. Sampled slots use their own seeded rng. When use_trace, replays
-        the captured logits trace (~3× faster than eager); otherwise eager."""
+        the captured logits trace (~3× faster than eager); otherwise eager.
+
+        Times two sub-segments (CBEngine attaches the histograms): device =
+        execute_trace + to_torch + upcast (includes device sync, since to_torch
+        blocks); sample = the per-slot host argmax/sample loop. Lets us answer
+        the host-loop-vs-device question without Tracy."""
+        import time
         import ttnn
         cb.update_input_buffers_batched(self.state, toks, curs)
+        t0 = time.perf_counter()
         if self.use_trace:
             ttnn.execute_trace(self.state.mesh, self._trace_id, cq_id=0, blocking=False)
             rm = self._logits_handle  # persistent trace handle — do NOT deallocate
@@ -253,6 +260,7 @@ class Scheduler:
         if not self.use_trace:
             ttnn.deallocate(rm)
         logits = t[:self.B].float().numpy()
+        t1 = time.perf_counter()
         out = [DUMMY_TOK] * self.B
         for s in range(self.B):
             rid = self.slots[s]
@@ -265,6 +273,10 @@ class Scheduler:
                 out[s] = base._sample_from_logits(
                     logits[s], sp.get('temperature', 1.0), sp.get('top_p', 1.0),
                     sp.get('top_k', 0), self.reqs[rid]['rng'])
+        t2 = time.perf_counter()
+        if hasattr(self, 'm_device'):
+            self.m_device.observe(t1 - t0)
+            self.m_sample.observe(t2 - t1)
         return out
 
     def run(self, max_iters=10000):
