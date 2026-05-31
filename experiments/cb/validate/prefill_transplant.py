@@ -6,21 +6,22 @@ production S1a/S1b chunked prefill on a temp state, transplanting the
 post-prefill state into a CB slot, then continuing decode through the existing
 CB engine.
 
-Reference path: forward_prefill_tp_inner (the proven 1-tok-per-iter loop on
-production state) + 4 single-token decode steps via forward_token_tp_inner.
-Both paths use the SAME prompt and the SAME greedy argmax, so identical math
-should give identical tokens.
+Both paths use S1a (forward_prefill_chunked_tp) as the prefill. We're not
+gating S1a vs the 1-tok-per-iter stub here (S1a has known bf16 per-position
+cos≈0.95-0.99 vs that stub; that's not the transplant's fault). What we ARE
+gating: AFTER an S1a prefill, does a transplant + N CB decode steps produce
+the same tokens as N production decode steps in-place?
 
-Test path:
-  1. _reset_state_buffers, then forward_prefill_chunked_tp(prompt) to populate
-     production state. Capture the last-position argmax as `first_tok`.
-  2. setup_cb_state + cb_reset_states → empty CB state.
-  3. cb_prefill_transplant(state, slot=0, L=len(prompt)).
-  4. Step the CB engine 3 times with `first_tok` as the seed for slot 0,
-     decoding 3 more tokens. We thus emit 4 tokens total — the same 4 the
-     reference path emits.
+Reference path: S1a prefill on production state → N decode steps via
+forward_token_tp_inner on the SAME production state. State stays where it was
+written; no transplant.
 
-Gate: argmax of the 4 generated tokens IDENTICAL between reference and test.
+Test path: S1a prefill on production state → cb_prefill_transplant into slot
+s → N CB decode steps via forward_batch_tp_inner on cb_dn/cb_kv slot s.
+
+Gate: argmax of the N+1 generated tokens IDENTICAL between reference and
+test. Drift here = transplant bug OR CB-step-vs-prod-step divergence (which
+should be zero per CB1 "bit-identical to prod").
 
 Run on qb1 (from repo root):
   make run PY=experiments/cb/validate/prefill_transplant.py
@@ -48,15 +49,13 @@ def _chip0_logits(state, rm):
 
 
 def _reference_decode(state, base, prompt_ids, n_decode):
-    """Reference: 1-tok-per-iter prefill (forward_prefill_tp_inner stub) +
-    n_decode greedy decode steps on production state. Returns the list of
-    n_decode+1 generated token ids (first one is the prefill argmax)."""
+    """Reference: S1a chunked prefill on production state + n_decode greedy
+    decode steps via forward_token_tp_inner (production decode, NO transplant).
+    Returns the list of n_decode+1 generated token ids."""
     import ttnn
     base._reset_state_buffers(state)
-    last_logits = base.forward_prefill_tp_inner(state, prompt_ids, capture_logits=False)
-    ttnn.synchronize_device(state.mesh)
-    first_tok = int(np.argmax(_chip0_logits(state, last_logits)))
-    ttnn.deallocate(last_logits)
+    cap = base.forward_prefill_chunked_tp(state, prompt_ids, capture_logits=True)
+    first_tok = int(np.argmax(cap[-1]))
     gen = [first_tok]
     pos = len(prompt_ids)
     tid = first_tok
@@ -136,6 +135,10 @@ def main():
     log("=== CB setup ===")
     B = 4
     cb.setup_cb_state(state, B)
+    # bit-identical to production: CB defaults to shiftacc conv (fast, drifts).
+    # For correctness validation use kdim (sum-reduce — same math as prod).
+    state.cb_conv_mode = 'kdim'
+    state.cb_dn_recurrence_mode = 'manual'
 
     log("=== test: chunked prefill + transplant + CB decode ===")
     test_tokens = _test_path_decode(state, base, ids, args.decode, slot_s=args.slot)
