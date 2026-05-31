@@ -78,6 +78,9 @@ def main():
     ap.add_argument("--max-new", type=int, default=24)
     ap.add_argument("--conv", choices=["kdim", "shiftacc"], default="kdim")
     ap.add_argument("--owned-gdn", action="store_true", default=True)
+    ap.add_argument("--chunked-prefill", action="store_true",
+                    help="S2 path: admit via Scheduler(chunked_prefill=True). "
+                         "Forces --conv kdim --owned-gdn=False internally.")
     args = ap.parse_args()
 
     log("bootstrap production 27B server (server_tp)…")
@@ -97,7 +100,8 @@ def main():
         f"haystack≈{args.length} tok, prompt={len(prompt)} tok, code={code}, frac={args.frac}")
 
     # serve it through the CB scheduler (B=1 slot), greedy decode
-    s = sched.Scheduler(state, 1, args.max_new, eos)
+    s = sched.Scheduler(state, 1, args.max_new, eos,
+                        chunked_prefill=args.chunked_prefill)
     s.submit(prompt)
     t0 = time.perf_counter()
     iters = s.run()
