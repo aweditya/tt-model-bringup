@@ -27,18 +27,12 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
-sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+_PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())
+sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
+sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
-import server_tp as base       # noqa: E402
-import server_tp_cb as cb      # noqa: E402
-
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+from _runner import bootstrap_27b_cb, log  # noqa: E402
+import server_tp_cb as cb                    # noqa: E402
 
 
 def _cos(a, b):
@@ -131,8 +125,7 @@ def main():
     args = ap.parse_args()
 
     log("bootstrap production 27B server (server_tp)…")
-    state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
-    base.bootstrap(state)
+    state, base = bootstrap_27b_cb()
     tok = state.tok
     # Long enough to exercise many positions (--max-pos up to ~40) so a not-bit-
     # identical op (shift-accum conv) is checked for drift amplification, not just

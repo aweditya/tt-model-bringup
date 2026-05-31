@@ -20,17 +20,11 @@ from pathlib import Path
 
 import numpy as np
 
-PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
-sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+_PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())
+sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
+sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
-import server_tp as base  # noqa: E402
-
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+from _runner import bootstrap_27b_cb, log  # noqa: E402
 
 
 def _cos(a, b):
@@ -48,10 +42,9 @@ def main():
     lens = [int(x) for x in args.lens.split(",")]
 
     log("bootstrap production 27B server (server_tp)…")
-    state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
-    base.bootstrap(state)
+    state, base = bootstrap_27b_cb()
     tok = state.tok
-    state.deltanet_recurrence_mode = "manual"  # qb1 baseline; the chunked path uses Neumann
+    # qb1 baseline; the chunked path uses Neumann. Mode defaulted to "manual" by bootstrap_27b_cb.
 
     prompt = ("The capital of France is the city of Paris, which has long been a "
               "center of art, science, philosophy, and political history in Europe, "

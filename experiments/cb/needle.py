@@ -28,14 +28,12 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
-sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+_PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())
+sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
+sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
-import server_tp as base       # noqa: E402
-import cb_scheduler as sched   # noqa: E402
-
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
+from _runner import bootstrap_27b_cb, log  # noqa: E402
+import cb_scheduler as sched                 # noqa: E402
 
 DISTRACTOR = (
     "The history of computing spans many centuries from the abacus to modern "
@@ -46,10 +44,6 @@ DISTRACTOR = (
     "single chip. Today processors contain billions of transistors and execute "
     "instructions in parallel across many cores. ")
 ALPHABET = "BCDFGHJKLMNPQRSTVWXYZ23456789"
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def build_prompt(tok, target_len, frac, code):
@@ -87,11 +81,9 @@ def main():
     args = ap.parse_args()
 
     log("bootstrap production 27B server (server_tp)…")
-    state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
-    base.bootstrap(state)
-    state.deltanet_recurrence_mode = "owned_gdn" if args.owned_gdn else "manual"
-    state.deltanet_decay_gate_mode = "manual"
-    state.deltanet_decay_mode = "native_softplus"
+    state, _ = bootstrap_27b_cb()
+    if args.owned_gdn:
+        state.deltanet_recurrence_mode = "owned_gdn"
     state.cb_dn_recurrence_mode = "owned_gdn" if args.owned_gdn else "manual"
     state.cb_conv_mode = args.conv
     tok = state.tok

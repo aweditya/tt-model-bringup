@@ -32,18 +32,13 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
-sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+_PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())
+sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
+sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
-import server_tp as base       # noqa: E402
-import server_tp_cb as cb      # noqa: E402
-
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+from _runner import bootstrap_27b_cb, log  # noqa: E402
+import server_tp as base                     # noqa: E402  (prod_ref uses base.* at module scope)
+import server_tp_cb as cb                    # noqa: E402
 
 
 def prod_ref(state, prompt_ids):
@@ -146,11 +141,7 @@ def main():
     batches = [int(x) for x in args.batches.split(",")]
 
     log("bootstrap production 27B server (server_tp)…")
-    state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
-    base.bootstrap(state)
-    state.deltanet_recurrence_mode = "manual"
-    state.deltanet_decay_gate_mode = "manual"
-    state.deltanet_decay_mode = "native_softplus"
+    state, _ = bootstrap_27b_cb()
     state.cb_dn_recurrence_mode = "owned_gdn" if args.owned_gdn else "manual"
     state.cb_conv_mode = "shiftacc" if args.shiftacc else "kdim"
     log(f"DN recurrence: {state.cb_dn_recurrence_mode}; conv: {state.cb_conv_mode}")

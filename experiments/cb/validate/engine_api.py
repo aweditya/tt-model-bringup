@@ -31,29 +31,23 @@ import threading
 import time
 from pathlib import Path
 
-PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
-sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+_PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())
+sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
+sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
-import server_tp as base                       # noqa: E402
-from cb_engine import CBEngine                  # noqa: E402
+from _runner import bootstrap_27b_cb, log       # noqa: E402
+from cb_engine import CBEngine                   # noqa: E402
 
 # cb_api builds a module-level app when TT_CB_API_BUILD_APP=1; the validator
 # builds its own (no lifespan), so suppress the default app to avoid double
 # bootstrap on import.
 import os
 os.environ["TT_CB_API_BUILD_APP"] = "0"
-from cb_api import _build_app                   # noqa: E402
-
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
+from cb_api import _build_app                    # noqa: E402
 
 PORT = 18765
 HOST = "127.0.0.1"
 MAX_NEW = 16
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 # ── HTTP helpers (stdlib only) ────────────────────────────────────────────────
@@ -156,11 +150,7 @@ def _start_uvicorn(app):
 # ── tests ─────────────────────────────────────────────────────────────────────
 def main():
     log("bootstrap production 27B server (server_tp)…")
-    state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
-    base.bootstrap(state)
-    state.deltanet_recurrence_mode = "manual"
-    state.deltanet_decay_gate_mode = "manual"
-    state.deltanet_decay_mode = "native_softplus"
+    state, base = bootstrap_27b_cb()
     tok = state.tok
     eos_id = getattr(tok, "eos_token_id", None)
     eos_id = int(eos_id) if eos_id is not None else -1

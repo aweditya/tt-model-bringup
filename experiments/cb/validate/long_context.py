@@ -19,17 +19,12 @@ from pathlib import Path
 
 import numpy as np
 
-PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
-sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+_PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())
+sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
+sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
-import server_tp as base  # noqa: E402
-
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+from _runner import bootstrap_27b_cb, log  # noqa: E402
+import server_tp as base                     # noqa: E402  (module-scope refs in _decode + main)
 
 
 def _chip0_logits(state, rm):
@@ -61,10 +56,8 @@ def main():
     args = ap.parse_args()
 
     log("bootstrap production 27B server (server_tp)…")
-    state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
-    base.bootstrap(state)
+    state, _ = bootstrap_27b_cb()
     tokenizer = state.tok
-    state.deltanet_recurrence_mode = "manual"
 
     NEEDLE = "7X9Q2"
     needle_s = f" Important: the Aurora project access code is {NEEDLE}. Keep it confidential."

@@ -24,19 +24,14 @@ import threading
 import time
 from pathlib import Path
 
-PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
-sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+_PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())
+sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
+sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
-import server_tp as base       # noqa: E402
-from cb_scheduler import Scheduler  # noqa: E402
+from _runner import bootstrap_27b_cb, log  # noqa: E402
+from cb_scheduler import Scheduler           # noqa: E402
 
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-SOCK = str(PROJECT_ROOT / ".cache" / "cb_demo.sock")
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+SOCK = str(_PROJECT / ".cache" / "cb_demo.sock")
 
 
 PROMPTS = [
@@ -85,9 +80,7 @@ def main():
     args = ap.parse_args()
 
     log("bootstrap production 27B server (server_tp)…")
-    state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
-    base.bootstrap(state)
-    state.deltanet_recurrence_mode = "manual"
+    state, _ = bootstrap_27b_cb()
     eos_id = getattr(state.tok, "eos_token_id", None)
     sched = Scheduler(state, args.slots, args.max_new, eos_id, use_trace=True)
     log(f"CB server ready: {args.slots} slots, trace-captured. Firing {args.clients} clients…")

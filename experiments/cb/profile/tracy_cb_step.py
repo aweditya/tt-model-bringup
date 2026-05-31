@@ -35,20 +35,14 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
-sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+_PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())
+sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
+sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
 import tracy  # noqa: E402  (must import before server_tp pulls in ttnn)
 
-import server_tp as base                 # noqa: E402
-from cb_engine import CBEngine            # noqa: E402
-
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+from _runner import bootstrap_27b_cb, log  # noqa: E402
+from cb_engine import CBEngine               # noqa: E402
 
 
 def main():
@@ -61,11 +55,7 @@ def main():
     args = ap.parse_args()
 
     log("bootstrap server_tp…")
-    state = base.MeshServerState()
-    base.bootstrap(state)
-    state.deltanet_recurrence_mode = "manual"
-    state.deltanet_decay_gate_mode = "manual"
-    state.deltanet_decay_mode = "native_softplus"
+    state, _ = bootstrap_27b_cb()
 
     eos_id = getattr(state.tok, "eos_token_id", None)
     eos_id = int(eos_id) if eos_id is not None else -1

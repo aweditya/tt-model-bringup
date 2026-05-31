@@ -31,18 +31,12 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "serve").is_dir())
-sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
+_PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())
+sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
+sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
-import server_tp as base       # noqa: E402
-import server_tp_cb as cb      # noqa: E402
-
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+from _runner import bootstrap_27b_cb, log  # noqa: E402
+import server_tp_cb as cb                    # noqa: E402
 
 
 def bench_one(state, B, steps, warmup, blocks_per_seq):
@@ -88,12 +82,7 @@ def main():
     batches = [int(x) for x in args.batches.split(",")]
 
     log("bootstrap production 27B server (server_tp)…")
-    state = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
-    base.bootstrap(state)
-    # match the proven manual DN math (owned_gdn is B=1-only)
-    state.deltanet_recurrence_mode = "manual"
-    state.deltanet_decay_gate_mode = "manual"
-    state.deltanet_decay_mode = "native_softplus"
+    state, _ = bootstrap_27b_cb()  # manual DN math (owned_gdn is B=1-only)
 
     log(f"=== eager batched decode throughput (steps={args.steps}, warmup={args.warmup}) ===")
     base_ms = None

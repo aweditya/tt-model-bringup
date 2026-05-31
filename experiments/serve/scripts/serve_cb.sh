@@ -46,7 +46,7 @@ cmd_start() {
     : > "$LOG_FILE"
     TT_METAL_HOME="${TT_METAL_HOME:-$HOME/tenstorrent/tt-metal}"
     TT_BUILD_DIR="${TT_BUILD_DIR:-$TT_METAL_HOME/build_Release}"
-    HF_HOME="${HF_HOME:-$CACHE_DIR/hf}" \
+    HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}" \
     TT_METAL_HOME="$TT_METAL_HOME" \
     TT_BUILD_DIR="$TT_BUILD_DIR" \
     ARCH_NAME="${ARCH_NAME:-blackhole}" \
