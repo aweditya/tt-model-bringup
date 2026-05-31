@@ -15,20 +15,23 @@ scoping in [`27b_chunked_prefill_plan.md`](27b_chunked_prefill_plan.md).
 
 Each gate is a permanent file under `experiments/cb/validate/` or `experiments/cb/isolate/`.
 
-### S2.1 — Isolation: chunked SDPA on Qwen3.6 shapes ⏳ NOW
+### S2.1 — Isolation: chunked SDPA on Qwen3.6 shapes ✅ DONE (commit `ef110c7`)
 - **What**: standalone test calling `ttnn.transformer.chunked_scaled_dot_product_attention` at Qwen3.6-27B GQA shapes on (1,4): NQ=40, NKV=8, head_dim=128, page_size=32, single slot, C ∈ {8, 16, 32}.
 - **Reference**: replay decode SDPA C times against the same paged KV (the slow loop we're replacing).
 - **Gate**: per-position cos ≥ 0.99999; output bit-equivalent up to bf16 rounding.
 - **File**: `experiments/cb/isolate/chunked_sdpa.py`
 - **Why first**: this is the ONLY new primitive; everything else is plumbing. If the op doesn't accept our shapes / mesh layout, the whole path changes.
 
-### S2.2 — Swap S1a's attention primitive
+### S2.2 — Swap S1a's attention primitive (DEFERRED — perf-only)
+
+S1a already populates production paged KV via `paged_fill_cache` (server_tp.py:1709-1712), so the transplant doesn't need the chunked-SDPA swap. The non-paged SDPA inside S1a is O(L²) in compute and O(L²) in memory, but at L≤8192 that's fine. Defer to a post-S2.4 perf check — pick back up only if attention SDPA shows up as the TTFT bottleneck.
+
+### S2.3 — State converter ⏳ NOW
 - **What**: in `server_tp.py:forward_prefill_chunked_tp`, replace the current attention call with `ttnn.transformer.chunked_scaled_dot_product_attention(... page_table_tensor=..., chunk_start_idx_tensor=...)`.
 - **Gate**: existing `experiments/cb/validate/long_context.py` PASS (non-capture path + needle retrieval, single-seq). Cos ≥ 0.999 vs current S1a on a 200-tok needle prompt.
 - **Touches**: only `forward_prefill_chunked_tp`. Decode path untouched.
 
-### S2.3 — State converter
-- **What**: `cb_prefill_transplant(state, slot_s)` — writes the post-prefill temp state into slot `s`:
+- **What**: `cb_prefill_transplant(state, slot_s, L)` — writes the post-prefill temp state into slot `s`:
   - For each attention layer: post-prefill KV (whatever layout S1a leaves it in after the chunked-SDPA swap) → `cb_kv[li]['kc'/'vc']` slot-s blocks.
   - For each GDN layer: post-S1b SSM H/K → `cb_dn[li]['ssm']` slot-s row; post-S1b conv kdim state → `cb_dn[li]['conv_cols']` 3-col shiftacc layout for slot s.
 - **Gate**: layer-by-layer, post-transplant slot-s state matches a reference (1-tok-per-iter CB prefill of the same prompt into the same slot) with cos ≥ 0.999.
