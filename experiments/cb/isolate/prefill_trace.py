@@ -115,6 +115,60 @@ def main():
         f"stub argmax at the actual last position. Refactor path is correct "
         f"for production chat (greedy decode bit-equivalent at first token).")
 
+    # === T1: capture trace + replay; verify replay output matches eager ===
+    log(f"=== T1: capture forward_prefill_chunked_traced_inner + replay ===")
+    base._reset_state_buffers(state)
+
+    # JIT warmup — capture-during-JIT hangs on Blackhole (feedback_c4v4_validated).
+    base.update_prefill_input_buffers(state, padded)
+    for i in range(2):
+        warmup_out = base.forward_prefill_chunked_traced_inner(state)
+        ttnn.synchronize_device(state.mesh)
+        ttnn.deallocate(warmup_out)
+    log("  ✓ JIT warmup done")
+
+    base._reset_state_buffers(state)
+    base.update_prefill_input_buffers(state, padded)
+    t_cap0 = time.time()
+    trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
+    trace_out = base.forward_prefill_chunked_traced_inner(state)
+    ttnn.end_trace_capture(state.mesh, trace_id, cq_id=0)
+    t_cap = time.time() - t_cap0
+    log(f"  ✓ trace captured in {t_cap:.2f}s; output buffer at fixed address")
+
+    # Replay with the SAME prompt — output should match T0's eager result.
+    base._reset_state_buffers(state)
+    base.update_prefill_input_buffers(state, padded)
+    t_rep0 = time.time()
+    ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+    ttnn.synchronize_device(state.mesh)
+    t_rep = time.time() - t_rep0
+    t1_logits_full = ttnn.to_torch(
+        trace_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+    ).float().numpy()
+    # untilize returns [chunk_size, vocab_per_chip * NCHIPS] concatenated across mesh
+    t1_logits = t1_logits_full[:CHUNK_SIZE, :state.vocab_size]
+    t1_last = t1_logits[L - 1]
+    t1_argmax = int(np.argmax(t1_last))
+    t1_vs_t0 = _cos(t1_last, t0_last)
+    log(f"  T1 trace replay: elapsed={t_rep:.2f}s (vs T0 eager {t0_elapsed:.2f}s, "
+        f"speedup {t0_elapsed/t_rep:.1f}x)")
+    log(f"  T1 last-pos argmax = {t1_argmax} ({tok.decode([t1_argmax])!r})")
+    log(f"  T1 vs T0 (eager same-input): cos = {t1_vs_t0:.6f}")
+
+    ttnn.release_trace(state.mesh, trace_id)
+
+    if t1_argmax != t0_argmax:
+        log(f"FAIL T1: trace replay argmax {t1_argmax} != eager T0 argmax {t0_argmax}")
+        raise SystemExit(1)
+    if t1_vs_t0 < 0.99:
+        log(f"FAIL T1: trace replay cos vs eager {t1_vs_t0:.4f} < 0.99 — "
+            f"trace not capturing eager behaviour exactly")
+        raise SystemExit(1)
+    log(f"PASS T1: trace replay at L={CHUNK_SIZE} matches eager bit-for-bit "
+        f"(cos vs eager={t1_vs_t0:.6f}, argmax match, {t0_elapsed/t_rep:.1f}x faster). "
+        f"S1a tracing works; T2/T3 can build on this.")
+
 
 if __name__ == "__main__":
     main()

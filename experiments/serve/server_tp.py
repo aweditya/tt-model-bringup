@@ -512,6 +512,75 @@ def bootstrap(state: MeshServerState):
     print("  ✓ input buffers pre-allocated (cur_pos_buf, tok_buf, rot_idxs_buf)",
           flush=True)
 
+    # Prefill trace input buffers: tok IDs + positions for a fixed chunk_size.
+    # forward_prefill_chunked_traced reads from these; host updates before replay.
+    PREFILL_CHUNK_SIZE = 128
+    state.prefill_chunk_size = PREFILL_CHUNK_SIZE
+    state.prefill_tok_buf = ttnn.from_torch(
+        torch.zeros((1, PREFILL_CHUNK_SIZE), dtype=torch.int32),
+        dtype=ttnn.uint32, device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    state.prefill_pos_buf = ttnn.from_torch(
+        torch.zeros((1, PREFILL_CHUNK_SIZE), dtype=torch.int32),
+        dtype=ttnn.uint32, device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    print(f"  ✓ prefill trace input buffers pre-allocated (chunk_size={PREFILL_CHUNK_SIZE})",
+          flush=True)
+
+    # Pre-allocate Neumann DN accumulators at fixed C=32 (the inner block size
+    # used by _prefill_dn_chunked_blocks). Lets _chunked_dn_with_chunked_recurrence_tp
+    # work inside a captured trace (which forbids host->device allocations).
+    # All positions are slice-written per iter → safe to reuse across calls.
+    from full_layer_tp_probe import (
+        NV_PER_CHIP, K_DIM, V_DIM, VAL_DIM_CHIP, NCHIPS,
+    )
+    PREFILL_INNER_C = 32
+    state.prefill_inner_c = PREFILL_INNER_C
+    total_NV = NCHIPS * NV_PER_CHIP
+    state.dn_chunked_q = ttnn.from_torch(
+        torch.zeros((total_NV, PREFILL_INNER_C, K_DIM), dtype=torch.bfloat16),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
+    state.dn_chunked_k = ttnn.from_torch(
+        torch.zeros((total_NV, PREFILL_INNER_C, K_DIM), dtype=torch.bfloat16),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
+    state.dn_chunked_v = ttnn.from_torch(
+        torch.zeros((total_NV, PREFILL_INNER_C, V_DIM), dtype=torch.bfloat16),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
+    state.dn_chunked_z = ttnn.from_torch(
+        torch.zeros((PREFILL_INNER_C, NCHIPS * VAL_DIM_CHIP), dtype=torch.bfloat16),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1))
+    print(f"  ✓ DN Neumann buffers pre-allocated (C={PREFILL_INNER_C})", flush=True)
+
+    # Pre-compute the constant masks used by _chunked_recurrence_tp +
+    # _neumann_inverse_via_mesh_tp. They depend only on C and NV_PER_CHIP,
+    # so building them once at bootstrap lets the prefill path run inside
+    # a captured trace.
+    import numpy as _np
+    _tril_np = _np.tril(_np.ones((PREFILL_INNER_C, PREFILL_INNER_C), dtype=_np.float32))
+    _strict_np = _tril_np - _np.eye(PREFILL_INNER_C, dtype=_np.float32)
+    _tril_per_chip = _np.broadcast_to(_tril_np, (NV_PER_CHIP, PREFILL_INNER_C, PREFILL_INNER_C)).copy()
+    _strict_per_chip = _np.broadcast_to(_strict_np, (NV_PER_CHIP, PREFILL_INNER_C, PREFILL_INNER_C)).copy()
+    state.dn_tril_mask = ttnn.from_torch(
+        torch.from_numpy(_tril_per_chip), dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    state.dn_strict_lower_mask = ttnn.from_torch(
+        torch.from_numpy(_strict_per_chip), dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    _I_per_chip = _np.zeros((NV_PER_CHIP, PREFILL_INNER_C, PREFILL_INNER_C), dtype=_np.float32)
+    for i in range(NV_PER_CHIP):
+        _np.fill_diagonal(_I_per_chip[i], 1.0)
+    state.dn_I_tt = ttnn.from_torch(
+        torch.from_numpy(_I_per_chip), dtype=ttnn.float32,
+        layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    print(f"  ✓ DN tril/strict_lower/I masks pre-allocated", flush=True)
+
     print("[bootstrap] STAGE B COMPLETE — all weights + state buffers on mesh.", flush=True)
 
 
@@ -788,18 +857,23 @@ def _chunked_recurrence_tp(state, q_seq, k_seq, v_seq, g_seq, beta_seq, S_prev, 
     # Broadcast-friendly per-head shapes: [NV_PER_CHIP, C, C]
     tril_per_chip = np.broadcast_to(tril_np, (NV_PER_CHIP, C, C)).copy()
     strict_lower_per_chip = np.broadcast_to(strict_lower_np, (NV_PER_CHIP, C, C)).copy()
-    tril_mask = ttnn.from_torch(
-        torch.from_numpy(tril_per_chip),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-        device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
-    strict_lower_mask = ttnn.from_torch(
-        torch.from_numpy(strict_lower_per_chip),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-        device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
+    # Trace-safe: reuse bootstrap-pre-allocated masks when C matches.
+    if hasattr(state, 'dn_tril_mask') and C == state.prefill_inner_c:
+        tril_mask = state.dn_tril_mask
+        strict_lower_mask = state.dn_strict_lower_mask
+    else:
+        tril_mask = ttnn.from_torch(
+            torch.from_numpy(tril_per_chip),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        strict_lower_mask = ttnn.from_torch(
+            torch.from_numpy(strict_lower_per_chip),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
 
     # --- G = cumsum(g) along last dim ---
     G = ttnn.cumsum(g_seq, dim=-1)  # [NV_PER_CHIP, C]
@@ -916,8 +990,9 @@ def _chunked_recurrence_tp(state, q_seq, k_seq, v_seq, g_seq, beta_seq, S_prev, 
     ttnn.deallocate(G_a)
     ttnn.deallocate(G_b)
     ttnn.deallocate(beta_3d)
-    ttnn.deallocate(tril_mask)
-    ttnn.deallocate(strict_lower_mask)
+    if not (hasattr(state, 'dn_tril_mask') and C == state.prefill_inner_c):
+        ttnn.deallocate(tril_mask)
+        ttnn.deallocate(strict_lower_mask)
 
     return O, S_new
 
@@ -950,12 +1025,15 @@ def _neumann_inverse_via_mesh_tp(state, L_tt, C):
         np.fill_diagonal(I_per_chip[i], 1.0)
     # Use ReplicateTensorToMesh — same I on every chip's slice (chips have
     # different heads but the I is just identity for each).
-    I_tt = ttnn.from_torch(
-        torch.from_numpy(I_per_chip),
-        dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
-        device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
+    if hasattr(state, 'dn_I_tt') and C == state.prefill_inner_c:
+        I_tt = state.dn_I_tt
+    else:
+        I_tt = ttnn.from_torch(
+            torch.from_numpy(I_per_chip),
+            dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
 
     # Step 1: compute powers L², L⁴, L⁸, ..., L^(C/2)
     powers = [L_tt]
@@ -974,7 +1052,8 @@ def _neumann_inverse_via_mesh_tp(state, L_tt, C):
     # Deallocate intermediates we no longer need
     for p in powers[1:]:  # powers[0] is L_tt (caller may own)
         ttnn.deallocate(p)
-    ttnn.deallocate(I_tt)
+    if not (hasattr(state, 'dn_I_tt') and C == state.prefill_inner_c):
+        ttnn.deallocate(I_tt)
 
     return T
 
@@ -1046,22 +1125,31 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
     _t = _tic()
     # === PRE-RECURRENCE: per-pos conv1d + QKV split + L2-norm, collect into batched ===
     total_NV = NCHIPS * NV_PER_CHIP
-    q_collected = ttnn.from_torch(
-        torch.zeros((total_NV, C, K_DIM), dtype=torch.bfloat16),
-        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
-        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
-    k_collected = ttnn.from_torch(
-        torch.zeros((total_NV, C, K_DIM), dtype=torch.bfloat16),
-        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
-        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
-    v_collected = ttnn.from_torch(
-        torch.zeros((total_NV, C, V_DIM), dtype=torch.bfloat16),
-        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
-        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
-    z_collected = ttnn.from_torch(
-        torch.zeros((C, NCHIPS * VAL_DIM_CHIP), dtype=torch.bfloat16),
-        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
-        device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1))
+    # Trace-safe: reuse pre-allocated buffers when shape matches (C=PREFILL_INNER_C).
+    # Per-position slice_write covers ALL positions, so previous values are
+    # fully overwritten — safe to share across calls.
+    if hasattr(state, 'dn_chunked_q') and C == state.prefill_inner_c:
+        q_collected = state.dn_chunked_q
+        k_collected = state.dn_chunked_k
+        v_collected = state.dn_chunked_v
+        z_collected = state.dn_chunked_z
+    else:
+        q_collected = ttnn.from_torch(
+            torch.zeros((total_NV, C, K_DIM), dtype=torch.bfloat16),
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
+        k_collected = ttnn.from_torch(
+            torch.zeros((total_NV, C, K_DIM), dtype=torch.bfloat16),
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
+        v_collected = ttnn.from_torch(
+            torch.zeros((total_NV, C, V_DIM), dtype=torch.bfloat16),
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0))
+        z_collected = ttnn.from_torch(
+            torch.zeros((C, NCHIPS * VAL_DIM_CHIP), dtype=torch.bfloat16),
+            layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16,
+            device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1))
 
     def _gqa(t, n_kh, d):
         t2 = ttnn.reshape(t, [n_kh, 1, d])
@@ -1132,8 +1220,11 @@ def _chunked_dn_with_chunked_recurrence_tp(state, x_seq_tt, dn, cfg, seq_len):
     k_seq_tile = ttnn.to_layout(k_collected, ttnn.TILE_LAYOUT)
     v_seq_tile = ttnn.to_layout(v_collected, ttnn.TILE_LAYOUT)
     z_seq_tile = ttnn.to_layout(z_collected, ttnn.TILE_LAYOUT)
-    ttnn.deallocate(q_collected); ttnn.deallocate(k_collected)
-    ttnn.deallocate(v_collected); ttnn.deallocate(z_collected)
+    # Only deallocate if WE allocated them (eager fallback). Pre-allocated
+    # state buffers are owned by state — leave them alive for the next call.
+    if not (hasattr(state, 'dn_chunked_q') and C == state.prefill_inner_c):
+        ttnn.deallocate(q_collected); ttnn.deallocate(k_collected)
+        ttnn.deallocate(v_collected); ttnn.deallocate(z_collected)
 
     _toc(_t, "3_pre_recurrence_collect")
 
@@ -1905,6 +1996,76 @@ def forward_prefill_chunked_tp(state, prompt_ids, capture_logits=False):
         arr = ttnn.to_torch(rm_logits, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
         return arr[:seq_len].float().cpu().numpy().reshape(seq_len, state.vocab_size)
     return ttnn.slice(rm_logits, [seq_len - 1, 0], [seq_len, state.vocab_size])
+
+
+def forward_prefill_chunked_traced_inner(state):
+    """Trace-friendly twin of forward_prefill_chunked_tp at fixed L=chunk_size.
+
+    Reads tokens + positions from pre-allocated state.prefill_tok_buf /
+    state.prefill_pos_buf instead of allocating inline. No host-side allocations
+    happen in this function — safe to capture as a trace once the input buffers
+    are populated. Host updates the buffers between replays via
+    copy_host_to_device_tensor.
+
+    Returns a [chunk_size, VOCAB] row-major device logits tensor. Caller slices
+    [actual_L - 1] for the real last-position.
+    """
+    import ttnn
+    cfg = state.cfg
+    HIDDEN = cfg['hidden']
+    L = state.prefill_chunk_size
+    mesh = state.mesh
+
+    x_tt = ttnn.reshape(
+        ttnn.embedding(state.prefill_tok_buf, state.embed_tt, layout=ttnn.TILE_LAYOUT,
+                       memory_config=ttnn.DRAM_MEMORY_CONFIG),
+        [L, HIDDEN])
+    cos_seq_tt = ttnn.reshape(
+        ttnn.embedding(state.prefill_pos_buf, state.cos_table_tt, layout=ttnn.TILE_LAYOUT,
+                       memory_config=ttnn.DRAM_MEMORY_CONFIG),
+        [L, state.rotary_dim])
+    sin_seq_tt = ttnn.reshape(
+        ttnn.embedding(state.prefill_pos_buf, state.sin_table_tt, layout=ttnn.TILE_LAYOUT,
+                       memory_config=ttnn.DRAM_MEMORY_CONFIG),
+        [L, state.rotary_dim])
+
+    for layer in state.layers:
+        if layer['type'] == 'linear_attention':
+            x_tt = _prefill_dn_chunked_blocks(state, x_tt, layer['dn'], cfg, L)
+        else:
+            x_tt = gated_attn_step_prefill_tp(state, x_tt, layer['attn'],
+                                              cos_seq_tt, sin_seq_tt, cfg, L)
+        x_tt = mlp_step_tp(state, x_tt, layer['mlp'])
+    x_tt = _rms_norm_manual(x_tt, state.final_norm_tt, 1e-6, HIDDEN)
+
+    sharded = ttnn.linear(x_tt, state.lm_head_tt)
+    gathered = ttnn.all_gather(sharded, dim=-1)
+    sliced = ttnn.slice(gathered, [0, 0], [L, state.vocab_size])
+    return ttnn.untilize(sliced, use_multicore=True)
+
+
+def update_prefill_input_buffers(state, prompt_ids, chunk_start_idx=0):
+    """Host-side: write padded prompt + position indices into the pre-allocated
+    trace input buffers. Call BEFORE execute_trace (outside the captured region).
+    For L < chunk_size: prompt_ids gets padded with 0. For multi-chunk (later),
+    chunk_start_idx > 0 shifts the position indices."""
+    import ttnn
+    import torch
+    L = state.prefill_chunk_size
+    L_actual = len(prompt_ids)
+    if L_actual > L:
+        raise ValueError(f"prompt L={L_actual} > chunk_size={L}; needs chunking")
+    padded = list(prompt_ids) + [0] * (L - L_actual)
+    tok_host = ttnn.from_torch(
+        torch.tensor(padded, dtype=torch.int32).reshape(1, L),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    ttnn.copy_host_to_device_tensor(tok_host, state.prefill_tok_buf)
+    pos_host = ttnn.from_torch(
+        torch.arange(chunk_start_idx, chunk_start_idx + L, dtype=torch.int32).reshape(1, L),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    ttnn.copy_host_to_device_tensor(pos_host, state.prefill_pos_buf)
 
 
 # --- Handlers -----------------------------------------------------------------
