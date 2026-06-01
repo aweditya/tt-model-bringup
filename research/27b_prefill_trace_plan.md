@@ -32,8 +32,8 @@ Fix: trace S1a too. Both forwards become trace replays; no allocations happen af
 | T2 | Same trace replayed across L ∈ {5,8,9,11,15} all padded to 128 | ✅ DONE | all replays cos=1.000000 vs same-input eager | `523b141` |
 | T3 | Multi-chunk for L > 128 | 🟡 DEFERRED | needs per-chunk page_table + DN-state persistence | — |
 | T4 | TTFT bench legacy 1-tok/iter vs traced | ✅ DONE | crossover ~L=32; **9.76× at L=128** | `9ee90e4` |
-| T5 | Scheduler integration | ❌ **BLOCKED** | two-trace coexistence wedge | `530d259` (gated off) |
-| T6 | Production wire-up + concurrent load test | ⏸ blocked by T5 | — | — |
+| T5 | Scheduler integration | ✅ **DONE** | 4/4 turns / 0 errors under 2-client concurrent gate (after two-phase warmup) | `98450ec` |
+| T6 | Production wire-up + real concurrent load | ✅ **DONE** | server up with `TT_CB_CHUNKED_PREFILL=1`; user validated multi-window chat | live on qb1 |
 
 ### T5 blocker detail (5 attempts, all hung — pattern is two-trace coexistence)
 
@@ -110,6 +110,29 @@ Diagnostic env var: `TT_METAL_TRACE_ALLOC_TRACKING=1` (tt-metal commit
 the offending op.
 
 Saved in memory: `feedback_two_phase_warmup`. T5 unblocked for next session.
+
+## Production state (2026-06-01, post-T6)
+
+Server on qb1 runs **traced chunked prefill** (chunk_size=32, trace_region=800 MB,
+TT_CB_CHUNKED_PREFILL=1). For:
+- L ≤ 32 → traced replay (~1s) — turn-1 messages.
+- L > 32 → legacy 1-tok/iter fallback (~80 ms/tok) — turn-2+ with history.
+
+User-validated: 4 concurrent chat windows; turn-1 fast, turn-2 stalls briefly during
+re-prefill of full history (expected — TT vLLM alternating PREFILL_ONLY / DECODE_ONLY
+scheduler design). Once prefill finishes, all slots resume.
+
+## Next levers for chat speed (deferred, in priority order)
+
+1. **T3 multi-chunk** (~2 hrs): loop the same trace at advancing `chunk_start_idx`
+   so L > chunk_size doesn't fall to legacy. Needs per-chunk page_table for
+   `paged_fill_cache` and DN-state persistence across chunks.
+2. **Bigger chunk_size** (chunk_size=64 or 128): single-chunk traced covers
+   more turns. Needs re-checking memory budget; T5d hit model-load OOM with
+   trace_region=2.5 GB. Now with two-phase warmup, retry budgeting.
+3. **Prefix caching** (architectural): turn-N prefill = new tokens only, not
+   re-prefill entire history. The real chat win. Needs per-client session +
+   slot-state-persistence-across-requests + prefix matching.
 
 ## Risks
 

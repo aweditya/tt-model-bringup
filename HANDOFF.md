@@ -57,10 +57,14 @@ See README §"Chat server (production)" for `curl` + `openai` client examples.
 
 ## What's next
 
-**S2 — chunked prefill** (productionization step 1). Today CB prefills one
-token per scheduler iteration; chunked prefill processes the prompt in C-token
-chunks for realistic TTFT + end-to-end task times. WIP on branch
-`feature/chunked-prefill`. Plan: [`research/27b_chunked_prefill_plan.md`](research/27b_chunked_prefill_plan.md).
+**S2 — chunked prefill — LIVE in production (2026-06-01).** CB serves with
+`TT_CB_CHUNKED_PREFILL=1`: traced chunked prefill at chunk_size=32 for L ≤ 32,
+legacy 1-tok/iter fallback for L > 32. Two-phase warmup (compile-all-then-capture-all)
+solves the multi-trace coexistence wedge per [vLLM #352](https://github.com/tenstorrent/vllm/issues/352).
+Plan + post-mortem: [`research/27b_prefill_trace_plan.md`](research/27b_prefill_trace_plan.md).
+
+Next levers (deferred): T3 multi-chunk (loop trace for L > chunk_size), bigger
+chunk_size (memory permitting), prefix caching (per-client session for skip-rehistory).
 
 **35B perf** (parallel track). Next levers tracked in
 [`research/35b_perf_milestones.md`](research/35b_perf_milestones.md):
