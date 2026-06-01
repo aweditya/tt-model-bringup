@@ -57,16 +57,16 @@ See README §"Chat server (production)" for `curl` + `openai` client examples.
 
 ## What's next
 
-**Prefix caching — IN PROGRESS (2026-06-01, slot-level content-keyed).** The
-real chat TTFT win. Today turn-2+ re-prefills the entire conversation history
-even though the KV+DN state for that history was live in a CB slot seconds ago.
-Design: keep slots alive after response-done under a content key (hash of
-`tokens_so_far`); on returning request, resume the live slot at
-`cur_pos = len(matched_prefix)`. Same security model as vLLM APC (content-keyed,
-no session IDs). Fits hybrid attention+DN model naturally (DN state lives in
-slot, no Marconi-style checkpointing). Roadmap + milestones P0-P6 in
-[`research/27b_prefix_caching_plan.md`](research/27b_prefix_caching_plan.md).
-Research basis: [`research/vllm_prefix_caching_audit.md`](research/vllm_prefix_caching_audit.md).
+**Prefix caching — P0-P4 SHIPPED (logic-only, 2026-06-01).** Slot-level
+content-keyed prefix cache for the CB scheduler. Returning chats reclaim their
+live slot at `cur_pos = len(matched_prefix)`, skipping re-prefill of the history.
+All changes gated by `prefix_cache=False` default; prod server (chunk-prefill,
+no prefix cache) is unchanged. P0-P4 ship as pure-Python with 13/13 mock-driven
+lifecycle tests + 12/12 LiveSlotStore unit tests. **P5 (real-device validation
+on qb1) is next** — bit-identity vs cold prefill on a chat turn, then env-gate
+through cb_api + serve_cb.sh. P6 = TTL + Prometheus counters.
+Plan: [`research/27b_prefix_caching_plan.md`](research/27b_prefix_caching_plan.md).
+Research: [`research/vllm_prefix_caching_audit.md`](research/vllm_prefix_caching_audit.md).
 
 **S2 — chunked prefill — LIVE in production (2026-06-01).** CB serves with
 `TT_CB_CHUNKED_PREFILL=1`: traced chunked prefill at chunk_size=32 for L ≤ 32,

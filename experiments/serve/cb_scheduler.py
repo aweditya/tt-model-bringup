@@ -281,6 +281,52 @@ class Scheduler:
             cb.cb_reset_slots(self.state, admitted)  # fresh DN state for new seqs
         return admitted
 
+    def _admit_from_cache(self):
+        """For each waiting request, check the live-slot cache for a prefix
+        match. On hit, reclaim the cached slot at cur_pos = n_matched and
+        transition the request to PREFILL state (so the existing per-step loop
+        feeds prompt[n_matched..L-1] through the decode trace, then switches
+        to DECODE — same mechanism as cold prefill, just starting partway
+        through). On miss, leave in waiting for normal admit.
+
+        Degenerate case: if n_matched == len(prompt), the new prompt is exactly
+        the cached prefix (no new user content). Skip — let it fall through to
+        normal admit and cold-prefill again. Loses the cache benefit for this
+        rare case but keeps state transitions consistent.
+
+        Idempotent and safe to call every step; only processes waiting requests.
+        """
+        if not self.waiting:
+            return
+        # Iterate over a snapshot so we can mutate self.waiting (remove hits).
+        for rid in list(self.waiting):
+            r = self.reqs[rid]
+            slot_id, n = self.live_slots.find_longest_match(r['prompt'])
+            if slot_id is None:
+                self.pc_misses += 1
+                continue  # leave in waiting for normal admit
+            if n >= len(r['prompt']):
+                # Degenerate exact-match: no new suffix. Drop to normal admit
+                # so the request goes through cold prefill (rare; chat clients
+                # always append a new user message on turn N).
+                self.pc_misses += 1
+                continue
+            # Cache hit — reclaim the slot. Note: slots in live_slots have
+            # self.slots[s] is None by invariant (mark_live only fires after
+            # _finish flips it to None).
+            assert self.slots[slot_id] is None, \
+                f"prefix cache invariant: cached slot {slot_id} should be free"
+            self.live_slots.reclaim(slot_id)
+            self.slots[slot_id] = rid
+            r['slot'] = slot_id
+            r['cur_pos'] = n
+            r['next_tok'] = r['prompt'][n]
+            r['status'] = 'PREFILL'  # existing PREFILL loop consumes the suffix
+            # DO NOT call cb_reset_slots — the slot's DN+KV state IS the cached
+            # prefix's state, which is exactly what we want.
+            self.waiting.remove(rid)
+            self.pc_hits += 1
+
     def _slot_alloc_order(self):
         """Iteration order for slot allocation: non-cached free slots first,
         then cached free slots in LRU order (oldest first → evict-friendly).
@@ -425,7 +471,18 @@ class Scheduler:
            (the waiting request's prompt is consumed one tok/iter through the
            same forward; the slot transitions to DECODE on the last prompt
            token).
+
+        With prefix_cache=True, BEFORE either mode runs, waiting requests are
+        checked against the live-slot cache. Cache hits reclaim their cached
+        slot directly, bypassing prefill — the new suffix gets consumed via the
+        normal PREFILL state path (one tok/iter through the decode trace),
+        starting at cur_pos = n_matched.
         """
+        # Prefix-cache fast path: admit any waiting requests whose prompts match
+        # a cached prefix. This must run BEFORE chunked_prefill / _admit so that
+        # cache-hit admits skip the expensive prefill paths entirely.
+        if self.prefix_cache:
+            self._admit_from_cache()
         if self.chunked_prefill:
             if self.waiting and any(s is None for s in self.slots):
                 self._step_prefill_chunked()

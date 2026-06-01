@@ -64,12 +64,12 @@ Identical to vLLM's APC:
 
 | ID | What | Gate | Status | Commit |
 |---|---|---|---|---|
-| P0 | Design contracts + touch-point map | This doc + code-read pass | 🟡 in progress | — |
-| P1 | `LiveSlotStore` data structure | Unit test in `experiments/cb/isolate/`: mark live, find longest match, LRU evict | ⏳ | — |
-| P2 | Slot lifecycle — don't free on done | Existing CB engine validator passes; live slots accumulate; evict-when-needed works | ⏳ | — |
-| P3 | Admit-time prefix match + skip prefill | Chat smoke: turn 2 TTFT ≪ turn 1 for matching prefix | ⏳ | — |
-| P4 | Decode-suffix advance before generation | Bit-identical output vs cold prefill on same full prompt | ⏳ | — |
-| P5 | Production wire-up + env gate | `chat.py` real chat: turn-2+ TTFT < 100 ms | ⏳ | — |
+| P0 | Design contracts + touch-point map | This doc + code-read pass | ✅ DONE | `8490e09` |
+| P1 | `LiveSlotStore` data structure | 12/12 unit tests | ✅ DONE | `b876621` |
+| P2 | Slot lifecycle — don't free on done | 10/10 lifecycle mock tests | ✅ DONE | `3de9297` |
+| P3 | Admit-time prefix match + skip prefill | 13/13 lifecycle tests (P3 cases added) | ✅ DONE | (this commit) |
+| P4 | Decode-suffix advance before generation | **Subsumed by P3** — existing PREFILL loop handles it | ✅ DONE | (this commit) |
+| P5 | Production wire-up + env gate (qb1 device validation) | `chat.py` real chat: turn-2+ TTFT < 100 ms | ⏳ NEXT | — |
 | P6 | TTL + `/metrics` counters | Stale-slot TTL prevents leak; cache hit/miss visible in Prometheus | ⏳ | — |
 
 ## P0 — Design contracts
@@ -221,34 +221,42 @@ Gate: chat smoke test through `chat.py` — turn 1 TTFT ~ today's number; turn 2
 TTFT ~ N × decode_step_ms (where N = new tokens count). Should be 10-100× faster
 than turn 2 today.
 
-## P4 — Decode-suffix advance before generation
+## P4 — Decode-suffix advance before generation (subsumed by P3)
 
-When `new_suffix = prompt_tokens[n_matched:]` is non-empty, we need to "consume"
-those tokens before generating. Each one is a normal decode step where we
-*ignore* the model's logits and forcibly insert the next user token as if the
-model had produced it (teacher-forcing). The slot's KV cache + DN state advance
-through these positions.
+**P4 collapses into P3**: the suffix advance is exactly what the existing
+PREFILL state path in `step()` already does. With `cur_pos = n_matched` and
+`status = 'PREFILL'`:
 
 ```python
-def advance_decode(slot, new_tokens):
-    for tok in new_tokens:
-        slot.next_input_token = tok          # force the input
-        self._step_one_slot(slot)            # existing decode trace
-        # ignore logits this step
-    # now slot.cur_pos = original + len(new_tokens); ready to generate
+# experiments/serve/cb_scheduler.py:step() — existing code
+if r['status'] == 'PREFILL' and r['cur_pos'] < last_prompt:
+    r['cur_pos'] += 1
+    r['next_tok'] = r['prompt'][r['cur_pos']]
+else:
+    # last prefill token → transition to DECODE + emit first generated token
+    r['gen'].append(o)
+    r['status'] = 'DECODE'
+    ...
 ```
 
-This is N decode steps where N = len(new user message tokens). At our ~12 tok/s
-single-slot decode rate, a 50-token new user message = ~4s. Still way better
-than ~40s prefill.
+Each iteration feeds `prompt[cur_pos]` at position `cur_pos` through the decode
+trace, discards the output (it's a prefill step, not a generation step), and
+advances `cur_pos`. When `cur_pos == last_prompt`, it transitions to DECODE.
 
-(Future optimization: this is exactly the use case for traced chunked prefill
-at chunk_size=128. If we ship the chunk_size bump later, advance_decode can
-use it for new_suffix > 16.)
+Starting at `cur_pos = n_matched` instead of `0` is the only change. Saves
+`n_matched` decode steps. For typical chat: turn-2's history is 100-500 tokens,
+cache match covers all of it, only the new user message (5-50 tokens) gets
+processed through the decode loop. At ~12 tok/s that's <4s vs ~40s cold prefill.
 
-Gate: bit-identical comparison — feed (cached-prefix + new-suffix) two ways:
-(1) cold prefill all, (2) cache-hit + advance_decode. First generated token's
-logits must match cos ≥ 0.9999.
+**Gate (deferred to P5)**: bit-identical comparison — feed
+`(cached_prefix + new_suffix)` two ways: (1) cold prefill all; (2) cache-hit +
+PREFILL-loop suffix advance. First generated token's logits must match cos ≥ 0.9999.
+This needs a real device run on qb1.
+
+**Future optimization (out of scope for v1)**: at `len(new_suffix) > chunk_size`,
+the suffix advance is N×80ms decode steps; could use S1a chunked prefill on
+just the suffix (with `chunk_start_idx=n_matched` flowing through to the
+chunked SDPA). Track as T3-multi-chunk-revisit.
 
 ## P5 — Production wire-up + env gate
 

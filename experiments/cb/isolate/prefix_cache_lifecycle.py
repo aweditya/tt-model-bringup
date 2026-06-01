@@ -279,6 +279,85 @@ def case_pc_off_idle_step_still_runs_admit():
     print("  ✓ case_pc_off_idle_step_still_runs_admit")
 
 
+def case_admit_from_cache_hit():
+    """Cache hit: a waiting request with prompt matching a cached slot's
+    tokens_so_far gets reclaimed at cur_pos=n_matched."""
+    global _RESET_LOG
+    _RESET_LOG = []
+    s = make_scheduler(prefix_cache=True)
+    # Cache slot 1 with tokens_so_far = [10..29] (20 tokens)
+    cached_prefix = list(range(10, 30))
+    s.live_slots.mark_live(1, cached_prefix)
+    # Waiting request whose prompt extends the cached prefix
+    new_suffix = [100, 101, 102, 103, 104]
+    r = {
+        'id': 0,
+        'prompt': cached_prefix + new_suffix,  # 25 tokens, first 20 match
+        'gen': [], 'cur_pos': 0, 'next_tok': cached_prefix[0],
+        'status': 'WAIT', 'slot': None, 'sampling': None, 'rng': None,
+    }
+    s.reqs[0] = r
+    s.waiting.append(0)
+    s._admit_from_cache()
+    # Hit: slot 1 reclaimed, request now in PREFILL at cur_pos=20
+    assert_eq(s.slots[1], 0, "slot 1 holds rid 0")
+    assert_eq(r['slot'], 1, "request slot=1")
+    assert_eq(r['cur_pos'], 20, "cur_pos = n_matched (20)")
+    assert_eq(r['next_tok'], new_suffix[0], "next_tok = first suffix tok")
+    assert_eq(r['status'], 'PREFILL', "status PREFILL (will consume suffix)")
+    assert_eq(s.pc_hits, 1, "hit counter")
+    assert_eq(s.pc_misses, 0, "no miss")
+    assert_eq(len(s.waiting), 0, "request removed from waiting")
+    assert_eq(len(s.live_slots), 0, "cache entry reclaimed")
+    assert_eq(_RESET_LOG, [], "cb_reset_slots NOT called on cache hit")
+    print("  ✓ case_admit_from_cache_hit")
+
+
+def case_admit_from_cache_miss():
+    """Cache miss: waiting request stays in queue, miss counter increments."""
+    s = make_scheduler(prefix_cache=True)
+    s.live_slots.mark_live(1, list(range(10, 30)))
+    # Different prefix → miss
+    r = {
+        'id': 0,
+        'prompt': list(range(500, 530)),  # doesn't match cache
+        'gen': [], 'cur_pos': 0, 'next_tok': 500,
+        'status': 'WAIT', 'slot': None, 'sampling': None, 'rng': None,
+    }
+    s.reqs[0] = r
+    s.waiting.append(0)
+    s._admit_from_cache()
+    assert_eq(s.slots[1], None, "no slot taken")
+    assert_eq(s.pc_hits, 0, "no hit")
+    assert_eq(s.pc_misses, 1, "miss counter")
+    assert_eq(len(s.waiting), 1, "request stays in waiting")
+    assert_eq(len(s.live_slots), 1, "cache untouched")
+    print("  ✓ case_admit_from_cache_miss")
+
+
+def case_admit_from_cache_exact_match_falls_through():
+    """Degenerate: prompt == cached tokens_so_far (n == L). Skip — treat as
+    miss so the request falls through to cold prefill."""
+    s = make_scheduler(prefix_cache=True)
+    cached_prefix = list(range(10, 30))  # 20 tokens
+    s.live_slots.mark_live(1, cached_prefix)
+    r = {
+        'id': 0,
+        'prompt': list(cached_prefix),  # exact match
+        'gen': [], 'cur_pos': 0, 'next_tok': cached_prefix[0],
+        'status': 'WAIT', 'slot': None, 'sampling': None, 'rng': None,
+    }
+    s.reqs[0] = r
+    s.waiting.append(0)
+    s._admit_from_cache()
+    assert_eq(s.slots[1], None, "exact match — slot not taken via cache")
+    assert_eq(s.pc_hits, 0, "no hit credit")
+    assert_eq(s.pc_misses, 1, "counts as miss")
+    assert_eq(len(s.waiting), 1, "request stays")
+    assert_eq(len(s.live_slots), 1, "cache preserved")
+    print("  ✓ case_admit_from_cache_exact_match_falls_through")
+
+
 def case_cancel_does_not_mark_live():
     """Cancelled requests should NOT be cached (partial/interrupted state)."""
     s = make_scheduler(prefix_cache=True)
@@ -305,6 +384,9 @@ def main():
         case_admit_prefers_truly_free_over_cached,
         case_idle_step_returns_zero_no_forward,
         case_pc_off_idle_step_still_runs_admit,
+        case_admit_from_cache_hit,
+        case_admit_from_cache_miss,
+        case_admit_from_cache_exact_match_falls_through,
         case_cancel_does_not_mark_live,
     ]
     print(f"[prefix_cache_lifecycle] running {len(cases)} cases...")
