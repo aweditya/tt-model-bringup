@@ -46,13 +46,6 @@ from openai_endpoint import _chat_chunk, _chat_completion, _messages_to_prompt  
 DEFAULT_MODEL_ID = os.environ.get("TT_MODEL_ID", "Qwen/Qwen3.6-27B")
 
 
-def _try_get(q: queue.Queue, timeout: float):
-    try:
-        return q.get(timeout=timeout)
-    except queue.Empty:
-        return None
-
-
 def _build_sampling(body: dict) -> Optional[dict]:
     temperature = float(body.get("temperature", 0.0))
     if temperature <= 0.0:
@@ -98,38 +91,38 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None):
         return {"object": "list", "data": [{"id": model_id, "object": "model"}]}
 
     async def _drain_handle(handle, on_cancel=None):
-        """Pull tokens off the blocking queue in the default threadpool. On
-        CancelledError (Starlette cancels us when the client disconnects), invoke
-        on_cancel (engine.cancel) and drain to the terminal marker so the slot
-        frees in the engine's _drain_cancels."""
-        loop = asyncio.get_running_loop()
+        """Pure-asyncio drain — engine pushes via call_soon_threadsafe so
+        `await handle.aget()` doesn't burn an executor thread. On Starlette
+        cancel (client disconnect): call on_cancel, drain to terminal, re-raise."""
         try:
             while True:
-                msg = await loop.run_in_executor(None, _try_get, handle._q, 1.0)
-                if msg is None:
-                    continue
-                kind, payload = msg
+                kind, payload = await handle.aget()
                 if kind == "tok":
                     yield payload
                 else:
                     handle.final = kind
+                    if kind == "error":
+                        handle.error = payload
                     return
         except asyncio.CancelledError:
             if on_cancel is not None:
                 on_cancel()
             while handle.final is None:
-                m = await loop.run_in_executor(None, _try_get, handle._q, 2.0)
-                if m is None:
+                try:
+                    kind, payload = await asyncio.wait_for(handle.aget(), timeout=2.0)
+                except asyncio.TimeoutError:
                     break
-                if m[0] != "tok":
-                    handle.final = m[0]
+                if kind != "tok":
+                    handle.final = kind
+                    if kind == "error":
+                        handle.error = payload
                     break
             raise
 
     def _finish_reason(eos_id, handle, gen_ids) -> str:
         if eos_id is not None and gen_ids and gen_ids[-1] == eos_id:
             return "stop"
-        if handle.final == "cancelled":
+        if handle.final in ("cancelled", "error"):
             return "stop"
         return "length"
 
@@ -147,7 +140,8 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None):
         sampling = _build_sampling(body)
 
         try:
-            handle = eng.submit(prompt_ids, max_new=max_tokens, sampling=sampling)
+            handle = eng.submit(prompt_ids, max_new=max_tokens, sampling=sampling,
+                                 loop=asyncio.get_running_loop())
         except queue.Full as e:
             return JSONResponse(status_code=429, content={"error": str(e)})
         except RuntimeError as e:

@@ -8,8 +8,8 @@ much faster than the full qb1 validator (which spends ~350s booting the model).
 Run on qb1 (no env block needed; pure host code):
     cd ~/tt-xla && .venv/bin/python -m experiments.serve.tests.test_cb_api_routing
 """
+import asyncio
 import os
-import queue
 
 # Don't let the side-effecting module-level apps build (they import transformers
 # and FastAPI fully, which we don't need for routing tests).
@@ -29,12 +29,14 @@ class _Handle:
     def __init__(self, rid, toks, final="done"):
         self.rid = rid
         self.prompt_len = 1
-        self._q = queue.Queue()
-        for t in toks:
-            self._q.put(("tok", t))
-        self._q.put((final, None))
+        self._msgs = [("tok", t) for t in toks] + [(final, None)]
         self.final = None
         self.error = None
+
+    async def aget(self):
+        if self._msgs:
+            return self._msgs.pop(0)
+        await asyncio.sleep(3600)  # never reaches; drain stops at terminal
 
 
 class _FakeEngine:

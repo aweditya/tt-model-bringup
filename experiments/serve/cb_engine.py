@@ -34,22 +34,44 @@ from cb_scheduler import Scheduler  # noqa: E402
 
 
 class RequestHandle:
-    """Caller-side handle to one in-flight request. `tokens()` blocks on the
-    request's outbound queue, yielding generated token ids until the request
-    terminates; `final` is then one of 'done' | 'cancelled' | 'error'."""
+    """One in-flight request. Two queue modes:
+      - loop=None: sync queue.Queue; use .tokens() (blocks, no async req).
+      - loop=<asyncio loop>: asyncio.Queue; use `await handle.aget()` in handlers.
+        Engine pushes via loop.call_soon_threadsafe so no executor thread is burned.
+    `final` ∈ {'done','cancelled','error'} once the request terminates."""
 
-    __slots__ = ("rid", "prompt_len", "final", "error", "_q")
+    __slots__ = ("rid", "prompt_len", "final", "error", "_q_sync", "_q_async", "_loop")
 
-    def __init__(self, rid, q, prompt_len):
+    def __init__(self, rid, prompt_len, loop=None):
         self.rid = rid
         self.prompt_len = prompt_len
         self.final = None
         self.error = None
-        self._q = q
+        self._loop = loop
+        if loop is not None:
+            import asyncio as _asyncio
+            self._q_async = _asyncio.Queue()
+            self._q_sync = None
+        else:
+            self._q_sync = queue.Queue()
+            self._q_async = None
+
+    def _push(self, msg):
+        """Cross-thread-safe push from engine thread."""
+        if self._loop is not None:
+            try:
+                self._loop.call_soon_threadsafe(self._q_async.put_nowait, msg)
+            except RuntimeError:
+                pass  # loop closed (server shutting down) — drop silently
+        else:
+            self._q_sync.put(msg)
 
     def tokens(self, timeout=None):
+        """Sync iterator (tests/CLI demos). Raises if handle is async-mode."""
+        if self._q_sync is None:
+            raise RuntimeError("async handle; use `await handle.aget()`")
         while True:
-            kind, payload = self._q.get(timeout=timeout)
+            kind, payload = self._q_sync.get(timeout=timeout)
             if kind == "tok":
                 yield payload
             else:
@@ -57,6 +79,12 @@ class RequestHandle:
                 if kind == "error":
                     self.error = payload
                 return
+
+    async def aget(self):
+        """Async one-shot get (FastAPI handlers)."""
+        if self._q_async is None:
+            raise RuntimeError("sync handle; use .tokens()")
+        return await self._q_async.get()
 
 
 class CBEngine:
@@ -162,11 +190,11 @@ class CBEngine:
             raise self._err
         return self
 
-    def submit(self, prompt_ids, max_new=None, sampling=None):
-        """sampling: None → greedy; else {temperature, top_p, top_k, seed}.
-        temperature<=0 is normalised to greedy. Requires the engine to have been
-        built with sampling=True. Raises queue.Full if over max_inflight; the API
-        layer maps that to HTTP 429."""
+    def submit(self, prompt_ids, max_new=None, sampling=None, loop=None):
+        """Returns a RequestHandle. If `loop` is an asyncio event loop, the
+        handle uses an asyncio.Queue (handler awaits via `await handle.aget()`,
+        engine pushes via call_soon_threadsafe → no executor thread burned).
+        If `loop=None`, falls back to a sync queue.Queue (handle.tokens())."""
         if self._stop.is_set():
             raise RuntimeError("engine is stopping; not accepting new requests")
         if sampling is not None:
@@ -181,10 +209,10 @@ class CBEngine:
         with self._idlock:
             rid = self._next_id
             self._next_id += 1
-        q = queue.Queue()
-        self._inbound.put((rid, [int(t) for t in prompt_ids], mn, sampling, time.time(), q))
+        handle = RequestHandle(rid, len(prompt_ids), loop=loop)
+        self._inbound.put((rid, [int(t) for t in prompt_ids], mn, sampling, time.time(), handle))
         self.m_submitted.inc()
-        return RequestHandle(rid, q, len(prompt_ids))
+        return handle
 
     def cancel(self, rid):
         self._cancel_q.put(rid)
@@ -226,21 +254,48 @@ class CBEngine:
                 break
             if have_work:
                 t0 = time.perf_counter()
-                sched.step()
+                try:
+                    sched.step()
+                except BaseException as e:
+                    self._fail_active_requests(e)
+                    continue
                 self.m_step_seconds.observe(time.perf_counter() - t0)
-                self._stream()
+                try:
+                    self._stream()
+                except BaseException as e:
+                    self._fail_active_requests(e)
+                    continue
             else:
                 time.sleep(self.idle_sleep)
+
+    def _fail_active_requests(self, exc):
+        """Push an error to every in-flight handle's queue + clear state, so
+        FastAPI handlers don't block forever on a dead engine. The thread keeps
+        running; the next admitted request gets a fresh slot pool."""
+        msg = f"{type(exc).__name__}: {exc}"
+        print(f"[cb-engine] step failed: {msg}", file=sys.stderr, flush=True)
+        for sched_rid in list(self._meta.keys()):
+            m = self._meta.pop(sched_rid, None)
+            if m is None:
+                continue
+            m["handle"]._push(("error", msg))
+            self._ext_to_sched.pop(m["ext"], None)
+            if self._inflight_sem is not None:
+                try: self._inflight_sem.release()
+                except ValueError: pass
+        self._sched.waiting.clear()
+        self._sched.slots = [None] * self._sched.B
 
     def _drain_inbound(self):
         while True:
             try:
-                ext, prompt, mn, sampling, submit_t, q = self._inbound.get_nowait()
+                ext, prompt, mn, sampling, submit_t, handle = self._inbound.get_nowait()
             except queue.Empty:
                 return
             sched_rid = self._sched.submit(prompt, sampling=sampling)
-            self._meta[sched_rid] = {"ext": ext, "q": q, "max_new": mn, "sent": 0,
-                                      "submit_time": submit_t, "first_tok_time": None}
+            self._meta[sched_rid] = {"ext": ext, "handle": handle, "max_new": mn,
+                                      "sent": 0, "submit_time": submit_t,
+                                      "first_tok_time": None}
             self._ext_to_sched[ext] = sched_rid
 
     def _drain_cancels(self):
@@ -255,7 +310,7 @@ class CBEngine:
             self._sched.cancel(sched_rid)
             m = self._meta.pop(sched_rid)
             self._ext_to_sched.pop(ext, None)
-            m["q"].put(("cancelled", None))
+            m["handle"]._push(("cancelled", None))
             self.m_cancelled.inc()
             self.m_request_seconds.observe(time.time() - m["submit_time"])
             if self._inflight_sem is not None:
@@ -272,13 +327,13 @@ class CBEngine:
                 if m["sent"] == 0:
                     m["first_tok_time"] = now
                     self.m_ttft_seconds.observe(now - m["submit_time"])
-                m["q"].put(("tok", gen[m["sent"]]))
+                m["handle"]._push(("tok", gen[m["sent"]]))
                 m["sent"] += 1
                 self.m_tokens.inc()
             if r["status"] == "DONE" or m["sent"] >= m["max_new"]:
                 if r["status"] != "DONE":   # per-request cap before global cap
                     sched.cancel(sched_rid)
-                m["q"].put(("done", None))
+                m["handle"]._push(("done", None))
                 self.m_done.inc()
                 self.m_request_seconds.observe(now - m["submit_time"])
                 self._meta.pop(sched_rid, None)
