@@ -92,7 +92,8 @@ class CBEngine:
 
     def __init__(self, state, slots, max_new_cap, eos_id, use_trace=True,
                  sampling=False, max_inflight=None, topk_k=None,
-                 chunked_prefill=False, idle_sleep=0.001):
+                 chunked_prefill=False, prefix_cache=False, prefix_ttl_s=300.0,
+                 idle_sleep=0.001):
         self.state = state
         self.slots = slots
         self.max_new_cap = int(max_new_cap)
@@ -113,6 +114,12 @@ class CBEngine:
         # longer L). Forces cb_conv_mode='kdim' inside the scheduler so the
         # post-transplant decode math is bit-identical to S1a's path.
         self.chunked_prefill = bool(chunked_prefill)
+        # prefix_cache=True → slot-level content-keyed prefix caching. Completed
+        # CB slots are held under hash(tokens_so_far); a returning chat reclaims
+        # its slot at cur_pos=n_matched, skipping re-prefill. DN+KV state stays
+        # in-place — no Marconi-style checkpointing. Plan: 27b_prefix_caching_plan.md.
+        self.prefix_cache = bool(prefix_cache)
+        self.prefix_ttl_s = float(prefix_ttl_s)
         # Backpressure: cap on total in-flight requests (queued+active). When at
         # cap, submit() raises queue.Full → API maps to HTTP 429. Default unlimited.
         self.max_inflight = max_inflight
@@ -180,6 +187,23 @@ class CBEngine:
         M.gauge("cb_engine_sampling",
                 "1 if engine is in sampling mode (eager/logits-trace), else 0.",
                 fn=lambda: 1.0 if self.sampling else 0.0)
+        # ---- PC-P6 prefix-cache metrics ----
+        # Scheduler increments pc_hits/pc_misses/pc_evictions; we expose them
+        # as counters via lambda observation. live_slots gauge reflects current
+        # cached slot count (visible idle vs active).
+        self.m_pc_hits = M.counter("cb_prefix_cache_hits_total",
+            "Requests admitted via prefix-cache hit (skipped re-prefill).")
+        self.m_pc_misses = M.counter("cb_prefix_cache_misses_total",
+            "Requests that fell through to cold prefill (no match in cache).")
+        self.m_pc_evictions = M.counter("cb_prefix_cache_evictions_total",
+            "Cached slots evicted to make room for new requests (LRU + TTL).")
+        M.gauge("cb_prefix_cache_live_slots",
+            "Slots currently in the live prefix cache (queued for reuse).",
+            fn=lambda: 0 if (self._sched is None or self._sched.live_slots is None)
+                else len(self._sched.live_slots))
+        M.gauge("cb_prefix_cache_enabled",
+            "1 if prefix caching is enabled on this engine.",
+            fn=lambda: 1.0 if self.prefix_cache else 0.0)
 
     # ---- public API (any thread) ----
     def start(self):
@@ -229,10 +253,15 @@ class CBEngine:
             self._sched = Scheduler(self.state, self.slots, self.max_new_cap,
                                     self.eos_id, use_trace=self.use_trace,
                                     sampling=self.sampling, topk_k=self.topk_k,
-                                    chunked_prefill=self.chunked_prefill)
+                                    chunked_prefill=self.chunked_prefill,
+                                    prefix_cache=self.prefix_cache)
             # Attach sub-step histograms so _step_sampled can record the split.
             self._sched.m_device = self.m_step_device_seconds
             self._sched.m_sample = self.m_step_sample_seconds
+            self._pc_last_hits = 0
+            self._pc_last_misses = 0
+            self._pc_last_evictions = 0
+            self._pc_ttl_last_check = time.monotonic()
         except BaseException as e:  # surface bootstrap/capture failure to start()
             self._err = e
             self.started.set()
@@ -267,6 +296,37 @@ class CBEngine:
                     continue
             else:
                 time.sleep(self.idle_sleep)
+            if self.prefix_cache:
+                self._pc_sync_metrics()
+                self._pc_ttl_sweep()
+
+    def _pc_sync_metrics(self):
+        """Sync scheduler-side counters to Prometheus counters via delta. Cheap;
+        called every iter — pure-Python int ops."""
+        sched = self._sched
+        if sched.pc_hits > self._pc_last_hits:
+            self.m_pc_hits.inc(sched.pc_hits - self._pc_last_hits)
+            self._pc_last_hits = sched.pc_hits
+        if sched.pc_misses > self._pc_last_misses:
+            self.m_pc_misses.inc(sched.pc_misses - self._pc_last_misses)
+            self._pc_last_misses = sched.pc_misses
+        if sched.pc_evictions > self._pc_last_evictions:
+            self.m_pc_evictions.inc(sched.pc_evictions - self._pc_last_evictions)
+            self._pc_last_evictions = sched.pc_evictions
+
+    def _pc_ttl_sweep(self):
+        """Periodically free live-cached slots that have been idle > prefix_ttl_s.
+        Prevents disconnected/stale chats from indefinitely hoarding slots."""
+        now = time.monotonic()
+        if now - self._pc_ttl_last_check < 30.0:
+            return
+        self._pc_ttl_last_check = now
+        if self._sched.live_slots is None:
+            return
+        expired = self._sched.live_slots.expire_stale(self.prefix_ttl_s)
+        if expired:
+            self.m_pc_evictions.inc(len(expired))
+            self._pc_last_evictions = self._sched.pc_evictions  # don't double-count
 
     def _fail_active_requests(self, exc):
         """Push an error to every in-flight handle's queue + clear state, so

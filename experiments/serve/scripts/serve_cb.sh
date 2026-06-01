@@ -18,6 +18,13 @@
 #                            1=admit via S1a chunked prefill + on-device
 #                            transplant (S2). Wins at all L>=64 (~2-2.5x at
 #                            L=64-200, larger at long L).
+#   TT_CB_PREFIX_CACHE       0=no prefix cache (default; pre-PC behavior).
+#                            1=slot-level content-keyed prefix cache. Completed
+#                            CB slots are held under hash(tokens_so_far);
+#                            returning chats reclaim their slot at cur_pos=
+#                            len(matched_prefix) and skip re-prefill of history.
+#                            Plan: research/27b_prefix_caching_plan.md.
+#   TT_CB_PREFIX_TTL_S=300   live-slot TTL: free slots untouched > N seconds.
 set -u
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/tt-xla}"
@@ -62,6 +69,8 @@ cmd_start() {
     TT_CB_MAX_INFLIGHT="${TT_CB_MAX_INFLIGHT:-64}" \
     TT_CB_TOPK_K="${TT_CB_TOPK_K:-0}" \
     TT_CB_CHUNKED_PREFILL="${TT_CB_CHUNKED_PREFILL:-0}" \
+    TT_CB_PREFIX_CACHE="${TT_CB_PREFIX_CACHE:-0}" \
+    TT_CB_PREFIX_TTL_S="${TT_CB_PREFIX_TTL_S:-300}" \
     nohup setsid "$VENV_PY" -m uvicorn experiments.serve.cb_api:app \
         --host "$HOST_ADDR" --port "$PORT" --lifespan on \
         >> "$LOG_FILE" 2>&1 < /dev/null &
