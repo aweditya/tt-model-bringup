@@ -77,6 +77,40 @@ T0-T4 are gated, validated, and committed. The bug is integration only.
 Once two-trace coexistence is solved, `_step_prefill_chunked` in
 `cb_scheduler.py` (commit `530d259`) flips on and we ship.
 
+### ROOT CAUSE FOUND (post-mortem, 2026-06-01) — two-phase warmup
+
+[tenstorrent/vllm#352](https://github.com/tenstorrent/vllm/issues/352)
+documents the exact symptom and fix. Capturing prefill trace first then
+running decode JIT warmup compiles ops that prefill didn't touch; those
+compilations allocate kernel-cache buffers that can land on prefill
+trace's reserved memory → trace replay reads garbage → our 99% CPU hang.
+
+**Fix is order, not size**. TT vLLM's default trace_region_size is just
+50 MB and works fine for both traces — once warmup order is right.
+
+Two-phase warmup pattern (TT vLLM `model_runner.py:2538-2592`):
+
+```
+phase 1 (compile only, no captures):
+  warmup_prefill(enable_trace=False)
+  warmup_decode (enable_trace=False)
+  ttnn.synchronize_device(mesh)
+phase 2 (capture, no JIT — cache already populated):
+  warmup_prefill(enable_trace=True)
+  warmup_decode (enable_trace=True)
+```
+
+Code change required in `experiments/serve/cb_scheduler.py`:
+- Split `_capture_prefill_trace` and `_capture_trace` into separate
+  `_warmup_X(enable_trace=False)` and `_capture_X` methods.
+- In `__init__`, call both warmups first, then both captures.
+
+Diagnostic env var: `TT_METAL_TRACE_ALLOC_TRACKING=1` (tt-metal commit
+5043de3df5) makes the warning into an UnsafeAllocationTracker that names
+the offending op.
+
+Saved in memory: `feedback_two_phase_warmup`. T5 unblocked for next session.
+
 ## Risks
 
 1. **Chunked-SDPA precision at q_chunk_size=128**: S2.2 attempts at q_chunk_size=32 drifted to cos=0.43. Two reasons q_chunk_size=128 likely fixes it: Llama uses 64-256 in prod, and our S2.1 isolation at q_chunk_size=32 passed vs numpy (drift was integration-level). T1 catches this.
