@@ -443,18 +443,28 @@ class Scheduler:
                     self.live_slots.mark_live(s, tokens_so_far)
         return done
 
-    def cancel(self, rid):
+    def cancel(self, rid, mark_live=False):
         """Evict a request mid-flight. Frees its slot (the next _admit calls
         cb_reset_slots → fresh DN state for the new occupant; KV self-overwrites,
         cur_pos-bounded) or drops it from the waiting queue. Same eviction
         mechanism as a finished request — no device op here. Returns True if it
-        was live."""
+        was live.
+
+        mark_live=True: caller is signaling "this request hit a per-request cap
+        (e.g. max_tokens), and r['gen'] is the COMPLETE generated response — the
+        slot's state is a valid cache prefix." mark_live=False (default): user
+        cancel / engine-side abort; the partial state is not useful, drop it.
+        """
         r = self.reqs.get(rid)
         if r is None or r['status'] in ('DONE', 'CANCELLED'):
             return False
         s = r['slot']
         if s is not None and self.slots[s] == rid:
             self.slots[s] = None
+            if mark_live and self.prefix_cache:
+                tokens_so_far = list(r['prompt']) + list(r['gen'])
+                if len(tokens_so_far) >= PREFIX_CACHE_MIN_MATCH:
+                    self.live_slots.mark_live(s, tokens_so_far)
         if rid in self.waiting:
             self.waiting.remove(rid)
         r['status'] = 'CANCELLED'

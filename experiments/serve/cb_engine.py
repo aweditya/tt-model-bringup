@@ -392,7 +392,10 @@ class CBEngine:
                 self.m_tokens.inc()
             if r["status"] == "DONE" or m["sent"] >= m["max_new"]:
                 if r["status"] != "DONE":   # per-request cap before global cap
-                    sched.cancel(sched_rid)
+                    # Per-request cap is "done" semantically — r['gen'] is a
+                    # complete response. mark_live=True so prefix caching
+                    # keeps the slot under tokens_so_far for the next turn.
+                    sched.cancel(sched_rid, mark_live=True)
                 m["handle"]._push(("done", None))
                 self.m_done.inc()
                 self.m_request_seconds.observe(now - m["submit_time"])
