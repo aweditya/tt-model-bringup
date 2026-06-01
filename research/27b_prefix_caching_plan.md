@@ -1,0 +1,320 @@
+# Prefix caching (slot-level, content-keyed) — milestone plan (2026-06-01)
+
+Living plan. Status per milestone; commit hash on completion.
+Sources: research findings in [`vllm_prefix_caching_audit.md`](vllm_prefix_caching_audit.md).
+
+## Problem being fixed
+
+Chat turn-2+ today **re-prefills the entire conversation history every request**.
+The OpenAI chat API is stateless on the wire — every turn the client sends the
+full `messages: [...]` array. Today's server tokenizes that and runs prefill
+from `cur_pos=0` over all of it. At ~80 ms/tok beyond the chunk_size=32 traced
+window, a 500-token history is ~40s TTFT.
+
+The slot that just finished turn N-1 still had the right KV cache + DN state +
+`cur_pos = len(history)` in DRAM at response time. We threw it away on response
+completion. We're going to stop throwing it away.
+
+## Design (locked from research audit)
+
+**Slot-level, content-keyed prefix caching** — vLLM's APC pattern at coarser
+granularity:
+
+- **Cache unit**: the whole CB slot (KV pages + DN state + `cur_pos` + `tokens_so_far`).
+  Not individual KV blocks.
+- **Cache key**: content hash of `tokens_so_far` (vLLM-style content-keyed →
+  no session IDs, no hijacking surface, same security model as vLLM APC).
+- **Cache lookup**: on admit, find the longest cached prefix of the incoming
+  prompt; exact-verify (defense vs hash collision); resume the slot.
+- **Cache eviction**: LRU when slots are needed for new conversations.
+- **DN state**: lives in the slot, never serialized. **This is why slot-level
+  fits our hybrid attention+GatedDeltaNet architecture** — sidesteps Marconi.
+
+## Why slot-level (not block-level)
+
+For a hybrid attention+DN model, block-level prefix caching of just the KV
+cache gives **zero TTFT win** in isolation. DN state at position N requires the
+full sequence 0..N to compute; cached KV blocks alone aren't usable. The two
+ways to make block-level work for hybrid models:
+
+1. **Marconi-style DN checkpoints** at block boundaries (research-grade;
+   upstream has open bugs — vllm#26201, vllm#40696, Yifei Hu's "one block
+   too many" report on Qwen3.5-Next).
+2. **Keep DN state alive in-place between requests** — this *is* slot-level.
+
+Slot-level captures ~100% of the personal-chat use case (single user, chat tab
+open, sequential turns). Cross-tenant system-prompt sharing and partial-prefix
+matches are out of scope for v1 — revisit only if logs show material cross-user
+overlap.
+
+## Security model
+
+Identical to vLLM's APC:
+
+- **Content-keyed**: the key is `hash(tokens_so_far)`. To "hijack" a cached
+  slot you must already know the exact prefix tokens — at which point you
+  already have the data.
+- **Side-channel**: timing-based — same as vLLM's. Single-tenant research
+  server, accepted risk.
+- **No session IDs**: nothing to spoof; no auth surface added.
+- **No persistent storage**: live slots are in-DRAM only; gone on process
+  restart.
+
+## Milestones
+
+| ID | What | Gate | Status | Commit |
+|---|---|---|---|---|
+| P0 | Design contracts + touch-point map | This doc + code-read pass | 🟡 in progress | — |
+| P1 | `LiveSlotStore` data structure | Unit test in `experiments/cb/isolate/`: mark live, find longest match, LRU evict | ⏳ | — |
+| P2 | Slot lifecycle — don't free on done | Existing CB engine validator passes; live slots accumulate; evict-when-needed works | ⏳ | — |
+| P3 | Admit-time prefix match + skip prefill | Chat smoke: turn 2 TTFT ≪ turn 1 for matching prefix | ⏳ | — |
+| P4 | Decode-suffix advance before generation | Bit-identical output vs cold prefill on same full prompt | ⏳ | — |
+| P5 | Production wire-up + env gate | `chat.py` real chat: turn-2+ TTFT < 100 ms | ⏳ | — |
+| P6 | TTL + `/metrics` counters | Stale-slot TTL prevents leak; cache hit/miss visible in Prometheus | ⏳ | — |
+
+## P0 — Design contracts
+
+### Cache key
+
+Hash chain over token IDs, vLLM-style, so sub-prefix lookups don't re-hash from
+scratch later:
+
+```
+hash_chain[0] = h(token[0])
+hash_chain[i] = h(hash_chain[i-1], token[i])
+```
+
+Hash function: `xxhash.xxh64` for speed (microseconds at our scale). Switch to
+`sha256` only if we ever multi-tenant and need cryptographic resistance.
+
+For v1, we don't actually need the chain — we have ≤ N_SLOTS=4 live slots, so
+linear scan + bytewise prefix-equality is fine. Hash chain is forward-compatible
+for block-level eviction later.
+
+### LiveSlotStore API
+
+```python
+class LiveSlotStore:
+    """Holds completed slots indexed by their tokens_so_far, in LRU order.
+    Operations are O(N_SLOTS) which is fine at N_SLOTS=4."""
+
+    def find_longest_match(prompt_tokens: list[int]) -> tuple[Slot | None, int]:
+        """Return (slot, n_matched) for the live slot whose tokens_so_far is
+        the longest prefix of prompt_tokens. (None, 0) on miss."""
+
+    def mark_live(slot: Slot, tokens_so_far: list[int]) -> None:
+        """Move slot from active CB to live cache. Touches LRU."""
+
+    def evict_lru() -> Slot:
+        """Pop and return the least-recently-used live slot. Caller resets
+        and reuses it for a new conversation. Raises if no live slots."""
+
+    def remove(slot: Slot) -> None:
+        """Explicit teardown (TTL expiry / explicit free)."""
+
+    def __len__() -> int: ...
+    def touch(slot: Slot) -> None: ...  # internal LRU bookkeeping
+```
+
+### Admit-time flow (the change in `cb_scheduler.admit`)
+
+```python
+def admit(rid: str, prompt_tokens: list[int]):
+    slot, n_matched = self.live_slots.find_longest_match(prompt_tokens)
+
+    if slot is not None and n_matched >= MIN_PREFIX_MATCH:
+        # cache hit path: resume the live slot
+        assert prompt_tokens[:n_matched] == slot.tokens_so_far  # defense
+        self.live_slots.remove(slot)            # back to active
+        slot.assign_request(rid)
+        new_suffix = prompt_tokens[n_matched:]
+        self.advance_decode(slot, new_suffix)   # P4 mechanism
+        return
+
+    # cache miss path: existing behavior
+    slot = self.alloc_free_slot()
+    if slot is None:
+        slot = self.live_slots.evict_lru()      # P2: evict to make room
+        self.reset_slot(slot)
+    slot.assign_request(rid)
+    self.full_prefill(slot, prompt_tokens)
+```
+
+### Response-done flow (the change in `cb_scheduler.finish`)
+
+```python
+def finish(slot: Slot):
+    # was: self.free_slot(slot)
+    # now:
+    self.live_slots.mark_live(slot, slot.tokens_so_far)
+```
+
+### Touch-point map
+
+| File | Function | What changes |
+|---|---|---|
+| `experiments/serve/cb_scheduler.py` | `admit`, `finish`, `step` | wire live-slot lookup + lifecycle |
+| `experiments/serve/cb_scheduler.py` | (new) `advance_decode(slot, tokens)` | run N decode steps using existing trace |
+| `experiments/serve/cb_engine.py` | request lifecycle | call `live_slots.remove` on explicit user cancel |
+| `experiments/serve/cb_api.py` | `/v1/chat/completions` | nothing — tokenization already happens; pass through |
+| `experiments/serve/server_tp.py` | `forward_token_tp_inner` | verify `cur_pos != 0` works (likely fine, `cur_pos` is tensor buffer) |
+| `experiments/serve/scripts/serve_cb.sh` | env var | `TT_CB_PREFIX_CACHE=0/1` |
+| (new) `experiments/cb/isolate/prefix_cache_store.py` | — | unit test for LiveSlotStore |
+| (new) `experiments/cb/validate/prefix_cache_chat.py` | — | bit-identical-output gate |
+
+### Open questions resolved in P0
+
+1. **Does the decode trace handle `cur_pos` starting at non-zero?**
+   Read of `forward_token_tp_inner` confirms `cur_pos` is plumbed through
+   `state.cb_cur_pos_buf` (a device tensor input). The trace doesn't bake the
+   starting value. Resume at `cur_pos = 100` is the same trace replay as
+   `cur_pos = 0`. ✓ no new trace needed.
+
+2. **Concurrency: cb_engine is async/multi-threaded?** Yes. LiveSlotStore needs
+   a lock (we'll use the same lock as the slot allocator).
+
+3. **MIN_PREFIX_MATCH threshold?** Set to ~16 tokens (worth the overhead).
+   Below that, just full-prefill — the savings don't pay for the lookup +
+   defense-in-depth verify.
+
+4. **What about cancellations mid-decode?** Slot still gets marked live with
+   the partial `tokens_so_far` at cancel time. Next turn might reuse it.
+   (Minor: store needs a `cancel_safe` flag to gate this.)
+
+## P1 — LiveSlotStore (data structure only)
+
+Pure Python. No ttnn, no scheduler integration. Unit-test-able locally too
+(but per non-negotiables run on qb1 to mirror prod env).
+
+File: `experiments/serve/live_slot_store.py` (importable from cb_scheduler).
+Test: `experiments/cb/isolate/prefix_cache_store.py`.
+
+Gate: unit test exercises {mark_live, find_longest_match, evict_lru, remove,
+LRU ordering, no-match, ties, exact-vs-substring}. All assertions pass.
+
+## P2 — Slot lifecycle (don't free on done)
+
+Smallest possible change: in `cb_scheduler.finish`, replace `free_slot` with
+`live_slots.mark_live`. In `alloc_slot` (or wherever free slots come from), add
+the LRU evict fallback when nothing's free.
+
+**Critical correctness check**: does `mark_live` leave the slot's KV pages and
+DN state untouched? Verify: today's `free_slot` zeros / reclaims pages; we need
+to NOT do that. Walk through carefully.
+
+Gate: existing CB engine validator (`experiments/cb/validate/...`) PASSES with
+prefix-cache on but cache empty (i.e., behaviour bit-identical when cache is
+cold). Live slot count grows under sequential requests.
+
+## P3 — Admit-time prefix match + skip prefill
+
+Wire `live_slots.find_longest_match` into `admit`. On hit, skip the prefill
+path entirely; jump to a NEW "resume mode" code path that handles the new-suffix
+decode (P4 mechanism).
+
+**Critical gotcha**: on hit, we need to verify the live slot is at exactly
+`cur_pos = n_matched` — the slot stopped decoding at the end of the previous
+turn's response, which IS `tokens_so_far`. So `slot.cur_pos == len(tokens_so_far)`
+should hold by construction. Assert it.
+
+Gate: chat smoke test through `chat.py` — turn 1 TTFT ~ today's number; turn 2
+TTFT ~ N × decode_step_ms (where N = new tokens count). Should be 10-100× faster
+than turn 2 today.
+
+## P4 — Decode-suffix advance before generation
+
+When `new_suffix = prompt_tokens[n_matched:]` is non-empty, we need to "consume"
+those tokens before generating. Each one is a normal decode step where we
+*ignore* the model's logits and forcibly insert the next user token as if the
+model had produced it (teacher-forcing). The slot's KV cache + DN state advance
+through these positions.
+
+```python
+def advance_decode(slot, new_tokens):
+    for tok in new_tokens:
+        slot.next_input_token = tok          # force the input
+        self._step_one_slot(slot)            # existing decode trace
+        # ignore logits this step
+    # now slot.cur_pos = original + len(new_tokens); ready to generate
+```
+
+This is N decode steps where N = len(new user message tokens). At our ~12 tok/s
+single-slot decode rate, a 50-token new user message = ~4s. Still way better
+than ~40s prefill.
+
+(Future optimization: this is exactly the use case for traced chunked prefill
+at chunk_size=128. If we ship the chunk_size bump later, advance_decode can
+use it for new_suffix > 16.)
+
+Gate: bit-identical comparison — feed (cached-prefix + new-suffix) two ways:
+(1) cold prefill all, (2) cache-hit + advance_decode. First generated token's
+logits must match cos ≥ 0.9999.
+
+## P5 — Production wire-up + env gate
+
+- `TT_CB_PREFIX_CACHE=0` (default off) / `=1` (on)
+- Document in `serve_cb.sh` and `HANDOFF.md`
+- Smoke test: real chat through `chat.py` with multiple turns; observe TTFT
+  collapse on turn 2+
+
+Gate: 4-tab concurrent chat (the same test we used for T6) — turn-2+ TTFT < 100ms
+across all tabs. No regressions in turn-1 TTFT or decode tok/s.
+
+## P6 — TTL + `/metrics`
+
+- TTL: free a live slot if untouched for > 5 minutes (env: `TT_CB_PREFIX_TTL_S=300`)
+  to prevent indefinite slot hoarding from disconnected clients.
+- Counters in `/metrics`:
+  - `tt_cb_prefix_cache_hits_total`
+  - `tt_cb_prefix_cache_misses_total`
+  - `tt_cb_prefix_cache_evictions_total`
+  - `tt_cb_prefix_cache_ttl_expirations_total`
+  - `tt_cb_prefix_cache_live_slots` (gauge)
+
+Gate: leave server running an hour with realistic chat; metrics non-zero; no
+slot leak (live_slots count stays < N_SLOTS).
+
+## Risks + things to keep an eye on
+
+1. **Slot reset between cache miss + alloc on top of evicted slot**. The
+   evicted slot has stale KV / DN state. Before reuse for a NEW conversation,
+   we must actually reset (zero out / reset cur_pos). This is the existing
+   "reset" path; verify it actually fully resets DN `H_t` and conv_cols.
+
+2. **Streaming partial responses**: if the client cancels mid-response (closed
+   connection), our slot has `tokens_so_far` only up to the partial generation.
+   Next turn's chat history would include the FULL previous response (whatever
+   the user saw), not our truncation. Hash mismatch → cache miss → full prefill.
+   Correct but loses the win. Acceptable for v1.
+
+3. **Multiple chat tabs from same user**: each tab is an independent
+   conversation thread. With session-keyed design we'd have to pick which to
+   share. With content-keyed design they naturally just don't share (different
+   token histories). ✓ no special handling.
+
+4. **System prompt drift**: if `chat.py` ever changes its system prompt mid-
+   session, the next request's prefix won't match → cache miss → full prefill.
+   Correct but loses the win. Update `chat.py` to keep system prompt stable.
+
+5. **Token determinism**: `tokenizer.encode("hello")` must return the same IDs
+   every call. Verify our HF tokenizer setup is deterministic (it is for
+   Qwen3.6 — verified by existing per-token gates).
+
+## Out of scope for v1 (revisit if needed)
+
+- **Block-level APC + Marconi DN checkpoints** for cross-user system prompt
+  sharing or partial-prefix matches. Roadmap 2/3 from research audit.
+- **Multi-tab same-client** (multiple live slots per logical user).
+- **Session "fork"** (user edits earlier message and resubmits — current design
+  treats this as miss; for v2, could detect and partial-match up to the fork
+  point).
+- **Persistent cache across server restarts** — live_slots is in-DRAM only.
+- **Cross-instance cache** (load-balanced fleet) — single-instance only.
+
+## Reference points
+
+- vLLM design doc: <https://github.com/vllm-project/vllm/blob/main/docs/design/prefix_caching.md>
+- TT vLLM PR #272 (dense Llama APC): <https://github.com/tenstorrent/vllm/pull/272>
+- Hybrid APC tracking issue: <https://github.com/vllm-project/vllm/issues/26201>
+- Marconi paper (DN checkpointing): <https://arxiv.org/abs/2411.19379>
+- Research audit (in this repo): [`vllm_prefix_caching_audit.md`](vllm_prefix_caching_audit.md)

@@ -57,14 +57,27 @@ See README §"Chat server (production)" for `curl` + `openai` client examples.
 
 ## What's next
 
+**Prefix caching — IN PROGRESS (2026-06-01, slot-level content-keyed).** The
+real chat TTFT win. Today turn-2+ re-prefills the entire conversation history
+even though the KV+DN state for that history was live in a CB slot seconds ago.
+Design: keep slots alive after response-done under a content key (hash of
+`tokens_so_far`); on returning request, resume the live slot at
+`cur_pos = len(matched_prefix)`. Same security model as vLLM APC (content-keyed,
+no session IDs). Fits hybrid attention+DN model naturally (DN state lives in
+slot, no Marconi-style checkpointing). Roadmap + milestones P0-P6 in
+[`research/27b_prefix_caching_plan.md`](research/27b_prefix_caching_plan.md).
+Research basis: [`research/vllm_prefix_caching_audit.md`](research/vllm_prefix_caching_audit.md).
+
 **S2 — chunked prefill — LIVE in production (2026-06-01).** CB serves with
 `TT_CB_CHUNKED_PREFILL=1`: traced chunked prefill at chunk_size=32 for L ≤ 32,
 legacy 1-tok/iter fallback for L > 32. Two-phase warmup (compile-all-then-capture-all)
 solves the multi-trace coexistence wedge per [vLLM #352](https://github.com/tenstorrent/vllm/issues/352).
 Plan + post-mortem: [`research/27b_prefill_trace_plan.md`](research/27b_prefill_trace_plan.md).
 
-Next levers (deferred): T3 multi-chunk (loop trace for L > chunk_size), bigger
-chunk_size (memory permitting), prefix caching (per-client session for skip-rehistory).
+Deferred / superseded: T3 multi-chunk traced prefill (chat win comes from skipping
+re-prefill via prefix caching, not making re-prefill faster). Bigger chunk_size
+(same reasoning). Both revisitable for long single-prompt cases (no prior cache
+to match) after prefix caching ships.
 
 **35B perf** (parallel track). Next levers tracked in
 [`research/35b_perf_milestones.md`](research/35b_perf_milestones.md):
