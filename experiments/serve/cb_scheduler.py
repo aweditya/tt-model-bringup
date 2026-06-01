@@ -41,11 +41,13 @@ sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 
 import server_tp as base       # noqa: E402
 import server_tp_cb as cb      # noqa: E402
+from live_slot_store import LiveSlotStore  # noqa: E402
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 DUMMY_TOK = 0  # token fed to parked/FREE slots (output ignored)
+PREFIX_CACHE_MIN_MATCH = 16  # tokens; below this don't bother caching
 
 
 def _sample_from_topk(values, indices, sp, rng):
@@ -107,12 +109,25 @@ class Scheduler:
     """Orca iteration-level scheduler over a fixed pool of B slots."""
 
     def __init__(self, state, B, max_new, eos_id, use_trace=False, sampling=False,
-                 topk_k=None, chunked_prefill=False):
+                 topk_k=None, chunked_prefill=False, prefix_cache=False):
         self.state = state
         self.B = B
         self.max_new = max_new
         self.eos_id = eos_id
         self.use_trace = use_trace
+        # prefix_cache: slot-level content-keyed prefix caching. When a request
+        # completes, its slot is kept "live" indexed by hash(tokens_so_far)
+        # instead of being torn down. On the next admit, if the new prompt has
+        # the cached prefix, we reclaim the live slot at cur_pos=n_matched and
+        # only decode the new suffix (no re-prefill). Plan: research/27b_prefix_caching_plan.md.
+        # Default OFF — bit-identical to today.
+        self.prefix_cache = bool(prefix_cache)
+        self.live_slots = LiveSlotStore(min_match_tokens=PREFIX_CACHE_MIN_MATCH) \
+            if self.prefix_cache else None
+        # Prefix-cache metrics (incremented by P3+P6; safe to expose now).
+        self.pc_hits = 0
+        self.pc_misses = 0
+        self.pc_evictions = 0
         # chunked_prefill: alternating PREFILL_ONLY / DECODE_ONLY scheduler pattern
         # (TT vLLM convention; research/27b_chunked_prefill_prior_art.md). When a
         # new request is admitted, the next step runs S1a chunked prefill on the
@@ -237,18 +252,47 @@ class Scheduler:
         return rid
 
     def _admit(self):
+        """Admit waiting requests into free slots.
+
+        With prefix_cache=True, slot allocation prefers slots NOT currently in
+        the live cache (so we never evict a useful prefix unnecessarily). Only
+        when every free slot is also a live-cached slot do we LRU-evict one.
+        Reclaimed slots are removed from the cache *before* cb_reset_slots so
+        the cache entry never points at stale state.
+
+        With prefix_cache=False this is the original first-free-wins behavior.
+        """
         admitted = []
-        for s in range(self.B):
+        for s in self._slot_alloc_order():
             if self.slots[s] is None and self.waiting:
                 rid = self.waiting.popleft()
                 r = self.reqs[rid]
                 self.slots[s] = rid
                 r['slot'] = s; r['cur_pos'] = 0
                 r['next_tok'] = r['prompt'][0]; r['status'] = 'PREFILL'
+                if self.prefix_cache and s in self.live_slots:
+                    # We're about to wipe this slot's state via cb_reset_slots.
+                    # Drop its prefix cache entry first so it never points at
+                    # zeroed state.
+                    self.live_slots.reclaim(s)
+                    self.pc_evictions += 1
                 admitted.append(s)
         if admitted:
             cb.cb_reset_slots(self.state, admitted)  # fresh DN state for new seqs
         return admitted
+
+    def _slot_alloc_order(self):
+        """Iteration order for slot allocation: non-cached free slots first,
+        then cached free slots in LRU order (oldest first → evict-friendly).
+        Without prefix caching, returns range(self.B) (original behavior)."""
+        if not self.prefix_cache:
+            return range(self.B)
+        non_cached = [s for s in range(self.B)
+                      if self.slots[s] is None and s not in self.live_slots]
+        # live_slots.slot_ids() is LRU order (oldest first) — perfect for eviction
+        cached_free = [s for s in self.live_slots.slot_ids()
+                       if self.slots[s] is None]
+        return non_cached + cached_free
 
     def _warmup_prefill(self):
         """Phase 1 — eager forward_prefill_chunked_traced_inner to populate
@@ -288,7 +332,7 @@ class Scheduler:
         to eager forward_prefill_chunked_tp (legacy path, still functional).
         Both finish with cb_prefill_transplant into the CB slot."""
         rid = None; slot = None
-        for s in range(self.B):
+        for s in self._slot_alloc_order():
             if self.slots[s] is None and self.waiting:
                 rid = self.waiting.popleft(); slot = s
                 break
@@ -296,6 +340,11 @@ class Scheduler:
             return False
         r = self.reqs[rid]
         import numpy as np, ttnn
+        if self.prefix_cache and slot in self.live_slots:
+            # Evicting a cached slot for a new prefill — drop the stale entry
+            # before cb_reset_slots wipes the state it pointed at.
+            self.live_slots.reclaim(slot)
+            self.pc_evictions += 1
         cb.cb_reset_slots(self.state, [slot])
         base._reset_state_buffers(self.state)
         prompt = r['prompt']
@@ -332,6 +381,18 @@ class Scheduler:
         if done:
             r['status'] = 'DONE'
             self.slots[s] = None
+            # Prefix cache: keep the slot's DN+KV state alive under the request's
+            # full token sequence so a returning chat can resume from cur_pos
+            # without re-prefill. Drop trailing EOS so the next turn's prompt
+            # (which won't have EOS inside the assistant message) matches the
+            # cached prefix exactly.
+            if self.prefix_cache:
+                gen = r['gen']
+                if gen and gen[-1] == self.eos_id:
+                    gen = gen[:-1]
+                tokens_so_far = list(r['prompt']) + list(gen)
+                if len(tokens_so_far) >= PREFIX_CACHE_MIN_MATCH:
+                    self.live_slots.mark_live(s, tokens_so_far)
         return done
 
     def cancel(self, rid):
@@ -369,6 +430,17 @@ class Scheduler:
             if self.waiting and any(s is None for s in self.slots):
                 self._step_prefill_chunked()
                 return sum(1 for s in self.slots if s is not None)
+        # Idle-step guard: if prefix caching is enabled, never run a forward
+        # when there's nothing to do — the (DUMMY_TOK, cur_pos=0) feed for FREE
+        # slots mutates DN state, which would corrupt any live-cached slot's
+        # DN state. With this guard, between turns of a chat (no active +
+        # waiting), step() returns 0 without touching the device → cache pristine.
+        # (Pre-prefix-cache behavior preserved when prefix_cache=False.)
+        if self.prefix_cache:
+            has_active = any(s is not None for s in self.slots)
+            has_admissible = bool(self.waiting) and any(s is None for s in self.slots)
+            if not has_active and not has_admissible:
+                return 0
         self._admit()
         toks, curs = [DUMMY_TOK] * self.B, [0] * self.B
         for s in range(self.B):
