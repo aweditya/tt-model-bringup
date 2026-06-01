@@ -210,12 +210,63 @@ def main():
         log(f"  L={Lp:3d} replay {tr*1000:6.0f}ms  argmax t={t_arg}({tok.decode([t_arg])!r}) "
             f"ref={ref_arg}({tok.decode([ref_arg])!r}) cos={t_cos:.6f} {'OK' if ok else 'FAIL'}")
 
-    ttnn.release_trace(state.mesh, trace_id)
     if any_fail:
+        ttnn.release_trace(state.mesh, trace_id)
         log(f"FAIL T2: at least one replay disagreed with eager same-input reference")
         raise SystemExit(1)
     log(f"PASS T2: {len(t2_prompts)} different prompts all replay correctly. "
         f"Median replay time {sorted(rep_times)[len(rep_times)//2]*1000:.0f}ms.")
+
+    # === T4: TTFT bench — traced replay vs legacy 1-tok/iter at L sweep ===
+    log(f"=== T4: TTFT bench legacy vs traced at L in {{8, 32, 64, 100, 128}} ===")
+    bench_ids = tok.encode(("The history of computing spans many centuries from the abacus "
+                            "to modern silicon chips. Early mechanical calculators gave way "
+                            "to electromechanical machines and eventually fully electronic "
+                            "computers. The transistor revolutionized the field in the late "
+                            "1940s enabling smaller faster devices. Integrated circuits "
+                            "packed thousands then millions of transistors onto a single chip. "
+                            "Today processors contain billions of transistors and execute "
+                            "instructions in parallel across many cores. Modern AI chips "
+                            "accelerate matrix multiplication and tensor operations at scale.") * 3)
+    rows = []
+    for L_bench in (8, 32, 64, 100, 128):
+        if L_bench > len(bench_ids):
+            continue
+        ids_b = bench_ids[:L_bench]
+
+        # Legacy: 1 tok/iter via forward_prefill_tp_inner
+        base._reset_state_buffers(state)
+        ttnn.synchronize_device(state.mesh)
+        t0 = time.time()
+        leg = base.forward_prefill_tp_inner(state, ids_b, capture_logits=False)
+        ttnn.synchronize_device(state.mesh)
+        t_legacy = time.time() - t0
+        ttnn.deallocate(leg)
+
+        # Traced: pad to 128, replay
+        padded_b = list(ids_b) + [0] * (CHUNK_SIZE - L_bench)
+        base._reset_state_buffers(state)
+        base.update_prefill_input_buffers(state, padded_b)
+        ttnn.synchronize_device(state.mesh)
+        t0 = time.time()
+        ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+        ttnn.synchronize_device(state.mesh)
+        t_traced = time.time() - t0
+
+        speedup = t_legacy / t_traced if t_traced > 0 else 0.0
+        winner = "traced" if t_traced < t_legacy else "legacy"
+        rows.append((L_bench, t_legacy, t_traced, speedup, winner))
+        log(f"  L={L_bench:3d}: legacy {t_legacy*1000:6.0f}ms  traced {t_traced*1000:6.0f}ms  "
+            f"speedup {speedup:.2f}x  -> {winner}")
+
+    ttnn.release_trace(state.mesh, trace_id)
+    crossover = next((r[0] for r in rows if r[3] >= 1.0), None)
+    if crossover is None:
+        log(f"INFO T4: traced never beats legacy in tested L range. Trace bootstrap "
+            f"cost not amortised. Reconsider chunk_size or skip tracing for L<= max tested.")
+    else:
+        log(f"PASS T4: traced wins starting at L={crossover}. "
+            f"For L<{crossover}, legacy is faster. Integration plan: dispatch on L.")
 
 
 if __name__ == "__main__":
