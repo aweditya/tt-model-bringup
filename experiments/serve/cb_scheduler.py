@@ -429,14 +429,16 @@ class Scheduler:
             self.slots[s] = None
             # Prefix cache: keep the slot's DN+KV state alive under the request's
             # full token sequence so a returning chat can resume from cur_pos
-            # without re-prefill. Drop trailing EOS so the next turn's prompt
-            # (which won't have EOS inside the assistant message) matches the
-            # cached prefix exactly.
+            # without re-prefill.
+            #
+            # IMPORTANT: do NOT strip the trailing EOS. For Qwen3.6 chat the
+            # "EOS" detected here is usually <|im_end|>, which the chat
+            # template ALSO emits between turns. If we strip it, turn 2's
+            # tokenization (which includes <|im_end|> after assistant_1) won't
+            # match the cached prefix. The slot's DN+KV state already processed
+            # that token, so storing it in tokens_so_far is correct.
             if self.prefix_cache:
-                gen = r['gen']
-                if gen and gen[-1] == self.eos_id:
-                    gen = gen[:-1]
-                tokens_so_far = list(r['prompt']) + list(gen)
+                tokens_so_far = list(r['prompt']) + list(r['gen'])
                 if len(tokens_so_far) >= PREFIX_CACHE_MIN_MATCH:
                     self.live_slots.mark_live(s, tokens_so_far)
         return done

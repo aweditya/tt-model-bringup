@@ -163,9 +163,10 @@ def case_finish_marks_live_when_pc_on():
     print("  ✓ case_finish_marks_live_when_pc_on")
 
 
-def case_finish_skips_eos_in_tokens_so_far():
-    """If the last generated token is EOS, drop it from cached tokens_so_far —
-    the next turn's prompt won't have an EOS inside the assistant message."""
+def case_finish_keeps_eos_in_tokens_so_far():
+    """Trailing EOS (which for Qwen3.6 is usually <|im_end|>) MUST stay in
+    tokens_so_far so it matches the chat template's between-turns delimiter
+    on the next turn's prompt."""
     s = make_scheduler(prefix_cache=True)
     r = make_request(0, prompt_len=20, gen_len=10)
     s.reqs[0] = r
@@ -173,10 +174,10 @@ def case_finish_skips_eos_in_tokens_so_far():
     r['slot'] = 0
     r['gen'][-1] = s.eos_id  # EOS at the end
     s._finish(r, 0, last_out=s.eos_id)
-    expected_tokens = list(r['prompt']) + list(r['gen'][:-1])  # EOS dropped
+    expected_tokens = list(r['prompt']) + list(r['gen'])  # EOS KEPT
     entry = s.live_slots._by_slot[0]
-    assert_eq(list(entry.tokens_so_far), expected_tokens, "EOS dropped from cache")
-    print("  ✓ case_finish_skips_eos_in_tokens_so_far")
+    assert_eq(list(entry.tokens_so_far), expected_tokens, "EOS kept in cache")
+    print("  ✓ case_finish_keeps_eos_in_tokens_so_far")
 
 
 def case_finish_too_short_not_cached():
@@ -377,7 +378,7 @@ def main():
     cases = [
         case_pc_off_no_live_slots,
         case_finish_marks_live_when_pc_on,
-        case_finish_skips_eos_in_tokens_so_far,
+        case_finish_keeps_eos_in_tokens_so_far,
         case_finish_too_short_not_cached,
         case_slot_alloc_order_prefers_non_cached,
         case_admit_evicts_lru_cache_when_no_free,
