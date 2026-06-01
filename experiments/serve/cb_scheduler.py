@@ -147,44 +147,58 @@ class Scheduler:
         self._prefill_trace_out = None
         cb.setup_cb_state(state, B)
         cb.cb_reset_states(state)
-        # Capture prefill trace BEFORE the decode trace. Each trace reserves
-        # device scratch addresses; capturing prefill first means decode's
-        # allocations won't overlap with prefill's pre-baked addresses.
+        # Two-phase warmup for multi-trace coexistence (vLLM #352): compile
+        # ALL paths first (enable_trace=False), THEN capture all back-to-back.
+        # If we interleave warmup+capture, decode JIT compilation between
+        # captures allocates buffers that can land on prefill trace's reserved
+        # memory → 99% CPU hang on second capture (T5a-T5f all failed this way).
         if self.chunked_prefill:
-            self._capture_prefill_trace()
+            self._warmup_prefill()
         if use_trace:
-            self._capture_trace()
+            self._warmup_decode()
+        if self.chunked_prefill or use_trace:
+            import ttnn
+            ttnn.synchronize_device(state.mesh)
+        if self.chunked_prefill:
+            self._capture_prefill_trace_only()
+        if use_trace:
+            self._capture_decode_trace_only()
         self.slots = [None] * B          # slot -> request id or None
         self.waiting = deque()           # request ids
         self.reqs = {}                   # id -> request dict
         self._next_id = 0
 
-    def _capture_trace(self):
-        """Capture the batched forward once. step() then replays via
-        execute_trace at compute speed. Admission (cb_reset_slots) and
-        update_input_buffers run eager BETWEEN replays — they mutate the
-        persistent input buffers, which the next replay reads.
+    def _decode_kw(self):
+        """Trace-tail kwargs for the decode forward (one per engine mode):
+          sampling=False              → ttnn.argmax [B,1]
+          sampling=True,  topk_k=N    → ttnn.topk ([B,K], [B,K])
+          sampling=True,  topk_k=None → logits [B, vocab]"""
+        if self.sampling and self.topk_k is not None:
+            return {"return_topk": self.topk_k}
+        elif self.sampling:
+            return {"return_logits": True}
+        return {}
 
-        Three trace tails (one per engine mode):
-          sampling=False             → ttnn.argmax (returns [B,1]).
-          sampling=True,  topk_k=N   → ttnn.topk    (returns ([B,K], [B,K])).
-          sampling=True,  topk_k=None → logits      (returns [B, vocab])."""
+    def _warmup_decode(self):
+        """Phase 1 of two-phase warmup — eager forward to populate program
+        cache. NO trace capture; allocator stays in 'normal' mode."""
         import ttnn
         st = self.state
-        if self.sampling and self.topk_k is not None:
-            kw = {"return_topk": self.topk_k}
-        elif self.sampling:
-            kw = {"return_logits": True}
-        else:
-            kw = {}
-        for i in range(2):  # JIT warmup (capture-during-JIT hangs on Blackhole)
+        kw = self._decode_kw()
+        for i in range(2):
             cb.update_input_buffers_batched(st, [DUMMY_TOK] * self.B, [i] * self.B)
             out = cb.forward_batch_tp_inner(st, **kw)
             if isinstance(out, tuple):
                 for h in out: ttnn.deallocate(h)
             else:
                 ttnn.deallocate(out)
-        ttnn.synchronize_device(st.mesh)
+
+    def _capture_decode_trace_only(self):
+        """Phase 2 — capture (assumes _warmup_decode has been called +
+        synchronize_device fired). No JIT, no allocations during capture."""
+        import ttnn
+        st = self.state
+        kw = self._decode_kw()
         cb.update_input_buffers_batched(st, [DUMMY_TOK] * self.B, [2] * self.B)
         self._trace_id = ttnn.begin_trace_capture(st.mesh, cq_id=0)
         handle = cb.forward_batch_tp_inner(st, **kw)
@@ -236,15 +250,13 @@ class Scheduler:
             cb.cb_reset_slots(self.state, admitted)  # fresh DN state for new seqs
         return admitted
 
-    def _capture_prefill_trace(self):
-        """Capture forward_prefill_chunked_traced_inner as a trace. One-shot;
-        replayed thereafter via trace_id. Mutates production state buffers
-        during warmup + capture — call BEFORE any in-flight requests."""
+    def _warmup_prefill(self):
+        """Phase 1 — eager forward_prefill_chunked_traced_inner to populate
+        program cache. NO capture. Returns False if prerequisites missing."""
         import ttnn
         st = self.state
         if not hasattr(st, 'prefill_chunk_size') or not hasattr(st, 'dn_chunked_q'):
-            return None  # prefill trace prerequisites not in this build
-        # JIT warmup
+            return False
         dummy = [0] * st.prefill_chunk_size
         base.update_prefill_input_buffers(st, dummy)
         for _ in range(2):
@@ -252,16 +264,22 @@ class Scheduler:
             out = base.forward_prefill_chunked_traced_inner(st)
             ttnn.synchronize_device(st.mesh)
             ttnn.deallocate(out)
-        # Capture
+        return True
+
+    def _capture_prefill_trace_only(self):
+        """Phase 2 — capture forward_prefill_chunked_traced_inner as a trace.
+        Assumes _warmup_prefill ran + synchronize_device fired."""
+        import ttnn
+        st = self.state
+        if not hasattr(st, 'prefill_chunk_size') or not hasattr(st, 'dn_chunked_q'):
+            return None
+        dummy = [0] * st.prefill_chunk_size
         base._reset_state_buffers(st)
         base.update_prefill_input_buffers(st, dummy)
         self._prefill_trace_id = ttnn.begin_trace_capture(st.mesh, cq_id=0)
         self._prefill_trace_out = base.forward_prefill_chunked_traced_inner(st)
         ttnn.end_trace_capture(st.mesh, self._prefill_trace_id, cq_id=0)
-        ttnn.synchronize_device(st.mesh)   # Llama generator.py:297 — ensure
-        # prefill trace is fully committed before any further allocations
-        # (next: decode JIT warmup + capture). Skipping this risks the decode
-        # warmup colliding with in-flight prefill commits.
+        ttnn.synchronize_device(st.mesh)
         return self._prefill_trace_id
 
     def _step_prefill_chunked(self):
