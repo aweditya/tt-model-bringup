@@ -156,8 +156,6 @@ def main():
     log(f"  T1 last-pos argmax = {t1_argmax} ({tok.decode([t1_argmax])!r})")
     log(f"  T1 vs T0 (eager same-input): cos = {t1_vs_t0:.6f}")
 
-    ttnn.release_trace(state.mesh, trace_id)
-
     if t1_argmax != t0_argmax:
         log(f"FAIL T1: trace replay argmax {t1_argmax} != eager T0 argmax {t0_argmax}")
         raise SystemExit(1)
@@ -168,6 +166,56 @@ def main():
     log(f"PASS T1: trace replay at L={CHUNK_SIZE} matches eager bit-for-bit "
         f"(cos vs eager={t1_vs_t0:.6f}, argmax match, {t0_elapsed/t_rep:.1f}x faster). "
         f"S1a tracing works; T2/T3 can build on this.")
+
+    # === T2: replay trace with several different prompt lengths ===
+    # Same captured trace, different input → exercises that the trace is
+    # input-agnostic (just reads tok_buf/pos_buf which the host overwrites).
+    log(f"=== T2: replay trace across L ∈ {{8, 16, 32, 64, 100}} (all padded to {CHUNK_SIZE}) ===")
+    t2_prompts = [
+        "The capital of France is",
+        "Why is the sky blue? Explain in one paragraph.",
+        "Photosynthesis is the process by which plants",
+        "Write a haiku about silicon. Begin:",
+        "The largest planet in our solar system is Jupiter, which has many moons including",
+    ]
+    any_fail = False
+    rep_times = []
+    for p in t2_prompts:
+        p_ids = tok.encode(p)[:CHUNK_SIZE]
+        Lp = len(p_ids)
+        p_padded = list(p_ids) + [0] * (CHUNK_SIZE - Lp)
+
+        # Reference: eager same prompt + padding
+        base._reset_state_buffers(state)
+        ref = base.forward_prefill_chunked_tp(state, p_padded, capture_logits=True)
+        ref_pos = ref[Lp - 1]
+        ref_arg = int(np.argmax(ref_pos))
+
+        # Trace replay
+        base._reset_state_buffers(state)
+        base.update_prefill_input_buffers(state, p_padded)
+        tr0 = time.time()
+        ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=False)
+        ttnn.synchronize_device(state.mesh)
+        tr = time.time() - tr0
+        rep_times.append(tr)
+        tlogits = ttnn.to_torch(trace_out,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0)
+        ).float().numpy()[:CHUNK_SIZE, :state.vocab_size]
+        t_pos = tlogits[Lp - 1]
+        t_arg = int(np.argmax(t_pos))
+        t_cos = _cos(t_pos, ref_pos)
+        ok = (t_arg == ref_arg) and (t_cos >= 0.99)
+        any_fail = any_fail or not ok
+        log(f"  L={Lp:3d} replay {tr*1000:6.0f}ms  argmax t={t_arg}({tok.decode([t_arg])!r}) "
+            f"ref={ref_arg}({tok.decode([ref_arg])!r}) cos={t_cos:.6f} {'OK' if ok else 'FAIL'}")
+
+    ttnn.release_trace(state.mesh, trace_id)
+    if any_fail:
+        log(f"FAIL T2: at least one replay disagreed with eager same-input reference")
+        raise SystemExit(1)
+    log(f"PASS T2: {len(t2_prompts)} different prompts all replay correctly. "
+        f"Median replay time {sorted(rep_times)[len(rep_times)//2]*1000:.0f}ms.")
 
 
 if __name__ == "__main__":
