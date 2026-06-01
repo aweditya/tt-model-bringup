@@ -143,8 +143,15 @@ class Scheduler:
         self._logits_handle = None
         self._topk_values_handle = None
         self._topk_indices_handle = None
+        self._prefill_trace_id = None
+        self._prefill_trace_out = None
         cb.setup_cb_state(state, B)
         cb.cb_reset_states(state)
+        # Capture prefill trace BEFORE the decode trace. Each trace reserves
+        # device scratch addresses; capturing prefill first means decode's
+        # allocations won't overlap with prefill's pre-baked addresses.
+        if self.chunked_prefill:
+            self._capture_prefill_trace()
         if use_trace:
             self._capture_trace()
         self.slots = [None] * B          # slot -> request id or None
@@ -191,10 +198,13 @@ class Scheduler:
         cb.cb_reset_states(st)  # clean slate after warmup dirtied the state
 
     def release(self):
+        import ttnn
         if self._trace_id is not None:
-            import ttnn
             ttnn.release_trace(self.state.mesh, self._trace_id)
             self._trace_id = None
+        if self._prefill_trace_id is not None:
+            ttnn.release_trace(self.state.mesh, self._prefill_trace_id)
+            self._prefill_trace_id = None
 
     def submit(self, prompt, sampling=None):
         """sampling: None → greedy (argmax); else a dict
@@ -226,13 +236,35 @@ class Scheduler:
             cb.cb_reset_slots(self.state, admitted)  # fresh DN state for new seqs
         return admitted
 
+    def _capture_prefill_trace(self):
+        """Capture forward_prefill_chunked_traced_inner as a trace. One-shot;
+        replayed thereafter via trace_id. Mutates production state buffers
+        during warmup + capture — call BEFORE any in-flight requests."""
+        import ttnn
+        st = self.state
+        if not hasattr(st, 'prefill_chunk_size') or not hasattr(st, 'dn_chunked_q'):
+            return None  # prefill trace prerequisites not in this build
+        # JIT warmup
+        dummy = [0] * st.prefill_chunk_size
+        base.update_prefill_input_buffers(st, dummy)
+        for _ in range(2):
+            base._reset_state_buffers(st)
+            out = base.forward_prefill_chunked_traced_inner(st)
+            ttnn.synchronize_device(st.mesh)
+            ttnn.deallocate(out)
+        # Capture
+        base._reset_state_buffers(st)
+        base.update_prefill_input_buffers(st, dummy)
+        self._prefill_trace_id = ttnn.begin_trace_capture(st.mesh, cq_id=0)
+        self._prefill_trace_out = base.forward_prefill_chunked_traced_inner(st)
+        ttnn.end_trace_capture(st.mesh, self._prefill_trace_id, cq_id=0)
+        return self._prefill_trace_id
+
     def _step_prefill_chunked(self):
-        """PREFILL_ONLY step (TT vLLM pattern): chunked prefill ONE waiting
-        request via S1a + transplant. The slot is admitted and put directly into
-        DECODE state with the prefill's first generated token. Returns True if a
-        request was prefilled this step; False if there was nothing to prefill.
-        """
-        # Find one waiting request + a free slot.
+        """PREFILL_ONLY step. For L <= chunk_size with a captured trace: replay
+        the trace (3.3s constant, ~10x speedup at L=128). Otherwise fall back
+        to eager forward_prefill_chunked_tp (legacy path, still functional).
+        Both finish with cb_prefill_transplant into the CB slot."""
         rid = None; slot = None
         for s in range(self.B):
             if self.slots[s] is None and self.waiting:
@@ -243,21 +275,33 @@ class Scheduler:
         r = self.reqs[rid]
         import numpy as np, ttnn
         cb.cb_reset_slots(self.state, [slot])
-        base._reset_state_buffers(self.state)  # clears prod state for new prefill
-        cap = base.forward_prefill_chunked_tp(self.state, r['prompt'],
-                                              capture_logits=True)
+        base._reset_state_buffers(self.state)
+        prompt = r['prompt']
+        L = len(prompt)
+        traced = (getattr(self, '_prefill_trace_id', None) is not None
+                   and L <= self.state.prefill_chunk_size)
+        if traced:
+            padded = list(prompt) + [0] * (self.state.prefill_chunk_size - L)
+            base.update_prefill_input_buffers(self.state, padded)
+            ttnn.execute_trace(self.state.mesh, self._prefill_trace_id,
+                                cq_id=0, blocking=False)
+            ttnn.synchronize_device(self.state.mesh)
+            full = ttnn.to_torch(self._prefill_trace_out,
+                mesh_composer=ttnn.ConcatMeshToTensor(self.state.mesh, dim=0)
+            ).float().numpy()[:self.state.prefill_chunk_size, :self.state.vocab_size]
+            first_tok = int(np.argmax(full[L - 1]))
+        else:
+            cap = base.forward_prefill_chunked_tp(self.state, prompt, capture_logits=True)
+            ttnn.synchronize_device(self.state.mesh)
+            first_tok = int(np.argmax(cap[-1]))
+        cb.cb_prefill_transplant(self.state, slot, L)
         ttnn.synchronize_device(self.state.mesh)
-        first_tok = int(np.argmax(cap[-1]))
-        cb.cb_prefill_transplant(self.state, slot, len(r['prompt']))
-        ttnn.synchronize_device(self.state.mesh)
-        # Slot is now in DECODE state with one generated token.
         self.slots[slot] = rid
         r['slot'] = slot
-        r['cur_pos'] = len(r['prompt'])
+        r['cur_pos'] = L
         r['next_tok'] = first_tok
         r['gen'] = [first_tok]
         r['status'] = 'DECODE'
-        # Re-check finish (handles max_new=1 / EOS-as-first-tok edge cases).
         self._finish(r, slot, first_tok)
         return True
 
