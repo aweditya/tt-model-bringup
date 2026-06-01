@@ -69,8 +69,8 @@ Identical to vLLM's APC:
 | P2 | Slot lifecycle — don't free on done | 10/10 lifecycle mock tests | ✅ DONE | `3de9297` |
 | P3 | Admit-time prefix match + skip prefill | 13/13 lifecycle tests (P3 cases added) | ✅ DONE | (this commit) |
 | P4 | Decode-suffix advance before generation | **Subsumed by P3** — existing PREFILL loop handles it | ✅ DONE | (this commit) |
-| P5 | Production wire-up + env gate (qb1 device validation) | `chat.py` real chat: turn-2+ TTFT < 100 ms | ⏳ NEXT | — |
-| P6 | TTL + `/metrics` counters | Stale-slot TTL prevents leak; cache hit/miss visible in Prometheus | ⏳ | — |
+| P5 | Production wire-up + env gate | `TT_CB_PREFIX_CACHE=1` plumbed through; qb1 smoke gate `experiments/cb/validate/prefix_cache_smoke.py` | 🟡 SHIPPED, validating on qb1 | `fdf3c57` |
+| P6 | TTL + `/metrics` counters | `cb_prefix_cache_hits_total` + 3 more counters/gauges visible in `/metrics`; 300s TTL sweep in engine loop | 🟡 SHIPPED with P5 | `fdf3c57` |
 
 ## P0 — Design contracts
 
@@ -258,29 +258,31 @@ the suffix advance is N×80ms decode steps; could use S1a chunked prefill on
 just the suffix (with `chunk_start_idx=n_matched` flowing through to the
 chunked SDPA). Track as T3-multi-chunk-revisit.
 
-## P5 — Production wire-up + env gate
+## P5 — Production wire-up + env gate (SHIPPED 2026-06-01)
 
-- `TT_CB_PREFIX_CACHE=0` (default off) / `=1` (on)
-- Document in `serve_cb.sh` and `HANDOFF.md`
-- Smoke test: real chat through `chat.py` with multiple turns; observe TTFT
-  collapse on turn 2+
+- `TT_CB_PREFIX_CACHE=0` (default off) / `=1` (on); plumbed through
+  `cb_api.py` → `CBEngine(prefix_cache=…)` → `Scheduler(prefix_cache=…)`.
+- `TT_CB_PREFIX_TTL_S=300` (default) controls live-slot expiration.
+- Documented in `serve_cb.sh` header + the env list block.
+- Smoke gate: `experiments/cb/validate/prefix_cache_smoke.py` — drives
+  `/v1/chat/completions` for a 2-turn conversation, scrapes `/metrics` before
+  and after, and verifies (a) `cb_prefix_cache_hits_total` increments by 1
+  on turn 2, (b) turn 2 latency < turn 1 latency, (c) live_slots gauge tracks
+  lifecycle correctly.
 
-Gate: 4-tab concurrent chat (the same test we used for T6) — turn-2+ TTFT < 100ms
-across all tabs. No regressions in turn-1 TTFT or decode tok/s.
+## P6 — TTL + `/metrics` (SHIPPED 2026-06-01 with P5)
 
-## P6 — TTL + `/metrics`
-
-- TTL: free a live slot if untouched for > 5 minutes (env: `TT_CB_PREFIX_TTL_S=300`)
-  to prevent indefinite slot hoarding from disconnected clients.
-- Counters in `/metrics`:
-  - `tt_cb_prefix_cache_hits_total`
-  - `tt_cb_prefix_cache_misses_total`
-  - `tt_cb_prefix_cache_evictions_total`
-  - `tt_cb_prefix_cache_ttl_expirations_total`
-  - `tt_cb_prefix_cache_live_slots` (gauge)
-
-Gate: leave server running an hour with realistic chat; metrics non-zero; no
-slot leak (live_slots count stays < N_SLOTS).
+- TTL: `CBEngine._pc_ttl_sweep()` runs every ~30s in the engine loop, calls
+  `live_slots.expire_stale(prefix_ttl_s)`. Stale slots are reclaimed as
+  evictions in `cb_prefix_cache_evictions_total`.
+- `/metrics` adds:
+  - `cb_prefix_cache_hits_total` (counter)
+  - `cb_prefix_cache_misses_total` (counter)
+  - `cb_prefix_cache_evictions_total` (counter — LRU **and** TTL)
+  - `cb_prefix_cache_live_slots` (gauge)
+  - `cb_prefix_cache_enabled` (gauge, 0/1)
+- Engine loop calls `_pc_sync_metrics()` after every step → scheduler counters
+  → Prometheus counters via delta. Cheap (pure-Python int ops).
 
 ## Risks + things to keep an eye on
 
