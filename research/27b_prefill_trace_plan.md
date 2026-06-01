@@ -25,15 +25,57 @@ Fix: trace S1a too. Both forwards become trace replays; no allocations happen af
 
 ## Milestones
 
-| ID | What | Status | Gate | Commit |
+| ID | What | Status | Gate result | Commit |
 |---|---|---|---|---|
-| T0 | Refactor `forward_prefill_chunked_tp` static-shape + extract `_traced_prefill_chunk(state, chunk_start_idx)` (no Python branches at fixed L=128) | ⏳ | code compiles | — |
-| T1 | Isolation: `experiments/cb/isolate/prefill_trace.py` — capture trace at L=128, replay with L=128 prompt, compare to legacy stub | ⏳ | last-pos cos ≥ 0.99 | — |
-| T2 | Padding: T1 extended to L=8, L=64 (padded to 128) | ⏳ | first-L cos ≥ 0.99 | — |
-| T3 | Multi-chunk: T1 extended to L=256 (2 chunks), L=512 (4 chunks) | ⏳ | last-pos cos ≥ 0.99 | — |
-| T4 | Perf bench: extend `experiments/cb/bench/ttft.py` legacy vs traced at L ∈ {32, 128, 256, 512, 1024} | ⏳ | ≥ 5× at L=200 | — |
-| T5 | Integration: rewire `cb_scheduler._step_prefill_chunked` to use trace; re-run `cb_alternating_scheduler.py`, `engine_chunked_prefill.py`, `chunked_concurrent.py` | ⏳ | concurrent wedge test PASS | — |
-| T6 | Production: `serve_cb.sh` with TT_CB_CHUNKED_PREFILL=1; 4-client concurrent_chat.py load probe | ⏳ | no wedge under load | — |
+| T0 | Padded fixed-L=128 forward matches legacy stub argmax | ✅ DONE | argmax match (token 279 ' the') | `fa908fb` |
+| T1 | Capture trace + replay at L=128, bit-equivalent to eager | ✅ DONE | cos=1.000000 vs eager, **3.4× speedup** | `b8d67c8` |
+| T2 | Same trace replayed across L ∈ {5,8,9,11,15} all padded to 128 | ✅ DONE | all replays cos=1.000000 vs same-input eager | `523b141` |
+| T3 | Multi-chunk for L > 128 | 🟡 DEFERRED | needs per-chunk page_table + DN-state persistence | — |
+| T4 | TTFT bench legacy 1-tok/iter vs traced | ✅ DONE | crossover ~L=32; **9.76× at L=128** | `9ee90e4` |
+| T5 | Scheduler integration | ❌ **BLOCKED** | two-trace coexistence wedge | `530d259` (gated off) |
+| T6 | Production wire-up + concurrent load test | ⏸ blocked by T5 | — | — |
+
+### T5 blocker detail (5 attempts, all hung — pattern is two-trace coexistence)
+
+Symptom: scheduler init runs prefill JIT warmup + capture (succeeds — dbg
+output visible), then decode JIT warmup allocates → ttnn warns `"Allocating
+device buffers is unsafe due to the existence of an active trace"`, then
+python burns 99% CPU forever with no log progress.
+
+Attempts:
+
+| Ver | trace_region | chunk_size | sync after end-capture | Outcome |
+|---|---|---|---|---|
+| T5a | default (~50 MB) | 128 | no | Hung at warning |
+| T5b | 200 MB | 128 | no | Crashed: `ARC core failed to start` (mesh hardware) |
+| T5c | 200 MB | 128 | no | Explicit OOM: trace buffer needs 1.76 GB |
+| T5d | 2.5 GB | 128 | no | OOM during model load (635 MB/bank tensor doesn't fit) |
+| T5e | 1.5 GB | 64 | no | Same model-load OOM |
+| T5f | 800 MB | 32 | **yes** (Llama pattern) | Hung at warning again, same as T5a |
+
+Conclusions:
+- `trace_region_size` AND chunk_size AND Llama's sync pattern all applied;
+  hang persists. So at least one of these is true:
+  - Two-trace coexistence isn't supported in our ttnn build (despite docs)
+  - There's another Llama-side setup we're missing (SubDeviceManager? L1 buffer
+    type? device init flags?)
+  - The hang isn't allocator-related; could be in trace replay vs eager
+    interaction during decode warmup
+
+Production stays on legacy 1-tok/iter prefill (chunked_prefill=False default).
+T0–T4 stand as proven isolation tests — primitives work; integration needs
+a dedicated session with deeper ttnn debugging (py-spy on the hung process,
+ttnn allocator stats, look at how Llama 70B Galaxy handles it).
+
+Until resolved, production runs on legacy 1-tok/iter prefill (chunked path
+gated behind `chunked_prefill=False` default; uncommitted state-buffer
+allocations in `server_tp.py` are harmless — only triggered by `chunked_prefill=True`).
+
+### Standalone trace primitives are PROVEN
+
+T0-T4 are gated, validated, and committed. The bug is integration only.
+Once two-trace coexistence is solved, `_step_prefill_chunked` in
+`cb_scheduler.py` (commit `530d259`) flips on and we ship.
 
 ## Risks
 

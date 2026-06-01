@@ -179,7 +179,11 @@ def bootstrap(state: MeshServerState):
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
 
     print("[bootstrap] opening (1, 4) mesh device…", flush=True)
-    state.mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 4))
+    # trace_region_size: chunked-prefill trace at L=32 ≈ 0.45 GB + decode ~0.2 GB
+    # = ~0.65 GB. Set 800 MB. Tighter reserves leave room for the model — T5e
+    # at 1.5 GB still OOM'd on 635 MB/bank lm_head load with 581 MB/bank free.
+    state.mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 4),
+                                        trace_region_size=800_000_000)
     print(f"  ✓ mesh {state.mesh.get_num_devices()} chips", flush=True)
 
     # Load HF config
@@ -514,7 +518,10 @@ def bootstrap(state: MeshServerState):
 
     # Prefill trace input buffers: tok IDs + positions for a fixed chunk_size.
     # forward_prefill_chunked_traced reads from these; host updates before replay.
-    PREFILL_CHUNK_SIZE = 128
+    # chunk_size=32 keeps prefill trace memory ~0.45 GB so both traces + model
+    # weights fit. Trade: traced replay only helps L<=32 (single chunk); T3
+    # multi-chunk would cover longer prompts but is deferred.
+    PREFILL_CHUNK_SIZE = 32
     state.prefill_chunk_size = PREFILL_CHUNK_SIZE
     state.prefill_tok_buf = ttnn.from_torch(
         torch.zeros((1, PREFILL_CHUNK_SIZE), dtype=torch.int32),

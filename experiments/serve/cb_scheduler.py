@@ -258,6 +258,10 @@ class Scheduler:
         self._prefill_trace_id = ttnn.begin_trace_capture(st.mesh, cq_id=0)
         self._prefill_trace_out = base.forward_prefill_chunked_traced_inner(st)
         ttnn.end_trace_capture(st.mesh, self._prefill_trace_id, cq_id=0)
+        ttnn.synchronize_device(st.mesh)   # Llama generator.py:297 — ensure
+        # prefill trace is fully committed before any further allocations
+        # (next: decode JIT warmup + capture). Skipping this risks the decode
+        # warmup colliding with in-flight prefill commits.
         return self._prefill_trace_id
 
     def _step_prefill_chunked(self):
