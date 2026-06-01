@@ -57,16 +57,21 @@ See README §"Chat server (production)" for `curl` + `openai` client examples.
 
 ## What's next
 
-**Prefix caching — P0-P4 SHIPPED (logic-only, 2026-06-01).** Slot-level
-content-keyed prefix cache for the CB scheduler. Returning chats reclaim their
-live slot at `cur_pos = len(matched_prefix)`, skipping re-prefill of the history.
-All changes gated by `prefix_cache=False` default; prod server (chunk-prefill,
-no prefix cache) is unchanged. P0-P4 ship as pure-Python with 13/13 mock-driven
-lifecycle tests + 12/12 LiveSlotStore unit tests. **P5 (real-device validation
-on qb1) is next** — bit-identity vs cold prefill on a chat turn, then env-gate
-through cb_api + serve_cb.sh. P6 = TTL + Prometheus counters.
-Plan: [`research/27b_prefix_caching_plan.md`](research/27b_prefix_caching_plan.md).
+**Prefix caching — P0-P6 SHIPPED (logic + wire-up, 2026-06-01); qb1 smoke
+gate in progress.** Slot-level content-keyed prefix cache for the CB scheduler.
+Returning chats reclaim their live slot at `cur_pos = len(matched_prefix)`,
+skipping re-prefill of the history. Gated by `TT_CB_PREFIX_CACHE=0/1`
+(default 0 → prod bit-identical to today). `TT_CB_PREFIX_TTL_S=300` for
+stale-slot cleanup. Metrics in `/metrics`:
+`cb_prefix_cache_{hits,misses,evictions}_total`, `cb_prefix_cache_live_slots`,
+`cb_prefix_cache_enabled`.
+Validation status:
+- 12/12 LiveSlotStore unit tests
+- 13/13 scheduler lifecycle mock tests
+- qb1 smoke (`experiments/cb/validate/prefix_cache_smoke.py`): IN PROGRESS
+Plan + per-milestone status: [`research/27b_prefix_caching_plan.md`](research/27b_prefix_caching_plan.md).
 Research: [`research/vllm_prefix_caching_audit.md`](research/vllm_prefix_caching_audit.md).
+Memory: [[prefix-caching-design]] (slot-level, why not block, hybrid model fit).
 
 **S2 — chunked prefill — LIVE in production (2026-06-01).** CB serves with
 `TT_CB_CHUNKED_PREFILL=1`: traced chunked prefill at chunk_size=32 for L ≤ 32,
