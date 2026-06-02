@@ -224,7 +224,15 @@ def _build_app_with_default_lifespan():
         slots = int(os.environ.get("TT_CB_SLOTS", "4"))
         max_new_cap = int(os.environ.get("TT_CB_MAX_NEW", "1024"))
         max_inflight = int(os.environ.get("TT_CB_MAX_INFLIGHT", "0")) or None
-        topk_k = int(os.environ.get("TT_CB_TOPK_K", "0")) or None
+        # 35B has a known ttnn bulk-readback issue on its logits tensor —
+        # ttnn.to_torch returns garbage that varies per run (on-device argmax
+        # of the same tensor finds the right answer). cb_scheduler's logits
+        # path goes through that broken readback, so route 35B through topk-mode
+        # which uses smaller per-slot index readbacks (proven working in v0
+        # smoke). Override default TT_CB_TOPK_K=64 when TT_BACKEND=35b. Users
+        # can still set TT_CB_TOPK_K explicitly to override.
+        _topk_default = "64" if TT_BACKEND == "35b" else "0"
+        topk_k = int(os.environ.get("TT_CB_TOPK_K", _topk_default)) or None
         chunked_prefill = os.environ.get("TT_CB_CHUNKED_PREFILL", "0") == "1"
         prefix_cache = os.environ.get("TT_CB_PREFIX_CACHE", "0") == "1"
         prefix_ttl_s = float(os.environ.get("TT_CB_PREFIX_TTL_S", "300"))

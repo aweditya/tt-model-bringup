@@ -212,6 +212,26 @@ is ~6-9 days and gives a working chat server with trace speedup.
   Qwen3.6-35B-A3B tokenizer (qb1 was offline at plan-write time;
   defer to next qb1 availability).
 
+## Known issue (CB35-1 v0 — non-blocking)
+
+**Logits bulk-readback on 35B returns garbage** (2026-06-02). When
+`forward_batch_tp_inner` returns logits and the caller does
+`ttnn.to_torch(logits_tt, mesh_composer=ConcatMeshToTensor)`, the host
+sees garbage that VARIES PER RUN (observed argmaxes: 82530, 1099, 198294
+on the same input + state). On-device argmax + topk kernels reading the
+**same** tensor find the correct answer (token 8). Suspected ttnn bulk-
+readback bug specific to 35B's `[1, 248320]` bf16 tensor shape.
+
+**Workaround**: route 35B through topk-mode (`TT_CB_TOPK_K>0`) in
+cb_scheduler. cb_api.py sets `TT_CB_TOPK_K=64` as the default when
+`TT_BACKEND=35b` — cb_scheduler's `_step_sampled_topk` reads only [B, K]
+indices + values which are small per-slot and proven working in the v0
+smoke test (case 3: top-1 = base argmax across all 4 chips).
+
+Investigation deferred. Likely a 35B-shape-specific bulk-DMA timing or
+sync issue. Worth checking with smaller `[1, VOCAB]` shapes (e.g., a
+hypothetical Qwen3.6 variant with smaller vocab) to localize.
+
 ## Reference points
 
 - **DeepSeek-V3 reference (the canonical upstream MoE+CB)**:

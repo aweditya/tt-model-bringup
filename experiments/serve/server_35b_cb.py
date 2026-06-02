@@ -224,16 +224,14 @@ def forward_batch_tp_inner(state, return_logits=False, return_topk=None):
         return (top_vals, top_idxs)
 
     if return_logits:
-        # Convert TILE→ROW_MAJOR with ttnn.untilize (canonical kernel; same
-        # idiom as 27B's server_tp.py:1680). to_layout was producing garbage
-        # data in the host readback — likely a lazy view that doesn't
-        # materialize until consumed by another op.
-        rm = ttnn.untilize(logits, use_multicore=True)
-        ttnn.deallocate(logits)
-        return rm
+        # Return TILE-layout logits directly. ttnn.to_torch handles the
+        # TILE→ROW_MAJOR conversion at readback time, in one shot. The
+        # untilize/to_layout intermediate ops were producing host-unreadable
+        # output (kernel reads it fine; host sees partial data).
+        return logits
 
-    # Default: on-device argmax (greedy). Same as base.step_forward_inner.
-    rm = ttnn.untilize(logits, use_multicore=True)
+    # Default: on-device argmax (greedy). Identical to base.step_forward_inner.
+    rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
     ttnn.deallocate(logits)
     argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
     ttnn.deallocate(rm)
