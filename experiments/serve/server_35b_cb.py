@@ -285,6 +285,203 @@ def update_input_buffers_batched(state, token_ids, cur_positions):
     ttnn.copy_host_to_device_tensor(rt_host, state.cb_rot_idxs_buf)
 
 
+def dn_step_batched_35b(state, h_tt, w, cb_dn_layer, *, qk_l2_weight_tt=None, qk_l2_eps=None):
+    """Batched 35B DN block. h_tt [B, HIDDEN] or [B, 1, HIDDEN] per chip.
+
+    Per-slot state in cb_dn_layer = {"cs":[B,CONV_DIM_CHIP,KERNEL],
+                                    "rs":[B,NV_PER_CHIP,K,V]} (per chip).
+    Manual recurrence (no owned-GDN kernel — that's B=1 only).
+    Returns out [B, HIDDEN] replicated. Mutates cb_dn_layer state in place.
+
+    Mirrors base.dn_forward_ttnn but with B in the slot axis. All compute
+    ops broadcast over B; reshapes are the only B-aware step.
+    """
+    B = state.cb_B
+    mesh = state.mesh
+    cs_in = cb_dn_layer["cs"]
+    rs_in = cb_dn_layer["rs"]
+
+    # ── In-proj fused matmul + slice ────────────────────────────────────
+    fused = ttnn.matmul(h_tt, w["in_proj_combined"], compute_kernel_config=base.HIFI4)
+    fr = len(list(fused.shape))
+    OFF_QKV_END = CONV_DIM_CHIP
+    OFF_Z_END   = OFF_QKV_END + base.VALUE_DIM_CHIP
+    OFF_A_END   = OFF_Z_END + NV_PER_CHIP
+    OFF_B_END   = OFF_A_END + NV_PER_CHIP
+    if fr == 3:
+        mixed_qkv = ttnn.slice(fused, [0, 0, 0],         [B, 1, OFF_QKV_END])
+        z         = ttnn.slice(fused, [0, 0, OFF_QKV_END],[B, 1, OFF_Z_END])
+        a         = ttnn.slice(fused, [0, 0, OFF_Z_END], [B, 1, OFF_A_END])
+        b         = ttnn.slice(fused, [0, 0, OFF_A_END], [B, 1, OFF_B_END])
+    else:
+        mixed_qkv = ttnn.slice(fused, [0, 0],             [B, OFF_QKV_END])
+        z         = ttnn.slice(fused, [0, OFF_QKV_END],   [B, OFF_Z_END])
+        a         = ttnn.slice(fused, [0, OFF_Z_END],     [B, OFF_A_END])
+        b         = ttnn.slice(fused, [0, OFF_A_END],     [B, OFF_B_END])
+    ttnn.deallocate(fused)
+
+    # ── Conv1d shift+accumulate (batched) ───────────────────────────────
+    cur = ttnn.reshape(mixed_qkv, [B, CONV_DIM_CHIP, 1])
+    ttnn.deallocate(mixed_qkv)
+    cs_rank = len(list(cs_in.shape))
+    if cs_rank == 4:
+        prior = ttnn.slice(cs_in, [0, 0, 0, 1], [1, B, CONV_DIM_CHIP, CONV_KERNEL])
+        prior = ttnn.reshape(prior, [B, CONV_DIM_CHIP, CONV_KERNEL - 1])
+    else:
+        prior = ttnn.slice(cs_in, [0, 0, 1], [B, CONV_DIM_CHIP, CONV_KERNEL])
+    cs_new = ttnn.concat([prior, cur], dim=-1)
+    ttnn.deallocate(prior); ttnn.deallocate(cur)
+
+    cw_rank = len(list(w["conv1d_weight"].shape))
+    if cw_rank == 4:
+        w_conv = ttnn.reshape(w["conv1d_weight"], [1, CONV_DIM_CHIP, CONV_KERNEL])
+    else:
+        w_conv = w["conv1d_weight"]
+    state_w = ttnn.mul(cs_new, w_conv)  # broadcast w_conv over B
+    if cw_rank == 4:
+        ttnn.deallocate(w_conv)
+    conv_out_3d = ttnn.sum(state_w, dim=-1, keepdim=True)
+    ttnn.deallocate(state_w)
+    conv_out = ttnn.reshape(conv_out_3d, [B, CONV_DIM_CHIP])
+    ttnn.deallocate(conv_out_3d)
+    silu_out = ttnn.silu(conv_out)
+    ttnn.deallocate(conv_out)
+
+    # ── Split Q/K/V ──────────────────────────────────────────────────────
+    sr = len(list(silu_out.shape))
+    if sr == 3:
+        q_flat = ttnn.slice(silu_out, [0, 0, 0], [B, 1, base.KEY_DIM_CHIP])
+        k_flat = ttnn.slice(silu_out, [0, 0, base.KEY_DIM_CHIP], [B, 1, 2 * base.KEY_DIM_CHIP])
+        v_flat = ttnn.slice(silu_out, [0, 0, 2 * base.KEY_DIM_CHIP], [B, 1, CONV_DIM_CHIP])
+    else:
+        q_flat = ttnn.slice(silu_out, [0, 0], [B, base.KEY_DIM_CHIP])
+        k_flat = ttnn.slice(silu_out, [0, base.KEY_DIM_CHIP], [B, 2 * base.KEY_DIM_CHIP])
+        v_flat = ttnn.slice(silu_out, [0, 2 * base.KEY_DIM_CHIP], [B, CONV_DIM_CHIP])
+    ttnn.deallocate(silu_out)
+
+    q_h = ttnn.reshape(q_flat, [B, NK_PER_CHIP, HEAD_K_DIM])
+    k_h = ttnn.reshape(k_flat, [B, NK_PER_CHIP, HEAD_K_DIM])
+    v_h = ttnn.reshape(v_flat, [B, NV_PER_CHIP, HEAD_V_DIM])
+
+    # ── L2-norm Q/K (fused rms_norm path; same as base) ────────────────
+    if qk_l2_weight_tt is not None:
+        q_n = ttnn.rms_norm(q_h, weight=qk_l2_weight_tt, epsilon=qk_l2_eps)
+        k_n = ttnn.rms_norm(k_h, weight=qk_l2_weight_tt, epsilon=qk_l2_eps)
+        ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+    else:
+        # Manual chain (matches base when qk_l2_weight_tt is None).
+        q_sq = ttnn.mul(q_h, q_h)
+        q_sumsq = ttnn.sum(q_sq, dim=-1, keepdim=True)
+        ttnn.deallocate(q_sq)
+        q_inv = ttnn.rsqrt(ttnn.add(q_sumsq, base.EPS))
+        ttnn.deallocate(q_sumsq)
+        q_n = ttnn.mul(q_h, q_inv)
+        ttnn.deallocate(q_h); ttnn.deallocate(q_inv)
+        k_sq = ttnn.mul(k_h, k_h)
+        k_sumsq = ttnn.sum(k_sq, dim=-1, keepdim=True)
+        ttnn.deallocate(k_sq)
+        k_inv = ttnn.rsqrt(ttnn.add(k_sumsq, base.EPS))
+        ttnn.deallocate(k_sumsq)
+        k_n = ttnn.mul(k_h, k_inv)
+        ttnn.deallocate(k_h); ttnn.deallocate(k_inv)
+
+    # Q scale: 1/sqrt(HEAD_K_DIM)
+    q_scale = 1.0 / (HEAD_K_DIM ** 0.5)
+    q_n_scaled = ttnn.multiply(q_n, q_scale)
+    ttnn.deallocate(q_n)
+    q_n = q_n_scaled
+    q_h = q_n; k_h = k_n
+
+    # ── beta + g (manual chain; owned-decay-gate kernel is B=1 only) ────
+    beta = ttnn.sigmoid(b)
+    ttnn.deallocate(b)
+    a_plus_dt = ttnn.add(a, w["dt_bias"])
+    ttnn.deallocate(a)
+    softplus_v = ttnn.softplus(a_plus_dt)
+    ttnn.deallocate(a_plus_dt)
+    neg_exp_alog = ttnn.neg(ttnn.exp(w["A_log"]))
+    g_decay = ttnn.exp(ttnn.mul(softplus_v, neg_exp_alog))
+    ttnn.deallocate(softplus_v); ttnn.deallocate(neg_exp_alog)
+
+    # ── GQA broadcast: NK heads → NV heads via reshape→repeat→reshape ──
+    GQA_REPEAT = NV_PER_CHIP // NK_PER_CHIP
+    q_4d = ttnn.reshape(q_h, [B, NK_PER_CHIP, 1, HEAD_K_DIM])
+    k_4d = ttnn.reshape(k_h, [B, NK_PER_CHIP, 1, HEAD_K_DIM])
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+    q_rep_4d = ttnn.repeat(q_4d, ttnn.Shape([1, 1, GQA_REPEAT, 1]))
+    k_rep_4d = ttnn.repeat(k_4d, ttnn.Shape([1, 1, GQA_REPEAT, 1]))
+    ttnn.deallocate(q_4d); ttnn.deallocate(k_4d)
+    q_rep = ttnn.reshape(q_rep_4d, [B, NV_PER_CHIP, HEAD_K_DIM])
+    k_rep = ttnn.reshape(k_rep_4d, [B, NV_PER_CHIP, HEAD_K_DIM])
+    ttnn.deallocate(q_rep_4d); ttnn.deallocate(k_rep_4d)
+
+    # ── Recurrence (manual; owned-GDN kernel is B=1 only) ──────────────
+    g_b = ttnn.reshape(g_decay, [B, NV_PER_CHIP, 1, 1])
+    ttnn.deallocate(g_decay)
+    rs_decayed = ttnn.mul(rs_in, g_b)
+    ttnn.deallocate(g_b)
+
+    k_col = ttnn.reshape(k_rep, [B, NV_PER_CHIP, HEAD_K_DIM, 1])
+    state_k = ttnn.mul(rs_decayed, k_col)
+    kv_mem = ttnn.sum(state_k, dim=-2)
+    ttnn.deallocate(state_k)
+    kv_mem_3d = ttnn.reshape(kv_mem, [B, NV_PER_CHIP, HEAD_V_DIM])
+    ttnn.deallocate(kv_mem)
+
+    v_minus_kv = ttnn.sub(v_h, kv_mem_3d)
+    ttnn.deallocate(kv_mem_3d); ttnn.deallocate(v_h)
+    beta_b = ttnn.reshape(beta, [B, NV_PER_CHIP, 1])
+    ttnn.deallocate(beta)
+    delta = ttnn.mul(v_minus_kv, beta_b)
+    ttnn.deallocate(v_minus_kv); ttnn.deallocate(beta_b)
+
+    delta_row = ttnn.reshape(delta, [B, NV_PER_CHIP, 1, HEAD_V_DIM])
+    ttnn.deallocate(delta)
+    k_delta = ttnn.mul(k_col, delta_row)
+    ttnn.deallocate(k_col); ttnn.deallocate(delta_row)
+    rs_new = ttnn.add(rs_decayed, k_delta)
+    ttnn.deallocate(rs_decayed); ttnn.deallocate(k_delta)
+
+    q_col = ttnn.reshape(q_rep, [B, NV_PER_CHIP, HEAD_K_DIM, 1])
+    ttnn.deallocate(q_rep)
+    state_q = ttnn.mul(rs_new, q_col)
+    ttnn.deallocate(q_col)
+    core_attn_out_4d = ttnn.sum(state_q, dim=-2)
+    ttnn.deallocate(state_q)
+    core_attn_out = ttnn.reshape(core_attn_out_4d, [B, NV_PER_CHIP, HEAD_V_DIM])
+    ttnn.deallocate(core_attn_out_4d)
+
+    # ── RMSNormGated: keep [B, NV, HEAD_V] shape so rms_norm sees per-head
+    # rows EXACTLY the same as at B=1 (folding to [B*NV, HEAD_V] introduced
+    # ~0.009 mad drift, suspected kernel-shape sensitivity in bf16).
+    core_3d = core_attn_out  # already [B, NV, HEAD_V]
+    z_3d = ttnn.reshape(z, [B, NV_PER_CHIP, HEAD_V_DIM])
+    ttnn.deallocate(z)
+    normed_raw = ttnn.rms_norm(core_3d, epsilon=base.EPS)
+    ttnn.deallocate(core_3d)
+    normed = ttnn.mul(normed_raw, w["norm_weight"])
+    ttnn.deallocate(normed_raw)
+    gated = ttnn.mul(z_3d, normed, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
+    ttnn.deallocate(normed); ttnn.deallocate(z_3d)
+    gated_2d = ttnn.reshape(gated, [B, base.VALUE_DIM_CHIP])
+    ttnn.deallocate(gated)
+
+    # ── out_proj + all_reduce ────────────────────────────────────────────
+    partial = ttnn.matmul(gated_2d, w["out_proj"], compute_kernel_config=base.HIFI4)
+    ttnn.deallocate(gated_2d)
+    out = base.all_reduce_tt(partial, mesh)
+    ttnn.deallocate(partial)
+
+    # ── In-place state commit ───────────────────────────────────────────
+    cs_new = ttnn.reshape(cs_new, list(cs_in.shape))
+    ttnn.copy(cs_new, cs_in)
+    ttnn.deallocate(cs_new)
+    rs_new = ttnn.reshape(rs_new, list(rs_in.shape))
+    ttnn.copy(rs_new, rs_in)
+    ttnn.deallocate(rs_new)
+    return out
+
+
 def _batched_prelude(state):
     """Embed + RoPE rows for the B-slot batch. Returns:
       h_tt:    TILE [B, 1, HIDDEN] per chip (same shape pattern as base, B in slot axis)
