@@ -224,18 +224,16 @@ def forward_batch_tp_inner(state, return_logits=False, return_topk=None):
         return (top_vals, top_idxs)
 
     if return_logits:
-        # Convert to ROW_MAJOR for the cb_scheduler's per-slot host sample.
-        # NOTE: do NOT deallocate `logits` here — to_layout returns a view;
-        # deallocating the source while caller still holds `rm` causes the
-        # readback to read garbage (view-decay, feedback_ttnn_slice_view_decay).
-        # Caller's `ttnn.deallocate(rm)` cleans up via the underlying buffer.
-        rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+        # Convert TILE→ROW_MAJOR with ttnn.untilize (canonical kernel; same
+        # idiom as 27B's server_tp.py:1680). to_layout was producing garbage
+        # data in the host readback — likely a lazy view that doesn't
+        # materialize until consumed by another op.
+        rm = ttnn.untilize(logits, use_multicore=True)
+        ttnn.deallocate(logits)
         return rm
 
     # Default: on-device argmax (greedy). Same as base.step_forward_inner.
-    # Here the argmax kernel consumes rm immediately, so deallocating
-    # logits is safe (the kernel materializes its input).
-    rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+    rm = ttnn.untilize(logits, use_multicore=True)
     ttnn.deallocate(logits)
     argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
     ttnn.deallocate(rm)
