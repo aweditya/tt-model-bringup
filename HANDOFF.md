@@ -123,13 +123,21 @@ to match) after prefix caching ships.
    [`research/35b_cb_bringup_plan.md`](research/35b_cb_bringup_plan.md).
    Research basis: [`research/tt_metal_moe_cb_patterns.md`](research/tt_metal_moe_cb_patterns.md)
    (DeepSeek-V3 + Llama-70B-Galaxy patterns).
-   - **v0 SHIPPED 2026-06-02** (commit `112d72a`). `experiments/serve/server_35b_cb.py`
-     wraps `base.step_forward_inner` at B=1. Smoke (`cb35_v0_smoke.py`):
-     2/3 cases pass (argmax + topk bit-equiv to base). Case 2 logits-mode
-     surfaced a 35B-specific ttnn bulk-readback bug (logits values correct
-     on-device; `ttnn.to_torch` returns garbage on `[1, 248320]` bf16).
-     Workaround: `cb_api.py` defaults `TT_CB_TOPK_K=64` when `TT_BACKEND=35b`.
-     Bug tracked in task #149.
+   - **v0 BIT-VALIDATED 2026-06-02** (commits `112d72a`, `49778b3`).
+     `experiments/serve/server_35b_cb.py` delegates to `base.step_forward_inner`
+     at B=1 (set `state.sampler_topk` to switch argmax↔topk modes).
+     - `cb35_v0_smoke.py` (3/3 PASS): argmax bit-equiv (8=8), return_logits
+       raises (35B logits readback broken, #149), topk[0]=8 matches argmax.
+     - `cb35_v0_chat.py` (PASS): 8-token decode `[271]×8` bit-identical
+       base vs cb (multi-step state evolution validated).
+     - Root cause fix: `base.reset_caches_ttnn()` rebinds the list but
+       doesn't deallocate the prior per-layer (cs, rs) / (kc, vc) tensors.
+       In long-lived processes (the dev harness, real cb_engine sessions)
+       leaks fragment the allocator → matmul writes land in stale memory
+       → forward returns garbage. `cb_reset_states` now explicitly
+       deallocates first.
+     - `return_logits=True` raises `NotImplementedError`; cb_engine routes
+       35B through topk-mode via `TT_CB_TOPK_K=64` default in `cb_api.py`.
    - v1 (true B>1 batched forward): next. ~3-5 days.
    - v2 (trace capture at B=N): ~1-2 days.
    - v3 (owned-GDN batched FOLD trick): optional.
