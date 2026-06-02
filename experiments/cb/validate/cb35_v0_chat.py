@@ -8,7 +8,7 @@ single-token argmax test would miss.
 Cheap to run via cb35_dev_harness (no re-bootstrap; reloads server_35b_cb).
 
 Triggers via:
-  ssh qb1 'touch /tmp/cb35_trig/v0_chat'
+  ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/v0_chat'
 """
 from __future__ import annotations
 

@@ -48,80 +48,97 @@ because `ttnn.matmul` broadcasts. So CB35-5 collapses into CB35-3.
 
 ## Milestones (v0..v4)
 
-| ID | What | Gate | Effort |
+| ID | What | Gate | Status |
 |---|---|---|---|
-| **v0** | Single-slot CB (B=1 through `cb_scheduler.Scheduler`) | B=1 forward bit-identical to standalone `step_forward_ttnn`; 1 request through 1 slot generates correctly | ~1 day |
-| **v1** | Batched B>1 forward | B=8 distinct slots: each slot's gen tokens match standalone B=1 ref for its prompt | ~3-5 days |
-| **v2** | Two-phase warmup + trace capture at B=N | Traced forward bit-correct vs eager; ~5-10× speedup like 27B | ~1-2 days |
-| **v3** | Owned-GDN batched (FOLD-B trick) | +2-3% perf gain vs manual DN | ~3-5 days (optional) |
-| **v4** | Prefix cache for attention layers only | Smoke test shows turn-2 cache hit on attn KV; DN layers explicitly skipped | ~2-3 days (LOW PRIORITY) |
-| **prod** | TT_BACKEND=35b wire-up + real chat | `chat.py` works; multi-tab smoke | ~quick |
+| **v0** | Single-slot CB (B=1 through `cb_scheduler.Scheduler`) | B=1 forward bit-identical to standalone `step_forward_ttnn`; 1 request through 1 slot generates correctly | ✅ BIT-VALIDATED 2026-06-02 (`49778b3`) |
+| **v1** | Batched B>1 forward | B=8 distinct slots: each slot's gen tokens match standalone B=1 ref for its prompt | ⏳ NEXT |
+| **v2** | Two-phase warmup + trace capture at B=N | Traced forward bit-correct vs eager; ~5-10× speedup like 27B | ⏳ |
+| **v3** | Owned-GDN batched (FOLD-B trick) | +2-3% perf gain vs manual DN | optional |
+| **v4** | Prefix cache for attention layers only | Smoke test shows turn-2 cache hit on attn KV; DN layers explicitly skipped | LOW PRIORITY |
+| **prod** | TT_BACKEND=35b wire-up + real chat | `chat.py` works; multi-tab smoke | ⏳ |
 
 ## Per-stage detail
 
-### v0 — Single-slot CB (~1 day)
+### v0 — Single-slot CB ✅ BIT-VALIDATED 2026-06-02
 
-Smallest possible step: create `server_35b_cb.py`, set `cb_B=1`, route
-the existing single-stream forward through the CB scheduler. Validates
-all the plumbing without changing the model code.
+`server_35b_cb.py` (~150 LOC, commits `112d72a` + `49778b3`). Pure
+B=1 wrapper: `forward_batch_tp_inner` delegates to
+`base.step_forward_inner` (toggles `state.sampler_topk` for argmax vs
+topk routing). `cb_reset_states` aliases `state.dn_caches_tt[li]` and
+`state.kv_caches_tt[li]` directly as the per-slot caches.
 
-Tasks:
-- Create `server_35b_cb.py` by direct paste of `server_tp_cb.py` (695 LOC).
-- Swap constants: import `NV_PER_CHIP=8` (35B), `K_DIM=128`, `V_DIM=128`,
-  `CONV_DIM_CHIP=CONV_DIM/4` from `server_35b_ttnn` instead of `full_layer_tp_probe`.
-- In `setup_cb_state(state, B=1, ...)`: allocate `cb_dn[li]` for the 30
-  GDN layers + `cb_kv[li]` for the 10 GatedAttention layers (per the
-  10-block-of-4 pattern).
-- `forward_batch_35b_inner`: copy `step_forward_inner`
-  (`server_35b_ttnn.py:1602`) with a leading B axis. Layer dispatch:
-  - GDN layers → call `dn_forward_ttnn` (existing) wrapped with batch dim.
-    For v0 with B=1, this is essentially a no-op wrap.
-  - Attention layers → call `attn_forward_ttnn_sdpa` (existing).
-  - MoE FFN → call `moe_forward_ttnn_pattern_a_batched` (existing,
-    already batch-friendly).
+**Critical fix that unblocked v0**: `base.reset_caches_ttnn()` REBINDS
+the list but doesn't deallocate the previous per-layer (cs, rs) /
+(kc, vc) tensors. In long-lived processes (the dev harness and the real
+cb_engine session) leaked tensors fragment the device allocator until
+subsequent matmul outputs land in stale memory → forward returns garbage
+that VARIES PER RUN (82530, 198294, 219673, …). `cb_reset_states` now
+explicitly deallocates every old per-layer tensor before calling
+`reset_caches_ttnn`. Generic lesson: `[[ttnn-list-rebinding-leaks]]`.
 
-Reuse `cb_engine.CBEngine` + `cb_scheduler.Scheduler` with no changes.
+`return_logits=True` raises `NotImplementedError` (35B's `[1, VOCAB]`
+bulk readback via `ttnn.to_torch` is independently broken — issue #149).
+cb_engine routes 35B through topk-mode via `TT_CB_TOPK_K=64` default.
 
-Gate (3a/3b/3c ladder, mirrors CB1's gate for 27B):
-- 3a: B=1 forward at slot 0, logits cos vs standalone `step_forward_ttnn` ≥ 0.9999
-- 3b: B=4 forward, slot 0 real + slots 1-3 DUMMY_TOK at cur_pos=0;
-  slot 0 logits match standalone B=1 ref
-- 3c: distinct-slot isolation (B=4, two slots with different prompts;
-  each slot's gen matches its own B=1 ref)
+Gate results:
+- `cb35_v0_smoke.py`: 3/3 PASS
+  - argmax bit-equiv: base=8, cb=8 ✓
+  - return_logits raises ✓
+  - topk[0]=8 (matches base argmax) ✓
+- `cb35_v0_chat.py`: 8-token decode bit-identical `[271]×8` from both
+  paths — proves multi-step state evolution is correct.
 
-Effort: ~1 day. Most code is paste-and-swap.
+### v1 — Batched B>1 forward (~3-5 days, NEXT)
 
-### v1 — Batched B>1 forward (~3-5 days)
+Generalize each primitive to batched. v0 proved the wrapper plumbing;
+v1 introduces actual per-slot work. This is the bulk of the project.
 
-Generalize each primitive to batched.
+**Architecture — leading-B dim convention**:
+- v0 state shapes (per chip): `cs:[1, CONV_DIM_CHIP, KERNEL]`, `rs:[1, NV, K, V]`,
+  KV `[NUM_BLOCKS, 1, BLOCK, HEAD_DIM]`. The "1" everywhere is the slot
+  axis. v1 makes that axis `B`.
+- `state.cb_dn[li] = {"cs":[B,…], "rs":[B,…]}` allocated once at
+  `setup_cb_state(B=N)`.
+- Per-iter input buffers: `cb_tok_buf:[B, 1]`, `cb_cur_pos_buf:[B]`,
+  `cb_rot_idxs_buf:[B, 1]` (already set up at v0; just need to actually
+  use them in the forward instead of the single-stream `state.tok_buf`).
 
-- **DN batched**: 27B's `deltanet_step_batched` (`server_tp_cb.py:331`)
-  is the exact template. State shape `[B, NV_PER_CHIP, K_DIM, V_DIM]`
-  identical between 27B and 35B (only head counts differ). Manual
-  recurrence (owned-GDN kernel still B=1-only).
-- **GatedAttention batched**: 27B's `gated_attn_step_batched`
-  (`server_tp_cb.py:519`) handles partial RoPE and Q-gate split.
-  Port to 35B with shape constants. The per-head Q-gate chunk split
-  bug from B16 bringup is already handled in `attn_forward_ttnn_sdpa`
-  — lift that logic into batched form.
-- **MoE batched**: **already supports B>1 unchanged.** Pattern A masks
-  AFTER compute, so per-slot routing is trivial. `ttnn.matmul` of
-  `[B, E_LOCAL, 1, HIDDEN] @ [E_LOCAL, HIDDEN, 2*MOE_INTER]` broadcasts
-  over the B leading dim. Just feed `h_3d_repeat` with a leading B dim.
-- **Per-slot ragged state**: cur_pos / KV / DN reset mechanisms.
-  27B's `cb_reset_states`, `cb_reset_slots` (masked multiply) generalize
-  immediately.
+**Sub-stages v1.0 → v1.4** (each ships its own test):
 
-Gate (3d adds to v0's ladder):
-- 3d: B=8 distinct slots, 8 different prompts; each slot's generation
-  bit-identical to its standalone B=1 reference for 50+ decode steps.
+| v1.x | What | Gate |
+|---|---|---|
+| v1.0 | `setup_cb_state(B=8)` allocates B-leading caches | shapes correct; no forward yet |
+| v1.1 | **Embed + RoPE batched**: feed `cb_tok_buf` instead of `state.tok_buf` | h_tt has shape `[B, HIDDEN]` per chip; matches `[1, HIDDEN]` of base when B=1 |
+| v1.2 | **DN layer batched**: manual recurrence over `rs[B, NV, K, V]`; conv1d over `cs[B, CONV_DIM, KERNEL]` | per-slot output bit-identical to v0 B=1 ref for distinct prompts |
+| v1.3 | **GatedAttention batched**: per-slot KV write at slot's own `cur_pos`; SDPA over the per-slot KV slice | per-slot output bit-identical to v0 B=1 ref |
+| v1.4 | **MoE batched**: confirm `moe_forward_ttnn_pattern_a_batched` handles `[B, 1, HIDDEN]` input without code change | per-slot output bit-identical to v0 B=1 ref |
+| v1.5 | Full forward at B=8 end-to-end | 8 distinct prompts; each slot's 16-token decode matches its standalone B=1 ref |
 
-Risks:
-- Per-head Q-gate split is 35B-specific shape gotcha — copy from
-  `attn_forward_ttnn_sdpa` exactly.
-- Memory budget headroom is fine through B=16 on (1,4) per research §6.
+**Reuse map** (audit before writing anything):
+- 27B's `server_tp_cb.deltanet_step_batched` is the template. Need to
+  diff against 35B's `dn_forward_ttnn` to identify shape gotchas
+  (NV_PER_CHIP=8 vs 27B's 16; HEAD_K_DIM=HEAD_V_DIM=128).
+- 27B's `gated_attn_step_batched` handles partial RoPE + Q-gate split.
+  35B `attn_forward_ttnn_sdpa` has the **per-head Q-gate chunk split**
+  gotcha (`attn_output_gate=True`, q_proj doubled). Lift that logic into
+  the batched form.
+- MoE: `moe_forward_ttnn_pattern_a_batched` (`server_35b_ttnn.py:1225`)
+  already broadcasts. v1.4 is "verify it works with `[B, 1, HIDDEN]`
+  input" — should be free; just need to make sure topk routes per-slot.
 
-Effort: ~3-5 days (the bulk of the project).
+**Risks**:
+- Per-slot `cur_pos` in paged SDPA: each slot's KV write goes to its own
+  block; the paged kernel needs `cur_pos_tensor` of shape `[B]`. Verify
+  `paged_update_cache` API takes this.
+- MoE per-slot top-k: each slot independently routes to top-8 experts.
+  Pattern A's post-compute mask is per-(B, E) — make sure the
+  routing-mask construction is per-slot.
+- Memory budget at B=8: KV cache grows linearly with B; verify within
+  L1 + DRAM budget (research §6).
+
+**Harness-driven iteration**: each v1.x ships its own `cb35_v1_*` test
+in `experiments/cb/validate/`. The harness's dynamic-discovery means
+no harness restart between sub-stages.
 
 ### v2 — Trace capture at B=N (~1-2 days)
 
@@ -214,49 +231,53 @@ is ~6-9 days and gives a working chat server with trace speedup.
 
 ## Dev iteration harness (2026-06-02)
 
-35B weight upload is ~14 min per bootstrap. To avoid paying that cost
-per code change, use `experiments/cb/dev/cb35_dev_harness.py` — a
-long-running python process on qb1 that bootstraps once, then watches
-`/tmp/cb35_trig/` for trigger files and runs the named test via
-`importlib.reload`.
+35B weight upload is ~14 min per bootstrap. The harness
+(`experiments/cb/dev/cb35_dev_harness.py`) bootstraps once into a
+long-lived python process on qb1, then watches
+`~/tt-xla/.cache/cb35_runtime/trig/` for trigger files and runs the
+named test via `importlib.reload`. Per-iteration cost: ~15 seconds.
+
+**MUST be launched via tmux** — see [[qb1-tmux-for-long-running]].
+nohup+disown and setsid+exec both fail to keep the python alive after
+SSH disconnect on qb1; the controlling shell's death takes the process
+with it.
 
 Workflow:
 ```bash
 # one-time: launch harness on qb1 (14 min bootstrap, then idles)
-ssh qb1 'cd ~/tt-xla && nohup .venv/bin/python -u experiments/cb/dev/cb35_dev_harness.py > /tmp/cb35_harness.log 2>&1 < /dev/null & disown'
+bash scripts/run_harness_tmux.sh
 
 # per iteration (locally):
 bash scripts/deploy.sh experiments/serve/server_35b_cb.py experiments/cb/validate/cb35_v0_smoke.py
-ssh qb1 'touch /tmp/cb35_trig/v0_smoke'
-ssh qb1 'cat /tmp/cb35_trig/last.log'   # ← test output, seconds latency
+ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/v0_smoke'
+ssh qb1 'cat tt-xla/.cache/cb35_runtime/trig/last.log'   # ← test output
 ```
 
-To register a new test, add to the `TESTS` dict at the top of the harness
-and make the test module expose `main(state=None)`.
+Test discovery is dynamic: drop a `cb35_<name>.py` file with
+`main(state=None)` in `experiments/cb/{validate,isolate,bench,dev}/`,
+then `touch .cache/cb35_runtime/trig/<name>` runs it. No harness
+restart needed.
 
 Special triggers:
 - `_reload` — importlib.reload `server_35b_cb` only (no test run)
 - `_exit` — graceful shutdown
 
-## Known issue (CB35-1 v0 — non-blocking)
+## Known issues (carry-overs to v1)
 
-**Logits bulk-readback on 35B returns garbage** (2026-06-02). When
-`forward_batch_tp_inner` returns logits and the caller does
-`ttnn.to_torch(logits_tt, mesh_composer=ConcatMeshToTensor)`, the host
-sees garbage that VARIES PER RUN (observed argmaxes: 82530, 1099, 198294
-on the same input + state). On-device argmax + topk kernels reading the
-**same** tensor find the correct answer (token 8). Suspected ttnn bulk-
-readback bug specific to 35B's `[1, 248320]` bf16 tensor shape.
+**Logits bulk-readback on 35B returns garbage** (issue #149). When
+`ttnn.to_torch(logits_tt, mesh_composer=ConcatMeshToTensor)` is called
+on a `[1, 248320]` bf16 logits tensor, the host sees garbage that
+varies per run (observed argmaxes: 82530, 1099, 198294). On-device
+argmax + topk kernels reading the **same** tensor find the correct
+answer.
 
-**Workaround**: route 35B through topk-mode (`TT_CB_TOPK_K>0`) in
-cb_scheduler. cb_api.py sets `TT_CB_TOPK_K=64` as the default when
-`TT_BACKEND=35b` — cb_scheduler's `_step_sampled_topk` reads only [B, K]
-indices + values which are small per-slot and proven working in the v0
-smoke test (case 3: top-1 = base argmax across all 4 chips).
+**Workaround (active)**: v0's `forward_batch_tp_inner` raises
+`NotImplementedError` on `return_logits=True`. cb_api.py sets
+`TT_CB_TOPK_K=64` as the default when `TT_BACKEND=35b` — cb_scheduler
+routes through `_step_sampled_topk` which reads only `[B, K]` indices
++ values (small per-slot, proven working in v0 smoke case 3).
 
-Investigation deferred. Likely a 35B-shape-specific bulk-DMA timing or
-sync issue. Worth checking with smaller `[1, VOCAB]` shapes (e.g., a
-hypothetical Qwen3.6 variant with smaller vocab) to localize.
+Investigation deferred to task #149.
 
 ## Reference points
 

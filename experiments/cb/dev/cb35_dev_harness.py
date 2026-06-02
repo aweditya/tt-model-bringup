@@ -4,8 +4,8 @@ The 35B weight upload is ~14 min. Without this harness every fix-test
 cycle pays that cost. Here we bootstrap once into a long-lived python
 process and run tests on demand via trigger files. Iteration becomes:
 
-  EDIT (local) → deploy.sh → ssh qb1 'touch /tmp/cb35_trig/<test_name>'
-  → read /tmp/cb35_trig/last.log
+  EDIT (local) → deploy.sh → ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/<test_name>'
+  → read tt-xla/.cache/cb35_runtime/trig/last.log
 
 Each trigger:
   1. `importlib.reload`s `server_35b_cb` and the test module so the new
@@ -16,14 +16,12 @@ Each trigger:
 
 Usage:
   # one-time on qb1 (eats 14 min bootstrap, then idles):
-  bash scripts/run_remote.sh --no-reset experiments/cb/dev/cb35_dev_harness.py
+  bash scripts/run_harness_tmux.sh
 
   # per iteration (locally):
   bash scripts/deploy.sh experiments/serve/server_35b_cb.py experiments/cb/validate/cb35_v0_smoke.py
-  ssh qb1 'mkdir -p /tmp/cb35_trig && touch /tmp/cb35_trig/v0_smoke'
-  ssh qb1 'cat /tmp/cb35_trig/last.log'
-
-Add new tests by registering them in TESTS below.
+  ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/v0_smoke'
+  ssh qb1 'cat tt-xla/.cache/cb35_runtime/trig/last.log'
 """
 from __future__ import annotations
 
@@ -62,7 +60,7 @@ def _discover_test_module(trigger_name: str):
             continue
     return None
 
-TRIG_DIR = Path("/tmp/cb35_trig")
+TRIG_DIR = PROJECT_ROOT / ".cache" / "cb35_runtime" / "trig"
 LOG_PATH = TRIG_DIR / "last.log"
 
 

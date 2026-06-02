@@ -27,6 +27,9 @@ research/probe_logs/qb2_tp_tracy_p25_sync_20260515_0446/
 # (e.g. large intermediate NPZs from cosine_ladder_tp runs)
 .cache/**/_*
 
+# CB35 dev harness runtime (trigger files + log) — per-host, ephemeral.
+.cache/cb35_runtime/
+
 # Local environment file — never commit secrets (HF_TOKEN, etc.).
 # Template lives at .env.example.
 .env
