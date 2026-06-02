@@ -65,10 +65,14 @@ the history. qb1 smoke test:
 - Turn 2 (warm, **HIT**): **2.73s** — 1.96× speedup, 1 cache hit, 0 misses
 - Qualitative: turn 2 correctly continued conversation (France → Germany / Berlin)
 
-**Recommended runtime config:** `TT_CB_CHUNKED_PREFILL=0 TT_CB_PREFIX_CACHE=1`.
-Chunked prefill mode has a separate eager-fallback wedge issue at L>32 — for
-prefix-cache deployments, turn 2+ never re-prefills (cache hit), so chunked
-prefill buys nothing and is best left off.
+**Recommended runtime config (2026-06-02):** `TT_CB_CHUNKED_PREFILL=1 TT_CB_PREFIX_CACHE=1`.
+CW1 fix (`ea9aa20`) makes both flags coexist by skipping the eager
+chunked-prefill fallback for L > chunk_size — the L > chunk_size path
+takes the legacy 1-tok/iter route via the decode trace, which is
+allocation-free and safe alongside captured traces. Cold-start L > 32
+prompts pay 1-tok/iter latency (~80 ms/tok), but with prefix caching
+catching turn-2+ this is rare in chat workloads. Verified on qb1 smoke
+2026-06-02: 1.97× turn-2 speedup preserved, no wedge.
 
 Gated by `TT_CB_PREFIX_CACHE=0/1` (default 0). `TT_CB_PREFIX_TTL_S=300` for
 stale-slot cleanup. Metrics in `/metrics`: `cb_prefix_cache_{hits,misses,
@@ -101,20 +105,33 @@ to match) after prefix caching ships.
 
 ## Roadmap (priority order, 2026-06-02)
 
-1. **Fix `chunked_prefill=1 + prefix_cache=1` wedge** — eager fallback at
-   L>32 collides with captured trace memory. Today we ship with
-   `TT_CB_CHUNKED_PREFILL=0` as a workaround; first-turn prefill is slow at
-   ~80 ms/tok. Resolving lets us run both flags on. (Bug 3 in
-   `research/27b_prefix_caching_plan.md`.)
-2. **Long-context concurrent stress test (MM3)** — validate PC works at
+1. **DONE — `chunked_prefill=1 + prefix_cache=1` coexist** (CW1, commit `ea9aa20`).
+   Run prod with both flags on. Long L > chunk_size prompts use 1-tok/iter
+   fallback (slow but allocator-safe). Validated 2026-06-02: 1.97× turn-2
+   speedup preserved + no wedge.
+2. **DONE — `TT_BACKEND` env selector** (MM1, commit `418f9cc`). cb_api.py
+   has a `BACKENDS` registry; `TT_BACKEND={27b,35b}` switches at boot.
+3. **IN PROGRESS — 35B-A3B CB bringup (CB35-v0..v4)**. Plan:
+   [`research/35b_cb_bringup_plan.md`](research/35b_cb_bringup_plan.md).
+   Research basis: [`research/tt_metal_moe_cb_patterns.md`](research/tt_metal_moe_cb_patterns.md)
+   (DeepSeek-V3 + Llama-70B-Galaxy patterns).
+   - v0 (B=1 over cb_scheduler): in flight. `experiments/serve/server_35b_cb.py`
+     wraps base.step_forward_inner with the CB-compatible API. Gate:
+     `experiments/cb/validate/cb35_v0_smoke.py` (3 cases: argmax, logits, topk).
+   - v1 (true B>1 batched forward): next. ~3-5 days.
+   - v2 (trace capture at B=N): ~1-2 days.
+   - v3 (owned-GDN batched FOLD trick): optional.
+   - v4 (prefix cache for attn layers only): LOW PRIORITY (vllm#36493 reports
+     ~0.1% hit rate on this arch class — DN layers can't be cached).
+4. **Multi-model fleet** — plan: [`research/multi_model_serving_plan.md`](research/multi_model_serving_plan.md).
+   Once 35B is live, MM5 (Mistral Small 3.2 24B) is the strongest
+   framework-generalization test (different vendor, different tokenizer,
+   pure dense GQA, no DN). Candidate research:
+   [`research/home_llm_landscape_2026.md`](research/home_llm_landscape_2026.md).
+5. **Long-context concurrent stress test (MM3)** — validate PC works at
    L=1000+ prompts under realistic concurrency. Reuses
-   `experiments/cb/load/concurrent_chat.py`.
-3. **Multi-model chat fleet** — plan: [`research/multi_model_serving_plan.md`](research/multi_model_serving_plan.md).
-   The CB/PC stack is model-agnostic at every layer except one hardcoded
-   `import server_tp as base` in `cb_api.py:192`. Lifting that to a
-   `TT_BACKEND` env selector unlocks 35B-A3B (and later Llama 70B,
-   Qwen2.5-32B, etc.) via the same `/v1/*` endpoint with all the chat
-   speed wins (prefix caching, sampling, two-phase warmup) inherited.
+   `experiments/cb/load/concurrent_chat.py`. Final-validation step after
+   the multi-model work is in place.
 
 **35B perf** (parallel track). Next levers tracked in
 [`research/35b_perf_milestones.md`](research/35b_perf_milestones.md):
