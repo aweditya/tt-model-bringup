@@ -29,20 +29,41 @@ SOCKET_PATH = os.path.join(PROJECT_ROOT, ".cache", "server_tp.sock")
 
 
 # ── Pure translation helpers (no FastAPI / socket; unit-tested) ───────────────
+_THINK_SUFFIX = "<think>\n\n</think>\n\n"
+
+
 def _messages_to_prompt(tokenizer, messages: list[dict]) -> str:
     """OpenAI chat `messages` -> a prompt string via the model's chat template.
 
-    Qwen3.6 quirk: the chat template injects an empty `<think>\\n\\n</think>\\n\\n`
-    block at the active assistant prompt with `enable_thinking=False`, but does
-    NOT render it for past assistant messages. That asymmetry breaks slot-level
-    prefix caching (turn 2 fails to match turn 1's cached tokens). Strip the
-    block so active and past prompts tokenize identically. Validated with
-    experiments/cb/isolate/chat_template_roundtrip.py — full prefix match.
+    Qwen3.6's chat template has two asymmetries that break slot-level prefix
+    caching by default; we patch both here so a turn-2 prompt re-tokenizes to
+    the exact tokens cached at the end of turn 1.
+
+    Quirk 1: the ACTIVE assistant prompt always gets a `<think>\\n\\n</think>\\n\\n`
+    block appended (with `enable_thinking=False`). The model emits its
+    response (which often contains literal `<think>...</think>` markers
+    because `<think>` is NOT special in Qwen3.6 — `skip_special_tokens=True`
+    does NOT strip it from the decoded text), then `<|im_end|>` at the end.
+
+    Quirk 2: when rendering a PAST assistant message whose content contains
+    `</think>`, the template by default DROPS the `<think>...</think>` block
+    from the rendered output. `preserve_thinking=True` re-wraps the
+    extracted reasoning as `<think>...</think>` so past renders match what
+    the model actually emitted.
+
+    Patch: pass `enable_thinking=False, preserve_thinking=True`, then strip
+    ONLY the trailing `<think>\\n\\n</think>\\n\\n` (the active-prompt suffix).
+    Past messages keep their `<think>...</think>` content for the cache match.
+
+    Validated via experiments/cb/isolate/chat_template_inspect.py — turn 1
+    cached vs turn 2 prompt: 69/69 prefix match (was 44/69 before fix).
     """
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
-        enable_thinking=False)
-    return text.replace("<think>\n\n</think>\n\n", "")
+        enable_thinking=False, preserve_thinking=True)
+    if text.endswith(_THINK_SUFFIX):
+        text = text[:-len(_THINK_SUFFIX)]
+    return text
 
 
 def _chat_completion(text: str, model: str, prompt_toks: int, gen_toks: int,
