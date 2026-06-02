@@ -99,6 +99,23 @@ re-prefill via prefix caching, not making re-prefill faster). Bigger chunk_size
 (same reasoning). Both revisitable for long single-prompt cases (no prior cache
 to match) after prefix caching ships.
 
+## Roadmap (priority order, 2026-06-02)
+
+1. **Fix `chunked_prefill=1 + prefix_cache=1` wedge** — eager fallback at
+   L>32 collides with captured trace memory. Today we ship with
+   `TT_CB_CHUNKED_PREFILL=0` as a workaround; first-turn prefill is slow at
+   ~80 ms/tok. Resolving lets us run both flags on. (Bug 3 in
+   `research/27b_prefix_caching_plan.md`.)
+2. **Long-context concurrent stress test (MM3)** — validate PC works at
+   L=1000+ prompts under realistic concurrency. Reuses
+   `experiments/cb/load/concurrent_chat.py`.
+3. **Multi-model chat fleet** — plan: [`research/multi_model_serving_plan.md`](research/multi_model_serving_plan.md).
+   The CB/PC stack is model-agnostic at every layer except one hardcoded
+   `import server_tp as base` in `cb_api.py:192`. Lifting that to a
+   `TT_BACKEND` env selector unlocks 35B-A3B (and later Llama 70B,
+   Qwen2.5-32B, etc.) via the same `/v1/*` endpoint with all the chat
+   speed wins (prefix caching, sampling, two-phase warmup) inherited.
+
 **35B perf** (parallel track). Next levers tracked in
 [`research/35b_perf_milestones.md`](research/35b_perf_milestones.md):
 async all_reduce overlap, expert-broadcast elimination, routing-weight
