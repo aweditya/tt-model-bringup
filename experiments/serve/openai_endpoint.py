@@ -30,9 +30,19 @@ SOCKET_PATH = os.path.join(PROJECT_ROOT, ".cache", "server_tp.sock")
 
 # ── Pure translation helpers (no FastAPI / socket; unit-tested) ───────────────
 def _messages_to_prompt(tokenizer, messages: list[dict]) -> str:
-    """OpenAI chat `messages` -> a prompt string via the model's chat template."""
-    return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
+    """OpenAI chat `messages` -> a prompt string via the model's chat template.
+
+    Qwen3.6 quirk: the chat template injects an empty `<think>\\n\\n</think>\\n\\n`
+    block at the active assistant prompt with `enable_thinking=False`, but does
+    NOT render it for past assistant messages. That asymmetry breaks slot-level
+    prefix caching (turn 2 fails to match turn 1's cached tokens). Strip the
+    block so active and past prompts tokenize identically. Validated with
+    experiments/cb/isolate/chat_template_roundtrip.py — full prefix match.
+    """
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False)
+    return text.replace("<think>\n\n</think>\n\n", "")
 
 
 def _chat_completion(text: str, model: str, prompt_toks: int, gen_toks: int,
