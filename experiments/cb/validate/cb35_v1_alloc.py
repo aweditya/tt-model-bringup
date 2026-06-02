@@ -89,7 +89,12 @@ def main(state=None) -> int:
 
     kc_shape = _hostshape(state.cb_kv[attn_li]["kc"], mesh)
     log(f"  cb_kv[{attn_li}].kc host shape = {kc_shape}")
-    expect_kc = (B * state.sdpa_num_blocks, cb.NCHIPS, state.sdpa_block_size, cb.HEAD_DIM_ATTN)
+    # Logical: (total_blocks=B*sdpa_num_blocks, NCHIPS, BLOCK_SIZE, HEAD_DIM)
+    # sharded on dim=1. Per-chip view is (total_blocks, 1, BLOCK_SIZE, HEAD_DIM).
+    # ConcatMeshToTensor(dim=0) concatenates per-chip slabs along dim 0:
+    # → (NCHIPS * total_blocks, 1, BLOCK_SIZE, HEAD_DIM).
+    expect_kc = (cb.NCHIPS * B * state.sdpa_num_blocks, 1,
+                 state.sdpa_block_size, cb.HEAD_DIM_ATTN)
     if kc_shape != expect_kc:
         log(f"  ✗ FAIL: kc shape {kc_shape} != {expect_kc}")
         fails += 1
