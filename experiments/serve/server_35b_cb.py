@@ -69,6 +69,12 @@ def setup_cb_state(state, B, blocks_per_seq=None):
     mesh = state.mesh
     state.cb_B = B
 
+    # base.bootstrap doesn't call reset_caches_ttnn (the single-stream
+    # main() does). Call it here so the per-layer caches exist before we
+    # alias them.
+    if state.dn_caches_tt is None or state.kv_caches_tt is None:
+        state.reset_caches_ttnn()
+
     # Alias existing single-stream caches as the per-slot cache. At B=1
     # the layout is identical to what dn_forward_ttnn / attn_forward_ttnn
     # already produce/consume.
@@ -219,11 +225,16 @@ def forward_batch_tp_inner(state, return_logits=False, return_topk=None):
 
     if return_logits:
         # Convert to ROW_MAJOR for the cb_scheduler's per-slot host sample.
+        # NOTE: do NOT deallocate `logits` here — to_layout returns a view;
+        # deallocating the source while caller still holds `rm` causes the
+        # readback to read garbage (view-decay, feedback_ttnn_slice_view_decay).
+        # Caller's `ttnn.deallocate(rm)` cleans up via the underlying buffer.
         rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        ttnn.deallocate(logits)
         return rm
 
     # Default: on-device argmax (greedy). Same as base.step_forward_inner.
+    # Here the argmax kernel consumes rm immediately, so deallocating
+    # logits is safe (the kernel materializes its input).
     rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
     ttnn.deallocate(logits)
     argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
