@@ -69,8 +69,8 @@ Identical to vLLM's APC:
 | P2 | Slot lifecycle — don't free on done | 10/10 lifecycle mock tests | ✅ DONE | `3de9297` |
 | P3 | Admit-time prefix match + skip prefill | 13/13 lifecycle tests (P3 cases added) | ✅ DONE | (this commit) |
 | P4 | Decode-suffix advance before generation | **Subsumed by P3** — existing PREFILL loop handles it | ✅ DONE | (this commit) |
-| P5 | Production wire-up + env gate | `TT_CB_PREFIX_CACHE=1` plumbed through; qb1 smoke gate `experiments/cb/validate/prefix_cache_smoke.py` | 🟡 SHIPPED, validating on qb1 | `fdf3c57` |
-| P6 | TTL + `/metrics` counters | `cb_prefix_cache_hits_total` + 3 more counters/gauges visible in `/metrics`; 300s TTL sweep in engine loop | 🟡 SHIPPED with P5 | `fdf3c57` |
+| P5 | Production wire-up + env gate | qb1 smoke: **turn 1 5.33s → turn 2 2.73s, 1.96× speedup, 1 cache hit, 0 misses on turn 2** | ✅ DONE | `2cad663` |
+| P6 | TTL + `/metrics` counters | `cb_prefix_cache_*` counters + gauge visible in `/metrics`; 300s TTL sweep in engine loop | ✅ DONE | `fdf3c57` |
 
 ## P0 — Design contracts
 

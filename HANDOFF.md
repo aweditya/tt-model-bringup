@@ -57,21 +57,31 @@ See README §"Chat server (production)" for `curl` + `openai` client examples.
 
 ## What's next
 
-**Prefix caching — P0-P6 SHIPPED (logic + wire-up, 2026-06-01); qb1 smoke
-gate in progress.** Slot-level content-keyed prefix cache for the CB scheduler.
-Returning chats reclaim their live slot at `cur_pos = len(matched_prefix)`,
-skipping re-prefill of the history. Gated by `TT_CB_PREFIX_CACHE=0/1`
-(default 0 → prod bit-identical to today). `TT_CB_PREFIX_TTL_S=300` for
-stale-slot cleanup. Metrics in `/metrics`:
-`cb_prefix_cache_{hits,misses,evictions}_total`, `cb_prefix_cache_live_slots`,
-`cb_prefix_cache_enabled`.
-Validation status:
-- 12/12 LiveSlotStore unit tests
-- 13/13 scheduler lifecycle mock tests
-- qb1 smoke (`experiments/cb/validate/prefix_cache_smoke.py`): IN PROGRESS
+**Prefix caching — END-TO-END VALIDATED (2026-06-01).** Slot-level
+content-keyed prefix cache for the CB scheduler. Returning chats reclaim
+their live slot at `cur_pos = len(matched_prefix)`, skipping re-prefill of
+the history. qb1 smoke test:
+- Turn 1 (cold, miss): **5.33s**
+- Turn 2 (warm, **HIT**): **2.73s** — 1.96× speedup, 1 cache hit, 0 misses
+- Qualitative: turn 2 correctly continued conversation (France → Germany / Berlin)
+
+**Recommended runtime config:** `TT_CB_CHUNKED_PREFILL=0 TT_CB_PREFIX_CACHE=1`.
+Chunked prefill mode has a separate eager-fallback wedge issue at L>32 — for
+prefix-cache deployments, turn 2+ never re-prefills (cache hit), so chunked
+prefill buys nothing and is best left off.
+
+Gated by `TT_CB_PREFIX_CACHE=0/1` (default 0). `TT_CB_PREFIX_TTL_S=300` for
+stale-slot cleanup. Metrics in `/metrics`: `cb_prefix_cache_{hits,misses,
+evictions}_total`, `cb_prefix_cache_live_slots`, `cb_prefix_cache_enabled`.
+
+Load-bearing fixes from the smoke debug chain:
+- `mark_live` fires on `max_tokens` cap (not just EOS) — `4acc955`
+- `tokens_so_far` keeps trailing EOS for chat-template compat — `184f00e`
+- `_messages_to_prompt`: `preserve_thinking=True` + trailing-only `<think>` strip — `2cad663`
+
 Plan + per-milestone status: [`research/27b_prefix_caching_plan.md`](research/27b_prefix_caching_plan.md).
 Research: [`research/vllm_prefix_caching_audit.md`](research/vllm_prefix_caching_audit.md).
-Memory: [[prefix-caching-design]] (slot-level, why not block, hybrid model fit).
+Memory: [[prefix-caching-design]].
 
 **S2 — chunked prefill — LIVE in production (2026-06-01).** CB serves with
 `TT_CB_CHUNKED_PREFILL=1`: traced chunked prefill at chunk_size=32 for L ≤ 32,
