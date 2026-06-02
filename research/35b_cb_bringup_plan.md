@@ -1,272 +1,223 @@
-# Qwen3.6-35B-A3B → CB chat server — milestone plan (2026-06-02)
+# Qwen3.6-35B-A3B → CB chat server — milestone plan (revised 2026-06-02)
 
-Living plan. CB35-0..CB35-7 mirror the original 27B CB story (CB0..CB5)
-plus MoE-specific additions. **Heavy reuse of the 27B CB stack — we ONLY
-write 35B-specific bits.**
+Living plan. Replaces the original CB35-0..CB35-7 sketch with a tighter
+v0..v4 staging informed by the
+[`tt_metal_moe_cb_patterns.md`](tt_metal_moe_cb_patterns.md) research.
 
-## Goal
+**Key insight from research**: the hardest part I had imagined
+(CB35-5: MoE inside traced B=N forward) is **basically free**. The 35B
+server's existing `moe_forward_ttnn_pattern_a_batched`
+(`server_35b_ttnn.py:1225`) already supports arbitrary leading batch dim
+because `ttnn.matmul` broadcasts. So CB35-5 collapses into CB35-3.
 
-Bring 35B-A3B online as a CB chat backend behind the existing
-`/v1/*` endpoint via `TT_BACKEND=35b` (MM1 already shipped). Users get:
-- OpenAI-compatible chat (same as 27B)
-- Slot-level prefix caching (same as 27B)
-- Sampling, metrics, two-phase warmup, all 27B's hard-won goodies
-- Inherits future improvements to the shared CB stack for free
+## Goal (unchanged)
 
-Non-goal for v1: prefix-cache-style chat speedups on 35B's TTFT. That
-comes free once CB+PC is wired; no separate work.
+35B-A3B online as a CB chat backend behind `/v1/*` via `TT_BACKEND=35b`
+(MM1 shipped). Inherits everything the 27B chat path gives.
 
-## Why this is bigger than MM1 promised
+## Architecture corrections from research
 
-`server_35b_ttnn.py` is single-stream (B=1). Audit (commit `MM1`-era):
+- **256 routed experts** + 1 shared, top-8 routed (NOT 64; 64 is the
+  per-chip slice E_LOCAL = 256/4).
+- 40 layers in pattern `10 × (3 GDN + 1 GatedAttention)`. Every layer's
+  FFN is MoE.
+- GatedDeltaNet: 32 V heads, 16 QK heads, head_dim=128.
+- GatedAttention: 16 Q heads, 2 KV heads, head_dim=256, partial RoPE
+  (rotary_dim=64), `attn_output_gate=True` (Q proj doubled, per-head
+  chunk split — already handled by `attn_forward_ttnn_sdpa`).
+- Same tokenizer + Qwen3 chat template as 27B. **`/think` `/no_think`
+  soft-switch NOT supported** (model card explicit).
+- Default `state.moe_mode = "pattern_a_batched"` — trace-safe routing
+  (on-device top-k). **Do NOT take the topk-host-readback path.**
 
-| File | Class / API | 27B has | 35B has |
+## Reuse map (validated by research)
+
+### Reused as-is — zero changes
+- `cb_engine.py`, `cb_scheduler.py`, `cb_metrics.py`, `cb_api.py`,
+  `openai_endpoint.py`, `live_slot_store.py`, `protocol.py`
+- All test infra (`prefix_cache_store.py`, `prefix_cache_lifecycle.py`,
+  `chat_template_invariant.py`, `prefix_cache_smoke.py`)
+- Two-phase warmup pattern
+- Chat template patches (Qwen3.6 family → same `preserve_thinking + trailing strip`)
+- TT_BACKEND env selector (MM1 already shipped, registry has 35b key)
+
+### New — model-specific (~600-1200 LOC)
+- `experiments/serve/server_35b_cb.py` — direct paste from
+  `server_tp_cb.py` (695 LOC) with shape constants swapped and the dense
+  MLP replaced by the existing `moe_forward_ttnn_pattern_a_batched`.
+
+## Milestones (v0..v4)
+
+| ID | What | Gate | Effort |
 |---|---|---|---|
-| `server_tp.py` | `MeshServerState` | ✓ | — |
-| `server_35b_ttnn.py` | `State` | — | ✓ |
-| `server_tp_cb.py` | `setup_cb_state(state, B, blocks_per_seq)` | ✓ | — |
-| `server_tp_cb.py` | `cb_reset_states / cb_reset_slots` | ✓ | — |
-| `server_tp_cb.py` | `cb_prefill_transplant` | ✓ | — |
-| `server_tp_cb.py` | `update_input_buffers_batched(state, toks, curs)` | ✓ | — |
-| `server_tp_cb.py` | `forward_batch_tp_inner(state, ...)` | ✓ | — |
-| `server_35b_ttnn.py` | `update_input_buffers(state, tok, pos)` (B=1) | — | ✓ |
-| `server_35b_ttnn.py` | `step_forward_inner(state)` (B=1) | — | ✓ |
+| **v0** | Single-slot CB (B=1 through `cb_scheduler.Scheduler`) | B=1 forward bit-identical to standalone `step_forward_ttnn`; 1 request through 1 slot generates correctly | ~1 day |
+| **v1** | Batched B>1 forward | B=8 distinct slots: each slot's gen tokens match standalone B=1 ref for its prompt | ~3-5 days |
+| **v2** | Two-phase warmup + trace capture at B=N | Traced forward bit-correct vs eager; ~5-10× speedup like 27B | ~1-2 days |
+| **v3** | Owned-GDN batched (FOLD-B trick) | +2-3% perf gain vs manual DN | ~3-5 days (optional) |
+| **v4** | Prefix cache for attention layers only | Smoke test shows turn-2 cache hit on attn KV; DN layers explicitly skipped | ~2-3 days (LOW PRIORITY) |
+| **prod** | TT_BACKEND=35b wire-up + real chat | `chat.py` works; multi-tab smoke | ~quick |
 
-So: 35B is a fully-working B=1 chat brain; we need to wrap it in the
-CB B=N harness analogous to what `server_tp_cb.py` does for 27B.
+## Per-stage detail
 
-## What's reused vs new
+### v0 — Single-slot CB (~1 day)
 
-### Reused as-is (model-agnostic, zero changes)
-- `experiments/serve/cb_engine.py` — threaded engine wrapper
-- `experiments/serve/cb_scheduler.py` — Orca scheduler + slot-level prefix cache
-- `experiments/serve/cb_metrics.py` — Prometheus registry
-- `experiments/serve/cb_api.py` — `/v1/*` endpoints (post-MM1 backend selector)
-- `experiments/serve/live_slot_store.py` — prefix cache index
-- `experiments/serve/openai_endpoint.py` — chat-template renderer
-  (Qwen3.6-35B shares the Qwen3.6 chat template — verify in CB35-0)
-- All test infra: `prefix_cache_store.py`, `prefix_cache_lifecycle.py`,
-  `chat_template_invariant.py`, `prefix_cache_smoke.py`
-
-### New (35B-specific)
-- `experiments/serve/server_35b_ttnn_cb.py` — analogue of
-  `server_tp_cb.py` but for 35B. Per-slot state setup, cb_reset, batched
-  forward, MoE-aware DN/attn/MoE batched step functions.
-- Minor refactor of `server_35b_ttnn.py` to expose state as a class that
-  `cb_api.py` can construct (already has `class State` ✓; may need
-  `MeshServerState` alias).
-
-## Milestones
-
-| ID | What | Gate | Status |
-|---|---|---|---|
-| CB35-0 | Audit + design | This doc + tt-metal MoE pattern recon | 🟡 in progress |
-| CB35-1 | Batched state class + minimal batched forward (B=N, MoE per-slot loop) | B=4 forward, slot 0 = real request, others idle; slot 0 output matches B=1 reference within bf16 noise | ⏳ |
-| CB35-2 | Per-slot ragged state (cur_pos, KV, DN per slot) | 2 slots with different cur_pos; slot isolation holds (slot 0 gen != slot 1 gen) | ⏳ |
-| CB35-3 | Plug into existing `cb_scheduler.Scheduler` (no changes) | 5 reqs through 4 slots, all generations bit-identical to standalone B=1 refs | ⏳ |
-| CB35-4 | Two-phase warmup + trace capture for batched forward | Traced forward bit-correct vs eager; no wedge | ⏳ |
-| CB35-5 | MoE inside the traced forward (B=N) | Routing top-k per-slot works in trace; bit-correct vs eager | ⏳ |
-| CB35-6 | Prefix caching on 35B (mostly free) | `chat_template_invariant.py` 7/7 with 35B tokenizer; smoke shows turn-2 cache hit | ⏳ |
-| CB35-7 | Production wire-up via `TT_BACKEND=35b` | Real chat through `chat.py` on TT_BACKEND=35b; PC hits; no wedge | ⏳ |
-
-## Per-milestone detail
-
-### CB35-0 — Audit + design (this doc)
+Smallest possible step: create `server_35b_cb.py`, set `cb_B=1`, route
+the existing single-stream forward through the CB scheduler. Validates
+all the plumbing without changing the model code.
 
 Tasks:
-- Audit `server_35b_ttnn.py` vs `server_tp.py` (done above).
-- Confirm Qwen3.6-35B uses the same Jinja chat template as 27B (high
-  probability; verify via `chat_template_invariant.py` with
-  `TT_MODEL_ID=Qwen/Qwen3.6-35B-A3B`).
-- Confirm DN block shapes (27B vs 35B): if identical, `cb_dn_step` from
-  `server_tp_cb.py` may be a starting point — port + adapt.
-- Reference research: `research/tt_metal_moe_cb_patterns.md` (research
-  agent in flight) for tt-metal MoE + CB prior art (Llama-70B-Galaxy
-  patterns, vLLM MoE batched routing, Mixtral/DeepSeek demos if any).
+- Create `server_35b_cb.py` by direct paste of `server_tp_cb.py` (695 LOC).
+- Swap constants: import `NV_PER_CHIP=8` (35B), `K_DIM=128`, `V_DIM=128`,
+  `CONV_DIM_CHIP=CONV_DIM/4` from `server_35b_ttnn` instead of `full_layer_tp_probe`.
+- In `setup_cb_state(state, B=1, ...)`: allocate `cb_dn[li]` for the 30
+  GDN layers + `cb_kv[li]` for the 10 GatedAttention layers (per the
+  10-block-of-4 pattern).
+- `forward_batch_35b_inner`: copy `step_forward_inner`
+  (`server_35b_ttnn.py:1602`) with a leading B axis. Layer dispatch:
+  - GDN layers → call `dn_forward_ttnn` (existing) wrapped with batch dim.
+    For v0 with B=1, this is essentially a no-op wrap.
+  - Attention layers → call `attn_forward_ttnn_sdpa` (existing).
+  - MoE FFN → call `moe_forward_ttnn_pattern_a_batched` (existing,
+    already batch-friendly).
 
-Gate: this plan ready for execution.
+Reuse `cb_engine.CBEngine` + `cb_scheduler.Scheduler` with no changes.
 
-### CB35-1 — Batched state + minimal batched forward
+Gate (3a/3b/3c ladder, mirrors CB1's gate for 27B):
+- 3a: B=1 forward at slot 0, logits cos vs standalone `step_forward_ttnn` ≥ 0.9999
+- 3b: B=4 forward, slot 0 real + slots 1-3 DUMMY_TOK at cur_pos=0;
+  slot 0 logits match standalone B=1 ref
+- 3c: distinct-slot isolation (B=4, two slots with different prompts;
+  each slot's gen matches its own B=1 ref)
 
-Create `experiments/serve/server_35b_ttnn_cb.py` mirroring
-`server_tp_cb.py`:
+Effort: ~1 day. Most code is paste-and-swap.
 
-```python
-def setup_cb_state(state, B, blocks_per_seq=None):
-    """Allocate per-slot state on top of single-stream 35B state.
-       - cb_B = B
-       - cb_kv[li]   per-slot KV blocks (paged_update_cache layout)
-       - cb_dn[li]   per-slot DN ssm + conv_cols (same as 27B)
-       - cb_cur_pos_buf [B]
-       - cb_rot_idxs_buf [B,1]
-       MoE has no per-slot weights (experts are shared); intermediate
-       activations are per-token, allocated transiently inside forward."""
-```
+### v1 — Batched B>1 forward (~3-5 days)
 
-```python
-def update_input_buffers_batched(state, token_ids, cur_positions):
-    # Same pattern as 27B's: host→device copy into pre-allocated buffers.
-```
+Generalize each primitive to batched.
 
-```python
-def forward_batch_tp_inner(state, return_logits=False, return_topk=None):
-    # Batched embed + RoPE.
-    # For each layer:
-    #   if attention: paged SDPA (batched, like 27B)
-    #   if DN: cb_dn_step (batched, like 27B's masked recurrence)
-    #   MoE: top-k router across [B, HIDDEN], then loop OR scatter-gather
-    #        (v1: Python loop over B — slow but correct)
-    # Final norm + LM head + per-slot argmax/topk/logits.
-```
+- **DN batched**: 27B's `deltanet_step_batched` (`server_tp_cb.py:331`)
+  is the exact template. State shape `[B, NV_PER_CHIP, K_DIM, V_DIM]`
+  identical between 27B and 35B (only head counts differ). Manual
+  recurrence (owned-GDN kernel still B=1-only).
+- **GatedAttention batched**: 27B's `gated_attn_step_batched`
+  (`server_tp_cb.py:519`) handles partial RoPE and Q-gate split.
+  Port to 35B with shape constants. The per-head Q-gate chunk split
+  bug from B16 bringup is already handled in `attn_forward_ttnn_sdpa`
+  — lift that logic into batched form.
+- **MoE batched**: **already supports B>1 unchanged.** Pattern A masks
+  AFTER compute, so per-slot routing is trivial. `ttnn.matmul` of
+  `[B, E_LOCAL, 1, HIDDEN] @ [E_LOCAL, HIDDEN, 2*MOE_INTER]` broadcasts
+  over the B leading dim. Just feed `h_3d_repeat` with a leading B dim.
+- **Per-slot ragged state**: cur_pos / KV / DN reset mechanisms.
+  27B's `cb_reset_states`, `cb_reset_slots` (masked multiply) generalize
+  immediately.
 
-**Key MoE design decision (CB35-1 v1)**: handle batched routing by
-**iterating over B in Python inside the MoE forward**. Each iter does
-the existing single-stream MoE forward for that slot's hidden state.
-Slow (B× expert dispatch overhead) but correct. v2/v3 optimize.
+Gate (3d adds to v0's ladder):
+- 3d: B=8 distinct slots, 8 different prompts; each slot's generation
+  bit-identical to its standalone B=1 reference for 50+ decode steps.
 
-Reference: 27B's `cb_dn_step` in `server_tp_cb.py:333` uses a masked
-recurrence to update per-slot DN state. The mask pattern (multiply by 0
-for slots being reset, 1 for slots being preserved) is the cleanest way
-to do "per-slot stateful ops" in a single batched forward without
-branching.
+Risks:
+- Per-head Q-gate split is 35B-specific shape gotcha — copy from
+  `attn_forward_ttnn_sdpa` exactly.
+- Memory budget headroom is fine through B=16 on (1,4) per research §6.
 
-Gate: B=4 forward, slot 0 has a real request, slots 1-3 idle (DUMMY_TOK
-at cur_pos=0). Slot 0's output (last layer activations, or first
-generated token) matches standalone B=1 35B reference within bf16 noise
-(cos ≥ 0.999).
+Effort: ~3-5 days (the bulk of the project).
 
-### CB35-2 — Per-slot ragged state
+### v2 — Trace capture at B=N (~1-2 days)
 
-What changes from CB35-1:
-- Per-slot cur_pos in `cb_cur_pos_buf` (different positions per slot —
-  each request is at its own point in the conversation).
-- Per-slot KV reads/writes via paged tables (already correct in 27B —
-  port verbatim).
-- Per-slot DN reset on admit (mirror `cb_reset_slots` masked-mul).
+Two-phase warmup pattern (already proven for 27B). Steps:
+1. Warmup `forward_batch_35b_inner` at B=N WITHOUT trace (compile only)
+2. `ttnn.synchronize_device(mesh)`
+3. Capture both prefill (if any) + decode traces back-to-back
 
-Gate: 2 slots run different prompts in parallel; slot 0's gen tokens are
-identical to standalone B=1 reference for prompt 0, slot 1's gen tokens
-are identical to standalone B=1 reference for prompt 1. (Slot isolation
-test — same as CB2 was for 27B.)
+The 35B B=1 trace already works (P3 task done). Going B=N is the same
+pattern with bigger input buffers. Pattern A MoE is data-INDEPENDENT at
+the tensor level (mask is just data, not a control-flow branch), so
+trace capture works identically.
 
-### CB35-3 — Plug into `cb_scheduler.Scheduler`
+Gate: traced batched forward bit-correct vs eager (cos ≥ 0.9999 on
+logits); ~5-10× speedup like 27B.
 
-`cb_scheduler.py` already calls into `base.forward_batch_tp_inner` etc.
-via the engine. Once CB35-1+2 are done, the existing scheduler should
-just work with 35B.
+Effort: ~1-2 days assuming v1 is shape-clean.
 
-Gate: `cb_engine.CBEngine(state=35b_state, ...)` runs 5 requests through
-4 slots, sampling=True. Each rid's generation matches the standalone
-greedy-from-B=1 reference. Same gate as CB3 for 27B.
+### v3 — Owned-GDN batched FOLD trick (~3-5 days, optional)
 
-### CB35-4 — Two-phase warmup + traced forward
+Integrate the FOLD-B-into-slots trick from the 27B CB experiment
+(commit `a35fb3c`): fold `[B, NV, K, V]` → `[1, B*NV, K, V]` and call
+`qwen36_gdn_decode_owned` with `debug_mode=10` (race-free output
+variant).
 
-Two-phase warmup is already proven (`feedback_two_phase_warmup`,
-`research/27b_prefill_trace_plan.md`). Just:
-- Phase 1: warmup the 35B batched forward without trace
-- Phase 2: capture as a trace
-- Replay via `ttnn.execute_trace` per step
+Device kernel already in qb1+qb2 ttnn (verified 2026-05-28; memory
+[[remote-hosts]] section). This is pure Python integration.
 
-Risk: 35B trace may need a bigger `trace_region_size`. Two-phase warmup
-itself doesn't change memory budget, but the batched MoE inside the trace
-may pin more intermediates. Test with current 50-800MB region first; bump
-if OOM.
+Expected gain: ~+2.5% (matches 27B's owned decay/gate ship).
 
-Gate: traced forward at B=N bit-correct vs eager forward (cos ≥ 0.9999
-on slot outputs). No wedge over 50+ traced step replays.
+Effort: ~3-5 days. Risk: 35B DN has different state shape than 27B —
+verify fold math separately.
 
-### CB35-5 — MoE inside the trace
+**Decision gate**: if v0+v1+v2 hit < 60 ms/tok at B=8, **skip v3** — the
+integration cost outweighs the perf.
 
-The Python-B-loop MoE from CB35-1 won't directly trace (data-dependent
-dispatch inside Python). Two options:
-- **Option A**: trace the per-slot MoE forward N times (one trace per
-  active slot count). Memory-prohibitive at scale.
-- **Option B**: refactor MoE to be batched-tensor-only. For each slot
-  s, compute `top_k_experts[s]` on-device, then for each expert e,
-  compute `mask[B] = (any slot routed to e)`, run expert on
-  masked input, scatter results. This is roughly what Pattern A does
-  already at B=1.
-- **Option C**: precompute the router decision OUTSIDE the trace (host),
-  then inside the trace use deterministic expert dispatch.
+### v4 — Prefix cache (~2-3 days, LOW PRIORITY)
 
-Reference: the existing P3 task ("MoE trace refactor — top-k
-data-dependent dispatch") was about THIS exact problem for B=1. We
-already solved data-dependent dispatch for B=1; the question is whether
-that solution generalizes to B=N.
+⚠️ **Likely low ROI**. vllm-project/vllm#36493 reports Qwen3.5-35B-A3B
+(same arch class) prefix-cache hit rate ~0.1% — DN layers can't be
+safely cached because H_t state is autoregressive without a block
+notion. Only the 10 GatedAttention layers' KV cache is dedupable.
 
-Gate: traced batched forward with MoE inside == eager batched forward
-(cos ≥ 0.999 on logits, sampled-token equality after argmax).
+Skip unless we have a specific high-prefix-repetition use case (shared
+system prompt across users, document Q&A with reused contexts). For
+single-user chat through `chat.py`, the slot-level cache hit only on
+identical conversation continuations is already covered by 27B's PC; on
+35B the DN drift will mean prefix matches don't yield correct gen.
 
-### CB35-6 — Prefix caching on 35B
+If pursued: cache only attention-layer KV; explicitly mark DN layers as
+non-cacheable. Mirror the 27B implementation but with a per-layer
+"cacheable" flag.
 
-This one is mostly free given CB35-1..5 are done. The cb_scheduler
-already has the live-slot cache; we just need the chat-template
-roundtrip to work for 35B.
+### prod — Production wire-up (quick)
 
-Tasks:
-- Run `experiments/cb/isolate/chat_template_invariant.py` with
-  `TT_MODEL_ID=Qwen/Qwen3.6-35B-A3B`. Expect 5/5 must-pass cases (same
-  template family as 27B). If anything diverges, MM4 (per-model template
-  config) is blocking.
-- Verify `_messages_to_prompt`'s `preserve_thinking=True + trailing
-  strip` works correctly for 35B's tokenizer.
-- Run `experiments/cb/validate/prefix_cache_smoke.py` against the live
-  35B server: turn-2 cache hit.
+- MM1 already added `TT_BACKEND=35b` selection.
+- Restart `serve_cb.sh` with `TT_BACKEND=35b TT_CB_PREFIX_CACHE=0` (v4
+  off by default).
+- Real chat smoke through `chat.py`.
+- `/v1/models` advertises `Qwen/Qwen3.6-35B-A3B`.
+- 4-tab concurrent smoke.
 
-Gate: smoke test on 35B: turn-2 cache hit ≥ 1, turn-2 latency <<
-turn-1 latency, no wedge.
+Gate: real chat works; multi-tab no wedge.
 
-### CB35-7 — Production wire-up
+## Stop-gate decisions (per research §7)
 
-MM1 already added `TT_BACKEND=35b` selection. Just need:
-- Restart `serve_cb.sh` with `TT_BACKEND=35b TT_CB_PREFIX_CACHE=1`
-- Real chat smoke through `chat.py`
-- Verify `/v1/models` advertises Qwen3.6-35B-A3B
-- 4-tab concurrent chat smoke (multi-slot)
+- If v0+v1 hit > 60 ms/tok at B=8, **v2 trace mandatory before shipping**.
+- If v3 owned-GDN gain < +2%, **skip v3**.
+- v4 only attempted after measuring real cache-hit potential on the live
+  v2/v3 server.
 
-Gate: real chat works, PC hits visible in /metrics, no regressions.
+## Reuse summary
 
-## Risk catalog
+| Effort | What | Reused from 27B |
+|---|---|---|
+| ~1 day | v0 single-slot CB | `server_tp_cb.py` template, all scheduler/engine/api |
+| ~3-5 days | v1 batched forward | `cb_reset_slots`, `deltanet_step_batched`, `gated_attn_step_batched`; MoE is FREE because Pattern A already broadcasts |
+| ~1-2 days | v2 trace | two-phase warmup pattern from cb_scheduler.py |
+| ~3-5 days | v3 owned-GDN | FOLD trick from commit `a35fb3c` (27B experiment) |
+| ~2-3 days | v4 prefix cache | live_slot_store + cb_scheduler PC logic (mostly free; just guard DN layers) |
 
-1. **DN shape mismatch 27B vs 35B**: 27B's `cb_dn_step` may not directly
-   port. CB35-0 audit will check. If shapes differ, CB35-1 grows the
-   batched-DN-step work.
-2. **MoE in trace at B=N**: hardest unknown. Option B (batched-tensor
-   dispatch) is the right answer but may need significant work. Falling
-   back to eager (no trace) keeps CB working at slow tok/s.
-3. **Memory budget for batched B + MoE intermediates + traces**: 35B is
-   bigger than 27B. (1,4) P150 has 31.81 GB/chip. Batching B=4 ×
-   MoE intermediates may push tight. Trace_region_size may need tuning.
-4. **Chat template asymmetry beyond what we know**: 35B is same family
-   as 27B so likely fine, but the invariant test will catch.
+**Total**: ~10-20 days for the full stack (v0..v4). v0+v1+v2+prod alone
+is ~6-9 days and gives a working chat server with trace speedup.
 
-## Reuse summary (the cheaper case)
+## What stays open from previous version
 
-Total new code estimate: ~600-1200 LOC for `server_35b_ttnn_cb.py`
-(mirror of `server_tp_cb.py` which is ~700 LOC). ~10-20 LOC for any
-state class alias/cleanup in `server_35b_ttnn.py`. Zero changes to
-cb_engine, cb_scheduler, cb_metrics, cb_api, openai_endpoint,
-live_slot_store, all test files.
-
-All of CB35's correctness gates piggyback on the existing test infra
-(`prefix_cache_store.py`, `prefix_cache_lifecycle.py`,
-`chat_template_invariant.py`, `prefix_cache_smoke.py`) — they're
-backend-agnostic.
-
-## Sequence
-
-CB35-0 (this doc, today) → CB35-1 → CB35-2 → CB35-3 → CB35-4 → CB35-5
-→ CB35-6 → CB35-7.
-
-Each milestone ships independent value. CB35-1+2+3 alone = working CB
-on 35B (slow, no trace). CB35-4 adds the trace speedup. CB35-5 makes
-MoE+trace work properly. CB35-6+7 = chat with 35B and PC.
+- CB35-0 (audit) now done modulo the chat-template invariant test on
+  Qwen3.6-35B-A3B tokenizer (qb1 was offline at plan-write time;
+  defer to next qb1 availability).
 
 ## Reference points
-- `experiments/serve/server_tp_cb.py` — the canonical 27B template to
-  port.
-- `research/27b_cb_scope.md` — original 27B CB design doc.
-- `research/27b_prefix_caching_plan.md` — PC pattern (re-used as-is).
-- `feedback_two_phase_warmup` — multi-trace coexistence rule.
-- `research/tt_metal_moe_cb_patterns.md` (research agent in flight) —
-  external prior art on MoE+CB.
+
+- **DeepSeek-V3 reference (the canonical upstream MoE+CB)**:
+  `tt-metal/models/demos/deepseek_v3/tt/{moe.py, experts.py, moe_gate.py, generator.py, generator_vllm.py}`
+- **Llama-70B-Galaxy (dense-CB + trace warmup reference)**:
+  `tt-metal/models/demos/llama3_70b_galaxy/tt/generator.py` (esp. lines 315-360, 543-680, 1010-1076)
+- **Local templates**: `experiments/serve/server_tp_cb.py` (the file to
+  paste-and-modify), `server_35b_ttnn.py` (existing B=1 forward to wrap).
+- Research: `research/tt_metal_moe_cb_patterns.md`.
