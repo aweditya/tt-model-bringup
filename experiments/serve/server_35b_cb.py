@@ -224,25 +224,64 @@ def cb_reset_slots(state, slot_ids):
 # Input buffer update
 # ----------------------------------------------------------------------------
 def update_input_buffers_batched(state, token_ids, cur_positions):
-    """Host→device copy of [B] token IDs + [B] cur_pos. At B=1: delegates
-    to the existing update_input_buffers."""
-    if state.cb_B != 1:
-        raise NotImplementedError("v0 supports B=1 only")
-    base.update_input_buffers(state, int(token_ids[0]), int(cur_positions[0]))
-    # Also update cb_*_buf so scheduler's batched view stays consistent.
-    # (Single-source-of-truth would be nicer, but base.update_input_buffers
-    # writes its own state.tok_buf etc., not the cb_ aliases.)
+    """Host→device copy of [B] token IDs + [B] cur_pos + clamped rot_idxs.
+
+    At B=1: ALSO writes the single-stream state.tok_buf / state.cur_pos_buf
+    / state.rot_idxs_buf via base.update_input_buffers — the v0 forward
+    path delegates to base.step_forward_inner which reads those buffers.
+
+    For empty slots (`cur_pos == -1`): rot_idxs is clamped to 0 (the embed
+    is read but never used downstream). Matches 27B's convention.
+    """
+    B = state.cb_B
+    assert len(token_ids) == B, f"expected {B} tokens, got {len(token_ids)}"
+    assert len(cur_positions) == B, f"expected {B} positions, got {len(cur_positions)}"
     mesh = state.mesh
+
+    if B == 1:
+        # Keep single-stream buffers consistent for the v0 delegate-to-base path.
+        base.update_input_buffers(state, int(token_ids[0]), int(cur_positions[0]))
+
+    # cb_* batched buffers (used by v1+ forward path).
     tok_host = ttnn.from_torch(
-        torch.tensor([[int(token_ids[0])]], dtype=torch.int32),
+        torch.tensor([int(t) for t in token_ids], dtype=torch.int32).reshape(B, 1),
         layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
         mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
     ttnn.copy_host_to_device_tensor(tok_host, state.cb_tok_buf)
+
     cp_host = ttnn.from_torch(
-        torch.tensor([int(cur_positions[0])], dtype=torch.int32),
+        torch.tensor([int(p) for p in cur_positions], dtype=torch.int32).reshape(B),
         layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
         mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
     ttnn.copy_host_to_device_tensor(cp_host, state.cb_cur_pos_buf)
+
+    rot_idxs = [max(int(p), 0) for p in cur_positions]
+    rt_host = ttnn.from_torch(
+        torch.tensor(rot_idxs, dtype=torch.int32).reshape(B, 1),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    ttnn.copy_host_to_device_tensor(rt_host, state.cb_rot_idxs_buf)
+
+
+def _batched_prelude(state):
+    """Embed + RoPE rows for the B-slot batch. Returns:
+      h_tt:    TILE [B, 1, HIDDEN] per chip (same shape pattern as base, B in slot axis)
+      cos_tt:  TILE [B, ROTARY_DIM] per chip
+      sin_tt:  TILE [B, ROTARY_DIM] per chip
+    """
+    B = state.cb_B
+    embed_out = ttnn.embedding(state.cb_tok_buf, state.embed_tt)
+    h_tt = ttnn.to_layout(embed_out, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(embed_out)
+
+    cos_row = ttnn.embedding(state.cb_rot_idxs_buf, state.cos_table_tt)
+    sin_row = ttnn.embedding(state.cb_rot_idxs_buf, state.sin_table_tt)
+    cos_tt = ttnn.to_layout(cos_row, ttnn.TILE_LAYOUT)
+    sin_tt = ttnn.to_layout(sin_row, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(cos_row); ttnn.deallocate(sin_row)
+    cos_tt = ttnn.reshape(cos_tt, [B, ROTARY_DIM])
+    sin_tt = ttnn.reshape(sin_tt, [B, ROTARY_DIM])
+    return h_tt, cos_tt, sin_tt
 
 
 # ----------------------------------------------------------------------------
