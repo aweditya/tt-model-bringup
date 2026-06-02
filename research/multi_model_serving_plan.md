@@ -154,20 +154,30 @@ For each model, the invariant holds across the must-pass cases.
 
 **Scope**: take a fresh model architecture (NOT Llama or Qwen2.5 — user
 wants something different from what they already have) and wire it as a
-CB server. Candidate selection pending the
-[`research/home_llm_landscape_2026.md`](home_llm_landscape_2026.md)
-research agent's output. Likely candidates being investigated:
-- DeepSeek family (V3 / V3.5 / R1 distill, etc.)
-- Google Gemma (3, 4 if available)
-- Mistral / Mixtral newer releases
-- Phi (latest) / Nemotron / Yi / 01.AI
+CB server. Candidate selection driven by
+[`research/home_llm_landscape_2026.md`](home_llm_landscape_2026.md).
 
-Selection criteria:
-- DIFFERENT architecture than Qwen3.6-{27B, 35B-A3B} (pure dense attention
-  preferred for clean generalization test, OR a different MoE design)
-- Fits on (1,4) P150 TP (≤ ~70B params, ideally 7-50B sweet spot)
+**Candidate ranking** (from the research doc §5):
+
+1. **Mistral Small 3.2 24B** — pure dense GQA, no DN/hybrid quirks.
+   Cleanest port: exercises CB+PC on a model that does NOT have Qwen3.6's
+   hybrid attention+DN architecture. Different tokenizer + chat template
+   (no `<think>` injection at all). Best test of framework generalization.
+2. **Gemma 4 31B dense** (Apr 2026 release, Apache 2.0) — different vendor
+   lineage. Multimodal (text+image+audio+video) opens a stretch direction
+   if we want to test the framework on VLMs later. ~31B fits our TP budget.
+3. **DeepSeek-R1-Distill-Qwen-32B** — same family as our existing models
+   architecturally (Qwen-based distillation), but exercises long-context
+   reasoning outputs. Least generalization payoff but most "fun" daily-driver.
+
+**My recommendation**: **Mistral Small 3.2 24B** — strongest signal on
+whether the CB+PC stack is genuinely model-agnostic.
+
+Selection criteria (all candidates meet):
+- DIFFERENT architecture than Qwen3.6-{27B, 35B-A3B}
+- Fits on (1,4) P150 TP (7-50B sweet spot)
 - Active community + ongoing updates
-- Genuinely useful as a daily-driver chat model
+- Daily-driver-quality chat model
 
 **Implementation**:
 1. Create `experiments/serve/server_<model>.py`
