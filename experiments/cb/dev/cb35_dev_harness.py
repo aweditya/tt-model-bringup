@@ -42,13 +42,25 @@ sys.stderr.reconfigure(line_buffering=True)
 
 import server_35b_ttnn as base  # noqa: E402
 
-# Tests registered by trigger-file basename. Each value is the importable
-# module path; the module must expose `main(state=None)`. We import lazily
-# inside the trigger loop so editing a test module + rsyncing it picks up
-# the new code via importlib.reload.
-TESTS: dict[str, str] = {
-    "v0_smoke": "cb35_v0_smoke",  # experiments/cb/validate/cb35_v0_smoke.py
-}
+# Tests are discovered dynamically by trigger-file basename. For trigger
+# 'foo', the harness searches for a module named (in order) cb35_foo,
+# cb35_v0_foo, foo across the test directories. Drop a file with
+# `main(state=None)` + touch the trigger; no harness restart needed.
+TEST_SEARCH_DIRS = ["experiments/cb/validate", "experiments/cb/isolate",
+                    "experiments/cb/bench", "experiments/cb/dev"]
+
+
+def _discover_test_module(trigger_name: str):
+    """Return the (re)loaded module for a trigger name, or None."""
+    candidates = [f"cb35_{trigger_name}", f"cb35_v0_{trigger_name}", trigger_name]
+    for cand in candidates:
+        try:
+            if cand in sys.modules:
+                return importlib.reload(sys.modules[cand])
+            return importlib.import_module(cand)
+        except ImportError:
+            continue
+    return None
 
 TRIG_DIR = Path("/tmp/cb35_trig")
 LOG_PATH = TRIG_DIR / "last.log"
@@ -65,40 +77,36 @@ def log(msg: str):
 
 def _add_test_paths():
     """Add test directories to sys.path so importlib.import_module finds them."""
-    for sub in ("experiments/cb/validate", "experiments/cb/isolate"):
+    for sub in TEST_SEARCH_DIRS:
         p = str(PROJECT_ROOT / sub)
         if p not in sys.path:
             sys.path.insert(0, p)
 
 
-def run_test(state, name: str, module_path: str) -> int:
-    """Reload module + run main(state=state). Returns exit code (0 = pass)."""
-    # Clear log
+def run_test(state, trigger_name: str) -> int:
+    """Discover + reload + run a test for the given trigger name."""
     if LOG_PATH.exists():
         LOG_PATH.unlink()
-    log(f"[harness] running {name} (module={module_path})")
+    log(f"[harness] running {trigger_name}")
     try:
-        # Reload server_35b_cb first — it's the code under test for all CB35 tests.
+        # Reload server_35b_cb — it's the code under test for all CB35 tests.
         import server_35b_cb  # noqa: F401
         importlib.reload(server_35b_cb)
-        # Reload the test module itself.
-        if module_path in sys.modules:
-            mod = importlib.reload(sys.modules[module_path])
-        else:
-            mod = importlib.import_module(module_path)
-        if not hasattr(mod, "main"):
-            log(f"  ✗ {name}: module has no main() entry point")
+        mod = _discover_test_module(trigger_name)
+        if mod is None:
+            log(f"  ✗ {trigger_name}: no matching test module in {TEST_SEARCH_DIRS}")
             return 1
-        # Tests must accept state= kwarg.
+        if not hasattr(mod, "main"):
+            log(f"  ✗ {trigger_name}: module {mod.__name__} has no main() entry point")
+            return 1
         try:
             rc = mod.main(state=state)
         except TypeError:
-            log("  ! test module's main() doesn't accept state=; calling without it "
-                "(will likely re-bootstrap — slow)")
+            log("  ! main() doesn't accept state=; calling without (slow — will re-bootstrap)")
             rc = mod.main()
         if rc is None:
             rc = 0
-        log(f"[harness] {name} exited rc={rc}")
+        log(f"[harness] {trigger_name} exited rc={rc}")
         return int(rc)
     except Exception:
         log(traceback.format_exc())
@@ -113,18 +121,21 @@ def main():
     log("[harness] bootstrapping 35B base state (~14 min)…")
     state = base.State()
     base.bootstrap(state, log)
-    log(f"[harness] ready. Available tests: {sorted(TESTS)}")
-    log(f"[harness] trigger via: touch {TRIG_DIR}/<test_name>")
+    log(f"[harness] ready. Drop trigger files into {TRIG_DIR}/")
+    log(f"[harness] examples: touch {TRIG_DIR}/v0_smoke  or  touch {TRIG_DIR}/v0_chat")
+    log(f"[harness] special: _reload (re-import server_35b_cb), _exit (shutdown)")
 
+    SKIP = {"last.log", "_reload", "_exit"}
     while True:
-        for name, module_path in TESTS.items():
-            trig = TRIG_DIR / name
-            if trig.exists():
-                try:
-                    trig.unlink()
-                except FileNotFoundError:
-                    pass
-                run_test(state, name, module_path)
+        for trig in TRIG_DIR.iterdir():
+            name = trig.name
+            if name in SKIP or trig.is_dir():
+                continue
+            try:
+                trig.unlink()
+            except FileNotFoundError:
+                continue
+            run_test(state, name)
         # Special trigger: 'reload' = importlib-reload server_35b_cb without running anything
         reload_trig = TRIG_DIR / "_reload"
         if reload_trig.exists():
