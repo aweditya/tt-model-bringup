@@ -152,38 +152,42 @@ For each model, the invariant holds across the must-pass cases.
 
 ## MM5 — Bringup of an additional model family
 
-**Scope**: take an existing bring-up script in `models/` (e.g., Llama 3.1
-70B) and wire it as a CB server.
+**Scope**: take a fresh model architecture (NOT Llama or Qwen2.5 — user
+wants something different from what they already have) and wire it as a
+CB server. Candidate selection pending the
+[`research/home_llm_landscape_2026.md`](home_llm_landscape_2026.md)
+research agent's output. Likely candidates being investigated:
+- DeepSeek family (V3 / V3.5 / R1 distill, etc.)
+- Google Gemma (3, 4 if available)
+- Mistral / Mixtral newer releases
+- Phi (latest) / Nemotron / Yi / 01.AI
 
-**Recommended candidate**: Llama 3.1 70B — dense attention only, no DN
-quirks, similar size to 27B for a TP fit. The cleanest "does our framework
-generalize" test.
+Selection criteria:
+- DIFFERENT architecture than Qwen3.6-{27B, 35B-A3B} (pure dense attention
+  preferred for clean generalization test, OR a different MoE design)
+- Fits on (1,4) P150 TP (≤ ~70B params, ideally 7-50B sweet spot)
+- Active community + ongoing updates
+- Genuinely useful as a daily-driver chat model
 
 **Implementation**:
-1. Create `experiments/serve/server_llama3_70b.py`
-2. Lift bootstrap + forward from the existing bring-up
-3. Verify `cb_reset_slots`, KV cache layout, paged SDPA all map
-4. Plug into TT_BACKEND selector
+1. Create `experiments/serve/server_<model>.py`
+2. Lift bootstrap + forward (port from upstream impl)
+3. Verify `cb_reset_slots`, KV cache layout, paged SDPA, MoE state (if any) all map
+4. Plug into `TT_BACKEND` selector
 5. Run the full PC test suite
 
-**Gate**: `TT_BACKEND=llama70b bash serve_cb.sh start` → 2-turn chat works,
+**Gate**: `TT_BACKEND=<model> bash serve_cb.sh start` → 2-turn chat works,
 prefix cache hits.
 
-**Risks**: trace capture, kernel needs, memory layout could all differ
-non-trivially. This is the biggest milestone, save for last.
+**Risks**: trace capture, kernel needs, memory layout could differ
+non-trivially per model family. This is the biggest milestone, save for last.
 
-## MM6 — Multi-model concurrency (stretch)
+## MM6 — Multi-model concurrency
 
-**Scope**: serve TWO different models simultaneously.
-
-**Approach options**:
-- **Cross-host**: qb1 hosts 35B, qb2 hosts 27B. Two FastAPI processes.
-  Client picks via URL. Trivial; just choose what to serve where.
-- **Same-host, single-chip-per-model**: harder. Would require breaking
-  TP=(1,4) and running each model on a (1,1) mesh. Significant scheduler
-  rework.
-
-**Recommendation**: cross-host first. Free if MM5 succeeds.
+**DROPPED 2026-06-02** per user direction. The cross-host case is mostly
+config (qb1 = model A, qb2 = model B); same-host concurrency requires
+breaking TP=(1,4) which is a much bigger scheduler change with unclear
+payoff for our personal-chat use case.
 
 ## Test plan / regression gates
 

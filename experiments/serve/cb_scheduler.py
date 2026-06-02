@@ -497,8 +497,24 @@ class Scheduler:
             self._admit_from_cache()
         if self.chunked_prefill:
             if self.waiting and any(s is None for s in self.slots):
-                self._step_prefill_chunked()
-                return sum(1 for s in self.slots if s is not None)
+                # CW1 fix: only take the chunked-prefill traced path when the
+                # request fits in chunk_size. For L > chunk_size, the existing
+                # _step_prefill_chunked falls back to eager forward_prefill_
+                # chunked_tp, which allocates device tensors at runtime
+                # (ttnn.from_torch + every op output). With both prefill and
+                # decode traces captured, those allocations collide with
+                # trace-reserved memory → wedge after a couple of requests.
+                #
+                # The L>chunk_size case is uncommon in chat (only first-turn
+                # prompts > 32 tokens; turn-2+ hits prefix cache). Falling
+                # through to _admit + 1-tok/iter through the decode trace is
+                # slower but allocation-free, so it's safe alongside captured
+                # traces.
+                next_rid = self.waiting[0]
+                next_L = len(self.reqs[next_rid]['prompt'])
+                if next_L <= self.state.prefill_chunk_size:
+                    self._step_prefill_chunked()
+                    return sum(1 for s in self.slots if s is not None)
         # Idle-step guard: if prefix caching is enabled, never run a forward
         # when there's nothing to do — the (DUMMY_TOK, cur_pos=0) feed for FREE
         # slots mutates DN state, which would corrupt any live-cached slot's
