@@ -50,47 +50,104 @@ VOCAB = base.VOCAB                    # 248320
 # Setup
 # ----------------------------------------------------------------------------
 def setup_cb_state(state, B, blocks_per_seq=None):
-    """v0: B=1 only. Sets cb_B and aliases cb_kv/cb_dn to the existing
-    single-stream caches. v1 will allocate true per-slot pools.
+    """Allocate per-slot DN + KV caches and per-iter input buffers for B slots.
 
-    The 35B single-stream State already has dn_caches_tt[li] = (cs, rs)
-    for DN layers and kv_caches_tt[li] = (kc, vc) for attention layers
-    (built by base.reset_caches_ttnn). For B=1 these ARE the per-slot
-    state — slot 0 IS the only slot.
+    v0 fast path (B=1): aliases the existing single-stream
+    state.dn_caches_tt[li] / state.kv_caches_tt[li] as cb_dn[li] / cb_kv[li].
+    No extra alloc; forward delegates to base.step_forward_inner.
 
-    Pre-allocates batched input buffers (cb_tok_buf, cb_cur_pos_buf,
-    cb_rot_idxs_buf) so scheduler can feed them via copy_host_to_device.
+    v1+ path (B>1): allocates separate B-leading per-slot caches plus a
+    per-slot page table for paged KV. Forward will read/write through
+    cb_dn / cb_kv (B=1 single-stream caches still exist but unused).
+
+    Layouts (per chip):
+      cb_dn[li]["cs"]:   [B, CONV_DIM_CHIP, KERNEL]   (each chip a column shard, dim=0)
+      cb_dn[li]["rs"]:   [B, NV_PER_CHIP, K, V]       (each chip a head shard, dim=0)
+      cb_kv[li]["kc"]:   [B*sdpa_num_blocks, 1, BLOCK_SIZE, HEAD_DIM]  (dim=1 shard)
+      cb_kv[li]["vc"]:   same shape as kc
+      cb_page_table_tt:  [B, sdpa_num_blocks] int32 — slot s owns blocks
+                         [s*nb, (s+1)*nb)
     """
-    if B != 1:
-        raise NotImplementedError(
-            f"v0 (CB35-1) supports B=1 only; got B={B}. CB35-2 will lift "
-            f"this to true batched forward.")
     cfg = state.text_cfg
     mesh = state.mesh
     state.cb_B = B
 
     # base.bootstrap doesn't call reset_caches_ttnn (the single-stream
-    # main() does). Call it here so the per-layer caches exist before we
-    # alias them.
+    # main() does). Call it here so per-layer caches exist for v0 alias path.
     if state.dn_caches_tt is None or state.kv_caches_tt is None:
         state.reset_caches_ttnn()
 
-    # Alias existing single-stream caches as the per-slot cache. At B=1
-    # the layout is identical to what dn_forward_ttnn / attn_forward_ttnn
-    # already produce/consume.
     state.cb_dn = {}
     state.cb_kv = {}
-    for li in range(cfg.num_hidden_layers):
-        if state.layer_types[li] == "linear_attention":
-            cs, rs = state.dn_caches_tt[li]
-            state.cb_dn[li] = {"cs": cs, "rs": rs}
-        else:
-            if state.kv_caches_tt[li] is not None:
-                kc, vc = state.kv_caches_tt[li]
-                state.cb_kv[li] = {"kc": kc, "vc": vc}
 
-    # Batched input buffers. At B=1 these are 1-element, but the cb_scheduler
-    # always indexes by [B] / [B,1] so shape it that way.
+    if B == 1:
+        # v0 fast path: alias existing single-stream caches. No extra alloc.
+        for li in range(cfg.num_hidden_layers):
+            if state.layer_types[li] == "linear_attention":
+                cs, rs = state.dn_caches_tt[li]
+                state.cb_dn[li] = {"cs": cs, "rs": rs}
+            else:
+                if state.kv_caches_tt[li] is not None:
+                    kc, vc = state.kv_caches_tt[li]
+                    state.cb_kv[li] = {"kc": kc, "vc": vc}
+        state.cb_page_table_tt = None  # B=1 path uses state.page_table_tt
+    else:
+        # v1+ path: per-slot caches with leading B dim.
+        # DN state shapes mirror base.reset_caches_ttnn but with B in the
+        # slot axis (replacing the "1"). Mesh-sharded on dim=0 (the NCHIPS
+        # axis) so per-chip view is [B, NV_PER_CHIP, K, V] / [B, CONV_DIM_CHIP, KERNEL].
+        _rs_dtype = getattr(state, "dn_state_dtype", ttnn.bfloat16)
+        for li in range(cfg.num_hidden_layers):
+            if state.layer_types[li] == "linear_attention":
+                cs_init = np.zeros(
+                    (NCHIPS, B, CONV_DIM_CHIP, CONV_KERNEL), dtype=np.float32)
+                rs_init = np.zeros(
+                    (NCHIPS, B, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM), dtype=np.float32)
+                cs_tt = ttnn.from_torch(
+                    torch.from_numpy(cs_init), dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT, device=mesh,
+                    mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
+                )
+                rs_tt = ttnn.from_torch(
+                    torch.from_numpy(rs_init), dtype=_rs_dtype,
+                    layout=ttnn.TILE_LAYOUT, device=mesh,
+                    mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
+                )
+                state.cb_dn[li] = {"cs": cs_tt, "rs": rs_tt}
+            else:
+                if state.attn_mode == "sdpa":
+                    # KV pool sized B * sdpa_num_blocks total, partitioned via
+                    # cb_page_table_tt. Per-chip layout mirrors base.reset_caches_ttnn
+                    # but with B * sdpa_num_blocks in dim 0.
+                    total_blocks = B * state.sdpa_num_blocks
+                    cache_shape = (total_blocks, NCHIPS,
+                                   state.sdpa_block_size, HEAD_DIM_ATTN)
+                    kc_init = np.zeros(cache_shape, dtype=np.float32)
+                    vc_init = np.zeros(cache_shape, dtype=np.float32)
+                    kc = ttnn.from_torch(
+                        torch.from_numpy(kc_init), dtype=ttnn.bfloat16,
+                        layout=ttnn.TILE_LAYOUT, device=mesh,
+                        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=1),
+                    )
+                    vc = ttnn.from_torch(
+                        torch.from_numpy(vc_init), dtype=ttnn.bfloat16,
+                        layout=ttnn.TILE_LAYOUT, device=mesh,
+                        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=1),
+                    )
+                    state.cb_kv[li] = {"kc": kc, "vc": vc}
+
+        # Per-slot page table: slot s owns blocks [s*nb, (s+1)*nb).
+        nb = state.sdpa_num_blocks
+        page_table_np = np.stack([
+            np.arange(s * nb, (s + 1) * nb, dtype=np.int32) for s in range(B)
+        ], axis=0)
+        state.cb_page_table_tt = ttnn.from_torch(
+            torch.from_numpy(page_table_np), dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+
+    # Batched input buffers — same shape pattern for B=1 or B>1.
     state.cb_tok_buf = ttnn.from_torch(
         torch.zeros(B, 1, dtype=torch.int32), layout=ttnn.ROW_MAJOR_LAYOUT,
         dtype=ttnn.uint32, device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
@@ -107,38 +164,52 @@ def setup_cb_state(state, B, blocks_per_seq=None):
 # Slot lifecycle (v0: trivial at B=1)
 # ----------------------------------------------------------------------------
 def cb_reset_states(state):
-    """Reset ALL slot's DN + KV state to zero. At B=1: re-runs the
-    single-stream allocator, which zeros everything.
+    """Reset ALL slot's DN + KV state to zero.
 
-    base.reset_caches_ttnn() just REPLACES the list, it doesn't deallocate
-    the old per-layer tensors — those leak. Over many resets in a long-lived
-    harness, the allocator fragments and subsequent matmul output lands in
-    stale memory → forward returns garbage. Explicitly deallocate first.
+    At B=1: cb_dn/cb_kv ARE the single-stream caches. Deallocate them
+    explicitly (base.reset_caches_ttnn just rebinds the list, leaking
+    the old tensors — [[ttnn-list-rebinding-leaks]]), then re-alias.
+
+    At B>1: cb_dn/cb_kv are separately-allocated B-leading tensors.
+    In-place zero them via masked-zero multiply (same pattern as
+    27B cb_reset_slots, but for all slots).
     """
-    if state.dn_caches_tt is not None:
-        for entry in state.dn_caches_tt:
-            if entry is not None:
-                cs, rs = entry
-                ttnn.deallocate(cs)
-                ttnn.deallocate(rs)
-    if state.kv_caches_tt is not None:
-        for entry in state.kv_caches_tt:
-            if entry is not None:
-                kc, vc = entry
-                ttnn.deallocate(kc)
-                ttnn.deallocate(vc)
+    if state.cb_B == 1:
+        if state.dn_caches_tt is not None:
+            for entry in state.dn_caches_tt:
+                if entry is not None:
+                    cs, rs = entry
+                    ttnn.deallocate(cs)
+                    ttnn.deallocate(rs)
+        if state.kv_caches_tt is not None:
+            for entry in state.kv_caches_tt:
+                if entry is not None:
+                    kc, vc = entry
+                    ttnn.deallocate(kc)
+                    ttnn.deallocate(vc)
 
-    state.reset_caches_ttnn()
-    # Re-alias after reset since reset_caches_ttnn re-allocates.
-    cfg = state.text_cfg
-    for li in range(cfg.num_hidden_layers):
-        if state.layer_types[li] == "linear_attention":
-            cs, rs = state.dn_caches_tt[li]
-            state.cb_dn[li] = {"cs": cs, "rs": rs}
-        else:
-            if state.kv_caches_tt[li] is not None:
-                kc, vc = state.kv_caches_tt[li]
-                state.cb_kv[li] = {"kc": kc, "vc": vc}
+        state.reset_caches_ttnn()
+        cfg = state.text_cfg
+        for li in range(cfg.num_hidden_layers):
+            if state.layer_types[li] == "linear_attention":
+                cs, rs = state.dn_caches_tt[li]
+                state.cb_dn[li] = {"cs": cs, "rs": rs}
+            else:
+                if state.kv_caches_tt[li] is not None:
+                    kc, vc = state.kv_caches_tt[li]
+                    state.cb_kv[li] = {"kc": kc, "vc": vc}
+    else:
+        # In-place zero via ttnn.mul(t, 0.0) → ttnn.copy.
+        for d in state.cb_dn.values():
+            for t in (d["cs"], d["rs"]):
+                z = ttnn.mul(t, 0.0)
+                ttnn.copy(z, t)
+                ttnn.deallocate(z)
+        for d in state.cb_kv.values():
+            for t in (d["kc"], d["vc"]):
+                z = ttnn.mul(t, 0.0)
+                ttnn.copy(z, t)
+                ttnn.deallocate(z)
 
 
 def cb_reset_slots(state, slot_ids):
