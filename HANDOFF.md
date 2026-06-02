@@ -134,14 +134,30 @@ to match) after prefix caching ships.
      `cb_dn`/`cb_kv` + per-slot `cb_page_table_tt`. `_batched_prelude`
      reads `cb_tok_buf` / `cb_rot_idxs_buf`. Gate: 3/3 alloc + 4/4 prelude.
    - **v1.2 batched DN BIT-VALIDATED 2026-06-02** (commit `4546d29`).
-     `dn_step_batched_35b` bit-identical to `base.dn_forward_ttnn` at
-     B=1 (cos=1.0, mad=0.0) and B=2 slot 0 (cos=1.0, mad=0.0). Per-slot
-     independence verified.
-     Gotcha discovered: ttnn.rms_norm on bf16 has shape-dependent
-     accumulation drift — `[B, N, D]` rank-3 input vs `[B*N, D]` 2D fold
-     give different bf16 results. The drift amplifies disproportionately
-     through matmul + all_reduce. Keep rank-3 (memory:
-     [[ttnn-rms-norm-shape-drift]]).
+     `dn_step_batched_35b` cos=1.0/mad=0.0 at B=1 and B=2 slot 0. Rank-3
+     `[B, N, D]` rms_norm fix ([[ttnn-rms-norm-shape-drift]]).
+   - **v1.3 batched GatedAttention BIT-VALIDATED 2026-06-02** (commit
+     `e8f2d82`). `attn_step_batched_35b` cos=1.0/mad=0.0 at B=1 and B=2
+     slot 0 — first-try pass. Rank-3 `_apply_partial_rope_b` sidesteps
+     base's K-broadcast workaround. Paged KV write + SDPA decode use
+     `cb_cur_pos_buf`/`cb_page_table_tt` for per-slot context.
+     `setup_cb_paged_cfgs` builds B-sized HEIGHT_SHARDED L1 mem cfg +
+     SDPA progcfg (B=1 reuses base's `state.paged_*`).
+   - **v1.4 batched MoE SHIPPED 2026-06-02** (commit `2d0f582`).
+     `moe_step_batched_35b` — B=1 bit-identical to base
+     `moe_forward_ttnn_pattern_a_batched`. B>1 is per-slot sequential
+     loop with KNOWN ~13% rel drift between identical-input slots at
+     small magnitudes (layer-0 MoE-only output, |out|~3e-4). Likely
+     ttnn-internal MoE matmul accumulation-order non-determinism. The
+     true broadcast port (B-leading Pattern A) is v1.4b, task #156.
+   - **v1.5 full B>1 forward SHIPPED 2026-06-02** (commit `bc96651`).
+     `forward_batch_tp_inner_batched` + `layer_forward_batched_35b` —
+     drives full 40-layer chain at B>1 across multi-step decode without
+     errors. Bit-equiv to B=1 reference FAILS (slot 0 sequence diverges
+     from B=1 ref) because the v1.4 per-slot MoE drift compounds across
+     30 MoE layers and 4 steps. **v1.5 bit-equiv is GATED on v1.4b.**
+     Infrastructure shippable for B=1 production; B>1 production needs
+     v1.4b.
    - v1 (true B>1 batched forward): next. ~3-5 days.
    - v2 (trace capture at B=N): ~1-2 days.
    - v3 (owned-GDN batched FOLD trick): optional.

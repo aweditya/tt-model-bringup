@@ -110,9 +110,10 @@ v1 introduces actual per-slot work. This is the bulk of the project.
 | v1.0 | `setup_cb_state(B=8)` allocates B-leading caches | ✅ BIT-VALIDATED 3/3 (`ec01052`) |
 | v1.1 | Embed + RoPE batched | ✅ BIT-VALIDATED 4/4 (`cf211a4`) |
 | v1.2 | DN layer batched (manual recurrence) | ✅ BIT-VALIDATED cos=1.0 mad=0.0 (`4546d29`) |
-| v1.3 | GatedAttention batched (paged SDPA over per-slot KV) | ⏳ NEXT |
-| v1.4 | MoE batched (Pattern A verify) | ⏳ |
-| v1.5 | Full forward at B=8 end-to-end | ⏳ |
+| v1.3 | GatedAttention batched (paged SDPA over per-slot KV) | ✅ BIT-VALIDATED cos=1.0 mad=0.0 (`e8f2d82`) |
+| v1.4 | MoE batched (per-slot loop) | ⚠ B=1 bit-id, B>1 13% drift (`2d0f582`) |
+| v1.4b | MoE batched (true broadcast Pattern A) | ⏳ task #156 — blocks v1.5 bit-equiv |
+| v1.5 | Full forward at B=2 (multi-step) | ⚠ runs, bit-equiv blocked on v1.4b (`bc96651`) |
 
 **Reuse map** (audit before writing anything):
 - 27B's `server_tp_cb.deltanet_step_batched` is the template. Need to
