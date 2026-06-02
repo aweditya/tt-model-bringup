@@ -1,34 +1,17 @@
 """server_35b_cb.py — CB layer for Qwen3.6-35B-A3B.
 
-Analogue of `server_tp_cb.py` for the 35B-A3B MoE hybrid. Imports
-`server_35b_ttnn` as `base` for single-stream primitives + constants,
-adds per-slot state + batched forwards on top.
+Analogue of `server_tp_cb.py` for the 35B-A3B MoE hybrid.
 
-Reuse map (mirror of server_tp_cb.py):
-    setup_cb_state(state, B)           — per-slot DN + KV + cur_pos
-    cb_reset_states(state)             — reset all DN slots
-    cb_reset_slots(state, slot_ids)    — reset specific DN slots (masked mul)
-    cb_prefill_transplant(state,s,L)   — copy single-stream state into slot
-    update_input_buffers_batched       — batched host→device copy
-    deltanet_step_batched(state, ...)  — batched DN forward (manual recurrence)
-    gated_attn_step_batched(state, ...) — batched paged SDPA
-    moe_step_batched(state, ...)       — calls existing Pattern A MoE
-    forward_batch_35b_inner(state, ...) — full layered forward at B=N
+v0 strategy (CB35-1): B=1 ONLY. Each function wraps the existing
+single-stream 35B paths from `server_35b_ttnn` (step_forward_inner,
+update_input_buffers, dn_caches_tt, kv_caches_tt). The point is to
+validate end-to-end CB integration (cb_engine + cb_scheduler driving
+35B forwards through /v1/*) before tackling true B>1 batching.
 
-Plan: research/35b_cb_bringup_plan.md (v0 = B=1, v1 = B>1, v2 = trace).
-v0 status: SKELETON ONLY — fill in each function from the 27B template
-when device validation is unblocked.
+v1 (CB35-2) generalizes to B>1 with batched DN / attn / MoE primitives.
+Plan: research/35b_cb_bringup_plan.md.
 
-Constants imported from server_35b_ttnn (NOT full_layer_tp_probe, which
-is 27B-specific):
-    NV_PER_CHIP = 8  (vs 27B's 12)
-    NK_PER_CHIP = 4  (vs 27B's 6)
-    HEAD_K_DIM = HEAD_V_DIM = 128
-    CONV_DIM_CHIP, CONV_KERNEL = 4
-    HIDDEN = 2048 (vs 27B's 5120)
-    NQ_PER_CHIP = 4, NUM_KV_HEADS = 2, HEAD_DIM_ATTN = 256
-    ROTARY_DIM = 64 (partial)
-    E_LOCAL = 64, TOP_K = 8, MOE_INTER = 512
+Imported by cb_api when TT_BACKEND=35b (MM1).
 """
 from __future__ import annotations
 
@@ -41,25 +24,22 @@ sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-import server_35b_ttnn as base  # noqa: E402  — single-stream machinery + constants
+import server_35b_ttnn as base  # noqa: E402
 import ttnn  # noqa: E402
 
-# ----------------------------------------------------------------------------
-# Constants — re-exported from base for clarity. Mirrors what 27B's
-# server_tp_cb.py gets from full_layer_tp_probe.
-# ----------------------------------------------------------------------------
-NV_PER_CHIP = base.NV_PER_CHIP        # 8 — DN value heads per chip
+# Constants re-exported from base.
+NV_PER_CHIP = base.NV_PER_CHIP        # 8
 NK_PER_CHIP = base.NK_PER_CHIP        # 4
 HEAD_K_DIM = base.HEAD_K_DIM          # 128
 HEAD_V_DIM = base.HEAD_V_DIM          # 128
 CONV_DIM_CHIP = base.CONV_DIM_CHIP
 CONV_KERNEL = base.CONV_KERNEL        # 4
 HIDDEN = base.HIDDEN                  # 2048
-NQ_PER_CHIP = base.NQ_PER_CHIP        # 4 — attn Q heads per chip
+NQ_PER_CHIP = base.NQ_PER_CHIP        # 4
 NUM_KV_HEADS = base.NUM_KV_HEADS      # 2
 HEAD_DIM_ATTN = base.HEAD_DIM_ATTN    # 256
-ROTARY_DIM = base.ROTARY_DIM          # 64 (partial)
-E_LOCAL = base.E_LOCAL                # 64 — MoE experts per chip
+ROTARY_DIM = base.ROTARY_DIM          # 64
+E_LOCAL = base.E_LOCAL                # 64
 TOP_K = base.TOP_K                    # 8
 MOE_INTER_CHIP = base.MOE_INTER_CHIP
 NCHIPS = base.NCHIPS                  # 4
@@ -67,175 +47,202 @@ VOCAB = base.VOCAB                    # 248320
 
 
 # ----------------------------------------------------------------------------
-# v0 / CB35-1 — Per-slot state allocation
+# Setup
 # ----------------------------------------------------------------------------
 def setup_cb_state(state, B, blocks_per_seq=None):
-    """Allocate per-slot DN + KV state on top of single-stream 35B state.
+    """v0: B=1 only. Sets cb_B and aliases cb_kv/cb_dn to the existing
+    single-stream caches. v1 will allocate true per-slot pools.
 
-    Mirror of server_tp_cb.py:45 (setup_cb_state). For each of the 40
-    layers in the 35B model:
-      - DN layers (3 per block, 30 total): allocate per-slot conv_state
-        + recurrent (H_t) state. State shape matches base.reset_caches_ttnn
-        but with leading B dim. H_t rank-5 sharded dim=2 (NCHIPS axis).
-      - GatedAttention layers (1 per block, 10 total): paged KV cache,
-        shape (NUM_BLOCKS, NCHIPS, BLOCK_SIZE, HEAD_DIM_ATTN) sharded
-        along dim=1 — same as base.reset_caches_ttnn but with per-slot
-        page_table indirection (paged_update_cache).
-      - MoE expert weights: NO per-slot state (experts are shared across
-        slots; intermediate activations are per-token, allocated
-        transiently inside forward).
+    The 35B single-stream State already has dn_caches_tt[li] = (cs, rs)
+    for DN layers and kv_caches_tt[li] = (kc, vc) for attention layers
+    (built by base.reset_caches_ttnn). For B=1 these ARE the per-slot
+    state — slot 0 IS the only slot.
 
-    Sets:
-        state.cb_B
-        state.cb_dn[li]  per-DN-layer dict {'rs': [B,...], 'cs': [B,...]}
-        state.cb_kv[li]  per-attn-layer dict {'kc': [...paged...], 'vc': [...]}
-        state.cb_cur_pos_buf  [B] int32 device
-        state.cb_rot_idxs_buf [B, 1] int32 device
-        state.cb_page_table_tt [B, blocks_per_seq] int32 device — per-slot
-            paged KV pages, identity for B=1 to start
-        state.cb_blocks_per_seq
-
-    TODO: copy from server_tp_cb.py:45-144 and:
-      - swap NV_PER_CHIP / K_DIM / V_DIM / CONV_DIM_CHIP constants
-      - use base.HEAD_K_DIM / HEAD_V_DIM for DN H_t shape
-      - 35B has 10 attn layers vs 27B's 14 — count from base.text_cfg.layer_types
-      - 35B H_t state is rank-5 (NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM)
-        sharded dim=0 (see server_35b_ttnn.py:1409); per-slot adds leading B
-        → (B, NCHIPS, 1, NV_PER_CHIP, HEAD_K_DIM, HEAD_V_DIM) sharded dim=1
-      - conv state: rank-4 (NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL); per-slot
-        adds leading B → (B, NCHIPS, 1, CONV_DIM_CHIP, CONV_KERNEL) sharded dim=1
+    Pre-allocates batched input buffers (cb_tok_buf, cb_cur_pos_buf,
+    cb_rot_idxs_buf) so scheduler can feed them via copy_host_to_device.
     """
-    raise NotImplementedError("CB35-1 v0 stub — port from server_tp_cb.py:45-144")
+    if B != 1:
+        raise NotImplementedError(
+            f"v0 (CB35-1) supports B=1 only; got B={B}. CB35-2 will lift "
+            f"this to true batched forward.")
+    cfg = state.text_cfg
+    mesh = state.mesh
+    state.cb_B = B
+
+    # Alias existing single-stream caches as the per-slot cache. At B=1
+    # the layout is identical to what dn_forward_ttnn / attn_forward_ttnn
+    # already produce/consume.
+    state.cb_dn = {}
+    state.cb_kv = {}
+    for li in range(cfg.num_hidden_layers):
+        if state.layer_types[li] == "linear_attention":
+            cs, rs = state.dn_caches_tt[li]
+            state.cb_dn[li] = {"cs": cs, "rs": rs}
+        else:
+            if state.kv_caches_tt[li] is not None:
+                kc, vc = state.kv_caches_tt[li]
+                state.cb_kv[li] = {"kc": kc, "vc": vc}
+
+    # Batched input buffers. At B=1 these are 1-element, but the cb_scheduler
+    # always indexes by [B] / [B,1] so shape it that way.
+    state.cb_tok_buf = ttnn.from_torch(
+        torch.zeros(B, 1, dtype=torch.int32), layout=ttnn.ROW_MAJOR_LAYOUT,
+        dtype=ttnn.uint32, device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    state.cb_cur_pos_buf = ttnn.from_torch(
+        torch.full((B,), -1, dtype=torch.int32), layout=ttnn.ROW_MAJOR_LAYOUT,
+        dtype=ttnn.int32, device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    state.cb_rot_idxs_buf = ttnn.from_torch(
+        torch.zeros(B, 1, dtype=torch.int32), layout=ttnn.ROW_MAJOR_LAYOUT,
+        dtype=ttnn.uint32, device=mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    return state
 
 
+# ----------------------------------------------------------------------------
+# Slot lifecycle (v0: trivial at B=1)
+# ----------------------------------------------------------------------------
 def cb_reset_states(state):
-    """Reset ALL slot's DN state to zero. Mirror of server_tp_cb.py:146.
-
-    Pure math: ttnn.mul(t, 0.0) → ttnn.copy(z, t) → deallocate. Same for
-    both 27B and 35B since shape only adds a B leading dim that gets
-    multiplied by 0 anyway.
-    """
-    raise NotImplementedError("CB35-1 v0 stub — port from server_tp_cb.py:146-155")
+    """Reset ALL slot's DN + KV state to zero. At B=1: re-runs the
+    single-stream allocator, which zeros everything."""
+    state.reset_caches_ttnn()
+    # Re-alias after reset since reset_caches_ttnn re-allocates.
+    cfg = state.text_cfg
+    for li in range(cfg.num_hidden_layers):
+        if state.layer_types[li] == "linear_attention":
+            cs, rs = state.dn_caches_tt[li]
+            state.cb_dn[li] = {"cs": cs, "rs": rs}
+        else:
+            if state.kv_caches_tt[li] is not None:
+                kc, vc = state.kv_caches_tt[li]
+                state.cb_kv[li] = {"kc": kc, "vc": vc}
 
 
 def cb_reset_slots(state, slot_ids):
-    """Masked-multiply reset for specific slots. Mirror of server_tp_cb.py:157.
-
-    Build mask[B] = 1 for slots NOT being reset, 0 for slots being reset.
-    Apply to each layer's DN ssm + conv_cols. Other slots' state preserved.
-    """
-    raise NotImplementedError("CB35-1 v0 stub — port from server_tp_cb.py:157-185")
-
-
-def cb_prefill_transplant(state, slot_s, L):
-    """Copy single-stream prefill state into slot s. Mirror of server_tp_cb.py:188.
-
-    Optional for v0 — only needed if we use chunked_prefill mode. v0 uses
-    1-tok/iter prefill via the decode trace, so this can be a no-op stub
-    initially. Wire in if/when 35B grows a forward_prefill_chunked_tp.
-    """
-    raise NotImplementedError("CB35-1 v0 OPTIONAL stub — port from server_tp_cb.py:188-307")
+    """Reset specific slots' DN state. At B=1 with slot 0 in slot_ids:
+    same effect as cb_reset_states. v1 will use masked multiply."""
+    if state.cb_B == 1 and 0 in slot_ids:
+        cb_reset_states(state)
+    # else: no-op (slot 0 wasn't reset, nothing to do)
 
 
 # ----------------------------------------------------------------------------
-# v0 / CB35-1 — Batched input buffer update
+# Input buffer update
 # ----------------------------------------------------------------------------
 def update_input_buffers_batched(state, token_ids, cur_positions):
-    """Host→device copy of [B] token IDs + [B] cur_pos into pre-allocated
-    state.cb_*_buf tensors. Called OUTSIDE the trace, before
-    ttnn.execute_trace.
-
-    Mirror of server_tp_cb.py:310. Identical between 27B and 35B.
-    """
-    raise NotImplementedError("CB35-1 v0 stub — port from server_tp_cb.py:310-329")
-
-
-# ----------------------------------------------------------------------------
-# v1 / CB35-2 — Batched per-primitive forward steps
-# ----------------------------------------------------------------------------
-def deltanet_step_batched(state, x_tt, dn_li, cfg):
-    """Batched DN forward step at B=cb_B for layer index dn_li.
-
-    Manual recurrence path (owned_gdn kernel is B=1-only). Updates
-    state.cb_dn[dn_li]['rs'] and ['cs'] in-place.
-
-    Mirror of server_tp_cb.py:331-518. 35B-specific adaptations:
-      - State shape: H_t rank-6 with leading B (vs 27B's rank-5)
-      - NV_PER_CHIP=8 (vs 12), HEAD_K_DIM=HEAD_V_DIM=128 (same)
-      - Conv state same layout as 27B with B dim
-      - Q/K L2-norm: use base.dn_fused_qk_norm path if state flag set
-
-    Reference for the math: server_35b_ttnn.py:dn_forward_ttnn (line 372)
-    is the existing B=1 forward; lift its body with a leading B axis.
-    """
-    raise NotImplementedError("CB35-2 v1 stub — port from server_tp_cb.py:331-517")
-
-
-def gated_attn_step_batched(state, x_tt, attn_li, cos_tt, sin_tt, cfg):
-    """Batched paged SDPA forward step at B=cb_B for attn layer.
-
-    Mirror of server_tp_cb.py:519-625. 35B-specific:
-      - NQ_PER_CHIP=4 (vs 27B's 6), NUM_KV_HEADS=2 (vs 27B's 8)
-      - HEAD_DIM_ATTN=256 (vs 27B's 128) — partial RoPE rotary_dim=64
-      - attn_output_gate=True doubles Q proj — per-head chunk split
-        (see feedback_qwen36_attn_qgate_chunk_per_head.md)
-      - Lift attention math from server_35b_ttnn.py:attn_forward_ttnn_sdpa
-        (line 743) with a leading B axis.
-
-    Uses ttnn.experimental.paged_update_cache (with update_idxs_tensor =
-    state.cb_cur_pos_buf) for KV write and paged_scaled_dot_product_attention_decode
-    for read — both already correct in 27B's CB, just need 35B shapes.
-    """
-    raise NotImplementedError("CB35-2 v1 stub — port from server_tp_cb.py:519-625")
-
-
-def moe_step_batched(state, x_tt, moe_li, cfg):
-    """Batched MoE FFN forward step.
-
-    HOT TAKE FROM RESEARCH: this is essentially FREE because the existing
-    moe_forward_ttnn_pattern_a_batched (server_35b_ttnn.py:1225) already
-    supports B>1 unchanged — ttnn.matmul broadcasts over leading dim.
-
-    Implementation: reshape x_tt from [B, HIDDEN] to [B, 1, HIDDEN] (the
-    shape Pattern A expects), call base.moe_forward_ttnn_pattern_a_batched,
-    reshape back to [B, HIDDEN].
-
-    NO per-slot state mutation — MoE experts are stateless across slots.
-    """
-    # NOTE: this is the easy one. Implement first to confirm the pattern.
-    # Then deltanet_step_batched + gated_attn_step_batched are the bulk.
-    raise NotImplementedError("CB35-2 v1 stub — wrap base.moe_forward_ttnn_pattern_a_batched")
+    """Host→device copy of [B] token IDs + [B] cur_pos. At B=1: delegates
+    to the existing update_input_buffers."""
+    if state.cb_B != 1:
+        raise NotImplementedError("v0 supports B=1 only")
+    base.update_input_buffers(state, int(token_ids[0]), int(cur_positions[0]))
+    # Also update cb_*_buf so scheduler's batched view stays consistent.
+    # (Single-source-of-truth would be nicer, but base.update_input_buffers
+    # writes its own state.tok_buf etc., not the cb_ aliases.)
+    mesh = state.mesh
+    tok_host = ttnn.from_torch(
+        torch.tensor([[int(token_ids[0])]], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    ttnn.copy_host_to_device_tensor(tok_host, state.cb_tok_buf)
+    cp_host = ttnn.from_torch(
+        torch.tensor([int(cur_positions[0])], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    ttnn.copy_host_to_device_tensor(cp_host, state.cb_cur_pos_buf)
 
 
 # ----------------------------------------------------------------------------
-# v0 + v1 / CB35-1, CB35-2 — Full batched forward
+# Forward (v0: delegates to single-stream step_forward_inner)
 # ----------------------------------------------------------------------------
-def forward_batch_35b_inner(state, return_logits=False, return_topk=None):
-    """One batched forward step at B=cb_B. Returns per-slot argmax/topk/logits.
+def forward_batch_tp_inner(state, return_logits=False, return_topk=None):
+    """One batched forward step. v0: B=1.
 
-    Layer dispatch loop:
-        for L in range(num_layers):
-            if state.layer_types[L] == 'linear_attention':
-                x = deltanet_step_batched(state, x, dn_li=L, ...)
-            else:
-                x = gated_attn_step_batched(state, x, attn_li=L, cos, sin, ...)
-            x = moe_step_batched(state, x, moe_li=L, ...)
-        Then: final_norm, lm_head (vocab-sharded), per-slot argmax/topk.
+    Mirrors base.step_forward_inner's body (server_35b_ttnn.py:1602) but
+    routes the final op based on the requested return mode (instead of
+    base's hardcoded sampler_topk check). At B=1 this is functionally
+    identical to step_forward_inner.
 
-    Mirror of server_tp_cb.py:638-end. The only model-specific changes are
-    layer-type dispatch (35B has GDN layers interleaved every block of 4
-    vs 27B's different pattern) and MoE call (FREE per above).
-
-    Returns: same shape as 27B's forward_batch_tp_inner.
+    Returns shape per cb_scheduler convention:
+      - return_logits=False, return_topk=None: argmax_tt UINT32 [1, 1]
+      - return_logits=True:                    logits tensor [1, VOCAB]
+      - return_topk=K:                         (values [1, K], indices [1, K])
     """
-    raise NotImplementedError("CB35-1+2 stub — port from server_tp_cb.py:638-end")
+    if state.cb_B != 1:
+        raise NotImplementedError("v0 supports B=1 only")
+
+    # ── Same prelude as step_forward_inner (embed + RoPE rows). ────────
+    embed_out = ttnn.embedding(state.tok_buf, state.embed_tt)
+    h_tt = ttnn.to_layout(embed_out, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(embed_out)
+
+    cos_row = ttnn.embedding(state.rot_idxs_buf, state.cos_table_tt)
+    sin_row = ttnn.embedding(state.rot_idxs_buf, state.sin_table_tt)
+    cos_tt = ttnn.to_layout(cos_row, ttnn.TILE_LAYOUT)
+    sin_tt = ttnn.to_layout(sin_row, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(cos_row); ttnn.deallocate(sin_row)
+    cos_tt = ttnn.reshape(cos_tt, [1, ROTARY_DIM])
+    sin_tt = ttnn.reshape(sin_tt, [1, ROTARY_DIM])
+
+    # ── Layer chain (same as base.step_forward_inner lines 1627-1656). ─
+    n = state.text_cfg.num_hidden_layers
+    for L in range(n):
+        lt = state.layer_types[L]
+        h_new, new_dn, new_kv = base.layer_forward_ttnn(
+            h_tt, state.per_layer_tt[L], lt, state.mesh,
+            cos_tt, sin_tt, state.dn_caches_tt[L], state.kv_caches_tt[L],
+            sub_capture=None, state=state,
+        )
+        ttnn.deallocate(h_tt)
+        h_tt = h_new
+        if new_dn is not None:
+            old_conv, old_rec = state.dn_caches_tt[L]
+            new_conv, new_rec = new_dn
+            if new_conv is not old_conv:
+                ttnn.deallocate(old_conv)
+            if new_rec is not old_rec:
+                ttnn.deallocate(old_rec)
+            state.dn_caches_tt[L] = new_dn
+        if new_kv is not None:
+            state.kv_caches_tt[L] = new_kv
+
+    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+
+    # ── Final norm + LM head. ──────────────────────────────────────────
+    h_norm = ttnn.rms_norm(h_tt, weight=state.final_norm_tt, epsilon=base.EPS)
+    ttnn.deallocate(h_tt)
+    logits = ttnn.matmul(h_norm, state.lm_head_tt, compute_kernel_config=base.HIFI4)
+    ttnn.deallocate(h_norm)
+
+    # ── Final op: branch on requested mode. ────────────────────────────
+    if return_topk is not None:
+        top_vals, top_idxs = ttnn.topk(logits, k=int(return_topk), dim=-1)
+        ttnn.deallocate(logits)
+        return (top_vals, top_idxs)
+
+    if return_logits:
+        # Convert to ROW_MAJOR for the cb_scheduler's per-slot host sample.
+        rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.deallocate(logits)
+        return rm
+
+    # Default: on-device argmax (greedy). Same as base.step_forward_inner.
+    rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+    ttnn.deallocate(logits)
+    argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
+    ttnn.deallocate(rm)
+    return argmax_tt
 
 
 # ----------------------------------------------------------------------------
-# Helpers (mirror server_tp_cb.py setup_cb_write_mem_cfg + _attn_finish)
+# cb_prefill_transplant — not needed for v0 (no chunked prefill on 35B)
+# ----------------------------------------------------------------------------
+def cb_prefill_transplant(state, slot_s, L):
+    """No-op stub for v0. 35B uses 1-tok/iter prefill via the decode path;
+    no chunked prefill → no transplant needed."""
+    pass
+
+
+# ----------------------------------------------------------------------------
+# setup_cb_write_mem_cfg — not needed for v0 (no paged_update_cache batching)
 # ----------------------------------------------------------------------------
 def setup_cb_write_mem_cfg(state):
-    """Pre-build the HEIGHT_SHARDED L1 mem config used by paged_update_cache.
-    Mirror of server_tp_cb.py:626-636.
-    """
-    raise NotImplementedError("CB35-1 v0 stub — port from server_tp_cb.py:626-636")
+    """No-op for v0; v1 paged_update_cache batching will need this."""
+    pass
