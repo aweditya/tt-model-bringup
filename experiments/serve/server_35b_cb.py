@@ -552,6 +552,97 @@ def _batched_prelude(state):
 # ----------------------------------------------------------------------------
 # Forward (v0: delegates to single-stream step_forward_inner)
 # ----------------------------------------------------------------------------
+def layer_forward_batched_35b(state, h_tt, w, layer_type, cos_tt, sin_tt,
+                                cb_dn_layer, cb_kv_layer):
+    """Batched analogue of base.layer_forward_ttnn for B>1.
+      residual = h
+      h = input_layernorm(h)
+      mixer = DN(h) OR attn(h)
+      h = residual + mixer
+      residual = h
+      h = post_attention_layernorm(h)
+      moe = MoE(h)
+      h = residual + moe
+    Returns h_final [B, 1, HIDDEN] replicated.
+    """
+    B = state.cb_B
+    residual_1 = h_tt
+    h_norm_1 = ttnn.rms_norm(h_tt, weight=w["input_layernorm"], epsilon=base.EPS)
+    if layer_type == "linear_attention":
+        use_fused_qk_norm = bool(getattr(state, "dn_fused_qk_norm", False))
+        qk_l2_w = getattr(state, "qk_l2_weight_tt", None) if use_fused_qk_norm else None
+        qk_l2_eps = getattr(state, "qk_l2_eps", base.EPS / HEAD_K_DIM) if use_fused_qk_norm else None
+        mixer_out = dn_step_batched_35b(state, h_norm_1, w, cb_dn_layer,
+                                          qk_l2_weight_tt=qk_l2_w, qk_l2_eps=qk_l2_eps)
+    else:
+        mixer_out = attn_step_batched_35b(state, h_norm_1, w, cb_kv_layer, cos_tt, sin_tt)
+    ttnn.deallocate(h_norm_1)
+    # Mixer returns [B, HIDDEN]; residual is [B, 1, HIDDEN]. At B=1 ttnn
+    # broadcasts cleanly (1 in dim 0 trivially matches). At B>1 the
+    # broadcast would produce [B, B, HIDDEN] (since each tensor has one
+    # dim of size B and one of size 1 in incompatible positions). Reshape
+    # mixer to [B, 1, HIDDEN] so the add is elementwise per-slot.
+    mixer_3d = ttnn.reshape(mixer_out, [B, 1, HIDDEN]) if B > 1 else mixer_out
+    h_after_mixer = ttnn.add(residual_1, mixer_3d)
+    ttnn.deallocate(mixer_out)
+    if B > 1 and mixer_3d is not mixer_out:
+        pass  # mixer_3d is a view of mixer_out; deallocating mixer_out frees it.
+
+    residual_2 = h_after_mixer
+    h_norm_2 = ttnn.rms_norm(h_after_mixer, weight=w["post_attention_layernorm"], epsilon=base.EPS)
+    moe_out = moe_step_batched_35b(state, h_norm_2, w)
+    ttnn.deallocate(h_norm_2)
+    # Same rank-alignment dance for MoE output. moe_step_batched_35b at
+    # B>1 already returns a rank-3 [B, 1, HIDDEN] from the per-slot concat,
+    # so reshape only if needed.
+    moe_shape = list(moe_out.shape)
+    if B > 1 and len(moe_shape) == 2:
+        moe_3d = ttnn.reshape(moe_out, [B, 1, HIDDEN])
+    else:
+        moe_3d = moe_out
+    h_final = ttnn.add(residual_2, moe_3d)
+    ttnn.deallocate(residual_2); ttnn.deallocate(moe_out)
+    return h_final
+
+
+def forward_batch_tp_inner_batched(state):
+    """Full forward at B>1: embed+RoPE prelude → 40-layer chain → final_norm
+    → lm_head → on-device argmax (per slot).
+
+    Returns argmax_tt UINT32 [B, 1] (per-slot top-1 token).
+
+    At B=1, delegates to base.step_forward_inner (the v0 path) for parity
+    with prior validation.
+    """
+    B = state.cb_B
+    if B == 1:
+        return base.step_forward_inner(state)
+
+    mesh = state.mesh
+    h_tt, cos_tt, sin_tt = _batched_prelude(state)
+
+    n = state.text_cfg.num_hidden_layers
+    for L in range(n):
+        lt = state.layer_types[L]
+        cb_dn_l = state.cb_dn.get(L)
+        cb_kv_l = state.cb_kv.get(L)
+        h_new = layer_forward_batched_35b(state, h_tt, state.per_layer_tt[L], lt,
+                                            cos_tt, sin_tt, cb_dn_l, cb_kv_l)
+        ttnn.deallocate(h_tt)
+        h_tt = h_new
+    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+
+    h_norm = ttnn.rms_norm(h_tt, weight=state.final_norm_tt, epsilon=base.EPS)
+    ttnn.deallocate(h_tt)
+    logits = ttnn.matmul(h_norm, state.lm_head_tt, compute_kernel_config=base.HIFI4)
+    ttnn.deallocate(h_norm)
+    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+    ttnn.deallocate(logits)
+    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
+    ttnn.deallocate(logits_rm)
+    return argmax_tt
+
+
 def forward_batch_tp_inner(state, return_logits=False, return_topk=None):
     """One batched forward step. v0: B=1.
 
