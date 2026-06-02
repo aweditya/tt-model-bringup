@@ -43,7 +43,9 @@ The target is the hardware ceiling, not parity with someone else's number.
 ## Chat path (production)
 
 ```bash
-bash experiments/serve/scripts/serve_cb.sh start   # ~6 min bootstrap; /health → 503 until ready
+# Recommended config:
+TT_CB_CHUNKED_PREFILL=1 TT_CB_PREFIX_CACHE=1 \
+  bash experiments/serve/scripts/serve_cb.sh start   # ~6 min bootstrap; /health → 503 until ready
 bash experiments/serve/scripts/serve_cb.sh status
 bash experiments/serve/scripts/serve_cb.sh stop    # SIGTERM → graceful drain → mesh release
 ```
@@ -54,6 +56,12 @@ Env knobs: `TT_CB_PORT=8000`, `TT_CB_SLOTS=4`, `TT_CB_MAX_NEW=1024`,
 Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/models`,
 `/health`, `/metrics` (Prometheus).
 See README §"Chat server (production)" for `curl` + `openai` client examples.
+
+**Current status (2026-06-02): 27B server is STOPPED.** qb1's mesh is
+consumed by the 35B dev harness (CB35-1 v0 work — see Roadmap §3). The
+27B production stack is feature-complete (CB + prefix caching + sampling
++ OpenAI endpoint + metrics, all validated). Restart any time with the
+command above — exclusive of running the 35B harness on the same host.
 
 ## What's next
 
@@ -130,7 +138,10 @@ to match) after prefix caching ships.
    - **Dev iteration harness** (`experiments/cb/dev/cb35_dev_harness.py`):
      bootstrap-once long-running python on qb1, watches `/tmp/cb35_trig/`,
      reloads via `importlib`. Cuts fix-test cycle from ~14 min to seconds.
-     See `research/35b_cb_bringup_plan.md` for usage.
+     **MUST launch via `bash scripts/run_harness_tmux.sh`** — nohup + disown
+     and setsid + double-fork both fail to keep the python alive after SSH
+     disconnect on qb1 (it dies before completing bootstrap). tmux
+     survives by design. See `research/35b_cb_bringup_plan.md` for usage.
 4. **Multi-model fleet** — plan: [`research/multi_model_serving_plan.md`](research/multi_model_serving_plan.md).
    Once 35B is live, MM5 (Mistral Small 3.2 24B) is the strongest
    framework-generalization test (different vendor, different tokenizer,
