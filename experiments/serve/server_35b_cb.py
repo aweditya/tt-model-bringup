@@ -485,6 +485,49 @@ def dn_step_batched_35b(state, h_tt, w, cb_dn_layer, *, qk_l2_weight_tt=None, qk
     return out
 
 
+def moe_step_batched_35b(state, h_tt, w):
+    """Per-slot MoE for B>1 — sequential loop over slots.
+
+    h_tt: [B, 1, HIDDEN] or [B, HIDDEN] replicated. Each slot routes to
+    top-8 of 256 experts independently. Returns [B, HIDDEN] replicated.
+
+    PERF NOTE: this is a B-sequential loop calling
+    base.moe_forward_ttnn_pattern_a_batched per slot. CORRECTNESS-FIRST
+    implementation — the routing/expert-mask logic in Pattern A assumes
+    a single token per call, and a true B-broadcasting port requires
+    refactoring the per-expert matmul shape from [E_LOCAL,1,H] to
+    [B,E_LOCAL,1,H] which is a separate v1.4b project. At B=8 this loop
+    is ~8× the per-token cost; if profiling shows MoE is the bottleneck
+    we ship the broadcast variant.
+
+    At B=1: single call, identical to base path.
+    """
+    B = state.cb_B
+    mesh = state.mesh
+    if B == 1:
+        # base reshapes input to [1, 1, HIDDEN] internally — pass h_tt as-is
+        # whether rank 2 or 3. No view+dealloc dance needed.
+        return base.moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh)
+
+    # B>1 sequential loop. Slice one slot at a time; base handles the inner
+    # reshape. ttnn.slice returns a fresh tensor (NOT a view), so the
+    # eventual deallocate is safe.
+    slot_outs = []
+    rank = len(list(h_tt.shape))
+    for s in range(B):
+        if rank == 3:
+            h_s = ttnn.slice(h_tt, [s, 0, 0], [s + 1, 1, HIDDEN])
+        else:
+            h_s = ttnn.slice(h_tt, [s, 0], [s + 1, HIDDEN])
+        out_s = base.moe_forward_ttnn_pattern_a_batched(h_s, w, mesh)
+        ttnn.deallocate(h_s)
+        slot_outs.append(out_s)
+    out = ttnn.concat(slot_outs, dim=0)
+    for t in slot_outs:
+        ttnn.deallocate(t)
+    return out
+
+
 def _batched_prelude(state):
     """Embed + RoPE rows for the B-slot batch. Returns:
       h_tt:    TILE [B, 1, HIDDEN] per chip (same shape pattern as base, B in slot axis)
