@@ -103,16 +103,16 @@ v1 introduces actual per-slot work. This is the bulk of the project.
   `cb_rot_idxs_buf:[B, 1]` (already set up at v0; just need to actually
   use them in the forward instead of the single-stream `state.tok_buf`).
 
-**Sub-stages v1.0 → v1.4** (each ships its own test):
+**Sub-stages v1.0 → v1.5** (each ships its own test):
 
-| v1.x | What | Gate |
+| v1.x | What | Status |
 |---|---|---|
-| v1.0 | `setup_cb_state(B=8)` allocates B-leading caches | shapes correct; no forward yet |
-| v1.1 | **Embed + RoPE batched**: feed `cb_tok_buf` instead of `state.tok_buf` | h_tt has shape `[B, HIDDEN]` per chip; matches `[1, HIDDEN]` of base when B=1 |
-| v1.2 | **DN layer batched**: manual recurrence over `rs[B, NV, K, V]`; conv1d over `cs[B, CONV_DIM, KERNEL]` | per-slot output bit-identical to v0 B=1 ref for distinct prompts |
-| v1.3 | **GatedAttention batched**: per-slot KV write at slot's own `cur_pos`; SDPA over the per-slot KV slice | per-slot output bit-identical to v0 B=1 ref |
-| v1.4 | **MoE batched**: confirm `moe_forward_ttnn_pattern_a_batched` handles `[B, 1, HIDDEN]` input without code change | per-slot output bit-identical to v0 B=1 ref |
-| v1.5 | Full forward at B=8 end-to-end | 8 distinct prompts; each slot's 16-token decode matches its standalone B=1 ref |
+| v1.0 | `setup_cb_state(B=8)` allocates B-leading caches | ✅ BIT-VALIDATED 3/3 (`ec01052`) |
+| v1.1 | Embed + RoPE batched | ✅ BIT-VALIDATED 4/4 (`cf211a4`) |
+| v1.2 | DN layer batched (manual recurrence) | ✅ BIT-VALIDATED cos=1.0 mad=0.0 (`4546d29`) |
+| v1.3 | GatedAttention batched (paged SDPA over per-slot KV) | ⏳ NEXT |
+| v1.4 | MoE batched (Pattern A verify) | ⏳ |
+| v1.5 | Full forward at B=8 end-to-end | ⏳ |
 
 **Reuse map** (audit before writing anything):
 - 27B's `server_tp_cb.deltanet_step_batched` is the template. Need to
@@ -126,19 +126,37 @@ v1 introduces actual per-slot work. This is the bulk of the project.
   already broadcasts. v1.4 is "verify it works with `[B, 1, HIDDEN]`
   input" — should be free; just need to make sure topk routes per-slot.
 
-**Risks**:
-- Per-slot `cur_pos` in paged SDPA: each slot's KV write goes to its own
-  block; the paged kernel needs `cur_pos_tensor` of shape `[B]`. Verify
-  `paged_update_cache` API takes this.
-- MoE per-slot top-k: each slot independently routes to top-8 experts.
-  Pattern A's post-compute mask is per-(B, E) — make sure the
-  routing-mask construction is per-slot.
-- Memory budget at B=8: KV cache grows linearly with B; verify within
-  L1 + DRAM budget (research §6).
+**Lessons learned from v1.0–v1.2** (bake into v1.3+):
+- `cb_reset_states` MUST `ttnn.deallocate` old per-layer caches BEFORE
+  reset (else fragmentation + garbage matmul outputs — v0 bug, generalized
+  in `[[ttnn-list-rebinding-leaks]]`).
+- `setup_cb_state` MUST `ttnn.deallocate` on B-change re-setup (B=4→B=1
+  leaks B>1 caches; aliases are NOT deallocatable).
+- ttnn.rms_norm on bf16 has shape-dependent accumulation drift. Use
+  rank-3 `[B, N, D]` shapes, never fold to `[B*N, D]`. Same likely true
+  for ttnn.sigmoid/silu reductions but unverified
+  (`[[ttnn-rms-norm-shape-drift]]`).
+- Intermediate-readback pattern (capture chip-0 view at each stage,
+  diff vs B=1 reference) localizes shape-drift bugs in minutes.
+
+**v1.3 specific risks**:
+- RoPE: cos/sin become `[B, ROTARY_DIM]` per chip. base's K-broadcast
+  workaround (concat K to NQ rows, rope, slice row 0) relies on cos/sin
+  being scalar per step — needs revisiting at B>1 since each slot has
+  different cos/sin. Likely fix: keep K as `[B, 1, HEAD_DIM]`, broadcast
+  cos to `[B, 1, ROTARY_DIM]`, apply rope rank-3.
+- Per-slot `cur_pos` in paged SDPA: `paged_update_cache` and
+  `paged_scaled_dot_product_attention_decode` both take
+  `cur_pos_tensor=cb_cur_pos_buf` (shape `[B]`) per the 27B audit.
+  Verified API supports this.
+- Per-slot Q-gate split (`attn_output_gate=True`): the per-head chunk
+  split (Q-side doubled, split into Q and gate) needs to broadcast over
+  B. Lift the rank-3 slicing pattern.
 
 **Harness-driven iteration**: each v1.x ships its own `cb35_v1_*` test
 in `experiments/cb/validate/`. The harness's dynamic-discovery means
-no harness restart between sub-stages.
+no harness restart between sub-stages. **Always clear `__pycache__`
+before retriggering after a deploy** — stale .pyc masks new imports.
 
 ### v2 — Trace capture at B=N (~1-2 days)
 

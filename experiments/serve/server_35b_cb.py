@@ -169,6 +169,9 @@ def setup_cb_state(state, B, blocks_per_seq=None):
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
         )
 
+    # B-sized paged config (write mem cfg + SDPA program config).
+    setup_cb_paged_cfgs(state)
+
     # Batched input buffers — same shape pattern for B=1 or B>1.
     state.cb_tok_buf = ttnn.from_torch(
         torch.zeros(B, 1, dtype=torch.int32), layout=ttnn.ROW_MAJOR_LAYOUT,
@@ -547,8 +550,173 @@ def cb_prefill_transplant(state, slot_s, L):
 
 
 # ----------------------------------------------------------------------------
-# setup_cb_write_mem_cfg — not needed for v0 (no paged_update_cache batching)
+# setup_cb_paged_cfgs — B-sized HEIGHT_SHARDED L1 mem cfg for paged KV writes
 # ----------------------------------------------------------------------------
-def setup_cb_write_mem_cfg(state):
-    """No-op for v0; v1 paged_update_cache batching will need this."""
-    pass
+def setup_cb_paged_cfgs(state):
+    """Build the B-core HEIGHT_SHARDED L1 mem config used as input to
+    paged_update_cache, plus the B-tile SDPA program config.
+
+    At B=1: reuses state.paged_write_mem_cfg / state.paged_sdpa_progcfg
+    (already configured for single-stream by base.bootstrap).
+    """
+    B = state.cb_B
+    if B == 1:
+        state.cb_write_mem_cfg = state.paged_write_mem_cfg
+        state.cb_sdpa_progcfg = state.paged_sdpa_progcfg
+        return
+    SDPA_TILE_HEIGHT = 32
+    grid = state.mesh.compute_with_storage_grid_size()
+    shard_grid = ttnn.num_cores_to_corerangeset(B, grid, row_wise=True)
+    shard_spec = ttnn.ShardSpec(
+        shard_grid, [SDPA_TILE_HEIGHT, HEAD_DIM_ATTN],
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    state.cb_write_mem_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec,
+    )
+    state.cb_sdpa_progcfg = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
+        q_chunk_size=0, k_chunk_size=0,
+        exp_approx_mode=False,
+    )
+
+
+def _apply_partial_rope_b(x_3d, cos_b, sin_b, n_heads, B):
+    """Rank-3 partial RoPE. x_3d: [B, n_heads, HEAD_DIM_ATTN];
+    cos_b / sin_b: [B, 1, ROTARY_DIM]. Same math as base._apply_partial_rope
+    but with leading B dim throughout (avoids the rank-2 slice/concat bug
+    on single rows — [[qwen36-attn-rope-single-row-ttnn-bug]]).
+    """
+    x_rot = ttnn.slice(x_3d, [0, 0, 0], [B, n_heads, ROTARY_DIM])
+    x_pass = ttnn.slice(x_3d, [0, 0, ROTARY_DIM], [B, n_heads, HEAD_DIM_ATTN])
+    half = ROTARY_DIM // 2
+    x1 = ttnn.slice(x_rot, [0, 0, 0], [B, n_heads, half])
+    x2 = ttnn.slice(x_rot, [0, 0, half], [B, n_heads, ROTARY_DIM])
+    neg_x2 = ttnn.neg(x2)
+    ttnn.deallocate(x2)
+    rotated = ttnn.concat([neg_x2, x1], dim=-1)
+    ttnn.deallocate(neg_x2); ttnn.deallocate(x1)
+    x_rot_cos = ttnn.mul(x_rot, cos_b)
+    rotated_sin = ttnn.mul(rotated, sin_b)
+    ttnn.deallocate(x_rot); ttnn.deallocate(rotated)
+    x_rot_embed = ttnn.add(x_rot_cos, rotated_sin)
+    ttnn.deallocate(x_rot_cos); ttnn.deallocate(rotated_sin)
+    x_embed = ttnn.concat([x_rot_embed, x_pass], dim=-1)
+    ttnn.deallocate(x_rot_embed); ttnn.deallocate(x_pass)
+    return x_embed
+
+
+def attn_step_batched_35b(state, h_tt, w, cb_kv_layer, cos_tt, sin_tt):
+    """Batched 35B GatedAttention block via paged SDPA decode.
+
+    h_tt: [B, 1, HIDDEN] or [B, HIDDEN] per chip.
+    cos_tt / sin_tt: [B, ROTARY_DIM] per chip (from _batched_prelude).
+    cb_kv_layer = {"kc":[B*NUM_BLOCKS, NCHIPS, BLOCK_SIZE, HEAD_DIM_ATTN],
+                   "vc":[...]} (sharded on dim=1, per-chip view [B*NB, 1, BLOCK, HEAD]).
+    Reads per-slot cur_pos from state.cb_cur_pos_buf, page table from
+    state.cb_page_table_tt (B=1: state.page_table_tt).
+
+    Returns out [B, HIDDEN] replicated. Mutates kc/vc in place.
+    """
+    B = state.cb_B
+    mesh = state.mesh
+    kc = cb_kv_layer["kc"]
+    vc = cb_kv_layer["vc"]
+
+    # Choose per-slot or single-stream paged config buffers.
+    cur_pos_buf = state.cb_cur_pos_buf if B > 1 else state.cur_pos_buf
+    page_table_tt = state.cb_page_table_tt if B > 1 else state.page_table_tt
+    write_mem_cfg = state.cb_write_mem_cfg
+    sdpa_progcfg = state.cb_sdpa_progcfg
+
+    # ── Q/K/V projections (per-chip head shards) ───────────────────────
+    q_full = ttnn.matmul(h_tt, w["q_proj"], compute_kernel_config=base.HIFI4)
+    k = ttnn.matmul(h_tt, w["k_proj"], compute_kernel_config=base.HIFI4)
+    v = ttnn.matmul(h_tt, w["v_proj"], compute_kernel_config=base.HIFI4)
+
+    # ── Split Q + gate per head ────────────────────────────────────────
+    # q_full per chip: [B, 1, NQ_PER_CHIP * HEAD_DIM_ATTN * 2] (gate-doubled).
+    # Reshape to [B, NQ_PER_CHIP, HEAD_DIM_ATTN * 2] then slice Q and gate halves.
+    q_full_3d = ttnn.reshape(q_full, [B, NQ_PER_CHIP, HEAD_DIM_ATTN * 2])
+    ttnn.deallocate(q_full)
+    q_h = ttnn.slice(q_full_3d, [0, 0, 0], [B, NQ_PER_CHIP, HEAD_DIM_ATTN])
+    gate_per_head = ttnn.slice(q_full_3d, [0, 0, HEAD_DIM_ATTN],
+                                [B, NQ_PER_CHIP, HEAD_DIM_ATTN * 2])
+    ttnn.deallocate(q_full_3d)
+    # Flatten gate to [B, NQ_PER_CHIP * HEAD_DIM_ATTN] for the post-SDPA mul.
+    gate_part = ttnn.reshape(gate_per_head, [B, NQ_PER_CHIP * HEAD_DIM_ATTN])
+    ttnn.deallocate(gate_per_head)
+
+    # ── Q/K rms_norm — keep rank-3 (lesson from v1.2) ───────────────────
+    k_h = ttnn.reshape(k, [B, 1, HEAD_DIM_ATTN])  # 1 KV head per chip
+    ttnn.deallocate(k)
+    q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=base.EPS)
+    k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=base.EPS)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+
+    # ── RoPE: rank-3 helper sidesteps the rank-2 single-row slice bug ──
+    cos_b = ttnn.reshape(cos_tt, [B, 1, ROTARY_DIM])
+    sin_b = ttnn.reshape(sin_tt, [B, 1, ROTARY_DIM])
+    q_n_rope = _apply_partial_rope_b(q_n, cos_b, sin_b, NQ_PER_CHIP, B)
+    ttnn.deallocate(q_n)
+    k_n_rope = _apply_partial_rope_b(k_n, cos_b, sin_b, 1, B)
+    ttnn.deallocate(k_n)
+    ttnn.deallocate(cos_b); ttnn.deallocate(sin_b)
+
+    # ── V reshape (per-chip 1 KV head) ──────────────────────────────────
+    v_h = ttnn.reshape(v, [B, 1, HEAD_DIM_ATTN])
+    ttnn.deallocate(v)
+
+    # ── Paged KV write at slot's own cur_pos ───────────────────────────
+    # Per-chip write tensor: [1, B, 1, HEAD_DIM_ATTN] padded on dim -2 to
+    # SDPA_BLOCK_SIZE then HEIGHT_SHARDED across B cores.
+    SDPA_TILE_H = state.sdpa_block_size
+    def _shard_for_paged_write(t_3d):
+        # t_3d: [B, 1, HEAD_DIM_ATTN]
+        t4 = ttnn.reshape(t_3d, [1, B, 1, HEAD_DIM_ATTN])
+        t_pad = ttnn.pad(t4, [[0, 0], [0, 0], [0, SDPA_TILE_H - 1], [0, 0]],
+                         value=0.0)
+        return ttnn.to_memory_config(t_pad, write_mem_cfg)
+    k_sharded = _shard_for_paged_write(k_n_rope)
+    v_sharded = _shard_for_paged_write(v_h)
+    ttnn.deallocate(k_n_rope); ttnn.deallocate(v_h)
+    ttnn.experimental.paged_update_cache(
+        kc, k_sharded,
+        update_idxs_tensor=cur_pos_buf,
+        page_table=page_table_tt,
+    )
+    ttnn.experimental.paged_update_cache(
+        vc, v_sharded,
+        update_idxs_tensor=cur_pos_buf,
+        page_table=page_table_tt,
+    )
+    ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
+
+    # ── Paged SDPA decode ──────────────────────────────────────────────
+    # Q shape [1, B, NQ_PER_CHIP, HEAD_DIM] per chip per 27B convention.
+    q_for_sdpa = ttnn.reshape(q_n_rope, [1, B, NQ_PER_CHIP, HEAD_DIM_ATTN])
+    ttnn.deallocate(q_n_rope)
+    attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+        q_for_sdpa, kc, vc,
+        cur_pos_tensor=cur_pos_buf,
+        page_table_tensor=page_table_tt,
+        scale=1.0 / (HEAD_DIM_ATTN ** 0.5),
+        program_config=sdpa_progcfg,
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+    )  # [1, B, NQ_PER_CHIP, HEAD_DIM] per chip
+    ttnn.deallocate(q_for_sdpa)
+    attn_flat = ttnn.reshape(attn_out, [B, NQ_PER_CHIP * HEAD_DIM_ATTN])
+    ttnn.deallocate(attn_out)
+
+    # ── attn_output_gate: attn_out * sigmoid(gate) ─────────────────────
+    gate_sig = ttnn.sigmoid(gate_part)
+    ttnn.deallocate(gate_part)
+    gated = ttnn.mul(attn_flat, gate_sig)
+    ttnn.deallocate(attn_flat); ttnn.deallocate(gate_sig)
+
+    # ── o_proj column-sharded + all_reduce ─────────────────────────────
+    partial = ttnn.matmul(gated, w["o_proj"], compute_kernel_config=base.HIFI4)
+    ttnn.deallocate(gated)
+    out = base.all_reduce_tt(partial, mesh)
+    ttnn.deallocate(partial)
+    return out
