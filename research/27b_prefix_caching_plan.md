@@ -286,7 +286,7 @@ chunked SDPA). Track as T3-multi-chunk-revisit.
 
 ## P5 smoke gate findings (2026-06-01, in progress)
 
-First two smoke runs against qb1 wedged the server after turn 1 completed.
+First three smoke runs hit a chain of compatibility bugs:
 
 - Bug 1 (FIXED `4acc955`): per-request `max_tokens` cap triggers
   `engine._stream → sched.cancel()`, NOT `_finish()` → `mark_live` was never
@@ -294,17 +294,22 @@ First two smoke runs against qb1 wedged the server after turn 1 completed.
 - Bug 2 (FIXED `184f00e`): pre-existing — stripping trailing EOS from
   cached `tokens_so_far` mismatches the chat template's between-turns
   `<|im_end|>` on the next turn's prompt.
-- Bug 3 (IN PROGRESS): server still wedges after turn 1 + 2 in chunked-
-  prefill-on (`TT_CB_CHUNKED_PREFILL=1`) + prefix-cache-on mode.
-  Hypothesis: the L>chunk_size legacy fallback in `_step_prefill_chunked`
-  (`forward_prefill_chunked_tp`, eager) allocates device buffers AFTER the
-  decode + prefill traces are captured. The "Allocating device buffers is
-  unsafe due to the existence of an active trace" warning at runtime is the
-  smoking gun. Pre-prefix-cache, this likely also misbehaved (user reported
-  "turn-2 stalled briefly"); with prefix caching, turn 2 should never go
-  through this eager path (cache hit → suffix advance via decode trace).
-  Testing isolation by running with `TT_CB_CHUNKED_PREFILL=0` to bypass the
-  eager fallback entirely.
+- Bug 3 (WORKAROUND): with `TT_CB_CHUNKED_PREFILL=1`, the L>chunk_size eager
+  fallback (`forward_prefill_chunked_tp`) wedges the server after a couple
+  of requests. Symptom: "Allocating device buffers is unsafe due to the
+  existence of an active trace" at runtime; eager allocations collide with
+  reserved trace memory. **Workaround**: run with `TT_CB_CHUNKED_PREFILL=0`
+  + `TT_CB_PREFIX_CACHE=1`. Without chunked prefill we never hit the eager
+  path; with prefix caching, turn 2+ skips prefill entirely via the cache.
+- Bug 4 (FIXED `c55b6f7`): Qwen3.6's chat template injects an empty
+  `<think>\n\n</think>\n\n` block at the active assistant prompt (with
+  `enable_thinking=False`), but does NOT render it for past assistant
+  messages. Turn 1's prompt has the markers; turn 2's tokenization of the
+  same conversation doesn't → longest-prefix match collapses from 246 to 44.
+  Validated via `experiments/cb/isolate/chat_template_roundtrip.py` —
+  44/246 → **244/244 match** after fix. Fix: `_messages_to_prompt` now
+  passes `enable_thinking=False` AND strips the literal `<think>\n\n</think>\n\n`
+  block from the resulting prompt string.
 
 ## Recommended runtime config (current understanding)
 
