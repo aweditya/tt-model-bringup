@@ -80,8 +80,13 @@ Load-bearing fixes from the smoke debug chain:
 - `_messages_to_prompt`: `preserve_thinking=True` + trailing-only `<think>` strip — `2cad663`
 
 Plan + per-milestone status: [`research/27b_prefix_caching_plan.md`](research/27b_prefix_caching_plan.md).
-Research: [`research/vllm_prefix_caching_audit.md`](research/vllm_prefix_caching_audit.md).
-Memory: [[prefix-caching-design]].
+Research:
+- [`research/vllm_prefix_caching_audit.md`](research/vllm_prefix_caching_audit.md) — APC design
+- [`research/vllm_chat_template_handling.md`](research/vllm_chat_template_handling.md) — Qwen3.6 quirks + upstream-blessed `preserve_thinking` fix
+
+Regression gate: `experiments/cb/isolate/chat_template_invariant.py`
+(7 cases including 239/239 long-prompt, unicode, 3-turn compound).
+Memory: [[prefix-caching-design]], [[qwen36-preserve-thinking]].
 
 **S2 — chunked prefill — LIVE in production (2026-06-01).** CB serves with
 `TT_CB_CHUNKED_PREFILL=1`: traced chunked prefill at chunk_size=32 for L ≤ 32,

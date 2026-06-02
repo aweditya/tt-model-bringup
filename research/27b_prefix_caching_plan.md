@@ -71,6 +71,7 @@ Identical to vLLM's APC:
 | P4 | Decode-suffix advance before generation | **Subsumed by P3** — existing PREFILL loop handles it | ✅ DONE | (this commit) |
 | P5 | Production wire-up + env gate | qb1 smoke: **turn 1 5.33s → turn 2 2.73s, 1.96× speedup, 1 cache hit, 0 misses on turn 2** | ✅ DONE | `2cad663` |
 | P6 | TTL + `/metrics` counters | `cb_prefix_cache_*` counters + gauge visible in `/metrics`; 300s TTL sweep in engine loop | ✅ DONE | `fdf3c57` |
+| PC-followup | 3-turn round-trip invariant test | 7/7 cases (5 must-pass + 2 known-gap informational) including long-system-prompt 239/239 and unicode | ✅ DONE | (this commit) |
 
 ## P0 — Design contracts
 
@@ -317,6 +318,26 @@ First three smoke runs hit a chain of compatibility bugs:
 TTFT is slower (1-tok/iter through decode trace) but turn-2+ TTFT is much
 faster (cache hit + suffix advance). Net win for any conversation with ≥2
 turns, which is the dominant chat case.
+
+## Regression gate
+
+`experiments/cb/isolate/chat_template_invariant.py` — pure-tokenizer test
+asserting `tokenize(render(messages_N)) + gen_N == tokenize(render(messages_{N+1}))[:len(cached)]`
+across 7 scenarios:
+
+| Case | Result |
+|---|---|
+| 2-turn empty `<think></think>` (smoke scenario) | 32/32 ✓ |
+| 2-turn non-empty thinking trace | 45/45 ✓ |
+| 3-turn compound (cached_1⊂turn_2, cached_2⊂turn_3) | 31/31, 56/56 ✓ |
+| Long system prompt (~239 prefix tokens) | 239/239 ✓ |
+| Unicode (Japanese) round-trip | 38/38 ✓ |
+| Response without `<think>` markers | KNOWN GAP (informational) |
+| Tool-call message | KNOWN GAP (rolling-checkpoint override) |
+
+Run pre-deploy when touching `_messages_to_prompt`, the chat template, or
+the tokenizer version. Catches regressions before they cause silent
+cache-miss perf cliffs in prod.
 
 ## Risks + things to keep an eye on
 
