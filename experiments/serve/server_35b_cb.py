@@ -108,7 +108,26 @@ def setup_cb_state(state, B, blocks_per_seq=None):
 # ----------------------------------------------------------------------------
 def cb_reset_states(state):
     """Reset ALL slot's DN + KV state to zero. At B=1: re-runs the
-    single-stream allocator, which zeros everything."""
+    single-stream allocator, which zeros everything.
+
+    base.reset_caches_ttnn() just REPLACES the list, it doesn't deallocate
+    the old per-layer tensors — those leak. Over many resets in a long-lived
+    harness, the allocator fragments and subsequent matmul output lands in
+    stale memory → forward returns garbage. Explicitly deallocate first.
+    """
+    if state.dn_caches_tt is not None:
+        for entry in state.dn_caches_tt:
+            if entry is not None:
+                cs, rs = entry
+                ttnn.deallocate(cs)
+                ttnn.deallocate(rs)
+    if state.kv_caches_tt is not None:
+        for entry in state.kv_caches_tt:
+            if entry is not None:
+                kc, vc = entry
+                ttnn.deallocate(kc)
+                ttnn.deallocate(vc)
+
     state.reset_caches_ttnn()
     # Re-alias after reset since reset_caches_ttnn re-allocates.
     cfg = state.text_cfg
@@ -161,81 +180,32 @@ def update_input_buffers_batched(state, token_ids, cur_positions):
 def forward_batch_tp_inner(state, return_logits=False, return_topk=None):
     """One batched forward step. v0: B=1.
 
-    Mirrors base.step_forward_inner's body (server_35b_ttnn.py:1602) but
-    routes the final op based on the requested return mode (instead of
-    base's hardcoded sampler_topk check). At B=1 this is functionally
-    identical to step_forward_inner.
+    Delegates to base.step_forward_inner — at B=1 we ARE the single-stream
+    path. base reads state.sampler_topk to choose between argmax-mode and
+    topk-mode internally; we set it transiently around the call.
 
-    Returns shape per cb_scheduler convention:
-      - return_logits=False, return_topk=None: argmax_tt UINT32 [1, 1]
-      - return_logits=True:                    logits tensor [1, VOCAB]
-      - return_topk=K:                         (values [1, K], indices [1, K])
+    return_logits is NOT supported by base; v0 routes it to topk K=64 and
+    raises (cb_engine's logits-mode shouldn't be used for 35B — see
+    TT_CB_TOPK_K=64 default in cb_api).
+
+    Returns:
+      - return_topk=K:   (top_vals [1, K], top_idxs [1, K])
+      - default:         argmax_tt UINT32 [1, 1]
     """
     if state.cb_B != 1:
         raise NotImplementedError("v0 supports B=1 only")
 
-    # ── Same prelude as step_forward_inner (embed + RoPE rows). ────────
-    embed_out = ttnn.embedding(state.tok_buf, state.embed_tt)
-    h_tt = ttnn.to_layout(embed_out, ttnn.TILE_LAYOUT)
-    ttnn.deallocate(embed_out)
-
-    cos_row = ttnn.embedding(state.rot_idxs_buf, state.cos_table_tt)
-    sin_row = ttnn.embedding(state.rot_idxs_buf, state.sin_table_tt)
-    cos_tt = ttnn.to_layout(cos_row, ttnn.TILE_LAYOUT)
-    sin_tt = ttnn.to_layout(sin_row, ttnn.TILE_LAYOUT)
-    ttnn.deallocate(cos_row); ttnn.deallocate(sin_row)
-    cos_tt = ttnn.reshape(cos_tt, [1, ROTARY_DIM])
-    sin_tt = ttnn.reshape(sin_tt, [1, ROTARY_DIM])
-
-    # ── Layer chain (same as base.step_forward_inner lines 1627-1656). ─
-    n = state.text_cfg.num_hidden_layers
-    for L in range(n):
-        lt = state.layer_types[L]
-        h_new, new_dn, new_kv = base.layer_forward_ttnn(
-            h_tt, state.per_layer_tt[L], lt, state.mesh,
-            cos_tt, sin_tt, state.dn_caches_tt[L], state.kv_caches_tt[L],
-            sub_capture=None, state=state,
-        )
-        ttnn.deallocate(h_tt)
-        h_tt = h_new
-        if new_dn is not None:
-            old_conv, old_rec = state.dn_caches_tt[L]
-            new_conv, new_rec = new_dn
-            if new_conv is not old_conv:
-                ttnn.deallocate(old_conv)
-            if new_rec is not old_rec:
-                ttnn.deallocate(old_rec)
-            state.dn_caches_tt[L] = new_dn
-        if new_kv is not None:
-            state.kv_caches_tt[L] = new_kv
-
-    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
-
-    # ── Final norm + LM head. ──────────────────────────────────────────
-    h_norm = ttnn.rms_norm(h_tt, weight=state.final_norm_tt, epsilon=base.EPS)
-    ttnn.deallocate(h_tt)
-    logits = ttnn.matmul(h_norm, state.lm_head_tt, compute_kernel_config=base.HIFI4)
-    ttnn.deallocate(h_norm)
-
-    # ── Final op: branch on requested mode. ────────────────────────────
-    if return_topk is not None:
-        top_vals, top_idxs = ttnn.topk(logits, k=int(return_topk), dim=-1)
-        ttnn.deallocate(logits)
-        return (top_vals, top_idxs)
-
     if return_logits:
-        # Return TILE-layout logits directly. ttnn.to_torch handles the
-        # TILE→ROW_MAJOR conversion at readback time, in one shot. The
-        # untilize/to_layout intermediate ops were producing host-unreadable
-        # output (kernel reads it fine; host sees partial data).
-        return logits
+        raise NotImplementedError(
+            "v0 doesn't support return_logits — 35B's [1, VOCAB] bulk readback "
+            "is broken (issue #149). Use topk-mode (TT_CB_TOPK_K>0).")
 
-    # Default: on-device argmax (greedy). Identical to base.step_forward_inner.
-    rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-    ttnn.deallocate(logits)
-    argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
-    ttnn.deallocate(rm)
-    return argmax_tt
+    saved_topk = getattr(state, "sampler_topk", 0)
+    try:
+        state.sampler_topk = int(return_topk) if return_topk is not None else 0
+        return base.step_forward_inner(state)
+    finally:
+        state.sampler_topk = saved_topk
 
 
 # ----------------------------------------------------------------------------

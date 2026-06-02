@@ -119,33 +119,22 @@ def main(state=None) -> int:
     else:
         log(f"  ✓ PASS")
 
-    # ── Case 2: logits mode (KNOWN ISSUE — informational only) ──────────
-    # On-device argmax + topk kernels read the logits CORRECTLY (cases 1+3
-    # pass), but ttnn.to_torch on the full [1, 248320] bf16 logits tensor
-    # returns garbage that varies per run (82530, 1099, 198294 observed —
-    # different each bootstrap). The on-device argmax of the SAME tensor
-    # finds the right answer. Suspected ttnn bulk-readback bug for 35B's
-    # shape. Not blocking for v0 — cb_engine can use topk-mode (TT_CB_TOPK_K>0).
-    log("[cb35-v0-smoke] case 2: logits return_logits=True (KNOWN ISSUE)")
+    # ── Case 2: logits mode (NOT SUPPORTED IN v0) ───────────────────────
+    # v0 doesn't implement return_logits — 35B's [1, VOCAB] bulk readback
+    # via ttnn.to_torch is broken (different garbage per run; on-device
+    # argmax/topk find the right answer). cb_engine routes 35B through
+    # topk-mode (TT_CB_TOPK_K=64) which is reliable. We just check the
+    # NotImplementedError contract.
+    log("[cb35-v0-smoke] case 2: return_logits=True — expect NotImplementedError")
     cb.cb_reset_states(state)
     feed(state, PROMPT_TOK, 0)
-    logits_tt = cb.forward_batch_tp_inner(state, return_logits=True)
-    # On-device argmax of the same logits — should match base, proves the
-    # logits values themselves are correct, only host readback is broken.
-    am_of_logits_tt = ttnn.argmax(logits_tt, dim=-1, keepdim=True, use_multicore=True)
-    am_of_logits = host_int_from_argmax(state, am_of_logits_tt)
-    ttnn.deallocate(am_of_logits_tt)
-    log(f"  on-device argmax of returned-logits = {am_of_logits} (expect {am_base})")
-    # Host readback for informational comparison only.
-    logits_np = host_logits_from(state, logits_tt, base_argmax=am_base)
-    ttnn.deallocate(logits_tt)
-    am_from_host = int(np.argmax(logits_np))
-    log(f"  argmax(host logits)  = {am_from_host} ← garbage from ttnn.to_torch bulk readback")
-    if am_of_logits == am_base:
-        log(f"  ⚠ on-device argmax matches base → logits ARE correct; bulk readback bug")
-    else:
-        log(f"  ✗ FAIL: even on-device argmax disagrees with base — forward is wrong")
+    try:
+        logits_tt = cb.forward_batch_tp_inner(state, return_logits=True)
+        ttnn.deallocate(logits_tt)
+        log(f"  ✗ FAIL: return_logits=True should raise NotImplementedError")
         fails += 1
+    except NotImplementedError as e:
+        log(f"  ✓ PASS: raised NotImplementedError ({str(e)[:60]}…)")
 
     # ── Case 3: topk mode (K=8) → top-1 index match ─────────────────────
     log("[cb35-v0-smoke] case 3: topk K=8; top-1 idx match")
