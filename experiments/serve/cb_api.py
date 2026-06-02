@@ -43,7 +43,20 @@ sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 os.environ.setdefault("TT_OPENAI_BUILD_APP", "0")
 from openai_endpoint import _chat_chunk, _chat_completion, _messages_to_prompt  # noqa: E402
 
-DEFAULT_MODEL_ID = os.environ.get("TT_MODEL_ID", "Qwen/Qwen3.6-27B")
+# MM1 (2026-06-02): TT_BACKEND selects which server module to import. Each
+# backend exposes the same shape (`MeshServerState` / `State` + `bootstrap(state)`
+# + `forward_token_tp_inner(state)` / `forward_batch_tp_inner(state)`). Adding a
+# new backend = register it here + drop a `server_*.py` in this directory.
+BACKENDS = {
+    "27b":   ("server_tp",        "Qwen/Qwen3.6-27B"),
+    "35b":   ("server_35b_ttnn",  "Qwen/Qwen3.6-35B-A3B"),
+}
+TT_BACKEND = os.environ.get("TT_BACKEND", "27b")
+if TT_BACKEND not in BACKENDS:
+    raise ValueError(
+        f"unknown TT_BACKEND={TT_BACKEND!r}; valid backends: {sorted(BACKENDS)}")
+_BACKEND_MODULE, _BACKEND_DEFAULT_MODEL = BACKENDS[TT_BACKEND]
+DEFAULT_MODEL_ID = os.environ.get("TT_MODEL_ID", _BACKEND_DEFAULT_MODEL)
 
 
 def _build_sampling(body: dict) -> Optional[dict]:
@@ -188,8 +201,12 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None):
 def _build_app_with_default_lifespan():
     """uvicorn entry: bootstraps state + CBEngine(sampling=True) in lifespan;
     stops the engine on shutdown. Bootstrap is sync + slow (~350s on qb1) — runs
-    in the default executor so the event loop stays responsive."""
-    import server_tp as base
+    in the default executor so the event loop stays responsive.
+
+    The model backend is picked by TT_BACKEND (default 27b → server_tp). See
+    `BACKENDS` at module top for the registry."""
+    import importlib
+    base = importlib.import_module(_BACKEND_MODULE)
     from cb_engine import CBEngine
 
     state: dict = {}

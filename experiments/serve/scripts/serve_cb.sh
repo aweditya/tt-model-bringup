@@ -25,6 +25,9 @@
 #                            len(matched_prefix) and skip re-prefill of history.
 #                            Plan: research/27b_prefix_caching_plan.md.
 #   TT_CB_PREFIX_TTL_S=300   live-slot TTL: free slots untouched > N seconds.
+#   TT_BACKEND=27b           which model server module to load. Valid values
+#                            registered in cb_api.py:BACKENDS. Defaults to 27b
+#                            (server_tp.py); 35b loads server_35b_ttnn.py.
 set -u
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/tt-xla}"
@@ -71,6 +74,7 @@ cmd_start() {
     TT_CB_CHUNKED_PREFILL="${TT_CB_CHUNKED_PREFILL:-0}" \
     TT_CB_PREFIX_CACHE="${TT_CB_PREFIX_CACHE:-0}" \
     TT_CB_PREFIX_TTL_S="${TT_CB_PREFIX_TTL_S:-300}" \
+    TT_BACKEND="${TT_BACKEND:-27b}" \
     nohup setsid "$VENV_PY" -m uvicorn experiments.serve.cb_api:app \
         --host "$HOST_ADDR" --port "$PORT" --lifespan on \
         >> "$LOG_FILE" 2>&1 < /dev/null &
