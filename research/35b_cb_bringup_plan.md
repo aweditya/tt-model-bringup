@@ -212,6 +212,32 @@ is ~6-9 days and gives a working chat server with trace speedup.
   Qwen3.6-35B-A3B tokenizer (qb1 was offline at plan-write time;
   defer to next qb1 availability).
 
+## Dev iteration harness (2026-06-02)
+
+35B weight upload is ~14 min per bootstrap. To avoid paying that cost
+per code change, use `experiments/cb/dev/cb35_dev_harness.py` — a
+long-running python process on qb1 that bootstraps once, then watches
+`/tmp/cb35_trig/` for trigger files and runs the named test via
+`importlib.reload`.
+
+Workflow:
+```bash
+# one-time: launch harness on qb1 (14 min bootstrap, then idles)
+ssh qb1 'cd ~/tt-xla && nohup .venv/bin/python -u experiments/cb/dev/cb35_dev_harness.py > /tmp/cb35_harness.log 2>&1 < /dev/null & disown'
+
+# per iteration (locally):
+bash scripts/deploy.sh experiments/serve/server_35b_cb.py experiments/cb/validate/cb35_v0_smoke.py
+ssh qb1 'touch /tmp/cb35_trig/v0_smoke'
+ssh qb1 'cat /tmp/cb35_trig/last.log'   # ← test output, seconds latency
+```
+
+To register a new test, add to the `TESTS` dict at the top of the harness
+and make the test module expose `main(state=None)`.
+
+Special triggers:
+- `_reload` — importlib.reload `server_35b_cb` only (no test run)
+- `_exit` — graceful shutdown
+
 ## Known issue (CB35-1 v0 — non-blocking)
 
 **Logits bulk-readback on 35B returns garbage** (2026-06-02). When

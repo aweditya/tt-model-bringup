@@ -115,14 +115,22 @@ to match) after prefix caching ships.
    [`research/35b_cb_bringup_plan.md`](research/35b_cb_bringup_plan.md).
    Research basis: [`research/tt_metal_moe_cb_patterns.md`](research/tt_metal_moe_cb_patterns.md)
    (DeepSeek-V3 + Llama-70B-Galaxy patterns).
-   - v0 (B=1 over cb_scheduler): in flight. `experiments/serve/server_35b_cb.py`
-     wraps base.step_forward_inner with the CB-compatible API. Gate:
-     `experiments/cb/validate/cb35_v0_smoke.py` (3 cases: argmax, logits, topk).
+   - **v0 SHIPPED 2026-06-02** (commit `112d72a`). `experiments/serve/server_35b_cb.py`
+     wraps `base.step_forward_inner` at B=1. Smoke (`cb35_v0_smoke.py`):
+     2/3 cases pass (argmax + topk bit-equiv to base). Case 2 logits-mode
+     surfaced a 35B-specific ttnn bulk-readback bug (logits values correct
+     on-device; `ttnn.to_torch` returns garbage on `[1, 248320]` bf16).
+     Workaround: `cb_api.py` defaults `TT_CB_TOPK_K=64` when `TT_BACKEND=35b`.
+     Bug tracked in task #149.
    - v1 (true B>1 batched forward): next. ~3-5 days.
    - v2 (trace capture at B=N): ~1-2 days.
    - v3 (owned-GDN batched FOLD trick): optional.
    - v4 (prefix cache for attn layers only): LOW PRIORITY (vllm#36493 reports
      ~0.1% hit rate on this arch class — DN layers can't be cached).
+   - **Dev iteration harness** (`experiments/cb/dev/cb35_dev_harness.py`):
+     bootstrap-once long-running python on qb1, watches `/tmp/cb35_trig/`,
+     reloads via `importlib`. Cuts fix-test cycle from ~14 min to seconds.
+     See `research/35b_cb_bringup_plan.md` for usage.
 4. **Multi-model fleet** — plan: [`research/multi_model_serving_plan.md`](research/multi_model_serving_plan.md).
    Once 35B is live, MM5 (Mistral Small 3.2 24B) is the strongest
    framework-generalization test (different vendor, different tokenizer,

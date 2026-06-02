@@ -80,13 +80,19 @@ def feed(state, tok_id: int, cur_pos: int):
     cb.update_input_buffers_batched(state, [tok_id], [cur_pos])
 
 
-def main() -> int:
-    log("[cb35-v0-smoke] bootstrapping 35B base state (~6 min on qb1)…")
-    state = base.State()
-    base.bootstrap(state, log)
+def main(state=None) -> int:
+    if state is None:
+        log("[cb35-v0-smoke] bootstrapping 35B base state (~14 min on qb1)…")
+        state = base.State()
+        base.bootstrap(state, log)
+    else:
+        log("[cb35-v0-smoke] using pre-bootstrapped state from harness")
 
-    log("[cb35-v0-smoke] setup_cb_state(B=1)…")
-    cb.setup_cb_state(state, B=1)
+    if not hasattr(state, "cb_B"):
+        log("[cb35-v0-smoke] setup_cb_state(B=1)…")
+        cb.setup_cb_state(state, B=1)
+    else:
+        log(f"[cb35-v0-smoke] cb_state already set up (B={state.cb_B})")
 
     # Pick a fixed prompt token to feed at pos 0; record the argmax via base.
     PROMPT_TOK = 100  # arbitrary
