@@ -70,12 +70,34 @@ def setup_cb_state(state, B, blocks_per_seq=None):
     """
     cfg = state.text_cfg
     mesh = state.mesh
+    prev_B = getattr(state, "cb_B", None)
     state.cb_B = B
 
     # base.bootstrap doesn't call reset_caches_ttnn (the single-stream
     # main() does). Call it here so per-layer caches exist for v0 alias path.
     if state.dn_caches_tt is None or state.kv_caches_tt is None:
         state.reset_caches_ttnn()
+
+    # Repeat setup_cb_state calls (e.g., changing B between test runs in the
+    # dev harness): free anything we previously allocated.
+    if prev_B is not None and prev_B > 1:
+        # B>1 cb_dn/cb_kv are NEW allocations (not aliases). Free them.
+        # B=1 cb_dn/cb_kv share storage with state.dn_caches_tt and must NOT
+        # be freed here (base path still uses them).
+        for d in getattr(state, "cb_dn", {}).values():
+            ttnn.deallocate(d["cs"])
+            ttnn.deallocate(d["rs"])
+        for d in getattr(state, "cb_kv", {}).values():
+            ttnn.deallocate(d["kc"])
+            ttnn.deallocate(d["vc"])
+        if getattr(state, "cb_page_table_tt", None) is not None:
+            ttnn.deallocate(state.cb_page_table_tt)
+    # Input buffers are allocated unconditionally below — always free old ones.
+    if prev_B is not None:
+        for name in ("cb_tok_buf", "cb_cur_pos_buf", "cb_rot_idxs_buf"):
+            old = getattr(state, name, None)
+            if old is not None:
+                ttnn.deallocate(old)
 
     state.cb_dn = {}
     state.cb_kv = {}
