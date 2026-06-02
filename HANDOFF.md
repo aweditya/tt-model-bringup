@@ -123,21 +123,25 @@ to match) after prefix caching ships.
    [`research/35b_cb_bringup_plan.md`](research/35b_cb_bringup_plan.md).
    Research basis: [`research/tt_metal_moe_cb_patterns.md`](research/tt_metal_moe_cb_patterns.md)
    (DeepSeek-V3 + Llama-70B-Galaxy patterns).
-   - **v0 BIT-VALIDATED 2026-06-02** (commits `112d72a`, `49778b3`).
-     `experiments/serve/server_35b_cb.py` delegates to `base.step_forward_inner`
-     at B=1 (set `state.sampler_topk` to switch argmax↔topk modes).
-     - `cb35_v0_smoke.py` (3/3 PASS): argmax bit-equiv (8=8), return_logits
-       raises (35B logits readback broken, #149), topk[0]=8 matches argmax.
-     - `cb35_v0_chat.py` (PASS): 8-token decode `[271]×8` bit-identical
-       base vs cb (multi-step state evolution validated).
-     - Root cause fix: `base.reset_caches_ttnn()` rebinds the list but
-       doesn't deallocate the prior per-layer (cs, rs) / (kc, vc) tensors.
-       In long-lived processes (the dev harness, real cb_engine sessions)
-       leaks fragment the allocator → matmul writes land in stale memory
-       → forward returns garbage. `cb_reset_states` now explicitly
-       deallocates first.
-     - `return_logits=True` raises `NotImplementedError`; cb_engine routes
-       35B through topk-mode via `TT_CB_TOPK_K=64` default in `cb_api.py`.
+   - **v0 BIT-VALIDATED 2026-06-02** (commits `112d72a`, `49778b3`):
+     `cb35_v0_smoke` 3/3 + `cb35_v0_chat` (8-tok decode bit-identical).
+     Critical fix: `base.reset_caches_ttnn` leaks per-layer tensors;
+     `cb_reset_states` explicit-deallocs first.
+     `return_logits=True` raises (35B [1,VOCAB] readback broken, #149).
+     cb_engine routes 35B through topk via `TT_CB_TOPK_K=64`.
+   - **v1.0 alloc + v1.1 embed/RoPE BIT-VALIDATED 2026-06-02** (commits
+     `ec01052`, `cf211a4`). `setup_cb_state(B>1)` allocates B-leading
+     `cb_dn`/`cb_kv` + per-slot `cb_page_table_tt`. `_batched_prelude`
+     reads `cb_tok_buf` / `cb_rot_idxs_buf`. Gate: 3/3 alloc + 4/4 prelude.
+   - **v1.2 batched DN BIT-VALIDATED 2026-06-02** (commit `4546d29`).
+     `dn_step_batched_35b` bit-identical to `base.dn_forward_ttnn` at
+     B=1 (cos=1.0, mad=0.0) and B=2 slot 0 (cos=1.0, mad=0.0). Per-slot
+     independence verified.
+     Gotcha discovered: ttnn.rms_norm on bf16 has shape-dependent
+     accumulation drift — `[B, N, D]` rank-3 input vs `[B*N, D]` 2D fold
+     give different bf16 results. The drift amplifies disproportionately
+     through matmul + all_reduce. Keep rank-3 (memory:
+     [[ttnn-rms-norm-shape-drift]]).
    - v1 (true B>1 batched forward): next. ~3-5 days.
    - v2 (trace capture at B=N): ~1-2 days.
    - v3 (owned-GDN batched FOLD trick): optional.
