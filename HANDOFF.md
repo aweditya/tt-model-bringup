@@ -3,24 +3,27 @@
 What this project is, where the perf is now, what to run, and what is next.
 Read top to bottom; everything else is linked.
 
-## Live session state (2026-06-02 evening, may be compaction-fresh)
+## Live session state (2026-06-02 late evening)
 
-- **35B HTTP server on qb1 is bootstrapping** — last fresh launch pid 186787
-  via `serve_cb.sh start` with `TT_BACKEND=35b TT_CB_SLOTS=2 TT_CB_TOPK_K=64`.
-  Tail `~/tt-xla/.cache/server_cb.bootstrap.log` over ssh for live progress.
-- **Bootstrap hangs at "enumerate shards"** in every recent attempt — the
-  same 35B bootstrap function runs in ~14 min under the dev harness but
-  appears stuck under uvicorn lifespan. Side-file confirms no progress.
-  Suspected cause: ttnn op behavior inside the asyncio executor thread.
-  v0/v1/v2 device primitives + `cb35_prod_topk` 4/4 PASS via dev harness;
-  the HTTP smoke is the only gate that hasn't cleared end-to-end.
-- **Background poll**: shell task `b9wcjerwb` watches for first
-  `layer 10/40 uploaded` OR `Application startup {complete,failed}`.
-- **Dev harness** previously alive in tmux session `cb35` was SIGKILLed
-  when we stopped to start serve_cb. Restart with
-  `bash scripts/run_harness_tmux.sh qb1` if you want to fall back to
-  trigger-file testing. Harness uses old `/tmp/cb35_trig/` paths in this
-  session (next bootstrap will use `~/tt-xla/.cache/cb35_runtime/`).
+- **27B HTTP smoke PASSED** end-to-end on qb1 — `/v1/chat/completions` returns
+  "The capital of France is Paris." in 2.4s with `finish_reason=stop`.
+  Three regressions fixed this session: cb_scheduler dispatch (commit `97abfab`),
+  35B bootstrap log-signature (`8111d70`), 27B bootstrap log-signature (`a7ea0fe`),
+  deploy gap (workflow), 35B tokenizer alias (`73fd269`).
+- **35B HTTP bootstrap PASSED** end-to-end on qb1 — 14:29 bootstrap, all 40
+  layers + setup buffers, `/health` reports `{"ok":true,"ready":true,
+  "model":"Qwen/Qwen3.6-35B-A3B","slots":2,"sampling":true}`.
+- **35B first inference step CRASHES** — task #160 `CB35-bug`. Server log:
+  `[cb-engine] step failed: TypeError: only length-1 arrays can be converted
+  to Python scalars`. Suspect site: `server_35b_cb.py:268`
+  (`int(token_ids[0])`). The dev-harness validator (`cb35_prod_topk`, 4/4 PASS)
+  drives `_step_sampled_topk` directly and skips the cb_scheduler.advance
+  layer where this fires. Memory: `feedback_dev_harness_vs_cb_engine_gap.md`.
+- The earlier "35B bootstrap hangs at enumerate shards" hypothesis was wrong.
+  Side-file was frozen because only the FIRST log line was routed through
+  the new `log` callable; layer-upload logs DID emit ("layer 10/40 uploaded"
+  etc.). Bootstrap completed in ~14 min the first time we let it run to
+  completion (then crashed at lifespan post-bootstrap on `state.tok`).
 
 ## Project
 
