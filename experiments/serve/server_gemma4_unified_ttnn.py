@@ -107,12 +107,18 @@ def np_to_replicated(arr, mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
 
 
 def np_stacked_to_sharded(per_chip_list, mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
-    """Stack a list of NCHIPS numpy arrays as the leading axis; shard along it."""
+    """Stack a list of NCHIPS numpy arrays as the leading axis; shard along it.
+
+    Uses `ShardTensorToMesh(dim=0)` (1D sharder) — matches 35B's
+    `np_stacked_to_sharded` (`server_35b_ttnn.py:96`). The 2D variant
+    `ShardTensor2dMesh` keeps the leading 4-dim on each chip's tensor
+    which breaks downstream matmul (`a=1 vs b=4` shape mismatch).
+    """
     stacked = np.stack(per_chip_list, axis=0).astype(np.float32)
     return ttnn.from_torch(
         torch.from_numpy(stacked),
         dtype=dtype, layout=layout, device=mesh,
-        mesh_mapper=ttnn.ShardTensor2dMesh(mesh, dims=(0, None), mesh_shape=ttnn.MeshShape(1, NCHIPS)),
+        mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
     )
 
 
@@ -317,49 +323,91 @@ def bootstrap(state, log=None):
     log("[bootstrap] ready (v0.1.0 — embed + L0 input_layernorm only).")
 
 
-# ── v0.1.0 forward: embed → scale → L0.input_layernorm ─────────────────
+# ── v0.1.0 + v0.1.1 forward: embed → scale → L0 input_layernorm →
+#                              Q/K/V proj → q_norm/k_norm ─────────────
 def step_forward_v01(state, tok_id, capture):
-    """Smallest deterministic forward: embed(tok) → ·sqrt(HIDDEN) → rms_norm(w_in).
+    """v0.1.1 forward at pos 0 (L0 only, sliding attention path).
 
-    capture['embed_scaled'] = [HIDDEN] fp32 (post-scale embed)
-    capture['in_norm']       = [HIDDEN] fp32 (post L0 input_layernorm)
+    Stages (each adds a capture entry):
+      v0.1.0:  embed_scaled, in_norm
+      v0.1.1:  q_proj_out, k_proj_out, v_proj_out, q_norm_out, k_norm_out
+
+    All capture arrays are returned in [HEAD, HEAD_DIM] order matching HF's
+    `attn_L0_<sub>` shape (post-reshape from flat [head*dim]).
     """
-    # Write token into a single-element tensor inside this function (no
-    # pre-allocated buf yet; v0.4 will introduce one for trace).
+    # ── v0.1.0: embed lookup + sqrt(HIDDEN) scale + input_layernorm ──
     tok_tt = ttnn.from_torch(
         torch.tensor([[int(tok_id)]], dtype=torch.int32),
         dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    embed = ttnn.embedding(tok_tt, state.embed_tt)  # [1, 1, HIDDEN] per chip
+    embed = ttnn.embedding(tok_tt, state.embed_tt)
     ttnn.deallocate(tok_tt)
     h = ttnn.to_layout(embed, ttnn.TILE_LAYOUT)
     ttnn.deallocate(embed)
-
-    # Gemma 4 §1.7: multiply embed by sqrt(HIDDEN). Use ttnn.multiply with
-    # a Python scalar — broadcasts trivially. fp32_dest_acc keeps precision.
     h_scaled = ttnn.multiply(h, EMBED_SCALE)
     ttnn.deallocate(h)
-
     capture["embed_scaled"] = _readback_replicated(h_scaled, state.mesh)
 
-    # L0 input_layernorm: Gemma 4 Llama-style `y = x/rms · w` (NO +1.0).
-    # ttnn.rms_norm uses the weight directly; matches.
     w0 = state.per_layer_tt[0]
     in_norm = ttnn.rms_norm(h_scaled, weight=w0["input_layernorm"], epsilon=EPS)
     ttnn.deallocate(h_scaled)
-
     capture["in_norm"] = _readback_replicated(in_norm, state.mesh)
+
+    # ── v0.1.1: Q/K/V projections + per-head q_norm/k_norm ──
+    # Q proj: replicated [1, HIDDEN] @ sharded [HIDDEN, NQ_PER_CHIP * head_dim]
+    # → per-chip [1, NQ_PER_CHIP * head_dim].
+    q = ttnn.matmul(in_norm, w0["q_proj"], compute_kernel_config=HIFI4)
+    k = ttnn.matmul(in_norm, w0["k_proj"], compute_kernel_config=HIFI4)
+    v = ttnn.matmul(in_norm, w0["v_proj"], compute_kernel_config=HIFI4)
     ttnn.deallocate(in_norm)
+
+    # Capture POST-PROJECTION shapes, reassembled to [HEAD, HEAD_DIM].
+    capture["q_proj_out"] = _readback_sharded_head(q, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING)
+    capture["k_proj_out"] = _readback_sharded_head(k, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+    capture["v_proj_out"] = _readback_sharded_head(v, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+
+    # Per-head RMSNorm: q_norm operates on the last (head_dim) axis. We
+    # reshape per chip to [NQ_PER_CHIP, HEAD_DIM] so rms_norm normalizes
+    # along HEAD_DIM. Weight is replicated [HEAD_DIM] across chips.
+    q_h = ttnn.reshape(q, [NQ_PER_CHIP, HEAD_DIM_SLIDING])
+    ttnn.deallocate(q)
+    k_h = ttnn.reshape(k, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
+    ttnn.deallocate(k)
+    ttnn.deallocate(v)  # v is not normed (sliding layer; V is raw projection)
+    q_n = ttnn.rms_norm(q_h, weight=w0["q_norm"], epsilon=EPS)
+    k_n = ttnn.rms_norm(k_h, weight=w0["k_norm"], epsilon=EPS)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+
+    capture["q_norm_out"] = _readback_sharded_head(q_n, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING)
+    capture["k_norm_out"] = _readback_sharded_head(k_n, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+    ttnn.deallocate(q_n); ttnn.deallocate(k_n)
 
 
 def _readback_replicated(t_tt, mesh):
     """Read back a replicated tensor; return as a flat fp32 numpy array."""
     arr = ttnn.to_torch(t_tt, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
-    # Replicated: take the chip-0 copy.
     if arr.ndim >= 1 and arr.shape[0] == NCHIPS:
         arr = arr[0]
     return arr.float().reshape(-1).numpy()
+
+
+def _readback_sharded_head(t_tt, mesh, per_chip_heads, head_dim):
+    """Read back a tensor sharded over the Q-head (or KV-head) axis.
+
+    The shard layout for q_proj/k_proj/v_proj is "each chip holds
+    `per_chip_heads * head_dim` columns of the output". The flat per-chip
+    output is [1, per_chip_heads * head_dim] for the projections, and
+    [per_chip_heads, head_dim] for the post-RMSNorm tensors. Either way,
+    after `ConcatMeshToTensor(dim=0)`, the chip-leading dim is NCHIPS and
+    the total head count = NCHIPS * per_chip_heads.
+
+    Returns [NCHIPS * per_chip_heads, head_dim] in HF [NUM_HEADS, HEAD_DIM]
+    layout (matches `attn_L0_q_norm` view shape `[B, S, NQ, head_dim]`).
+    """
+    arr = ttnn.to_torch(t_tt, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
+    arr = arr.float().reshape(NCHIPS, per_chip_heads, head_dim)
+    return arr.reshape(NCHIPS * per_chip_heads, head_dim).numpy()
 
 
 if __name__ == "__main__":

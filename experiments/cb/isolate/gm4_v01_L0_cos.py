@@ -62,42 +62,90 @@ def main():
     hf_in_norm = np.load(ORACLE_DIR / "L0_in_norm.npy")  # [seq, 3840]
     hf_in_norm_pos0 = hf_in_norm[0, :]
 
-    log(f"oracle: prompt_ids={prompt_ids.tolist()} hidden_shape={hidden_states.shape}")
-    log(f"oracle: hf_embed_scaled[:4]={hf_embed_scaled[:4]} rms={np.sqrt(np.mean(hf_embed_scaled**2)):.4f}")
-    log(f"oracle: hf_in_norm_pos0[:4]={hf_in_norm_pos0[:4]} rms={np.sqrt(np.mean(hf_in_norm_pos0**2)):.4f}")
+    # v0.1.1 sub-step refs: require --hook-attn-layer 0 oracle re-run.
+    attn_refs = {}
+    optional = ["q_proj", "k_proj", "v_proj", "q_norm", "k_norm"]
+    for sub in optional:
+        p = ORACLE_DIR / f"L0_attn_L0_{sub}.npy"
+        if p.exists():
+            attn_refs[sub] = np.load(p)
 
-    log("bootstrapping Gemma 4 12B server (eats ~3-5 min on first run)…")
+    log(f"oracle: prompt_ids={prompt_ids.tolist()} hidden_shape={hidden_states.shape}")
+    log(f"oracle: v0.1.1 attn sub-step refs: {sorted(attn_refs.keys())}")
+
+    log("bootstrapping Gemma 4 12B server (~85 sec)…")
     t0 = time.time()
     state = srv.State()
     srv.bootstrap(state, log=log)
     log(f"bootstrap took {time.time()-t0:.1f}s")
 
-    log("running v0.1.0 forward at pos 0 (tok_id = prompt_ids[0])…")
+    log("running v0.1.1 forward at pos 0 (tok_id = prompt_ids[0])…")
     cap = {}
     tok_id0 = int(prompt_ids[0])
     srv.step_forward_v01(state, tok_id=tok_id0, capture=cap)
 
-    log(f"tt: embed_scaled[:4]={cap['embed_scaled'][:4]} rms={np.sqrt(np.mean(cap['embed_scaled']**2)):.4f}")
-    log(f"tt: in_norm[:4]     ={cap['in_norm'][:4]} rms={np.sqrt(np.mean(cap['in_norm']**2)):.4f}")
+    log("=" * 64)
+    log(f"Gemma 4 12B v0.1.1 cosine ladder vs HF oracle (gate: cos ≥ {PASS_THRESH})")
+    log("=" * 64)
 
-    # Cosines
+    results = []
+
+    # v0.1.0 gates (already PASSing as of commit b9f3c35).
     c_embed = cos(cap["embed_scaled"], hf_embed_scaled)
     c_in    = cos(cap["in_norm"],      hf_in_norm_pos0)
     m_embed = mad(cap["embed_scaled"], hf_embed_scaled)
     m_in    = mad(cap["in_norm"],      hf_in_norm_pos0)
+    results.append(("embed_scaled", c_embed, m_embed))
+    results.append(("in_norm", c_in, m_in))
 
+    # v0.1.1 gates: per-head comparison [NUM_HEADS, HEAD_DIM] vs HF pos 0.
+    # HF q_proj shape: [seq, NUM_Q * head_dim] = [6, 4096] (pre-view).
+    # HF q_norm shape: [seq, NUM_Q, head_dim] = [6, 16, 256] (post-view).
+    # TT q_proj_out / q_norm_out: [NUM_Q, head_dim] = [16, 256].
+    def _hf_proj_pos0_to_head(arr_pos, n_heads, head_dim):
+        # arr_pos shape can be [HEAD*DIM] (proj hook output) OR
+        # [HEAD, DIM] (norm hook output after view). Reshape to [HEAD, DIM].
+        a = arr_pos.reshape(-1)
+        return a.reshape(n_heads, head_dim)
+
+    if "q_proj" in attn_refs:
+        hf_q = attn_refs["q_proj"][0]  # [4096] flat
+        tt_q = cap["q_proj_out"]       # [16, 256]
+        c = cos(tt_q, _hf_proj_pos0_to_head(hf_q, 16, 256))
+        results.append(("q_proj_out", c, mad(tt_q, _hf_proj_pos0_to_head(hf_q, 16, 256))))
+    if "k_proj" in attn_refs:
+        hf_k = attn_refs["k_proj"][0]  # [2048] flat
+        tt_k = cap["k_proj_out"]       # [8, 256]
+        c = cos(tt_k, _hf_proj_pos0_to_head(hf_k, 8, 256))
+        results.append(("k_proj_out", c, mad(tt_k, _hf_proj_pos0_to_head(hf_k, 8, 256))))
+    if "v_proj" in attn_refs:
+        hf_v = attn_refs["v_proj"][0]
+        tt_v = cap["v_proj_out"]
+        c = cos(tt_v, _hf_proj_pos0_to_head(hf_v, 8, 256))
+        results.append(("v_proj_out", c, mad(tt_v, _hf_proj_pos0_to_head(hf_v, 8, 256))))
+    if "q_norm" in attn_refs:
+        hf_qn = attn_refs["q_norm"][0]  # already [16, 256] post-view
+        tt_qn = cap["q_norm_out"]
+        c = cos(tt_qn, hf_qn)
+        results.append(("q_norm_out", c, mad(tt_qn, hf_qn)))
+    if "k_norm" in attn_refs:
+        hf_kn = attn_refs["k_norm"][0]
+        tt_kn = cap["k_norm_out"]
+        c = cos(tt_kn, hf_kn)
+        results.append(("k_norm_out", c, mad(tt_kn, hf_kn)))
+
+    all_pass = True
+    for name, c, m in results:
+        status = "PASS" if c >= PASS_THRESH else "FAIL"
+        if c < PASS_THRESH:
+            all_pass = False
+        log(f"  {name:14s}: cos={c:.6f}  mad={m:.4e}  [{status}]")
     log("=" * 64)
-    log(f"v0.1.0 cosine ladder vs HF oracle (gate: cos ≥ {PASS_THRESH})")
-    log("=" * 64)
-    log(f"  embed_scaled : cos={c_embed:.6f} mad={m_embed:.4e} "
-        f"[{'PASS' if c_embed >= PASS_THRESH else 'FAIL'}]")
-    log(f"  in_norm      : cos={c_in:.6f}    mad={m_in:.4e} "
-        f"[{'PASS' if c_in    >= PASS_THRESH else 'FAIL'}]")
-    log("=" * 64)
+    log(f"VERDICT: {'PASS' if all_pass else 'FAIL'} ({len(results)} sub-steps checked)")
 
     import ttnn
     ttnn.close_device(state.mesh)
-    return 0 if (c_embed >= PASS_THRESH and c_in >= PASS_THRESH) else 1
+    return 0 if all_pass else 1
 
 
 if __name__ == "__main__":
