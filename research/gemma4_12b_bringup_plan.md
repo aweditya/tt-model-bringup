@@ -90,19 +90,70 @@ also parked.
 (`research/35b_cb_bringup_plan.md`). Single-slot bit-validated forward
 → batched B>1 → traced → prod wire-up. Concrete sub-tasks in §4.
 
-**Step 0 — hardware-probe pre-flight (no model upload, ~5 min)**.
-Before any LOC of `server_gemma4_unified_ttnn.py` is written:
-1. **§6.1 introspection probe**: confirm qb1's installed ttnn exposes
-   `sliding_window_size` on
-   `ttnn.experimental.paged_scaled_dot_product_attention_decode`. If
-   missing, rebuild ttnn or switch to a manual K/V slice fallback before
-   v0.3.
-2. **§6.3 GELU probe**: 1D pointwise check that some ttnn UnaryOp
-   matches `torch.nn.functional.gelu(approximate="tanh")` to within
-   1e-5 over `[-5, 5]`. Pick the matching enum for the MLP swap.
+**Step 0 — hardware-probe pre-flight DONE 2026-06-03**.
 
-These are CHEAP (no weight upload) and de-risk the two technical
-unknowns called out in §3.3 and §3.6.
+### 0.1 sliding_window kwarg — POSITIVE ✓
+
+`ttnn.transformer.paged_scaled_dot_product_attention_decode` exists on
+qb1's installed ttnn AND exposes `sliding_window_size (int, optional)`
+in its kwargs (verified via `bash scripts/run_remote.sh --no-reset
+experiments/utils/ttnn_introspect.py paged_scaled_dot_product_attention_decode
+ttnn.transformer --doc`). Sliding-window decode is a **kwarg flip**,
+not a new kernel. §3.3 risk dissolved.
+
+Bonus from the doc: `cur_pos (List of int, optional)` documents *"If a
+position is given as (-1), compute for the corresponding index in the
+batch is skipped."* — exactly the empty-slot semantics 35B's #162 is
+fighting. We may be able to use `cur_pos=-1` to safely batch empty
+slots in Gemma 4 v1 instead of carrying 35B's masked-multiply reset
+pattern forward.
+
+### 0.2 GELU variant — POSITIVE with gotcha ⚠
+
+Probe: `experiments/utils/gemma4_gelu_variant_probe.py` (forked from
+`experiments/utils/test_fused_swiglu_isolated.py`, x ∈ [-5, 5], N=4096,
+bf16 round-trip on (1,1) mesh).
+
+| Variant | max_abs vs torch tanh GELU | cos |
+|---|---|---|
+| A: `ttnn.gelu(x, fast_and_approximate_mode=False)` | **1.57e-2** | **0.99999803** |
+| B: `ttnn.gelu(x, fast_and_approximate_mode=True)` | 2.64e-2 | 0.99999316 |
+| C: `ttnn.mul(x, ones, input_tensor_a_activations=[UnaryOpType.GELU])` | 2.64e-2 | 0.99999316 |
+
+The variants A and B differ algorithmically; A is closer to both torch
+references (tanh and exact). The fused-activation path (C) gives the
+SAME numbers as B — **the kernel's fused `UnaryOpType.GELU` is the
+fast/approximate variant**, NOT the exact GELU. This matters because
+35B's SwiGLU shipped `ttnn.mul(silu_gate, up, activations=[SILU])`
+fused; Gemma 4 CANNOT mirror that pattern without losing precision.
+
+**Decision for Gemma 4 v0**: split into two ops in the MLP forward:
+
+```python
+gelu_gate = ttnn.gelu(s_gate, fast_and_approximate_mode=False)
+s_mid    = ttnn.mul(gelu_gate, s_up)
+ttnn.deallocate(gelu_gate)
+```
+
+Two dispatches per MLP per layer (96 dispatches/token at 48 layers)
+instead of one — accept the perf cost for correctness. Post-v0.4 we
+can evaluate the fused path as a perf lever; 2.6e-2 max_abs over 48
+layers is the same magnitude as 35B's chain drift
+[[bf16-chain-drift-at-B-gt-1]] and may compound to argmax flips.
+
+The bf16 round-trip noise (~1.5e-2 max_abs even for variant A) is
+expected — same magnitude as 35B observations. Cosine is the bench
+metric, not max_abs.
+
+### Net effect on the plan
+
+- §3.3 sliding-window SDPA: ~~1 day~~ → effectively 0; kwarg flip.
+- §3.6 GELU_tanh: ~~0.5 day~~ → 1 hour; two-op call shape decided.
+- §6.1 BLOCKER-RISK: closed.
+- §6.3 risk: closed; left a perf note for later.
+- New micro-finding for #162: sliding-window kernel supports
+  `cur_pos=-1` to skip empty slots. Try this when Gemma 4 v1 hits
+  multi-slot — may resolve 35B's poison too if backported.
 
 ------------------------------------------------------------------------
 
