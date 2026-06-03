@@ -32,7 +32,48 @@ Read top to bottom; everything else is linked.
   this ragged-slot case never manifested. Memory:
   `feedback_35b_batched_forward_empty_slot_poison.md`. Earlier
   cb_reset_slots fix (`1fc039c`) was necessary but not sufficient.
-- **35B long-context drift — task #163 READY-TO-EXECUTE on dev harness**.
+- **35B long-context drift — task #163 PIVOTED on real data 2026-06-03**.
+  Dev harness up, 4 probes ran. **Two critical findings overturn the
+  prior model of the bug:**
+  1. **Memory baseline was stale.** "cos@L32 pos 1 = 0.9311 (drift
+     origin)" came from an older run on the broken manual path. The
+     real owned_gdn baseline is **0.99 at pos 1**. There's NO drift
+     at pos 1. Memory entry `feedback_35b_a3b_l32_dn_decode_drift`
+     superseded by `feedback_35b_drift_cliff_pos1_to_pos5`.
+  2. **The real drift is a sharp CLIFF between pos 1 and pos 5.**
+     Measured 2026-06-03 on ladder prompt with owned_gdn=ON:
+     pos 0,1 cos_L32 = 0.99 / top1 match Y; pos 5 cos_L32 = 0.32 /
+     top1 NO. That's why short prompts work and longer ones collapse.
+  3. **The manual recurrence path itself is broken.** cos@L32 pos 0
+     with owned_gdn=OFF is **0.08** (effectively random math) vs
+     0.99 with owned_gdn=ON. Memory: `feedback_35b_manual_recurrence_path_broken`.
+     **This invalidates the fp32 H_t fix** (commit `92b442f`) —
+     fp32 mode auto-disables owned_gdn, so the fix routed through
+     the broken path. Not a precision bug; a structural bug in the
+     manual chain.
+  4. **H1 (DN H_t bf16 round-trip per step / Ollama precedent)
+     REJECTED.** With the manual path broken, we can't actually test
+     fp32 H_t. And independent of that — owned_gdn at pos 1 is 0.99,
+     so there's no H_t drift at pos 1 to begin with.
+
+  **Next investigation (sequential decision tree)**:
+  - Step 1: linear-search probe `CB35_LADDER_POSITIONS=0,1,2,3,4,5`
+    to find exactly which pos the cliff lands on.
+  - Step 2: capture per-layer cos at that position to see which
+    layer FIRST drifts (memory's "L32 is the locus" may also be stale).
+  - Step 3: probe sub-ops at the locus layer/pos via existing
+    sub_capture infra in step_forward_ttnn.
+  - Hypothesis flavor: the sharp cliff suggests a positional-state
+    bug (RoPE, KV cache write pattern, conv1d window state) more
+    than a per-step precision decay.
+
+  Infrastructure that's ready:
+  - Dev harness in tmux `cb35` on qb1, resident.
+  - 2 HF oracles: `.cache/hf_oracle_35b_100tok/` (5 pos),
+    `.cache/hf_oracle_35b_long/` (85 pos).
+  - 7 probe wrappers + `cb35_drift_ladder.py` core. Sequential walking
+    fixed (deploy `eab3b71`+`257ada5`+fix on top, see git log).
+  - `research/35b_drift_next_session_plan.md` for the GO commands.
   After 4 wasted server-restart cycles, switched to dev harness
   workflow. **Everything is staged**:
   - Both HF oracles generated on qb1 (`.cache/hf_oracle_35b_100tok/`

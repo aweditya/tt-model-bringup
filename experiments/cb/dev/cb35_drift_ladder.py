@@ -28,7 +28,9 @@ from pathlib import Path
 import numpy as np
 import ttnn
 
-import experiments.serve.server_35b_ttnn as srv
+# Harness adds <PROJECT_ROOT>/experiments/serve to sys.path; use the bare
+# module name to match the harness's existing imports.
+import server_35b_ttnn as srv
 
 
 def _log(msg: str) -> None:
@@ -106,13 +108,20 @@ def main(state):
     ttnn.synchronize_device(state.mesh)
     state.reset_caches_ttnn()
 
+    # Walk positions SEQUENTIALLY (DN recurrence needs 0..N-1 visited to
+    # produce correct state at N) and only RECORD cos at the configured
+    # positions-of-interest. Without this, pos 5+ samples stale state.
+    record_set = set(positions)
+    walk_end = max(positions) + 1
     per_pos = []
     L32_pos1_cos = None
-    for pos in positions:
-        cap = {}
+    for pos in range(walk_end):
+        cap = {} if pos in record_set else None
         t0 = time.time()
         tt_next = srv.step_forward_ttnn(state, int(hf_prompt[pos]), pos, capture=cap)
         step_ms = (time.time() - t0) * 1e3
+        if cap is None:
+            continue
 
         cos_per_layer = [_cos(cap["embed"], hf_hidden[0, pos])]
         for L in range(n_layers):

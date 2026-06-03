@@ -94,6 +94,94 @@ Each has per-position `cos_per_layer`, `cos_L32`, `cos_final_norm`,
 | ≈ 0.9311 | ≈ 0.9311 (unchanged) | **H1 dead.** Move to H3 (decay alone), H4 (RMSNorm), H5 (conv1d). New probe per hypothesis. |
 | Doesn't match memory | — | Suspect oracle mismatch (chat-template vs raw, wrong prompt). Verify oracle path. |
 
+## REAL findings (2026-06-03 — supersedes the decision tree above)
+
+The probes ran. **All 3 hypotheses in the table above were
+disproved in a different way than expected.** The actual picture:
+
+### Finding 1: Memory's "0.9311 baseline" was stale
+
+`feedback_35b_a3b_l32_dn_decode_drift.md` cited `cos@L32 pos 1 =
+0.9311` as the drift origin. That number was from an OLDER run on
+the broken manual path. The current owned_gdn baseline at pos 1 is
+**0.99**. Pos 1 is not the drift origin anymore.
+
+### Finding 2: Real drift is a CLIFF between pos 1 and pos 5
+
+Measured 2026-06-03 on the 85-token ladder prompt with owned_gdn=ON
+(default config), via `cb35_drift_long_bf16`:
+
+| pos | cos_L32 | cos_final | top1 |
+|---|---|---|---|
+| 0  | 0.9896 | 0.9950 | ✓ |
+| 1  | 0.9864 | 0.9925 | ✓ |
+| **5**  | **0.3172** | **0.5210** | ❌ |
+| 10 | 0.3910 | 0.2974 | ❌ |
+| 25 | 0.3781 | 0.1922 | ❌ |
+| 40 | 0.4647 | 0.5505 | ❌ |
+| 60 | 0.4652 | 0.6254 | ✓ |
+| 80 | 0.4364 | 0.6351 | ❌ |
+
+The cliff is BETWEEN pos 1 and pos 5 — sharp, not gradual. Short
+prompts that don't cross this cliff produce coherent output (Hello
+→ "How can I help"). Longer prompts collapse. Memory:
+`feedback_35b_drift_cliff_pos1_to_pos5`.
+
+### Finding 3: Manual recurrence path is structurally broken
+
+Same probe with `owned_gdn=OFF` (forces manual recurrence):
+
+| pos | cos_L32 |
+|---|---|
+| 0 | **0.0771** (essentially random) |
+| 1 | 0.0891 |
+| 5 | 0.0412 |
+
+Pos 0 has no recurrence state — both paths see zero. So this
+0.08 vs 0.99 is the manual path itself doing wrong math, not a
+precision issue. The fp32 H_t fix (commit `92b442f`) auto-disables
+owned_gdn → routes through this broken path → that's why it was
+"mechanically valid but drift unchanged". The math was wrong before
+fp32 storage ever mattered. Memory:
+`feedback_35b_manual_recurrence_path_broken`.
+
+### What to do next
+
+Forget H1/H3/H4/H5 — they were predicated on the stale baseline.
+The new investigation:
+
+1. **Localize the cliff** (one probe, ~30 sec):
+   ```bash
+   # Edit cb35_drift_long_bf16.py to set
+   #   CB35_LADDER_POSITIONS="0,1,2,3,4,5,6,7"
+   # Then:
+   bash scripts/deploy.sh experiments/cb/dev/cb35_drift_long_bf16.py
+   ssh qb1 'touch /tmp/cb35_trig/drift_long_bf16'
+   ```
+   Goal: pinpoint whether the cliff is at pos 2, 3, 4, or 5.
+
+2. **Capture per-layer cos at the cliff position**:
+   Look at all 40 layers' cos at the cliff pos. Identify which
+   LAYER first drops below 0.99. That's the locus (possibly L32,
+   possibly elsewhere — memory may be stale on this too).
+
+3. **Sub-op probe at the locus layer/pos**:
+   `step_forward_ttnn`'s `capture` dict already supports
+   `sub_capture_layers=[L]` — fills `layer_<L>_sub` with attn/MoE/DN
+   sub-step arrays. Find which sub-op first diverges.
+
+4. **Hypothesis: positional-state bug, not precision**:
+   A sharp cliff between pos 1-5 doesn't look like a precision-decay
+   bug (which would show gradual cos decline). It looks like
+   something becoming wrong at a specific position threshold. Likely
+   suspects: RoPE position lookup, KV cache write/read at pos > 0,
+   conv1d 4-tap window state shift.
+
+5. **Manual recurrence path repair (deferred)**:
+   The structural bug there is real but orthogonal to the
+   user-facing drift cliff. Track as a separate task. Don't try to
+   ship fp32 H_t fixes until manual is fixed.
+
 ## Hypotheses to test (in priority order, all via the harness)
 
 | H | What | Probe |
