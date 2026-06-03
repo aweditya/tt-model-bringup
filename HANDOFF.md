@@ -148,6 +148,13 @@ to match) after prefix caching ships.
      in batched expert matmul. mad=0.000000 vs base at B=2 slot 0.
      Fixed the 13% per-slot drift from v1.4 loop. Critical bug in init
      port: used `MOE_INTER_CHIP (128)` instead of `MOE_INTER (512)`.
+   - **CB35-prod wire-up GATED 2026-06-02** (commit `f1f7a61`).
+     Unified `forward_batch_tp_inner` dispatches B=1→base (v0 bit-id) /
+     B>1→v1 batched. Now supports `return_topk=K` at both Bs. cb_scheduler
+     can drop in without changes. `cb35_prod_topk.py` 4/4 PASS:
+     B=1 top-1 = 8 (matches v0), B=2 distinct prompts produce distinct
+     top-1 tokens. Ready for cb_api/cb_engine end-to-end at
+     `TT_CB_SLOTS=2`.
    - **v1.5 full B>1 forward FUNCTIONAL PASS 2026-06-02** (commit `0a50e97`).
      `forward_batch_tp_inner_batched` + `layer_forward_batched_35b` —
      40-layer chain at B>1 runs end-to-end. v1_chat results:
