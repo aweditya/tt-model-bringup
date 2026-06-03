@@ -3,124 +3,69 @@
 What this project is, where the perf is now, what to run, and what is next.
 Read top to bottom; everything else is linked.
 
-## Live session state (2026-06-03)
+## Live session state (2026-06-03 — Gemma 4 12B is the active priority)
 
-- **27B HTTP smoke PASSED** end-to-end on qb1 — `/v1/chat/completions` returns
-  "The capital of France is Paris." in 2.4s with `finish_reason=stop`.
-  Three regressions fixed this session: cb_scheduler dispatch (commit `97abfab`),
-  35B bootstrap log-signature (`8111d70`), 27B bootstrap log-signature (`a7ea0fe`),
-  deploy gap (workflow), 35B tokenizer alias (`73fd269`).
-- **35B HTTP bootstrap PASSED** end-to-end on qb1 — 14:29 bootstrap, all 40
-  layers + setup buffers, `/health` reports `{"ok":true,"ready":true,
-  "model":"Qwen/Qwen3.6-35B-A3B","slots":2,"sampling":true}`.
-- **35B first inference step crash fixed** in `39f4663`: cb_scheduler
-  reads the topk handle post-mesh-concat as `idxs[s, 0]` expecting a
-  scalar; 35B's 3-D hidden activations meant the readback was
-  `[B, 1, K]` and `int(row)` blew up. Fix is a generic squeeze of the
-  unit-seq dim in cb_scheduler's host path. 27B unchanged.
-- **35B HTTP COHERENT at TT_CB_SLOTS=1** (the new default for 35B,
-  committed in `cb_api.py`). Sample: "Hello" → `"Hello! How can I help
-  you today?"` (`finish_reason=stop`). cb_api now defaults
-  `TT_CB_SLOTS=1` for 35B (mirrors the existing backend-aware
-  `TT_CB_TOPK_K` pattern). 27B still defaults to 4 slots.
-- **35B B>1 BROKEN — task #162**. Triangulated this session:
-  TT_CB_SLOTS=2 with one /v1/chat admit produces deterministic
-  prompt-independent Chinese-char loops (`两件两特朗...`).
-  Same prompts at TT_CB_SLOTS=1 are coherent. Hypothesis: empty
-  slot's cur_pos=-1 poisons batched SDPA mask or MoE expert routing.
-  v1.5 dev-harness B=8 chat validation used all slots active, so
-  this ragged-slot case never manifested. Memory:
-  `feedback_35b_batched_forward_empty_slot_poison.md`. Earlier
-  cb_reset_slots fix (`1fc039c`) was necessary but not sufficient.
-- **35B long-context drift — task #163 PIVOTED on real data 2026-06-03**.
-  Dev harness up, 4 probes ran. **Two critical findings overturn the
-  prior model of the bug:**
-  1. **Memory baseline was stale.** "cos@L32 pos 1 = 0.9311 (drift
-     origin)" came from an older run on the broken manual path. The
-     real owned_gdn baseline is **0.99 at pos 1**. There's NO drift
-     at pos 1. Memory entry `feedback_35b_a3b_l32_dn_decode_drift`
-     superseded by `feedback_35b_drift_cliff_pos1_to_pos5`.
-  2. **The real drift is a sharp CLIFF between pos 1 and pos 5.**
-     Measured 2026-06-03 on ladder prompt with owned_gdn=ON:
-     pos 0,1 cos_L32 = 0.99 / top1 match Y; pos 5 cos_L32 = 0.32 /
-     top1 NO. That's why short prompts work and longer ones collapse.
-  3. **The manual recurrence path itself is broken.** cos@L32 pos 0
-     with owned_gdn=OFF is **0.08** (effectively random math) vs
-     0.99 with owned_gdn=ON. Memory: `feedback_35b_manual_recurrence_path_broken`.
-     **This invalidates the fp32 H_t fix** (commit `92b442f`) —
-     fp32 mode auto-disables owned_gdn, so the fix routed through
-     the broken path. Not a precision bug; a structural bug in the
-     manual chain.
-  4. **H1 (DN H_t bf16 round-trip per step / Ollama precedent)
-     REJECTED.** With the manual path broken, we can't actually test
-     fp32 H_t. And independent of that — owned_gdn at pos 1 is 0.99,
-     so there's no H_t drift at pos 1 to begin with.
+**Pivot 2026-06-03**: paused 35B drift (#163) and pivoted to Gemma 4 12B
+bringup (#165). Driver: 14-min 35B bootstrap per harness restart was
+severely rate-limiting iteration AND the harness itself hung silently
+mid-investigation (task #166 captures the harden-it-before-next-bootstrap
+work). Gemma 4 12B is dense, 12B, dual-attention-type — smaller weights
+(~5-7 min bootstrap), structurally interesting (sliding+global), and
+exercises position-dependent paths in isolation. If a positional-state
+bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
 
-  **Next investigation (sequential decision tree — full GO commands
-  in `research/35b_drift_next_session_plan.md` §"What to do next"):**
-  - **Step 1**: probe `CB35_LADDER_POSITIONS="0,1,2,3,4,5,6,7"` on
-    `cb35_drift_long_bf16`. Pinpoint `P_cliff` (first pos where
-    cos_L32 drops below 0.95).
-  - **Step 2**: at `P_cliff`, scan `cos_per_layer[0..39]` from the
-    JSON output. Find `L_locus` (first layer below 0.95). Memory's
-    "L32 is the locus" was on stale data — may not hold.
-  - **Step 3**: sub-op probe at `(L_locus, P_cliff)` via
-    `sub_capture_layers=[L_locus]` in `step_forward_ttnn` —
-    capture dict fills `layer_<L>_sub` with attn/MoE/DN sub-step
-    arrays. Find which sub-op first diverges vs HF oracle.
-  - **Working hypothesis flavor**: sharp pos1→pos5 cliff suggests
-    a **positional-state bug** (RoPE pos lookup, KV cache write/read
-    at pos > 0, conv1d 4-tap window state shift) — NOT a per-step
-    precision decay (which would be gradual cos decline).
+### Active — Gemma 4 12B bringup (#165)
 
-  **Infrastructure staged on qb1** (all current as of 2026-06-03):
-  - Dev harness tmux `cb35` resident; iter ~30 sec via trigger files.
-  - 2 HF oracles: `.cache/hf_oracle_35b_100tok/` (5 pos),
-    `.cache/hf_oracle_35b_long/` (85 pos).
-  - Probe core: `experiments/cb/dev/cb35_drift_ladder.py`.
-  - 6 thin env-config wrappers deployed:
-    `cb35_drift_{bf16,fp32_h,fp32_h_no_dg}` (5-pos) +
-    `cb35_drift_long_*` (85-pos).
-  - Each writes JSON `drift_ladder_*.json` with `cos_per_layer`,
-    `cos_L32`, `cos_final_norm`, `cos_logits` per probed position.
-  - Manual recurrence path bug (cos 0.08 @ pos 0) is **task #164**,
-    orthogonal to the cliff — don't fix-up fp32 H_t until #164 lands.
+- **Plan**: [`research/gemma4_12b_bringup_plan.md`](research/gemma4_12b_bringup_plan.md)
+  (verified `config.json` facts, code-reuse map at `file:line`, novel-item
+  ranking, sub-task breakdown with cosine gates).
+- **Step 0 — pre-flight hardware probes (no model upload, ~5 min)**:
+  1. **§6.1**: confirm qb1's installed ttnn exposes `sliding_window_size`
+     on `ttnn.experimental.paged_scaled_dot_product_attention_decode`.
+     If missing, rebuild ttnn or use manual K/V slice fallback before v0.3.
+  2. **§6.3**: 1D pointwise check — which ttnn UnaryOp matches
+     `torch.nn.functional.gelu(approximate="tanh")` over `[-5, 5]`.
+- **v0 staging** (mirrors 35B `research/35b_cb_bringup_plan.md`):
+  v0.1 L0-only forward → v0.2 all 48 layers → v0.3 KV cache with
+  sliding-window kwarg → v0.4 trace capture → v1 CB B=4 → v2 server
+  wire-up + chat smoke.
+- **Top NOVEL items** (full detail in plan §3):
+  dual head_dim (256 sliding / 512 global), four norms per layer
+  (Llama RMSNorm `w`, NOT Qwen `(1+w)` — bit us hard on 35B
+  [[qwen36-qnorm-knorm-zero-centered]]), tied embed + sqrt(hidden)
+  embed-scale + 30·tanh(x/30) logit softcap, GELU_tanh activation,
+  p-RoPE = standard partial RoPE with global head_dim divisor,
+  `attention_k_eq_v` on global layers only.
 
-  **Stale / superseded** (do not re-derive):
-  - "cos@L32 pos 1 = 0.9311 baseline" — measured on the broken
-    manual path; real owned_gdn = 0.99.
-  - H1/H3/H4/H5 DN-precision hypothesis ladder — all predicated
-    on the stale baseline.
-  - fp32 H_t opt-in (`92b442f`/`8010b3c`) is preserved on `main` but
-    routes through the broken manual path until #164 fixes manual.
-  - fp32 residual stream attempt (`35ea58f`+`7c3ede6`+`1c650b7`)
-    hung in warmup; reverted in `5c5228c`. Do not re-attempt
-    without ladder-confirmed cosine gain first.
+### Parked — 35B drift cliff (#163, #164, #162)
 
-## On the horizon — Gemma 4 12B bringup (task #165)
+- **#163**: full staging notes in
+  [`research/35b_drift_next_session_plan.md`](research/35b_drift_next_session_plan.md)
+  §"REAL findings 2026-06-03". Cliff between pos 1 (cos_L32=0.99) and
+  pos 5 (cos_L32=0.32); flavor = positional-state bug. Step 1 probe
+  wrapper `cb35_drift_cliff_search` deployed but never executed
+  (harness restart from hang was killed when we pivoted).
+  Cross-pollination: if Gemma 4 v0.3 surfaces a positional-state bug,
+  it may share mechanism with this cliff.
+- **#164**: manual recurrence path structurally broken
+  (cos 0.08 @ pos 0 with owned_gdn=OFF). Orthogonal to cliff;
+  fp32 H_t fix (`92b442f`/`8010b3c`) on main routes through broken path.
+- **#162**: B>1 batched forward empty-slot poison. Default
+  TT_CB_SLOTS=1 for 35B masks it.
+- **#166** (NEW): harness hang hardening — line-buffered Python log
+  write, 30s heartbeat, top-level try/except. ~12 LOC; ship BEFORE
+  next 35B bootstrap.
 
-Google released `gemma-4-12B` on 2026-06-03 (model card seen this
-session). Dense 12B / 48 layers / 262K vocab / 256K context / hybrid
-sliding-window-1024 + global attention / encoder-free multimodal /
-Apache 2.0. Architecturally closer to 27B dense than 35B MoE.
+### Earlier in this session (still active in prod)
 
-- **High-level scoping**: [`research/gemma4_12b_scoping.md`](research/gemma4_12b_scoping.md) (~9-12 day estimate).
-- **Detailed plan-of-action**: [`research/gemma4_12b_bringup_plan.md`](research/gemma4_12b_bringup_plan.md) (commit `808b4b4`) — verified `config.json` facts, code-reuse map at file:line, novel-item ranking, sub-task breakdown with cosine gates.
-
-Top NOVEL items the plan flags (need pre-implementation research):
-1. Dual head_dim per layer-type (256 sliding / 512 global) — heterogeneous KV cache + open `num_global_key_value_heads=1` on (1,4) mesh shape question.
-2. Four norms per layer + Llama-style RMSNorm (`w` not `(1+w)`) — opposite of the Qwen3.6 `+1.0` rule (see [[qwen36-qnorm-knorm-zero-centered]]).
-3. Tied embeddings + sqrt(hidden) embed scale + 30·tanh(x/30) logit softcap.
-
-Top OPEN questions (need on-device probe before code):
-1. Does qb1's ttnn expose `sliding_window_size` on `paged_scaled_dot_product_attention_decode`?
-2. `gelu_pytorch_tanh` ≡ which ttnn variant exactly?
-3. `num_global_key_value_heads=1` on a 4-chip mesh — replicate or concentrate?
-
-**Deliberately not started**: blocked on task #163 (drift cliff
-work in active investigation on the dev harness) and #164 (manual
-recurrence path repair). The drift work has hot infrastructure
-loaded — interleaving would lose context and harness state.
+- **27B HTTP smoke PASSED** end-to-end on qb1 (commits `97abfab`,
+  `a7ea0fe`, `73fd269`). `/v1/chat/completions` returns
+  "The capital of France is Paris." in 2.4s.
+- **35B HTTP COHERENT at TT_CB_SLOTS=1** (cb_api default for 35B).
+  Sample: "Hello" → "Hello! How can I help you today?" with
+  `finish_reason=stop`. 35B B>1 broken (see #162 above).
+- **35B first inference step crash fixed** in `39f4663` (cb_scheduler
+  3-D readback squeeze).
 
 ## Project
 

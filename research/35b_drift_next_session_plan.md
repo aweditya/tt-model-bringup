@@ -1,5 +1,19 @@
 # 35B drift — next session plan
 
+> **PARKED 2026-06-03**. Pivoted to Gemma 4 12B bringup (#165) because
+> 14-min 35B harness bootstrap was rate-limiting AND the harness hung
+> silently mid-investigation (#166 will harden it). All probe
+> infrastructure on qb1 was killed when we released the mesh. Pickup:
+> (a) ship #166 (harden harness ~12 LOC), (b) re-start tmux `cb35`
+> harness via `bash scripts/run_harness_tmux.sh qb1`, (c) re-deploy
+> `experiments/cb/dev/cb35_drift_cliff_search.py` and trigger it for
+> Step 1. The §REAL findings table is the load-bearing data.
+>
+> Cross-pollination opportunity: Gemma 4 v0.3 exercises sliding+global
+> positional-state paths in isolation. If a positional-state bug
+> surfaces there, it likely shares mechanism with the cliff here —
+> resume #163 with that information in hand.
+
 **Session-handoff scaffolding for task #163.**
 
 We spent ~4 hours today getting to this picture:

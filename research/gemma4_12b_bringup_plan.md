@@ -8,32 +8,49 @@ with a concrete cosine target.
 
 ------------------------------------------------------------------------
 
-## 0. SCHEDULING — this work is BLOCKED. Do not start.
+## 0. SCHEDULING — ACTIVE 2026-06-03
 
-This is **task #165** in the project task tracker. It is blocked on:
+This is **task #165** in the project task tracker. Status: **in_progress**.
 
-1. **Task #163** — 35B long-context drift cliff (pos 1 → pos 5 collapse,
-   `cos_L32 0.9864 → 0.3172`). Plan:
-   [`research/35b_drift_next_session_plan.md`](35b_drift_next_session_plan.md).
-   Live findings 2026-06-03 invalidated the original H1/H3/H4/H5
-   decision tree — the cliff is positional, not a precision-decay bug;
-   prime suspects are RoPE-position-lookup, KV-cache write/read past
-   pos 0, or conv1d state shift. Until that's root-caused, the same
-   class of mechanism could trivially poison Gemma 4's sliding/global
-   hybrid (also position-dependent at decode).
-2. **Task #164** — 35B manual recurrence path repair (pos 0 cos ≈ 0.08
-   on the `owned_gdn=OFF` branch). Decoupled, but must be triaged
-   (fix or defer) before opening a third concurrent bringup.
-3. (Optional) **Task #162** — 35B B>1 batched forward empty-slot poison
-   (`feedback_35b_batched_forward_empty_slot_poison`). Multi-client
-   serving for Gemma 4 will replicate this hazard if not fixed first.
+**Pivot rationale (2026-06-03)**: 35B drift work (#163) was rate-limited
+by the 14-min weight-upload bootstrap per harness restart, and the
+harness itself hung silently mid-investigation (see `[[feedback-cb35-dev-harness-hung-2026-06-03]]`).
+Pivot to Gemma 4 12B because:
+- Iteration cycle: ~5-7 min bootstrap (vs 35B's 14 min) cuts every
+  fix-test cycle ~2x.
+- Architecture: dense + dual-attention-type hybrid is a cleaner
+  vehicle for the same sliding+global mechanism that may sit behind
+  the 35B cliff.
+- Cross-pollination: Gemma 4's sliding/global hybrid forces us to
+  exercise position-dependent paths in isolation — if there's a
+  positional-state bug in our codebase (RoPE, paged KV write/read),
+  v0.3 will surface it FAST with no MoE/DN confounders.
 
-The dev harness (`scripts/run_harness_tmux.sh qb1`) is currently
-committed to the 35B cb35 tmux session for #163. Do not steal it.
+**Parked, not abandoned**: 35B drift investigation #163 stays at pending
+with full staging notes in [`research/35b_drift_next_session_plan.md`](35b_drift_next_session_plan.md)
+(§"REAL findings 2026-06-03"). Step 1 = linear-search pos 0-7,
+Step 2 = per-layer cos at P_cliff, Step 3 = sub-op probe. Pick back up
+after Gemma 4 v0.4 or sooner if the cliff turns out to be a shared
+mechanism. Tasks #164 (manual-path repair) and #162 (B>1 empty-slot)
+also parked.
 
-**Bringup sequencing once unblocked**: v0..v4 staging mirrors the 35B
-plan (`research/35b_cb_bringup_plan.md`). Single-slot bit-validated
-forward → batched B>1 → traced → prod wire-up.
+**Bringup sequencing**: v0..v4 mirrors the 35B plan
+(`research/35b_cb_bringup_plan.md`). Single-slot bit-validated forward
+→ batched B>1 → traced → prod wire-up. Concrete sub-tasks in §4.
+
+**Step 0 — hardware-probe pre-flight (no model upload, ~5 min)**.
+Before any LOC of `server_gemma4_unified_ttnn.py` is written:
+1. **§6.1 introspection probe**: confirm qb1's installed ttnn exposes
+   `sliding_window_size` on
+   `ttnn.experimental.paged_scaled_dot_product_attention_decode`. If
+   missing, rebuild ttnn or switch to a manual K/V slice fallback before
+   v0.3.
+2. **§6.3 GELU probe**: 1D pointwise check that some ttnn UnaryOp
+   matches `torch.nn.functional.gelu(approximate="tanh")` to within
+   1e-5 over `[-5, 5]`. Pick the matching enum for the MLP swap.
+
+These are CHEAP (no weight upload) and de-risk the two technical
+unknowns called out in §3.3 and §3.6.
 
 ------------------------------------------------------------------------
 
