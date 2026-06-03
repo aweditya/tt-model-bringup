@@ -1073,6 +1073,14 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     """
     residual_1 = h_tt
     h_norm_1 = ttnn.rms_norm(h_tt, weight=w["input_layernorm"], epsilon=EPS)
+    # If the residual stream is fp32 (TT_DN_STATE_DTYPE=fp32), rms_norm may
+    # preserve that and feed fp32 into the DN/attn matmuls, which then mismatch
+    # the bf16 conv/KV state on concat. Keep mixer inputs bf16 — the residual
+    # stream stays fp32 only on the OUTSIDE of the mixer (via the upcast of
+    # mixer_out below).
+    if h_norm_1.dtype != ttnn.bfloat16:
+        h_norm_1_bf = ttnn.typecast(h_norm_1, ttnn.bfloat16)
+        ttnn.deallocate(h_norm_1); h_norm_1 = h_norm_1_bf
     if sub_capture is not None:
         sub_capture["in_norm"] = _ttnn_to_numpy_replicated(h_norm_1, mesh).reshape(-1)
     if layer_type == "linear_attention":
@@ -1113,6 +1121,9 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
 
     residual_2 = h_after_mixer
     h_norm_2 = ttnn.rms_norm(h_after_mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
+    if h_norm_2.dtype != ttnn.bfloat16:
+        h_norm_2_bf = ttnn.typecast(h_norm_2, ttnn.bfloat16)
+        ttnn.deallocate(h_norm_2); h_norm_2 = h_norm_2_bf
     if sub_capture is not None:
         sub_capture["post_attn_norm"] = _ttnn_to_numpy_replicated(h_norm_2, mesh).reshape(-1)
     moe_sc = sub_capture.setdefault("moe_sub", {}) if sub_capture is not None else None
