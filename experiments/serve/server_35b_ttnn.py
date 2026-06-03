@@ -1099,6 +1099,13 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     if sub_capture is not None:
         sub_capture["mixer_out"] = _ttnn_to_numpy_replicated(mixer_out, mesh).reshape(-1)
     ttnn.deallocate(h_norm_1)
+    # Residual stream upcast: if residual_1 is fp32 (TT_DN_STATE_DTYPE=fp32
+    # implicitly promotes the residual stream via the embed typecast in
+    # step_forward_inner), upcast mixer_out so the add stays fp32. Otherwise
+    # no-op. Avoids ttnn.add picking the smaller dtype when operands differ.
+    if mixer_out.dtype != residual_1.dtype:
+        mixer_out_c = ttnn.typecast(mixer_out, residual_1.dtype)
+        ttnn.deallocate(mixer_out); mixer_out = mixer_out_c
     h_after_mixer = ttnn.add(residual_1, mixer_out)
     ttnn.deallocate(mixer_out)
     if sub_capture is not None:
@@ -1117,6 +1124,9 @@ def layer_forward_ttnn(h_tt, w, layer_type, mesh, cos_tt, sin_tt, dn_state, kv_c
     ttnn.deallocate(h_norm_2)
     if sub_capture is not None:
         sub_capture["moe_out"] = _ttnn_to_numpy_replicated(moe_out, mesh).reshape(-1)
+    if moe_out.dtype != residual_2.dtype:
+        moe_out_c = ttnn.typecast(moe_out, residual_2.dtype)
+        ttnn.deallocate(moe_out); moe_out = moe_out_c
     h_final = ttnn.add(residual_2, moe_out)
     ttnn.deallocate(residual_2); ttnn.deallocate(moe_out)
     return h_final, new_dn, new_kv
@@ -1637,6 +1647,18 @@ def step_forward_inner(state, capture=None):
     """
     embed_out = ttnn.embedding(state.tok_buf, state.embed_tt)  # [1, 1, HIDDEN] per chip
     h_tt = ttnn.to_layout(embed_out, ttnn.TILE_LAYOUT)
+    # Optional fp32 residual stream — gated on the same env-driven flag as
+    # the DN-state fp32 fix. The embedding kernel rejects fp32 weights so we
+    # cast the OUTPUT to fp32 immediately. Each layer's mixer/MoE outputs
+    # are upcast to fp32 before residual adds inside layer_forward_ttnn so
+    # the residual stream stays fp32 across all 40 layers. Cast back to
+    # bf16 at the final_norm input below.
+    if getattr(state, "dn_state_dtype", ttnn.bfloat16) == ttnn.float32:
+        h_tt_fp32 = ttnn.typecast(h_tt, ttnn.float32)
+        ttnn.deallocate(embed_out); embed_out = None
+        h_tt_old = h_tt
+        h_tt = h_tt_fp32
+        ttnn.deallocate(h_tt_old)
     ttnn.deallocate(embed_out)
     if capture is not None:
         capture["embed"] = _ttnn_to_numpy_replicated(h_tt, state.mesh).reshape(-1)
@@ -1686,6 +1708,11 @@ def step_forward_inner(state, capture=None):
     ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
 
     # 4. Final norm + lm_head + argmax (all on device).
+    # If residual stream went fp32, cast back to bf16 here — final_norm + lm_head
+    # weights are bf16 and rms_norm/matmul on this build prefer bf16 inputs.
+    if h_tt.dtype != ttnn.bfloat16:
+        h_tt_bf = ttnn.typecast(h_tt, ttnn.bfloat16)
+        ttnn.deallocate(h_tt); h_tt = h_tt_bf
     h_norm = ttnn.rms_norm(h_tt, weight=state.final_norm_tt, epsilon=EPS)
     ttnn.deallocate(h_tt)
     if capture is not None:
