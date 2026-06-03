@@ -232,10 +232,14 @@ def upload_mlp_layer(layer_sd, mesh):
 
 
 def all_reduce_tt(x_tt, mesh):
-    """All-reduce sum across the (1, NCHIPS) mesh; matches 35B prod path."""
-    return ttnn.experimental.all_reduce_async(
-        x_tt, math_op=ttnn.ReduceType.Sum, num_links=2,
-    )
+    """All-reduce sum across the (1, NCHIPS) mesh; matches `server_35b_ttnn.py:367`.
+
+    The simple `ttnn.all_reduce(cluster_axis=1)` is the right call on
+    qb1's current ttnn build. `ttnn.experimental.all_reduce_async`'s
+    signature was changed to require explicit barrier/scatter/gather
+    semaphores; mistakenly copying that broke v0.1.2 first try.
+    """
+    return ttnn.all_reduce(x_tt, cluster_axis=1)
 
 
 # ── State ──────────────────────────────────────────────────────────────
@@ -281,6 +285,15 @@ def bootstrap(state, log=None):
     log("[bootstrap] enumerate shards + load top-level weights to mesh…")
     key_to_shard = build_key_to_shard()
     log(f"  {len(key_to_shard)} keys total")
+
+    # Gemma 4's v_norm is `RMSNorm(head_dim, with_scale=False)` — pure
+    # x/rms(x), no learnable weight. ttnn.rms_norm requires a weight; we
+    # pass an all-ones tensor of size HEAD_DIM. One copy per head_dim.
+    # Loaded once and reused across all 48 layers' v_norm calls.
+    state.ones_head_dim_sliding = np_to_replicated(
+        np.ones(HEAD_DIM_SLIDING, dtype=np.float32), state.mesh)
+    state.ones_head_dim_global = np_to_replicated(
+        np.ones(HEAD_DIM_GLOBAL, dtype=np.float32), state.mesh)
 
     # Embed: replicated, ROW_MAJOR (ttnn.embedding requires it).
     # Tied embeddings: same table will serve as lm_head.T at v0.2.
@@ -383,26 +396,28 @@ def step_forward_v01(state, tok_id, capture):
     capture["k_norm_out"] = _readback_sharded_head(k_n, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
     ttnn.deallocate(q_n); ttnn.deallocate(k_n)
 
-    # ── v0.1.2: attention output at pos 0 (sliding L0) + o_proj ──
-    # At pos 0 with seq_len=1, softmax(QK^T/sqrt(d)) = 1 (single position
-    # attends to itself only with causal mask). RoPE at pos 0 is identity
-    # (cos[0]=1, sin[0]=0). So attn_out[q] = V[q // GQA_GROUP]. We expand
-    # v from [NKV_PER_CHIP, HEAD_DIM] to [NQ_PER_CHIP, HEAD_DIM] by
-    # interleaving each KV row GQA_GROUP_SLIDING times.
+    # ── v0.1.2: V-norm + attention output at pos 0 + o_proj ──
+    # Gemma 4 NEW vs 27B/35B: V goes through `v_norm = RMSNorm(head_dim,
+    # with_scale=False)` — pure x/rms(x), no learnable weight. This was
+    # missing in v0.1.2 first try; cost was rms(mixer_out) 3.7× too high
+    # and cos=0.95. Verified with `experiments/cb/isolate/gm4_v012_oproj_sanity.py`
+    # numpy reproducer (matched the TT result exactly → bug was in our
+    # mental model, not in TT).
+    # Reference: `transformers/models/gemma4_unified/modeling_gemma4_unified.py:391-401`.
     #
-    # v shape per chip: [NKV_PER_CHIP=2, HEAD_DIM=256]. We want
-    # [NQ_PER_CHIP=4, HEAD_DIM] = [kv0, kv0, kv1, kv1].
-    # Reshape to [NKV_PER_CHIP, 1, HEAD_DIM] then concat(dim=1) yields
-    # [NKV_PER_CHIP, GQA_GROUP_SLIDING, HEAD_DIM] = [2, 2, 256], then
-    # reshape to [NQ_PER_CHIP, HEAD_DIM] = [4, 256] — interleaved.
+    # At pos 0 with seq_len=1, softmax(QK^T/sqrt(d)) = 1 (single position
+    # attends to itself only with causal mask). RoPE at pos 0 is identity.
+    # So attn_out[q] = V_normed[q // GQA_GROUP]. Expand via
+    # `ttnn.repeat_interleave(..., dim=0)` — matches HF `repeat_kv` order
+    # [kv0, kv0, kv1, kv1, ...].
     v_h = ttnn.reshape(v, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
     ttnn.deallocate(v)
-    v_e = ttnn.reshape(v_h, [NKV_PER_CHIP_SLIDING, 1, HEAD_DIM_SLIDING])
+    # v_norm with `with_scale=False`: ttnn.rms_norm requires a weight, so
+    # we pass an all-ones tensor preloaded in bootstrap.
+    v_normed = ttnn.rms_norm(v_h, weight=state.ones_head_dim_sliding, epsilon=EPS)
     ttnn.deallocate(v_h)
-    v_e2 = ttnn.concat([v_e] * GQA_GROUP_SLIDING, dim=1)  # [2, 2, 256]
-    ttnn.deallocate(v_e)
-    attn_per_head = ttnn.reshape(v_e2, [NQ_PER_CHIP, HEAD_DIM_SLIDING])  # [4, 256]
-    ttnn.deallocate(v_e2)
+    attn_per_head = ttnn.repeat_interleave(v_normed, GQA_GROUP_SLIDING, dim=0)  # [NQ_PER_CHIP, head_dim]
+    ttnn.deallocate(v_normed)
 
     # Flatten to [1, NQ_PER_CHIP * HEAD_DIM] for o_proj.
     attn_flat = ttnn.reshape(attn_per_head, [1, NQ_PER_CHIP * HEAD_DIM_SLIDING])

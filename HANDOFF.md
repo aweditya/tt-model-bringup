@@ -46,9 +46,17 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
   gotcha en route (`ShardTensor2dMesh` vs the correct
   `ShardTensorToMesh(dim=0)`) — one-line fix; memory entry
   `[[ttnn-shard-1d-vs-2d]]`.
-- **v0.1.2 IN FLIGHT** — attention at pos 0 (sliding, GQA expansion
-  is trivial since softmax of one position = 1.0) + o_proj +
-  all_reduce. Gate: cos ≥ 0.999 on `mixer_out`.
+- **v0.1.2 DONE** — attention output at pos 0 + o_proj. cos=0.999990
+  mad=0.0625. Found via numpy reproducer that Gemma 4 has v_norm =
+  `RMSNorm(head_dim, with_scale=False)` applied to V after v_proj
+  (memory `[[gemma4-v-norm]]`). 27B/35B don't have this — reading the
+  HF source caught what guessing wouldn't. v0.1.2 also surfaced a
+  ttnn `all_reduce_async` signature change vs the simple
+  `ttnn.all_reduce(cluster_axis=1)` used by 35B (one-line fix in
+  `all_reduce_tt`).
+- **v0.1.3 IN FLIGHT** — post_attention_layernorm + residual + MLP +
+  post_feedforward_layernorm + residual. Gate: cos ≥ 0.999 on all 4
+  remaining sub-steps + L0 output.
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the

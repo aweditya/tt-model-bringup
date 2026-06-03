@@ -247,8 +247,8 @@ projection sub-steps.
 |---|---|---|---|
 | v0.1.0 | bootstrap + embed scale + L0 input_layernorm | cos ≥ 0.999 on `embed_scaled` + `in_norm` | **DONE 2026-06-03 commit `b9f3c35`** — cos 0.999996 / 0.999991 |
 | v0.1.1 | q/k/v_proj + q_norm/k_norm at L0 | cos ≥ 0.999 on `q_norm_out`, `k_norm_out`, `v_proj_out` (vs HF attn sub-hooks) | **DONE 2026-06-03 commit `a35525e`** — 7/7 PASS at cos ≥ 0.99997. Hit a sharder gotcha en route (memory `[[ttnn-shard-1d-vs-2d]]`). |
-| v0.1.2 | attention at pos 0 (sliding) + o_proj | cos ≥ 0.999 on `mixer_out` | IN FLIGHT |
-| v0.1.3 | post_attention_layernorm + residual_1 + MLP + post_ff_norm + residual_2 | cos ≥ 0.999 on all 4 remaining sub-steps + L0 output | |
+| v0.1.2 | attention at pos 0 (sliding) + v_norm + o_proj | cos ≥ 0.999 on `mixer_out` | **DONE 2026-06-03** — cos 0.999990 mad 0.0625; found Gemma 4 has v_norm RMSNorm(with_scale=False) NOT in 27B/35B, memory `[[gemma4-v-norm]]`. Numpy reproducer `experiments/cb/isolate/gm4_v012_oproj_sanity.py` isolated the math-model bug from any TT impl issue. |
+| v0.1.3 | post_attention_layernorm + residual_1 + MLP + post_ff_norm + residual_2 | cos ≥ 0.999 on all 4 remaining sub-steps + L0 output | IN FLIGHT |
 | v0.2 | all 48 layers (sliding + global dispatch) + final_norm + lm_head + softcap | greedy top-1 matches HF at pos 0..4 | |
 | v0.3 | KV cache + paged SDPA with `sliding_window_size=1024` | 8-tok generation matches HF token-for-token | |
 | v0.4 | Trace capture | 100-step traced == eager | |
