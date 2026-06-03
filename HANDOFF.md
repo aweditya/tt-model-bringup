@@ -118,6 +118,20 @@ Read top to bottom; everything else is linked.
   etc.). Bootstrap completed in ~14 min the first time we let it run to
   completion (then crashed at lifespan post-bootstrap on `state.tok`).
 
+## On the horizon — Gemma 4 12B bringup (task #165)
+
+Google released `gemma-4-12B` on 2026-06-03 (model card seen this
+session). Dense 12B / 48 layers / 262K vocab / 256K context / hybrid
+sliding-window-1024 + global attention / encoder-free multimodal /
+Apache 2.0. Architecturally closer to 27B dense than 35B MoE.
+Text-only scoping in `research/gemma4_12b_scoping.md` — ~9-12
+working days estimate, mirrors the 35B v0..v4 staging pattern.
+
+**Deliberately not started**: blocked on task #163 (drift cliff
+work in active investigation on the dev harness) and #164 (manual
+recurrence path repair). The drift work has hot infrastructure
+loaded — interleaving would lose context and harness state.
+
 ## Project
 
 Qwen3.6-family bringup on Tenstorrent Blackhole (P150 × 4). Production paths:
