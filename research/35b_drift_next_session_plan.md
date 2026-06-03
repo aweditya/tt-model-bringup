@@ -39,62 +39,50 @@ We spent ~4 hours today getting to this picture:
   - Each prints `HEADLINE: cos@L32 pos 1 = X.XXXX [PASS|PARTIAL|NO-MOVE]`
     and writes a JSON to `.cache/cb35_runtime/drift_ladder_*.json`.
 
-## GO-button — once `cb35` harness is ready
+## GO-button — SUPERSEDED 2026-06-03
 
-Check harness status:
+> The 6 probes below already ran. Their results overturn the working
+> model; do NOT re-run them blindly. See **§REAL findings** + **§What
+> to do next** below for the current step. Section preserved for
+> historical / commit-archaeology context only.
+
+<details>
+<summary>(click to expand — stale)</summary>
+
 ```bash
 ssh qb1 'tail -3 ~/tt-xla/.cache/cb35_runtime/harness.log'
 # Expect "[harness] ready. Drop trigger files into …"
-```
 
-When ready, fire the 3 short probes back-to-back (each ~30 sec):
-```bash
-# H0 baseline (memory expectation: cos@L32 pos 1 = 0.9311)
+# H0 baseline (memory expectation cos@L32 pos 1 = 0.9311 — STALE; real owned_gdn = 0.99)
 ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/drift_bf16'
-sleep 35
-ssh qb1 'cat tt-xla/.cache/cb35_runtime/trig/last.log | tail -20'
-
-# H1: fp32 H_t  (headline question — does cos climb ≥ 0.99?)
 ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/drift_fp32_h'
-sleep 35
-ssh qb1 'cat tt-xla/.cache/cb35_runtime/trig/last.log | tail -20'
-
-# H1+: fp32 H_t + owned_decay_gate off
 ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/drift_fp32_h_no_dg'
-sleep 35
-ssh qb1 'cat tt-xla/.cache/cb35_runtime/trig/last.log | tail -20'
-```
-
-Then the 3 long-context variants:
-```bash
 for v in drift_long_bf16 drift_long_fp32_h drift_long_fp32_h_no_dg; do
   ssh qb1 "touch tt-xla/.cache/cb35_runtime/trig/$v"
-  sleep 60
-  ssh qb1 "cat tt-xla/.cache/cb35_runtime/trig/last.log | tail -20"
 done
 ```
 
-The JSON files left behind under `.cache/cb35_runtime/`:
-```
-drift_ladder_bf16_gdnon_dgon.json     ← H0 short
-drift_ladder_fp32_gdnoff_dgon.json    ← H1 short
-drift_ladder_fp32_gdnoff_dgoff.json   ← H1+ short
-drift_ladder_*_long.*.json (similar)  ← full ladder runs
-```
+JSON outputs under `.cache/cb35_runtime/drift_ladder_*.json`.
 
-Each has per-position `cos_per_layer`, `cos_L32`, `cos_final_norm`,
-`cos_logits`, and a top-level `L32_pos1_cos` for the headline.
+</details>
 
-## Decision tree after the headline
+## Decision tree after the headline — SUPERSEDED 2026-06-03
+
+> Predicated on the stale 0.9311 baseline; all three rows are
+> falsified by the §REAL findings. Kept for archaeology only.
+
+<details>
+<summary>(click to expand — stale)</summary>
 
 | `H0 cos@L32 pos1` | `H1 cos@L32 pos1` | Verdict |
 |---|---|---|
 | ≈ 0.9311 | ≥ 0.99 | **H1 confirmed.** Long-context probe should show top-1 lift too. Plumb to server, ship. |
 | ≈ 0.9311 | 0.93–0.97 | **H1 partial.** Decay+state mixed. Try `_no_dg` variant; consider H3 (decay-only fp32). |
 | ≈ 0.9311 | ≈ 0.9311 (unchanged) | **H1 dead.** Move to H3 (decay alone), H4 (RMSNorm), H5 (conv1d). New probe per hypothesis. |
-| Doesn't match memory | — | Suspect oracle mismatch (chat-template vs raw, wrong prompt). Verify oracle path. |
 
-## REAL findings (2026-06-03 — supersedes the decision tree above)
+</details>
+
+## REAL findings (2026-06-03 — read this first, supersedes both sections above)
 
 The probes ran. **All 3 hypotheses in the table above were
 disproved in a different way than expected.** The actual picture:
@@ -145,44 +133,86 @@ owned_gdn → routes through this broken path → that's why it was
 fp32 storage ever mattered. Memory:
 `feedback_35b_manual_recurrence_path_broken`.
 
-### What to do next
+### What to do next — sequential decision tree
 
-Forget H1/H3/H4/H5 — they were predicated on the stale baseline.
-The new investigation:
+> Stale H1/H3/H4/H5 ladder (DN H_t / decay / RMSNorm / conv1d
+> precision) is **rejected** — predicated on the stale 0.9311
+> baseline. The new investigation localizes a positional-state bug.
 
-1. **Localize the cliff** (one probe, ~30 sec):
-   ```bash
-   # Edit cb35_drift_long_bf16.py to set
-   #   CB35_LADDER_POSITIONS="0,1,2,3,4,5,6,7"
-   # Then:
-   bash scripts/deploy.sh experiments/cb/dev/cb35_drift_long_bf16.py
-   ssh qb1 'touch /tmp/cb35_trig/drift_long_bf16'
-   ```
-   Goal: pinpoint whether the cliff is at pos 2, 3, 4, or 5.
+**Prerequisites — already staged on qb1:**
 
-2. **Capture per-layer cos at the cliff position**:
-   Look at all 40 layers' cos at the cliff pos. Identify which
-   LAYER first drops below 0.99. That's the locus (possibly L32,
-   possibly elsewhere — memory may be stale on this too).
+- Dev harness in tmux `cb35` (resident model, ~30 sec iter).
+- HF oracles at `.cache/hf_oracle_35b_100tok/` (5 pos),
+  `.cache/hf_oracle_35b_long/` (85 pos).
+- Probe core `experiments/cb/dev/cb35_drift_ladder.py` + 6 thin
+  env-config wrappers deployed.
+- Trigger directory `~/tt-xla/.cache/cb35_runtime/trig/`.
 
-3. **Sub-op probe at the locus layer/pos**:
-   `step_forward_ttnn`'s `capture` dict already supports
-   `sub_capture_layers=[L]` — fills `layer_<L>_sub` with attn/MoE/DN
-   sub-step arrays. Find which sub-op first diverges.
+**Step 1 — Localize the cliff between pos 1 and pos 5 (one probe, ~30 sec):**
 
-4. **Hypothesis: positional-state bug, not precision**:
-   A sharp cliff between pos 1-5 doesn't look like a precision-decay
-   bug (which would show gradual cos decline). It looks like
-   something becoming wrong at a specific position threshold. Likely
-   suspects: RoPE position lookup, KV cache write/read at pos > 0,
-   conv1d 4-tap window state shift.
+```bash
+# Edit experiments/cb/dev/cb35_drift_long_bf16.py to set:
+#   os.environ["CB35_LADDER_POSITIONS"] = "0,1,2,3,4,5,6,7"
+# (the wrapper is a thin env-setter calling cb35_drift_ladder.main)
 
-5. **Manual recurrence path repair (deferred)**:
-   The structural bug there is real but orthogonal to the
-   user-facing drift cliff. Track as a separate task. Don't try to
-   ship fp32 H_t fixes until manual is fixed.
+bash scripts/deploy.sh experiments/cb/dev/cb35_drift_long_bf16.py
+ssh qb1 'touch ~/tt-xla/.cache/cb35_runtime/trig/drift_long_bf16'
+sleep 35
+ssh qb1 'cat ~/tt-xla/.cache/cb35_runtime/trig/last.log | tail -25'
+```
 
-## Hypotheses to test (in priority order, all via the harness)
+Goal: find whether the cliff lands at pos 2, 3, 4, or 5. Headline
+metric: position P where `cos_L32` first drops below 0.95 (from
+0.99 at pos 1). Call this `P_cliff`.
+
+**Step 2 — Per-layer cos at `P_cliff` (which layer first drifts?):**
+
+`cb35_drift_ladder.py` already records `cos_per_layer` for every
+position in the JSON output. After Step 1, inspect:
+
+```bash
+ssh qb1 'python3 -c "import json; d=json.load(open(\"~/tt-xla/.cache/cb35_runtime/drift_ladder_bf16_gdnon_dgon.json\")); pos=str(<P_cliff>); print([(L, d[pos][\"cos_per_layer\"][L]) for L in range(40)])"'
+```
+
+(or write a 10-line script `experiments/cb/dev/inspect_cliff_layer.py`
+in the project — do NOT inline.) Find the smallest layer index `L`
+where `cos_per_layer[L] < 0.95`. Call this `L_locus`. Memory's
+"L32 is the locus" was on stale data and may not hold.
+
+**Step 3 — Sub-op probe at `(L_locus, P_cliff)`:**
+
+`step_forward_ttnn` accepts `sub_capture_layers=[L_locus]` and
+fills `capture["layer_<L>_sub"]` with attn/MoE/DN sub-step arrays.
+Add a new wrapper `experiments/cb/dev/cb35_drift_subop.py` that:
+
+1. Reuses `cb35_drift_ladder` plumbing.
+2. Passes `sub_capture_layers=[L_locus]` and `CB35_LADDER_POSITIONS=str(P_cliff)`.
+3. Compares each sub-op output cos vs HF oracle's matching sub-op
+   activation (`hf_reference_35b` already captures these — verify
+   by reading the oracle script).
+
+Headline: which sub-op (RoPE? KV-cache read? conv1d state shift?
+DN gate? MoE routing logits?) first drops below 0.95.
+
+**Working hypothesis flavor**: sharp cliff between pos 1-5 looks
+like a positional-state bug (RoPE pos lookup, KV cache write/read
+at pos > 0, conv1d 4-tap window shift, sliding KV mask), NOT a
+precision decay (which would be gradual). The sub-op probe pinpoints
+which positional-state op silently breaks at `P_cliff`.
+
+**Step 4 — Manual recurrence path repair (deferred, task #164):**
+
+Structural bug (cos 0.08 @ pos 0 with owned_gdn=OFF) is real but
+orthogonal to the user-facing cliff. Track separately. Don't ship
+fp32 H_t fixes until manual is repaired.
+
+## Stale hypothesis ladder — SUPERSEDED 2026-06-03
+
+> H1/H3/H4/H5 (DN precision) ladder predicated on the 0.9311 baseline.
+> Listed here so it isn't re-derived in a future session.
+
+<details>
+<summary>(click to expand — stale)</summary>
 
 | H | What | Probe |
 |---|---|---|
@@ -190,6 +220,8 @@ The new investigation:
 | **H3 (decay fp32)** | Cast ONLY g_decay to fp32, keep H_t bf16. Tests whether decay quantization (not state) is the dominant noise | drift_ladder + new variant flag |
 | **H4 (RMSNorm precision)** | Cast h_norm input to fp32 before rms_norm at L32 specifically | drift_ladder + new variant flag |
 | **H5 (conv1d state)** | fp32 conv state. Memory says it's "less drift-prone" but never measured directly | drift_ladder + conv-fp32 variant |
+
+</details>
 
 ## Key memory entries (don't re-discover)
 

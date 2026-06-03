@@ -56,67 +56,46 @@ Read top to bottom; everything else is linked.
      fp32 H_t. And independent of that — owned_gdn at pos 1 is 0.99,
      so there's no H_t drift at pos 1 to begin with.
 
-  **Next investigation (sequential decision tree)**:
-  - Step 1: linear-search probe `CB35_LADDER_POSITIONS=0,1,2,3,4,5`
-    to find exactly which pos the cliff lands on.
-  - Step 2: capture per-layer cos at that position to see which
-    layer FIRST drifts (memory's "L32 is the locus" may also be stale).
-  - Step 3: probe sub-ops at the locus layer/pos via existing
-    sub_capture infra in step_forward_ttnn.
-  - Hypothesis flavor: the sharp cliff suggests a positional-state
-    bug (RoPE, KV cache write pattern, conv1d window state) more
-    than a per-step precision decay.
+  **Next investigation (sequential decision tree — full GO commands
+  in `research/35b_drift_next_session_plan.md` §"What to do next"):**
+  - **Step 1**: probe `CB35_LADDER_POSITIONS="0,1,2,3,4,5,6,7"` on
+    `cb35_drift_long_bf16`. Pinpoint `P_cliff` (first pos where
+    cos_L32 drops below 0.95).
+  - **Step 2**: at `P_cliff`, scan `cos_per_layer[0..39]` from the
+    JSON output. Find `L_locus` (first layer below 0.95). Memory's
+    "L32 is the locus" was on stale data — may not hold.
+  - **Step 3**: sub-op probe at `(L_locus, P_cliff)` via
+    `sub_capture_layers=[L_locus]` in `step_forward_ttnn` —
+    capture dict fills `layer_<L>_sub` with attn/MoE/DN sub-step
+    arrays. Find which sub-op first diverges vs HF oracle.
+  - **Working hypothesis flavor**: sharp pos1→pos5 cliff suggests
+    a **positional-state bug** (RoPE pos lookup, KV cache write/read
+    at pos > 0, conv1d 4-tap window state shift) — NOT a per-step
+    precision decay (which would be gradual cos decline).
 
-  Infrastructure that's ready:
-  - Dev harness in tmux `cb35` on qb1, resident.
+  **Infrastructure staged on qb1** (all current as of 2026-06-03):
+  - Dev harness tmux `cb35` resident; iter ~30 sec via trigger files.
   - 2 HF oracles: `.cache/hf_oracle_35b_100tok/` (5 pos),
     `.cache/hf_oracle_35b_long/` (85 pos).
-  - 7 probe wrappers + `cb35_drift_ladder.py` core. Sequential walking
-    fixed (deploy `eab3b71`+`257ada5`+fix on top, see git log).
-  - `research/35b_drift_next_session_plan.md` for the GO commands.
-  After 4 wasted server-restart cycles, switched to dev harness
-  workflow. **Everything is staged**:
-  - Both HF oracles generated on qb1 (`.cache/hf_oracle_35b_100tok/`
-    5-pos, `.cache/hf_oracle_35b_long/` 85-pos).
-  - 6 harness-callable probe wrappers deployed:
-    `cb35_drift_{bf16,fp32_h,fp32_h_no_dg}` (short) +
-    `cb35_drift_long_*` (full ladder).
-  - `experiments/cb/dev/cb35_drift_ladder.py` is the core probe;
-    each wrapper sets env vars before calling it.
-  - Headline metric printed per run: `cos@L32 pos 1` (baseline 0.9311
-    per memory; H1 PASS if ≥ 0.99).
-  - `research/35b_drift_next_session_plan.md` has the copy-paste GO
-    block + decision tree.
-  - Dev harness (tmux `cb35` on qb1) bootstrapping NOW; once ready,
-    each probe runs in ~30 sec via trigger-file pattern.
-  Root cause hypothesis from research subagent + ollama#15865:
-  qwen36_gdn_decode_owned kernel uses a single CB format for ALL
-  18 CBs (program_factory.cpp:91) — math is fp32 in Dst but packs
-  back to bf16 each step. Decay≈0.99 amplifies the quantization
-  → coherent text degrades at ~30 tokens.
-  - **Fix attempt 1 (`92b442f`+`8010b3c`): fp32 H_t + manual DN
-    recurrence + typecast all operands to fp32.** Mechanically OK
-    (bootstrap green, tokens generated) but **drift symptom
-    UNCHANGED** — long-prompt output still degenerates at ~25 tokens.
-  - **Fix attempt 2 (`35ea58f`+`7c3ede6`+`1c650b7`): fp32 residual
-    stream across all 40 layers** — Bootstrap completes but
-    `engine.start()` warmup hangs (>30 min where bf16 takes <30 sec).
-    **REVERTED in `5c5228c`.** Do not re-attempt without ladder
-    confirmation of a cosine gain.
-  - **Current main HEAD**: fp32 H_t opt-in (`92b442f` / `8010b3c`)
-    preserved. Server can be restarted with default bf16 any time.
-- **Next investigation method**: use the dev harness
-  (`scripts/run_harness_tmux.sh qb1`) for FUTURE drift experiments
-  — model stays resident, iteration is ~30 sec not ~14 min. Memory:
-  `feedback_qb1_tmux_for_long_running.md`. We violated NN #1
-  ("think first") by skipping straight to server-restart iteration.
-- Memory: `feedback_dev_harness_vs_cb_engine_gap.md`,
-  `feedback_cb_backend_dispatch_holes.md`, `feedback_deploy_serve_files_too.md`.
-- The earlier "35B bootstrap hangs at enumerate shards" hypothesis was wrong.
-  Side-file was frozen because only the FIRST log line was routed through
-  the new `log` callable; layer-upload logs DID emit ("layer 10/40 uploaded"
-  etc.). Bootstrap completed in ~14 min the first time we let it run to
-  completion (then crashed at lifespan post-bootstrap on `state.tok`).
+  - Probe core: `experiments/cb/dev/cb35_drift_ladder.py`.
+  - 6 thin env-config wrappers deployed:
+    `cb35_drift_{bf16,fp32_h,fp32_h_no_dg}` (5-pos) +
+    `cb35_drift_long_*` (85-pos).
+  - Each writes JSON `drift_ladder_*.json` with `cos_per_layer`,
+    `cos_L32`, `cos_final_norm`, `cos_logits` per probed position.
+  - Manual recurrence path bug (cos 0.08 @ pos 0) is **task #164**,
+    orthogonal to the cliff — don't fix-up fp32 H_t until #164 lands.
+
+  **Stale / superseded** (do not re-derive):
+  - "cos@L32 pos 1 = 0.9311 baseline" — measured on the broken
+    manual path; real owned_gdn = 0.99.
+  - H1/H3/H4/H5 DN-precision hypothesis ladder — all predicated
+    on the stale baseline.
+  - fp32 H_t opt-in (`92b442f`/`8010b3c`) is preserved on `main` but
+    routes through the broken manual path until #164 fixes manual.
+  - fp32 residual stream attempt (`35ea58f`+`7c3ede6`+`1c650b7`)
+    hung in warmup; reverted in `5c5228c`. Do not re-attempt
+    without ladder-confirmed cosine gain first.
 
 ## On the horizon — Gemma 4 12B bringup (task #165)
 
