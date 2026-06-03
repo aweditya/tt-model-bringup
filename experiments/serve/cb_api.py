@@ -216,9 +216,13 @@ def _build_app_with_default_lifespan():
         st = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, base.bootstrap, st)
-        st.deltanet_recurrence_mode = "manual"
-        st.deltanet_decay_gate_mode = "manual"
-        st.deltanet_decay_mode = "native_softplus"
+        # 27B-only deltanet feature flags (the 35B path keys these via
+        # getattr-default in its forward; setting them here is a no-op for 35B
+        # but is incorrect-by-convention. Gate by backend.)
+        if TT_BACKEND == "27b":
+            st.deltanet_recurrence_mode = "manual"
+            st.deltanet_decay_gate_mode = "manual"
+            st.deltanet_decay_mode = "native_softplus"
         eos_id = getattr(st.tok, "eos_token_id", None)
         eos_id = int(eos_id) if eos_id is not None else -1
         slots = int(os.environ.get("TT_CB_SLOTS", "4"))

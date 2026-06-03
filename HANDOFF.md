@@ -5,14 +5,19 @@ Read top to bottom; everything else is linked.
 
 ## Project
 
-Qwen3.6-family bringup on Tenstorrent Blackhole (P150 × 4). Two production paths:
+Qwen3.6-family bringup on Tenstorrent Blackhole (P150 × 4). Production paths:
 
-- **27B dense, 4× P150 TP** — `experiments/serve/server_tp.py`.
+- **27B dense, 4× P150 TP** — `experiments/serve/server_tp.py` (single-stream
+  Unix socket) or via CB (`serve_cb.sh start`, default backend).
 - **27B continuous batching** — `experiments/serve/cb_api.py` + `cb_engine.py`,
-  served by `experiments/serve/scripts/serve_cb.sh`. **This is the canonical
-  chat path.** Both production paths run on `qb1` and `qb2`.
-- **35B-A3B MoE** — `experiments/serve/server_35b_ttnn.py` (in-progress
-  perf work; default `state.moe_mode = "pattern_a_batched"`).
+  served by `experiments/serve/scripts/serve_cb.sh` (the canonical chat path).
+- **35B-A3B MoE continuous batching** — same `serve_cb.sh` with
+  `TT_BACKEND=35b`. Routes through `server_35b_ttnn.py` (model) + `server_35b_cb.py`
+  (batched forward). Production-ready 2026-06-02.
+
+Backend selection: `BACKENDS` registry in `cb_api.py` + identical dispatch
+in `cb_scheduler.py`. Adding a new backend = drop a `server_<name>_ttnn.py`
++ `server_<name>_cb.py` + register both in `BACKENDS`/`_BACKEND_MODULES`.
 
 Hosts: `qb1` and `qb2`, both 4× Blackhole P150 with working `FABRIC_1D`.
 
@@ -43,9 +48,16 @@ The target is the hardware ceiling, not parity with someone else's number.
 ## Chat path (production)
 
 ```bash
-# Recommended config:
+# 27B (default backend):
 TT_CB_CHUNKED_PREFILL=1 TT_CB_PREFIX_CACHE=1 \
   bash experiments/serve/scripts/serve_cb.sh start   # ~6 min bootstrap; /health → 503 until ready
+
+# 35B-A3B MoE:
+TT_BACKEND=35b TT_CB_SLOTS=2 TT_CB_TOPK_K=64 \
+  bash experiments/serve/scripts/serve_cb.sh start   # ~6-14 min bootstrap
+# verify via:  curl http://qb1:8000/v1/models  (must report Qwen/Qwen3.6-35B-A3B)
+# 35B contract: TT_CB_TOPK_K must be >0 (logits-readback broken, #149);
+#               cb_api defaults TT_CB_TOPK_K=64 when TT_BACKEND=35b.
 bash experiments/serve/scripts/serve_cb.sh status
 bash experiments/serve/scripts/serve_cb.sh stop    # SIGTERM → graceful drain → mesh release
 ```

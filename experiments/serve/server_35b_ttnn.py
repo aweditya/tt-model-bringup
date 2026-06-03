@@ -1687,7 +1687,10 @@ def step_forward_inner(state, capture=None):
     return argmax_tt
 
 
-def bootstrap(state, log):
+def bootstrap(state, log=None):
+    # cb_api calls bootstrap(st) without a logger; the dev path passes one.
+    if log is None:
+        log = print
     log("[bootstrap] open mesh + fabric…")
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
     state.mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, NCHIPS))
