@@ -466,12 +466,21 @@ def dn_step_batched_35b(state, h_tt, w, cb_dn_layer, *, qk_l2_weight_tt=None, qk
     ttnn.deallocate(normed_raw)
     gated = ttnn.mul(z_3d, normed, input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
     ttnn.deallocate(normed); ttnn.deallocate(z_3d)
-    gated_2d = ttnn.reshape(gated, [B, base.VALUE_DIM_CHIP])
-    ttnn.deallocate(gated)
-
-    # ── out_proj + all_reduce ────────────────────────────────────────────
-    partial = ttnn.matmul(gated_2d, w["out_proj"], compute_kernel_config=base.HIFI4)
-    ttnn.deallocate(gated_2d)
+    # Return rank-3 [B, 1, HIDDEN] (not rank-2 [B, HIDDEN]) so the residual
+    # add downstream is straight elementwise without a rank-mismatch
+    # reshape. The reshape ON the TILE-layout matmul output introduces
+    # bf16 precision drift (similar class to rms_norm shape-drift); doing
+    # the rank change BEFORE the matmul avoids it.
+    if B > 1:
+        gated_3d = ttnn.reshape(gated, [B, 1, base.VALUE_DIM_CHIP])
+        ttnn.deallocate(gated)
+        partial = ttnn.matmul(gated_3d, w["out_proj"], compute_kernel_config=base.HIFI4)
+        ttnn.deallocate(gated_3d)
+    else:
+        gated_2d = ttnn.reshape(gated, [B, base.VALUE_DIM_CHIP])
+        ttnn.deallocate(gated)
+        partial = ttnn.matmul(gated_2d, w["out_proj"], compute_kernel_config=base.HIFI4)
+        ttnn.deallocate(gated_2d)
     out = base.all_reduce_tt(partial, mesh)
     ttnn.deallocate(partial)
 
@@ -651,30 +660,19 @@ def layer_forward_batched_35b(state, h_tt, w, layer_type, cos_tt, sin_tt,
     else:
         mixer_out = attn_step_batched_35b(state, h_norm_1, w, cb_kv_layer, cos_tt, sin_tt)
     ttnn.deallocate(h_norm_1)
-    # Mixer returns [B, HIDDEN]; residual is [B, 1, HIDDEN]. At B=1 ttnn
-    # broadcasts cleanly (1 in dim 0 trivially matches). At B>1 the
-    # broadcast would produce [B, B, HIDDEN] (since each tensor has one
-    # dim of size B and one of size 1 in incompatible positions). Reshape
-    # mixer to [B, 1, HIDDEN] so the add is elementwise per-slot.
-    mixer_3d = ttnn.reshape(mixer_out, [B, 1, HIDDEN]) if B > 1 else mixer_out
-    h_after_mixer = ttnn.add(residual_1, mixer_3d)
+    # At B>1, dn_step / attn_step return rank-3 [B, 1, HIDDEN] (the rank
+    # change is done BEFORE the final matmul to avoid the reshape-on-TILE
+    # precision drift). residual is also [B, 1, HIDDEN]. Clean add.
+    h_after_mixer = ttnn.add(residual_1, mixer_out)
     ttnn.deallocate(mixer_out)
-    if B > 1 and mixer_3d is not mixer_out:
-        pass  # mixer_3d is a view of mixer_out; deallocating mixer_out frees it.
 
     residual_2 = h_after_mixer
     h_norm_2 = ttnn.rms_norm(h_after_mixer, weight=w["post_attention_layernorm"], epsilon=base.EPS)
     moe_out = moe_step_batched_35b(state, h_norm_2, w)
     ttnn.deallocate(h_norm_2)
-    # Same rank-alignment dance for MoE output. moe_step_batched_35b at
-    # B>1 already returns a rank-3 [B, 1, HIDDEN] from the per-slot concat,
-    # so reshape only if needed.
-    moe_shape = list(moe_out.shape)
-    if B > 1 and len(moe_shape) == 2:
-        moe_3d = ttnn.reshape(moe_out, [B, 1, HIDDEN])
-    else:
-        moe_3d = moe_out
-    h_final = ttnn.add(residual_2, moe_3d)
+    # MoE at B>1 returns [B, 1, HIDDEN] from the broadcast matmul output.
+    # At B=1 it returns whatever base.moe returns (also rank 3).
+    h_final = ttnn.add(residual_2, moe_out)
     ttnn.deallocate(residual_2); ttnn.deallocate(moe_out)
     return h_final
 
@@ -923,8 +921,16 @@ def attn_step_batched_35b(state, h_tt, w, cb_kv_layer, cos_tt, sin_tt):
     ttnn.deallocate(attn_flat); ttnn.deallocate(gate_sig)
 
     # ── o_proj column-sharded + all_reduce ─────────────────────────────
-    partial = ttnn.matmul(gated, w["o_proj"], compute_kernel_config=base.HIFI4)
-    ttnn.deallocate(gated)
+    # At B>1, reshape gated to [B, 1, NQ*HEAD] so the matmul output is
+    # rank 3 [B, 1, HIDDEN] — matches base's residual rank for clean add.
+    if B > 1:
+        gated_3d = ttnn.reshape(gated, [B, 1, NQ_PER_CHIP * HEAD_DIM_ATTN])
+        ttnn.deallocate(gated)
+        partial = ttnn.matmul(gated_3d, w["o_proj"], compute_kernel_config=base.HIFI4)
+        ttnn.deallocate(gated_3d)
+    else:
+        partial = ttnn.matmul(gated, w["o_proj"], compute_kernel_config=base.HIFI4)
+        ttnn.deallocate(gated)
     out = base.all_reduce_tt(partial, mesh)
     ttnn.deallocate(partial)
     return out
