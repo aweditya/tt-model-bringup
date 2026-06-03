@@ -405,13 +405,16 @@ experiments through the dev harness above (`run_harness_tmux.sh qb1`)
 instead of full server restarts. Model stays resident; iteration
 ~30 sec vs ~14 min for a fresh server bootstrap.
 
-**Next investigator should**:
-1. Spin up the dev harness ONCE (14 min, one-time).
-2. Run `experiments/utils/cosine_ladder_35b.py` with
-   `--dn-state-dtype fp32 --owned-gdn off` to get per-layer cos@L32
-   pos1 numbers vs the HF oracle.
-3. Compare to baseline (bf16 default). If fp32 H_t doesn't move
-   cos@L32 ≥ 0.99, H1 is provably insufficient — move on to H3
-   (decay-only fp32 cast), H4 (RMSNorm precision), or H5 (conv1d).
-4. ONLY ship a fix to the production server once a ladder run
-   confirms cos@L32 pos 1 ≥ 0.99 AND needle-haystack@100 retrieves.
+**Status 2026-06-03**: harness scaffold complete, ready to execute.
+See `research/35b_drift_next_session_plan.md` for the copy-paste GO
+block + decision tree. Concrete state:
+
+- Harness on qb1 in tmux `cb35` (bootstrapping at time of writing).
+- Both HF oracles ready (`.cache/hf_oracle_35b_100tok/` 5-pos,
+  `.cache/hf_oracle_35b_long/` 85-pos).
+- 6 probe wrappers deployed:
+  `cb35_drift_{bf16,fp32_h,fp32_h_no_dg}` +
+  `cb35_drift_long_*`.
+- Per-probe runtime: ~30 sec.
+- Headline metric: `cos@L32 pos 1` printed prominently
+  (baseline 0.9311; H1 PASS if ≥ 0.99).

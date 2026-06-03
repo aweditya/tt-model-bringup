@@ -16,72 +16,83 @@ We spent ~4 hours today getting to this picture:
   (`scripts/run_harness_tmux.sh qb1`) iterates in ~30 sec on the
   resident model. Non-negotiable #1 ("think first") was violated.
 
-## State to pick up
+## State to pick up — ALL READY
 
 - ✅ Server-side: `TT_DN_STATE_DTYPE=fp32` env hook works for opt-in
-  fp32 H_t with manual recurrence path. Disabled `dn_owned_gdn` and
-  `dn_owned_decay_gate` when fp32 is requested. Default bf16 path
-  unchanged.
-- ✅ Probes: `experiments/utils/cosine_ladder_35b.py` has CLI hooks
-  `--dn-state-dtype {bf16,fp32}`, `--owned-gdn {on,off}`,
-  `--owned-decay-gate {on,off}` for exactly the A/B we need.
-- ✅ HF reference generator: `experiments/utils/hf_reference_35b.py`
-  produces the oracle that `cosine_ladder_35b.py` consumes
-  (under `.cache/hf_oracle_35b*/`).
-- ✅ Dev harness scaffold: `scripts/run_harness_tmux.sh qb1` launches
-  long-lived python with `state` resident; trigger files in
+  fp32 H_t with manual recurrence path. Default bf16 unchanged.
+- ✅ HF oracles BOTH generated and on qb1:
+  - `.cache/hf_oracle_35b_100tok/` — 5 positions ("The capital of
+    France is"), enough for the cos@L32 pos 1 headline question.
+  - `.cache/hf_oracle_35b_long/` — 85 positions (math ladder
+    prompt), covers the long-context drift regime.
+- ✅ Dev harness scaffold: `scripts/run_harness_tmux.sh qb1` running
+  in tmux session `cb35`; trigger files in
   `~/tt-xla/.cache/cb35_runtime/trig/` map to
   `experiments/cb/{validate,isolate,bench,dev}/cb35_<name>.py` and
-  iterate in ~30 sec.
-- ❌ **HF oracle not yet generated on qb1.** Need to run
-  `experiments/utils/hf_reference_35b.py` (one-time, ~30-60 min on
-  HF CPU) before the cosine ladder is useful.
-- ❌ **Dev-harness wrapper around cosine_ladder** not yet written.
-  cosine_ladder_35b.py is a standalone script (does its own
-  bootstrap). Need a thin harness-callable probe that takes
-  `state=<harness state>` and runs the ladder logic without
-  re-bootstrapping.
+  iterate in ~30 sec on resident state.
+- ✅ **6 probe wrappers DEPLOYED** to qb1:
+  - `cb35_drift_bf16` / `cb35_drift_fp32_h` / `cb35_drift_fp32_h_no_dg`
+    (5-position oracle — fast headline)
+  - `cb35_drift_long_bf16` / `cb35_drift_long_fp32_h` /
+    `cb35_drift_long_fp32_h_no_dg` (85-position oracle, full ladder)
+  - All wrap `cb35_drift_ladder.main(state)` with env config.
+  - Each prints `HEADLINE: cos@L32 pos 1 = X.XXXX [PASS|PARTIAL|NO-MOVE]`
+    and writes a JSON to `.cache/cb35_runtime/drift_ladder_*.json`.
 
-## First 30 minutes of next session
+## GO-button — once `cb35` harness is ready
 
-1. **Verify harness is up**
-   ```bash
-   ssh qb1 'tmux ls'                          # expect: cb35: 1 windows
-   ssh qb1 'tail -20 ~/tt-xla/.cache/cb35_runtime/harness.log'
-   ```
-   If not running, restart with `bash scripts/run_harness_tmux.sh qb1`.
+Check harness status:
+```bash
+ssh qb1 'tail -3 ~/tt-xla/.cache/cb35_runtime/harness.log'
+# Expect "[harness] ready. Drop trigger files into …"
+```
 
-2. **Generate HF oracle (one-time)**
-   - Local (CPU): `python3 experiments/utils/hf_reference_35b.py
-     --out .cache/hf_oracle_35b_100tok --max-new 100`
-     (~30-60 min on a modern CPU)
-   - Then sync to qb1: `bash scripts/deploy.sh .cache/hf_oracle_35b_100tok/`
-   - OR: run on qb1 directly via the harness (faster — has more RAM)
+When ready, fire the 3 short probes back-to-back (each ~30 sec):
+```bash
+# H0 baseline (memory expectation: cos@L32 pos 1 = 0.9311)
+ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/drift_bf16'
+sleep 35
+ssh qb1 'cat tt-xla/.cache/cb35_runtime/trig/last.log | tail -20'
 
-3. **Write thin harness wrapper for cosine ladder**
-   `experiments/cb/dev/cb35_drift_ladder.py`:
-   - Signature: `def main(state)`
-   - Args via env: `CB35_LADDER_DN_DTYPE=fp32 CB35_LADDER_OWNED_GDN=off`
-   - Loads HF oracle from `.cache/hf_oracle_35b_100tok/`
-   - For pos in [0, 1, 2, 5, 10]: run `step_forward_ttnn` with
-     `capture={}` dict, compare per-layer hidden states to HF,
-     write cos numbers to JSON.
-   - Print cos@L32 pos1 prominently — that's the drift origin
-     per memory `feedback_35b_a3b_l32_dn_decode_drift.md`.
+# H1: fp32 H_t  (headline question — does cos climb ≥ 0.99?)
+ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/drift_fp32_h'
+sleep 35
+ssh qb1 'cat tt-xla/.cache/cb35_runtime/trig/last.log | tail -20'
 
-4. **First numerical answer**: A/B between bf16 default and
-   `TT_DN_STATE_DTYPE=fp32` H_t-only via the harness:
-   ```bash
-   # baseline
-   ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/drift_ladder'
+# H1+: fp32 H_t + owned_decay_gate off
+ssh qb1 'touch tt-xla/.cache/cb35_runtime/trig/drift_fp32_h_no_dg'
+sleep 35
+ssh qb1 'cat tt-xla/.cache/cb35_runtime/trig/last.log | tail -20'
+```
 
-   # fp32 H_t variant
-   ssh qb1 'env CB35_LADDER_DN_DTYPE=fp32 CB35_LADDER_OWNED_GDN=off \
-     touch tt-xla/.cache/cb35_runtime/trig/drift_ladder'
-   ```
-   (Note: env vars need to be passed to harness, not trigger. Check
-   how the existing probes handle config — may need to write a
-   variant file per config.)
+Then the 3 long-context variants:
+```bash
+for v in drift_long_bf16 drift_long_fp32_h drift_long_fp32_h_no_dg; do
+  ssh qb1 "touch tt-xla/.cache/cb35_runtime/trig/$v"
+  sleep 60
+  ssh qb1 "cat tt-xla/.cache/cb35_runtime/trig/last.log | tail -20"
+done
+```
+
+The JSON files left behind under `.cache/cb35_runtime/`:
+```
+drift_ladder_bf16_gdnon_dgon.json     ← H0 short
+drift_ladder_fp32_gdnoff_dgon.json    ← H1 short
+drift_ladder_fp32_gdnoff_dgoff.json   ← H1+ short
+drift_ladder_*_long.*.json (similar)  ← full ladder runs
+```
+
+Each has per-position `cos_per_layer`, `cos_L32`, `cos_final_norm`,
+`cos_logits`, and a top-level `L32_pos1_cos` for the headline.
+
+## Decision tree after the headline
+
+| `H0 cos@L32 pos1` | `H1 cos@L32 pos1` | Verdict |
+|---|---|---|
+| ≈ 0.9311 | ≥ 0.99 | **H1 confirmed.** Long-context probe should show top-1 lift too. Plumb to server, ship. |
+| ≈ 0.9311 | 0.93–0.97 | **H1 partial.** Decay+state mixed. Try `_no_dg` variant; consider H3 (decay-only fp32). |
+| ≈ 0.9311 | ≈ 0.9311 (unchanged) | **H1 dead.** Move to H3 (decay alone), H4 (RMSNorm), H5 (conv1d). New probe per hypothesis. |
+| Doesn't match memory | — | Suspect oracle mismatch (chat-template vs raw, wrong prompt). Verify oracle path. |
 
 ## Hypotheses to test (in priority order, all via the harness)
 

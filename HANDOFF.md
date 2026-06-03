@@ -3,7 +3,7 @@
 What this project is, where the perf is now, what to run, and what is next.
 Read top to bottom; everything else is linked.
 
-## Live session state (2026-06-02 late evening)
+## Live session state (2026-06-03)
 
 - **27B HTTP smoke PASSED** end-to-end on qb1 — `/v1/chat/completions` returns
   "The capital of France is Paris." in 2.4s with `finish_reason=stop`.
@@ -32,7 +32,22 @@ Read top to bottom; everything else is linked.
   this ragged-slot case never manifested. Memory:
   `feedback_35b_batched_forward_empty_slot_poison.md`. Earlier
   cb_reset_slots fix (`1fc039c`) was necessary but not sufficient.
-- **35B long-context drift — task #163 IN-PROGRESS, H1 REJECTED**.
+- **35B long-context drift — task #163 READY-TO-EXECUTE on dev harness**.
+  After 4 wasted server-restart cycles, switched to dev harness
+  workflow. **Everything is staged**:
+  - Both HF oracles generated on qb1 (`.cache/hf_oracle_35b_100tok/`
+    5-pos, `.cache/hf_oracle_35b_long/` 85-pos).
+  - 6 harness-callable probe wrappers deployed:
+    `cb35_drift_{bf16,fp32_h,fp32_h_no_dg}` (short) +
+    `cb35_drift_long_*` (full ladder).
+  - `experiments/cb/dev/cb35_drift_ladder.py` is the core probe;
+    each wrapper sets env vars before calling it.
+  - Headline metric printed per run: `cos@L32 pos 1` (baseline 0.9311
+    per memory; H1 PASS if ≥ 0.99).
+  - `research/35b_drift_next_session_plan.md` has the copy-paste GO
+    block + decision tree.
+  - Dev harness (tmux `cb35` on qb1) bootstrapping NOW; once ready,
+    each probe runs in ~30 sec via trigger-file pattern.
   Root cause hypothesis from research subagent + ollama#15865:
   qwen36_gdn_decode_owned kernel uses a single CB format for ALL
   18 CBs (program_factory.cpp:91) — math is fp32 in Dst but packs
@@ -43,16 +58,12 @@ Read top to bottom; everything else is linked.
     (bootstrap green, tokens generated) but **drift symptom
     UNCHANGED** — long-prompt output still degenerates at ~25 tokens.
   - **Fix attempt 2 (`35ea58f`+`7c3ede6`+`1c650b7`): fp32 residual
-    stream across all 40 layers** (embed_out→fp32, mixer outputs
-    upcast before residual add, h_norm cast back to bf16 for
-    mixers). Bootstrap completes but **engine.start() warmup
-    hangs/extremely slow** (>30 min where bf16 takes <30 sec) —
-    presumably the dispatch cost of typecasts + slower fp32 math
-    in the trace warmup. Not validated.
-  - **Working baseline**: revert to `92b442f` (fp32 H_t only) for a
-    server that boots and generates (just doesn't fix drift), OR
-    revert beyond that to bf16 default which is the 27B-style
-    working short-prompt path.
+    stream across all 40 layers** — Bootstrap completes but
+    `engine.start()` warmup hangs (>30 min where bf16 takes <30 sec).
+    **REVERTED in `5c5228c`.** Do not re-attempt without ladder
+    confirmation of a cosine gain.
+  - **Current main HEAD**: fp32 H_t opt-in (`92b442f` / `8010b3c`)
+    preserved. Server can be restarted with default bf16 any time.
 - **Next investigation method**: use the dev harness
   (`scripts/run_harness_tmux.sh qb1`) for FUTURE drift experiments
   — model stays resident, iteration is ~30 sec not ~14 min. Memory:
