@@ -147,9 +147,12 @@ def _profile_scope(state, name: str):
         state.profile_context_stack.pop()
 
 
-def bootstrap(state: MeshServerState):
+def bootstrap(state: MeshServerState, log=None):
     """Stage A: open mesh + set fabric + load sharded weights + tokenizer."""
-    print("[bootstrap] importing ttnn + torch + numpy…", flush=True)
+    if log is None:
+        def log(msg):
+            print(msg, flush=True)
+    log("[bootstrap] importing ttnn + torch + numpy…")
     import numpy as np
     import torch
     import ttnn
