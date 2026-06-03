@@ -207,6 +207,52 @@ Validation use: v0.1 cosine-ladder probe loads
 `hidden_states.npy[1+L]` and compares vs the TT capture from
 `server_gemma4_unified_ttnn.step_forward_ttnn(..., capture=cap)`.
 
+### v0.1.0 — bootstrap + embed scale + L0 input_layernorm (in progress)
+
+Fork shape: `experiments/serve/server_gemma4_unified_ttnn.py` (NEW;
+forked from `server_35b_ttnn.py` per REUSE MANDATE). v0.1.0 scope:
+
+- Open mesh (1,4).
+- Read config from `~/.cache/huggingface/.../config.json` directly
+  (not via `AutoConfig`) so the SERVER doesn't depend on
+  `transformers >= git_main`. Tokenizer deferred to v0.2.
+- Upload embed (replicated, ROW_MAJOR, bf16).
+- Upload final_norm with Gemma 4 Llama-style `w` (NO `+1.0`).
+- Upload all 48 layer weights: each layer has the FOUR norms
+  (input/post_attention/pre_feedforward/post_feedforward; all `w` not
+  `(1+w)`), Q/K/V/o projections, q_norm/k_norm, MLP (gate/up/down).
+  Sliding layers use NUM_KV_HEADS=8, head_dim=256 (sharded across 4
+  chips → 2 KV heads/chip). Global layers (8 of 48) currently upload
+  K-replicated across chips; the (1, 1·512) shape is plan §6.8 — v0.3
+  will resolve.
+- `step_forward_v01(state, tok_id, capture)`:
+  `embed(tok) → ·sqrt(HIDDEN) → rms_norm(input_layernorm_w)`.
+  Returns two capture entries: `embed_scaled`, `in_norm`.
+
+Validator: `experiments/cb/isolate/gm4_v01_L0_cos.py`. Loads
+`.cache/hf_oracle_gemma4_12b/`, runs the forward at
+`tok_id=prompt_ids[0]`, cosines `embed_scaled` vs
+`hidden_states[0, 0, :]` and `in_norm` vs `L0_in_norm[0, :]`.
+
+Gate: both cos ≥ 0.999.
+
+Expected: bootstrap ~3-5 min (12B bf16, ~6 GB/chip). Forward < 1 sec.
+If gate PASSES we have a correct bootstrap + correct embed scale +
+correct RMSNorm convention. v0.1.1 then adds q/k/v_proj + q_norm/k_norm
+projection sub-steps.
+
+### v0.1 STAGED sub-task breakdown (extends §4)
+
+| Stage | Adds | Validation gate |
+|---|---|---|
+| v0.1.0 | bootstrap + embed scale + L0 input_layernorm | cos ≥ 0.999 on `embed_scaled` + `in_norm` |
+| v0.1.1 | q/k/v_proj + q_norm/k_norm at L0 | cos ≥ 0.999 on `q_norm_out`, `k_norm_out`, `v_proj_out` (vs HF attn sub-hooks) |
+| v0.1.2 | attention at pos 0 (sliding) + o_proj | cos ≥ 0.999 on `mixer_out` |
+| v0.1.3 | post_attention_layernorm + residual_1 + MLP + post_ff_norm + residual_2 | cos ≥ 0.999 on all 4 remaining sub-steps + L0 output |
+| v0.2 | all 48 layers (sliding + global dispatch) + final_norm + lm_head + softcap | greedy top-1 matches HF at pos 0..4 |
+| v0.3 | KV cache + paged SDPA with `sliding_window_size=1024` | 8-tok generation matches HF token-for-token |
+| v0.4 | Trace capture | 100-step traced == eager |
+
 ------------------------------------------------------------------------
 
 ## 1. Verified facts (sourced)

@@ -33,14 +33,21 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
     — DO NOT mirror 35B's SwiGLU fused pattern in Gemma 4 v0.
   - Bonus: SDPA doc confirms `cur_pos=-1` skips compute for that
     batch slot — may resolve 35B #162 if backported.
-- **NEXT — v0 oracle then v0.1 forward**:
-  1. Fork `experiments/utils/hf_reference_35b.py` →
-     `hf_reference_gemma4_12b.py` (oracle generator for 5-tok smoke +
-     85-tok long ladder; HF teacher-forced).
-  2. Fork `experiments/serve/server_35b_ttnn.py` →
-     `server_gemma4_unified_ttnn.py`; STRIP MoE+DN; keep hybrid
-     layer-type dispatch. v0.1 gate: per-sub-step cos ≥ 0.9999 vs
-     HF L0 hook on 5-tok prompt.
+- **v0 oracle DONE 2026-06-03**: `experiments/utils/hf_reference_gemma4_12b.py`
+  (commit `156dc9f`) produced `.cache/hf_oracle_gemma4_12b/` with
+  6-token "The capital of France is" forward; HF predicts " a" at pos 5;
+  all 6 L0 sub-captures present (in/post_attn/pre_ff/mlp/post_ff norms
+  + mixer_out).
+- **v0.1.0 IN FLIGHT**: `experiments/serve/server_gemma4_unified_ttnn.py`
+  (NEW; forked from `server_35b_ttnn.py` per REUSE MANDATE) +
+  `experiments/cb/isolate/gm4_v01_L0_cos.py` validator. Scope:
+  bootstrap (open mesh, upload embed + all 48 layer weights) + L0
+  input_layernorm forward at pos 0. Gate: cos ≥ 0.999 on
+  `embed_scaled` (vs HF `hidden_states[0, 0, :]`) and `in_norm` (vs
+  HF `L0_in_norm[0, :]`). Bootstrap ~3-5 min on first run.
+- **NEXT after v0.1.0 PASS**: v0.1.1 adds q/k/v_proj + q_norm/k_norm
+  with their own cosine gates. Staged plan in
+  `research/gemma4_12b_bringup_plan.md` §"v0.1 STAGED sub-task breakdown".
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
   existing file it forks (or "no prior art, here's why") in its commit
   message. Deep utility shelf exists: `experiments/cb/_runner.py`,
