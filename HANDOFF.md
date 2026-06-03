@@ -148,6 +148,12 @@ to match) after prefix caching ships.
      in batched expert matmul. mad=0.000000 vs base at B=2 slot 0.
      Fixed the 13% per-slot drift from v1.4 loop. Critical bug in init
      port: used `MOE_INTER_CHIP (128)` instead of `MOE_INTER (512)`.
+   - **v2 trace capture SHIPPED 2026-06-02** (commit `c547419`).
+     Two-phase warmup + `begin_trace_capture`/`end_trace_capture`
+     around `forward_batch_tp_inner` works at B=2. Replay 149.7 ms/step
+     vs eager 296.7 ms/step = **1.98× speedup**. cb_scheduler trace
+     plumbing inherits automatically (calls the unified entry).
+     Higher B → larger speedups.
    - **CB35-prod wire-up GATED 2026-06-02** (commit `f1f7a61`).
      Unified `forward_batch_tp_inner` dispatches B=1→base (v0 bit-id) /
      B>1→v1 batched. Now supports `return_topk=K` at both Bs. cb_scheduler

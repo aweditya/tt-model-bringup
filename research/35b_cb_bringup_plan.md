@@ -160,22 +160,23 @@ in `experiments/cb/validate/`. The harness's dynamic-discovery means
 no harness restart between sub-stages. **Always clear `__pycache__`
 before retriggering after a deploy** — stale .pyc masks new imports.
 
-### v2 — Trace capture at B=N (~1-2 days)
+### v2 — Trace capture at B=N ✅ SHIPPED 2026-06-02 (`c547419`)
 
-Two-phase warmup pattern (already proven for 27B). Steps:
-1. Warmup `forward_batch_35b_inner` at B=N WITHOUT trace (compile only)
-2. `ttnn.synchronize_device(mesh)`
-3. Capture both prefill (if any) + decode traces back-to-back
+Two-phase warmup + trace capture pattern (mirrors cb_scheduler.py:197-227).
+Inherits all the plumbing via `cb.forward_batch_tp_inner` dispatch.
 
-The 35B B=1 trace already works (P3 task done). Going B=N is the same
-pattern with bigger input buffers. Pattern A MoE is data-INDEPENDENT at
-the tensor level (mask is just data, not a control-flow branch), so
-trace capture works identically.
+cb35_v2_trace.py at B=2 results:
+  - capture/release_trace: OK
+  - mean eager  = 296.7 ms/step
+  - mean traced = 149.7 ms/step
+  - **speedup = 1.98×**
 
-Gate: traced batched forward bit-correct vs eager (cos ≥ 0.9999 on
-logits); ~5-10× speedup like 27B.
+cb_scheduler already drives the trace path automatically via the
+unified `cb.forward_batch_tp_inner` entry — no scheduler changes
+needed.
 
-Effort: ~1-2 days assuming v1 is shape-clean.
+Speedup at higher B will be larger (more dispatch amortization).
+1.98× at B=2 already crosses the bar; production trace is shipped.
 
 ### v3 — Owned-GDN batched FOLD trick (~3-5 days, optional)
 
