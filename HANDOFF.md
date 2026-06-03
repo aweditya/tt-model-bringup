@@ -17,8 +17,19 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
 ### Active — Gemma 4 12B bringup (#165)
 
 - **Plan**: [`research/gemma4_12b_bringup_plan.md`](research/gemma4_12b_bringup_plan.md)
-  (verified `config.json` facts, code-reuse map at `file:line`, novel-item
-  ranking, sub-task breakdown with cosine gates).
+  — start at §"REUSE MANDATE" (always grep for an existing pattern
+  before writing new code) → §0 Step 0 pre-flight → §2 code-reuse
+  map at `file:line` → §3 novel items → §4 sub-task breakdown with
+  cosine gates.
+- **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
+  existing file it forks (or "no prior art, here's why") in its commit
+  message. Deep utility shelf exists: `experiments/cb/_runner.py`,
+  `experiments/utils/{ttnn_introspect,hf_reference_35b,cosine_ladder_*,
+  test_fused_*_isolated,needle_haystack_*,tracy_*}.py`,
+  `experiments/cb/isolate/{paged_sdpa,paged_update_cache,chunked_sdpa,
+  owned_gdn,...}.py`, `experiments/serve/{server_35b_ttnn,server_35b_cb,
+  server_tp_cb,cb_api,cb_scheduler}.py`. Plan §"REUSE MANDATE" has
+  the full table.
 - **Step 0 — pre-flight hardware probes (no model upload, ~5 min)**:
   1. **§6.1**: confirm qb1's installed ttnn exposes `sliding_window_size`
      on `ttnn.experimental.paged_scaled_dot_product_attention_decode`.

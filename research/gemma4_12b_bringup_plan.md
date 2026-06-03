@@ -8,6 +8,58 @@ with a concrete cosine target.
 
 ------------------------------------------------------------------------
 
+## REUSE MANDATE (user-set, durable)
+
+**Before writing any new file, grep the repo for a forkable pattern.
+Before writing any new function, grep for an existing helper. Never
+re-implement what already ships.**
+
+The 27B + 35B bringups have produced a *deep* utility shelf:
+
+| Existing | Use for Gemma 4 |
+|---|---|
+| `experiments/cb/_runner.py` `project_root()` / `log()` / `bootstrap_27b_cb()` | New `bootstrap_gemma4_cb()` sister function — same shape, ~20 LOC |
+| `experiments/utils/ttnn_introspect.py` | Step 0.1 §6.1 — call as-is over ssh, NO new code |
+| `experiments/utils/test_fused_swiglu_isolated.py` + `test_fused_binary_activations_isolated.py` | Pattern for Step 0.2 §6.3 GELU variant probe — fork shape, swap unary list |
+| `experiments/utils/hf_reference_35b.py` | Fork → `hf_reference_gemma4_12b.py`; PRUNE MoE/DN hooks, ADD `--hook-rope-layer` |
+| `experiments/utils/cosine_ladder_35b.py` + `cosine_ladder_hf_ref.py` + `cosine_ladder_aggregate.py` | Fork → `cosine_ladder_gemma4_12b.py`; swap layer-count + oracle |
+| `experiments/cb/dev/cb35_drift_ladder.py` | Fork → `cb_gm4_drift_ladder.py` for harness-callable cosine ladder |
+| `experiments/cb/dev/cb35_dev_harness.py` | Fork → `cb_gm4_dev_harness.py`; AFTER #166 hardening lands |
+| `experiments/cb/isolate/paged_sdpa.py` | Reuse-or-fork for sliding+global SDPA isolation |
+| `experiments/cb/isolate/paged_update_cache.py` | Reuse for KV cache write/read isolation tests |
+| `experiments/cb/isolate/chunked_sdpa.py` | Reference for prefill chunked-SDPA pattern (v0.2+ if needed) |
+| `experiments/serve/server_35b_ttnn.py` | Fork base for `server_gemma4_unified_ttnn.py`; STRIP MoE/DN, KEEP hybrid dispatch |
+| `experiments/serve/server_35b_cb.py` + `server_tp_cb.py` | Fork base for CB shape (v1) |
+| `experiments/serve/cb_api.py` + `cb_scheduler.py` `BACKENDS` / `_BACKEND_MODULES` dicts | EDIT, don't fork — add `"gemma4_12b": (…)` entries |
+| `experiments/serve/openai_endpoint.py` `_messages_to_prompt` | Reuse as-is (tokenizer-driven; tokenizer ships with the model) |
+| `experiments/utils/needle_haystack_*.py` | Reuse for v0.4 sliding-window correctness test |
+| `experiments/utils/syntax_check.py` | Local Python-parse helper (no qb1 round-trip) |
+| `experiments/utils/full_layer_tp_probe.py` + `tp_attn_traced_probe.py` | Pattern for full-layer / TP-attn isolation probes |
+| `experiments/utils/p22_vocab_sharded_lm_head_probe.py` | Reference for vocab-sharded lm_head (with the tied-embed twist) |
+| `experiments/utils/paged_vs_nonpaged_sdpa_latency.py` | Pattern for sliding-window SDPA perf isolation (post-correctness) |
+| `experiments/utils/tracy_profile_traced_decode.py` + `run_tracy_probe.sh` | Reuse for traced-decode perf (post-v0.4) |
+| `experiments/utils/hf_download.py` | Use as-is for Gemma 4 12B safetensors fetch |
+| `experiments/utils/npz_inspect.py` | Use as-is for capture-dict inspection during debug |
+| `experiments/serve/scripts/deploy.sh` + `serve_cb.sh` | Use as-is; deploy.sh auto-globs `experiments/serve/*.py` |
+
+**Decision rule before any LOC**: state which existing file you are
+forking (or "no existing pattern, here's why") in the commit message.
+If reviewer can't see the prior art cited, the PR doesn't ship.
+
+**Memory cross-references** (search by name in `~/.claude/.../memory/`):
+- `feedback_cb_backend_dispatch_holes` — when adding `gemma4_12b` to
+  `BACKENDS`, grep every `import server_tp` AND every `27b`/`35b` literal
+  in `experiments/serve/` before deploying.
+- `feedback_deploy_serve_files_too` — `deploy.sh` on the WHOLE
+  `experiments/serve/` glob; one file stuck in local git burned hours.
+- `feedback_use_dev_harness_for_iteration` — once Gemma 4 v0.1 is up,
+  switch all probes to harness triggers; do NOT restart `serve_cb.sh`
+  per experiment.
+- `feedback_qwen36_qnorm_knorm_zero_centered` — the `(1+w)` rule that
+  bit us on 35B. For Gemma 4: DO NOT add `+1.0` (Llama-style RMSNorm).
+
+------------------------------------------------------------------------
+
 ## 0. SCHEDULING — ACTIVE 2026-06-03
 
 This is **task #165** in the project task tracker. Status: **in_progress**.
