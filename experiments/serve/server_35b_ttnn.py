@@ -1343,6 +1343,7 @@ class State:
     def __init__(self):
         self.mesh = None
         self.tokenizer = None
+        self.tok = None  # alias of self.tokenizer; cb_api expects state.tok
         self.text_cfg = None
         self.layer_types = None
         self.embed_w_np = None
@@ -1702,6 +1703,7 @@ def bootstrap(state, log=None):
     state.text_cfg.dtype = torch.bfloat16
     state.layer_types = list(state.text_cfg.layer_types)
     state.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    state.tok = state.tokenizer  # alias for cb_api's state.tok convention
 
     log("[bootstrap] enumerate shards + load top-level weights to mesh…")
     key_to_shard = build_key_to_shard()
