@@ -155,6 +155,58 @@ metric, not max_abs.
   `cur_pos=-1` to skip empty slots. Try this when Gemma 4 v1 hits
   multi-slot — may resolve 35B's poison too if backported.
 
+### Step 0.3 — separate venv setup DONE 2026-06-03
+
+User-mandated isolation: qb1's main `.venv` has `transformers 5.9.0`
+which does not recognize `gemma4_unified` (model released today). To
+keep 27B/35B prod pristine, Gemma 4 work runs in a sibling venv.
+
+- One-shot setup: `bash scripts/setup_venv_gemma4.sh qb1` (idempotent;
+  creates `~/tt-xla/.venv-gemma4`, installs transformers from git plus
+  torch / numpy / safetensors / huggingface_hub / accelerate /
+  sentencepiece, verifies `AutoConfig.from_pretrained("google/gemma-4-12B")`
+  loads).
+- Verified config matches plan §1.1: model_type=`gemma4_unified`,
+  text_model_type=`gemma4_unified_text`, n_layers=48, hidden_size=3840,
+  vocab_size=262144.
+- Run pattern for Gemma 4 HF reference / oracle scripts:
+  `ssh qb1 'source ~/tt-xla/.venv-gemma4/bin/activate && cd ~/tt-xla && python -u experiments/utils/hf_reference_gemma4_12b.py'`.
+- `scripts/run_remote.sh` hardcodes `.venv/bin/python`; OK for ttnn-only
+  probes (Step 0.1/0.2), not for HF-reference scripts. Decision: do
+  not edit `run_remote.sh` (keep it dumb); invoke the venv inline for
+  HF-dependent scripts. Will revisit if we end up running enough
+  Gemma 4 HF probes to justify a `PY_VENV` override.
+
+### Step 0.4 — HF oracle (in progress at commit time)
+
+Forked `experiments/utils/hf_reference_35b.py` →
+`experiments/utils/hf_reference_gemma4_12b.py` per REUSE MANDATE:
+- KEEP verbatim: argparse, log, save layout, forward call.
+- REMOVE: DN sub-hooks (`in_proj_qkv/z/a/b`, `conv1d`, etc.), MoE
+  router hooks, `--hook-dn-layer` flag.
+- ADD: `pre_feedforward_layernorm` + `post_feedforward_layernorm`
+  hooks (the 4-norm structure §1.5), `attn_layer_type` per-layer
+  dump in meta.json, `--hook-rope-layer` flag, `get_text_layers()`
+  helper that tolerates the gemma4_unified
+  `model.model.language_model.layers` path AND fallbacks.
+
+Outputs under `.cache/hf_oracle_gemma4_12b/`:
+`prompt_ids.npy`, `hidden_states.npy` `[49, seq, 3840]`,
+`logits.npy` `[seq, 262144]` (post-softcap), `final_norm.npy`,
+`argmax.npy`, `L0_*.npy` (6 sub-step captures including the two
+new pre/post feedforward norms), `meta.json` (with `layer_types`,
+`head_dim`, `global_head_dim`, `sliding_window`,
+`final_logit_softcapping`, `tie_word_embeddings`,
+`hidden_activation`, `base_attr_path`).
+
+First-run cost: ~24 GB download from HF Hub (~5-10 min) + ~3-5 min
+CPU bf16 load + ~30 sec forward. Subsequent runs skip the download.
+Log goes to `.cache/oracle_runs/gemma4_12b_smoke.log`.
+
+Validation use: v0.1 cosine-ladder probe loads
+`hidden_states.npy[1+L]` and compares vs the TT capture from
+`server_gemma4_unified_ttnn.step_forward_ttnn(..., capture=cap)`.
+
 ------------------------------------------------------------------------
 
 ## 1. Verified facts (sourced)

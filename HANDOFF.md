@@ -18,9 +18,29 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
 
 - **Plan**: [`research/gemma4_12b_bringup_plan.md`](research/gemma4_12b_bringup_plan.md)
   — start at §"REUSE MANDATE" (always grep for an existing pattern
-  before writing new code) → §0 Step 0 pre-flight → §2 code-reuse
-  map at `file:line` → §3 novel items → §4 sub-task breakdown with
-  cosine gates.
+  before writing new code) → §0 Step 0 pre-flight (DONE) → §2
+  code-reuse map at `file:line` → §3 novel items → §4 sub-task
+  breakdown with cosine gates.
+- **Step 0 DONE 2026-06-03 (commit `4395b28`)**:
+  - §6.1 `sliding_window_size` kwarg confirmed on
+    `ttnn.transformer.paged_scaled_dot_product_attention_decode`
+    — sliding decode is a kwarg flip, not a new kernel. Plan §3.3
+    risk closed.
+  - §6.3 GELU variant probe (`experiments/utils/gemma4_gelu_variant_probe.py`):
+    `ttnn.gelu(x, fast_and_approximate_mode=False)` matches
+    `gelu_pytorch_tanh` at cos=0.999998. The fused-activation path
+    (`ttnn.mul(.., [UnaryOpType.GELU])`) uses the APPROXIMATE kernel
+    — DO NOT mirror 35B's SwiGLU fused pattern in Gemma 4 v0.
+  - Bonus: SDPA doc confirms `cur_pos=-1` skips compute for that
+    batch slot — may resolve 35B #162 if backported.
+- **NEXT — v0 oracle then v0.1 forward**:
+  1. Fork `experiments/utils/hf_reference_35b.py` →
+     `hf_reference_gemma4_12b.py` (oracle generator for 5-tok smoke +
+     85-tok long ladder; HF teacher-forced).
+  2. Fork `experiments/serve/server_35b_ttnn.py` →
+     `server_gemma4_unified_ttnn.py`; STRIP MoE+DN; keep hybrid
+     layer-type dispatch. v0.1 gate: per-sub-step cos ≥ 0.9999 vs
+     HF L0 hook on 5-tok prompt.
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
   existing file it forks (or "no prior art, here's why") in its commit
   message. Deep utility shelf exists: `experiments/cb/_runner.py`,
