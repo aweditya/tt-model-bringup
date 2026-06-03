@@ -212,16 +212,41 @@ If pursued: cache only attention-layer KV; explicitly mark DN layers as
 non-cacheable. Mirror the 27B implementation but with a per-layer
 "cacheable" flag.
 
-### prod — Production wire-up (quick)
+### prod — Production wire-up (task #147, NEXT)
 
-- MM1 already added `TT_BACKEND=35b` selection.
-- Restart `serve_cb.sh` with `TT_BACKEND=35b TT_CB_PREFIX_CACHE=0` (v4
-  off by default).
-- Real chat smoke through `chat.py`.
-- `/v1/models` advertises `Qwen/Qwen3.6-35B-A3B`.
-- 4-tab concurrent smoke.
+The v1 stack is functionally complete. Production wire-up means routing
+`cb_engine`/`cb_scheduler` through `forward_batch_tp_inner_batched` at
+B>1 instead of the v0 delegate-to-base path.
 
-Gate: real chat works; multi-tab no wedge.
+**What's already done** (no changes needed):
+- MM1: `TT_BACKEND=35b` selector in `cb_api.py` (`BACKENDS` registry).
+- `TT_CB_TOPK_K=64` default for 35B (works around the [1,VOCAB] bulk
+  readback bug, #149).
+- `serve_cb.sh` lifecycle (start/stop/status) — model-agnostic.
+
+**What needs verifying / wiring**:
+- `cb_scheduler` calls `cb.forward_batch_tp_inner(state, return_topk=K)`
+  (logits → host top-K sampling). For 35B at B>1, this must route
+  through `forward_batch_tp_inner_batched` (the new batched forward).
+  Currently `cb.forward_batch_tp_inner` delegates to base at B=1; for
+  B>1 we need to wire it to the batched function (or have the scheduler
+  call a different entry).
+- The argmax/topk final-op in `forward_batch_tp_inner_batched` needs to
+  return the same tensor shape contract the scheduler expects
+  (UINT32 [B, 1] for argmax-mode, ([B, 1, K], [B, 1, K]) for topk-mode).
+
+**Sub-stages**:
+- prod.0: audit `cb_scheduler.step()` call sites that touch the
+  forward — what return shape it expects per B.
+- prod.1: add `return_topk` support to `forward_batch_tp_inner_batched`
+  (mirror the v0 pattern, the lm_head topk path).
+- prod.2: wire `forward_batch_tp_inner` to dispatch on B (B=1 → base
+  delegate, B>1 → `forward_batch_tp_inner_batched`).
+- prod.3: real chat smoke at TT_CB_SLOTS=2 via `chat.py`.
+- prod.4: 4-tab concurrent smoke.
+
+Gate: real chat works at B=2 with two concurrent clients; multi-tab no
+wedge.
 
 ## Stop-gate decisions (per research §7)
 

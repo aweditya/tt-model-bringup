@@ -677,18 +677,27 @@ def layer_forward_batched_35b(state, h_tt, w, layer_type, cos_tt, sin_tt,
     return h_final
 
 
-def forward_batch_tp_inner_batched(state):
+def forward_batch_tp_inner_batched(state, return_topk=None):
     """Full forward at B>1: embed+RoPE prelude → 40-layer chain → final_norm
-    → lm_head → on-device argmax (per slot).
+    → lm_head → on-device argmax OR topk (per slot).
 
-    Returns argmax_tt UINT32 [B, 1] (per-slot top-1 token).
+    Returns:
+      - return_topk=K:   (top_vals [B, 1, K], top_idxs [B, 1, K]) per chip,
+                         replicated across mesh.
+      - default:         argmax_tt UINT32 [B, 1, 1] per chip, replicated.
 
     At B=1, delegates to base.step_forward_inner (the v0 path) for parity
-    with prior validation.
+    with prior validation. base reads state.sampler_topk to switch modes;
+    we set it transiently around the call.
     """
     B = state.cb_B
     if B == 1:
-        return base.step_forward_inner(state)
+        saved_topk = getattr(state, "sampler_topk", 0)
+        try:
+            state.sampler_topk = int(return_topk) if return_topk is not None else 0
+            return base.step_forward_inner(state)
+        finally:
+            state.sampler_topk = saved_topk
 
     mesh = state.mesh
     h_tt, cos_tt, sin_tt = _batched_prelude(state)
@@ -708,6 +717,13 @@ def forward_batch_tp_inner_batched(state):
     ttnn.deallocate(h_tt)
     logits = ttnn.matmul(h_norm, state.lm_head_tt, compute_kernel_config=base.HIFI4)
     ttnn.deallocate(h_norm)
+
+    if return_topk is not None:
+        # topk operates on TILE layout directly; matches base path.
+        top_vals, top_idxs = ttnn.topk(logits, k=int(return_topk), dim=-1)
+        ttnn.deallocate(logits)
+        return (top_vals, top_idxs)
+
     logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
     ttnn.deallocate(logits)
     argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
@@ -716,34 +732,23 @@ def forward_batch_tp_inner_batched(state):
 
 
 def forward_batch_tp_inner(state, return_logits=False, return_topk=None):
-    """One batched forward step. v0: B=1.
+    """cb_engine/cb_scheduler entry point. Dispatches on state.cb_B:
+      - B == 1: delegate to base.step_forward_inner (v0 path; bit-validated).
+      - B > 1: route through forward_batch_tp_inner_batched (v1 path).
 
-    Delegates to base.step_forward_inner — at B=1 we ARE the single-stream
-    path. base reads state.sampler_topk to choose between argmax-mode and
-    topk-mode internally; we set it transiently around the call.
-
-    return_logits is NOT supported by base; v0 routes it to topk K=64 and
-    raises (cb_engine's logits-mode shouldn't be used for 35B — see
-    TT_CB_TOPK_K=64 default in cb_api).
+    return_logits is NOT supported on 35B — the [1, VOCAB] bulk readback
+    is broken (#149). cb_api defaults TT_CB_TOPK_K=64 to force topk-mode.
 
     Returns:
-      - return_topk=K:   (top_vals [1, K], top_idxs [1, K])
-      - default:         argmax_tt UINT32 [1, 1]
+      - return_topk=K:   (top_vals [B, ?, K], top_idxs [B, ?, K])
+      - default:         argmax_tt UINT32 [B, ?, 1]
     """
-    if state.cb_B != 1:
-        raise NotImplementedError("v0 supports B=1 only")
-
     if return_logits:
         raise NotImplementedError(
-            "v0 doesn't support return_logits — 35B's [1, VOCAB] bulk readback "
+            "35B doesn't support return_logits — [1, VOCAB] bulk readback "
             "is broken (issue #149). Use topk-mode (TT_CB_TOPK_K>0).")
 
-    saved_topk = getattr(state, "sampler_topk", 0)
-    try:
-        state.sampler_topk = int(return_topk) if return_topk is not None else 0
-        return base.step_forward_inner(state)
-    finally:
-        state.sampler_topk = saved_topk
+    return forward_batch_tp_inner_batched(state, return_topk=return_topk)
 
 
 # ----------------------------------------------------------------------------
