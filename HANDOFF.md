@@ -32,19 +32,32 @@ Read top to bottom; everything else is linked.
   this ragged-slot case never manifested. Memory:
   `feedback_35b_batched_forward_empty_slot_poison.md`. Earlier
   cb_reset_slots fix (`1fc039c`) was necessary but not sufficient.
-- **35B long-context drift FIX SHIPPED — task #163 (`92b442f`)**.
+- **35B long-context drift — task #163 IN-PROGRESS, H1 REJECTED**.
+  Root cause hypothesis from research subagent + ollama#15865:
   qwen36_gdn_decode_owned kernel uses a single CB format for ALL
-  18 CBs (program_factory.cpp:91) — even though math is HiFi4 +
-  fp32_dest_acc internally, state packs back to bf16 per step.
-  Decay≈0.99 amplifies the quantization → coherent text degrades
-  at ~30 tokens (cos@L32 pos1 = 0.9311 per memory). Ollama
-  precedent `ollama#15865` is the same kernel-family bug.
-  Fix: TT_DN_STATE_DTYPE=fp32 env hook + ttnn.typecast all DN
-  recurrence operands (g_decay, beta, v_h, k_rep, q_rep) to fp32
-  in manual path. Owned kernel auto-disabled (it rejects fp32 state).
-  Default behavior unchanged; opt-in via env. Memory:
-  `feedback_35b_a3b_l32_dn_decode_drift`,
-  `feedback_35b_dn_h_state_drift_lever`. Smoke pending bootstrap.
+  18 CBs (program_factory.cpp:91) — math is fp32 in Dst but packs
+  back to bf16 each step. Decay≈0.99 amplifies the quantization
+  → coherent text degrades at ~30 tokens.
+  - **Fix attempt 1 (`92b442f`+`8010b3c`): fp32 H_t + manual DN
+    recurrence + typecast all operands to fp32.** Mechanically OK
+    (bootstrap green, tokens generated) but **drift symptom
+    UNCHANGED** — long-prompt output still degenerates at ~25 tokens.
+  - **Fix attempt 2 (`35ea58f`+`7c3ede6`+`1c650b7`): fp32 residual
+    stream across all 40 layers** (embed_out→fp32, mixer outputs
+    upcast before residual add, h_norm cast back to bf16 for
+    mixers). Bootstrap completes but **engine.start() warmup
+    hangs/extremely slow** (>30 min where bf16 takes <30 sec) —
+    presumably the dispatch cost of typecasts + slower fp32 math
+    in the trace warmup. Not validated.
+  - **Working baseline**: revert to `92b442f` (fp32 H_t only) for a
+    server that boots and generates (just doesn't fix drift), OR
+    revert beyond that to bf16 default which is the 27B-style
+    working short-prompt path.
+- **Next investigation method**: use the dev harness
+  (`scripts/run_harness_tmux.sh qb1`) for FUTURE drift experiments
+  — model stays resident, iteration is ~30 sec not ~14 min. Memory:
+  `feedback_qb1_tmux_for_long_running.md`. We violated NN #1
+  ("think first") by skipping straight to server-restart iteration.
 - Memory: `feedback_dev_harness_vs_cb_engine_gap.md`,
   `feedback_cb_backend_dispatch_holes.md`, `feedback_deploy_serve_files_too.md`.
 - The earlier "35B bootstrap hangs at enumerate shards" hypothesis was wrong.

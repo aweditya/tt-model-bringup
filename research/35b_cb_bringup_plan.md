@@ -386,3 +386,32 @@ Investigation deferred to task #149.
 - **Local templates**: `experiments/serve/server_tp_cb.py` (the file to
   paste-and-modify), `server_35b_ttnn.py` (existing B=1 forward to wrap).
 - Research: `research/tt_metal_moe_cb_patterns.md`.
+
+## Task #163 — long-context drift (UPDATE 2026-06-03)
+
+H1 from research report (DN H_t bf16 round-trip per step, Ollama
+precedent ollama#15865) — **REJECTED**. fp32 H_t fix (`92b442f`)
+verified active via bootstrap log, server boots, tokens generate —
+but degenerate-loop output at ~25 tokens is **unchanged** vs the
+bf16 baseline. Implementation-correct, hypothesis wrong (or partial).
+
+fp32 residual stream extension (`35ea58f` + `7c3ede6` + `1c650b7`) —
+**STUCK in engine.start() warmup**. Bootstrap completes but warmup
+hangs >30 min (vs <30 sec for bf16). Presumably typecast dispatch
+overhead + fp32 math in the trace capture path.
+
+**Lesson re-learned (non-negotiable #1)**: should have routed drift
+experiments through the dev harness above (`run_harness_tmux.sh qb1`)
+instead of full server restarts. Model stays resident; iteration
+~30 sec vs ~14 min for a fresh server bootstrap.
+
+**Next investigator should**:
+1. Spin up the dev harness ONCE (14 min, one-time).
+2. Run `experiments/utils/cosine_ladder_35b.py` with
+   `--dn-state-dtype fp32 --owned-gdn off` to get per-layer cos@L32
+   pos1 numbers vs the HF oracle.
+3. Compare to baseline (bf16 default). If fp32 H_t doesn't move
+   cos@L32 ≥ 0.99, H1 is provably insufficient — move on to H3
+   (decay-only fp32 cast), H4 (RMSNorm precision), or H5 (conv1d).
+4. ONLY ship a fix to the production server once a ladder run
+   confirms cos@L32 pos 1 ≥ 0.99 AND needle-haystack@100 retrieves.
