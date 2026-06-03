@@ -89,9 +89,8 @@ def main(state=None) -> int:
         base.bootstrap(state, log)
     else:
         log("[cb35-v0-chat] using pre-bootstrapped state from harness")
-    if not hasattr(state, "cb_B"):
-        log("[cb35-v0-chat] setup_cb_state(B=1)…")
-        cb.setup_cb_state(state, B=1)
+    log(f"[cb35-v0-chat] setup_cb_state(B=1) (was B={getattr(state, 'cb_B', None)})")
+    cb.setup_cb_state(state, B=1)
 
     # Simple fixed prompt — picked to stress decode rather than test prompts.
     # A few-token prompt gives us prefill + multi-step decode in one run.

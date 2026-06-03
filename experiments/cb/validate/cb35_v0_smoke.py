@@ -88,11 +88,9 @@ def main(state=None) -> int:
     else:
         log("[cb35-v0-smoke] using pre-bootstrapped state from harness")
 
-    if not hasattr(state, "cb_B"):
-        log("[cb35-v0-smoke] setup_cb_state(B=1)…")
-        cb.setup_cb_state(state, B=1)
-    else:
-        log(f"[cb35-v0-smoke] cb_state already set up (B={state.cb_B})")
+    # Always set B=1 — v0 tests assume single-stream contract.
+    log(f"[cb35-v0-smoke] setup_cb_state(B=1) (was B={getattr(state, 'cb_B', None)})")
+    cb.setup_cb_state(state, B=1)
 
     # Pick a fixed prompt token to feed at pos 0; record the argmax via base.
     PROMPT_TOK = 100  # arbitrary

@@ -31,6 +31,7 @@ Run on qb1:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from collections import deque
@@ -39,8 +40,24 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 
-import server_tp as base       # noqa: E402
-import server_tp_cb as cb      # noqa: E402
+# Backend dispatch: TT_BACKEND selects which model module to use as
+# `base` (single-stream State + bootstrap) and `cb` (CB forward wrapper).
+# Mirrors cb_api.py:BACKENDS. Without this dispatch cb_scheduler ALWAYS
+# bound to 27B even when cb_api loaded 35B (caught 2026-06-02 — server
+# loaded 35B weights but the scheduler ran 27B forward, producing
+# coherent-but-wrong-model responses).
+import importlib  # noqa: E402
+_BACKEND_MODULES = {
+    "27b":   ("server_tp",        "server_tp_cb"),
+    "35b":   ("server_35b_ttnn",  "server_35b_cb"),
+}
+_TT_BACKEND = os.environ.get("TT_BACKEND", "27b")
+if _TT_BACKEND not in _BACKEND_MODULES:
+    raise ValueError(
+        f"unknown TT_BACKEND={_TT_BACKEND!r}; valid: {sorted(_BACKEND_MODULES)}")
+_base_mod, _cb_mod = _BACKEND_MODULES[_TT_BACKEND]
+base = importlib.import_module(_base_mod)
+cb = importlib.import_module(_cb_mod)
 from live_slot_store import LiveSlotStore  # noqa: E402
 
 sys.stdout.reconfigure(line_buffering=True)
