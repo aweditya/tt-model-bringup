@@ -18,16 +18,20 @@ Read top to bottom; everything else is linked.
   scalar; 35B's 3-D hidden activations meant the readback was
   `[B, 1, K]` and `int(row)` blew up. Fix is a generic squeeze of the
   unit-seq dim in cb_scheduler's host path. 27B unchanged.
-- **35B HTTP smoke garbage output ROOT-CAUSED + FIX SHIPPED**:
-  `server_35b_cb.cb_reset_slots` was hardcoded to no-op at `cb_B > 1`
-  ("v1 will use masked multiply" — never landed). With
-  `TT_CB_SLOTS=2` every admit skipped state reset → DN recurrent
-  state carried `_warmup_decode` pollution into every real request →
-  prompt-independent Chinese-char loop. Ported 27B's masked-multiply
-  per-slot reset pattern to 35B (cs `[B, CONV_DIM_CHIP, KERNEL]` ×
-  mask `[B,1,1]`, rs `[B, NV_PER_CHIP, K, V]` × mask `[B,1,1,1]`).
-  KV needs no reset (SDPA cur_pos-bound self-overwrites). Memory:
-  `feedback_35b_cb_reset_slots_b_gt_1_noop.md`. Smoke pending bootstrap.
+- **35B HTTP COHERENT at TT_CB_SLOTS=1** (the new default for 35B,
+  committed in `cb_api.py`). Sample: "Hello" → `"Hello! How can I help
+  you today?"` (`finish_reason=stop`). cb_api now defaults
+  `TT_CB_SLOTS=1` for 35B (mirrors the existing backend-aware
+  `TT_CB_TOPK_K` pattern). 27B still defaults to 4 slots.
+- **35B B>1 BROKEN — task #162**. Triangulated this session:
+  TT_CB_SLOTS=2 with one /v1/chat admit produces deterministic
+  prompt-independent Chinese-char loops (`两件两特朗...`).
+  Same prompts at TT_CB_SLOTS=1 are coherent. Hypothesis: empty
+  slot's cur_pos=-1 poisons batched SDPA mask or MoE expert routing.
+  v1.5 dev-harness B=8 chat validation used all slots active, so
+  this ragged-slot case never manifested. Memory:
+  `feedback_35b_batched_forward_empty_slot_poison.md`. Earlier
+  cb_reset_slots fix (`1fc039c`) was necessary but not sufficient.
 - Memory: `feedback_dev_harness_vs_cb_engine_gap.md`,
   `feedback_cb_backend_dispatch_holes.md`, `feedback_deploy_serve_files_too.md`.
 - The earlier "35B bootstrap hangs at enumerate shards" hypothesis was wrong.

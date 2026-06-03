@@ -239,19 +239,22 @@ Plus observability (`3e150c0`): `/bootstrap` endpoint + side-file
 **27B smoke**: PASS end-to-end. `/v1/chat/completions` returns
 "The capital of France is Paris." in 2.4s, finish_reason=stop.
 
-**35B smoke**: bootstrap + HTTP green; first inference crash fixed in
-`39f4663`. Degenerate output then ROOT-CAUSED to `cb_reset_slots`
-being a no-op at `cb_B > 1` (server_35b_cb.py:240, `"v1 will use
-masked multiply"` TODO that never landed). With TT_CB_SLOTS=2 every
-admit skipped state reset, so DN recurrent state carried `_warmup_decode`
-pollution into the first real request. Fix ports 27B's masked-multiply
-per-slot reset (`server_tp_cb.cb_reset_slots`) to 35B with the right
-DN tensor shapes:
-  cs per chip: `[B, CONV_DIM_CHIP, KERNEL]`     × mask `[B, 1, 1]`
-  rs per chip: `[B, NV_PER_CHIP, K, V]`         × mask `[B, 1, 1, 1]`
-KV needs no reset — cur_pos-bounded SDPA self-overwrites blocks.
+**35B smoke**: at TT_CB_SLOTS=1, end-to-end COHERENT — "Hello" →
+`"Hello! How can I help you today?"` (`finish_reason=stop`).
+At TT_CB_SLOTS>1 with ragged admission, prompt-independent garbage
+(`两件两特朗...` loop) — the empty slot's cur_pos=-1 poisons batched
+SDPA / MoE math. v1.5 (B=8 dev harness) validated only with all slots
+active so this case never ran. Workaround: backend-aware default
+`TT_CB_SLOTS=1` for 35B in `cb_api.py` (mirrors the existing
+`TT_CB_TOPK_K=64` 35B-specific default pattern). 27B unchanged at 4.
 
-**Task #161** tracks. Smoke pending bootstrap completion.
+Earlier `cb_reset_slots` no-op fix in `1fc039c` (port of 27B's
+masked-multiply pattern) was necessary but not sufficient — fixed
+warmup-pollution carry-over but not the empty-slot poisoning.
+
+**Task #162** (CB35-B-gt-1) tracks the proper B>1 fix. Likely loci:
+SDPA cur_pos=-1 mask handling, MoE expert routing with DUMMY_TOK in
+empty slot, or batched DN cross-slot reductions.
 
 **Session lessons saved to memory**:
 - `[[cb-backend-dispatch-holes]]`: shared-contract changes in

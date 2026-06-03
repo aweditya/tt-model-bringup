@@ -285,7 +285,15 @@ def _build_app_with_default_lifespan():
             st.deltanet_decay_mode = "native_softplus"
         eos_id = getattr(st.tok, "eos_token_id", None)
         eos_id = int(eos_id) if eos_id is not None else -1
-        slots = int(os.environ.get("TT_CB_SLOTS", "4"))
+        # 35B's B>1 batched forward path through cb_scheduler produces
+        # prompt-independent degenerate output when only a subset of slots is
+        # active (empty-slot inputs poison batched ops — likely SDPA mask or
+        # MoE routing). v1.5 was validated with all slots active in dev harness;
+        # cb_scheduler admits ragged. Until that's resolved, default 35B to 1
+        # slot (B=1 fast path delegates to base.step_forward_inner — bit-validated).
+        # Users can override with TT_CB_SLOTS explicitly for batched serving.
+        _slots_default = "1" if TT_BACKEND == "35b" else "4"
+        slots = int(os.environ.get("TT_CB_SLOTS", _slots_default))
         max_new_cap = int(os.environ.get("TT_CB_MAX_NEW", "1024"))
         max_inflight = int(os.environ.get("TT_CB_MAX_INFLIGHT", "0")) or None
         # 35B has a known ttnn bulk-readback issue on its logits tensor —
