@@ -1,25 +1,35 @@
 # Gemma 4 12B — bringup scoping
 
-Released 2026-06-03. Captured from the HuggingFace model card
-(`https://huggingface.co/google/gemma-4-12B`) before any code was
-written, so a fresh reader knows what's verified vs. assumed.
+Released 2026-06-03. Original capture from the HuggingFace model card
+(`https://huggingface.co/google/gemma-4-12B`). **All architecture
+numbers verified against `config.json` 2026-06-03** — see the deeper
+plan-of-action at [`gemma4_12b_bringup_plan.md`](gemma4_12b_bringup_plan.md)
+for `file:line` reuse mapping and per-sub-task validation gates.
 
-## Architecture (from model card)
+## Architecture (verified from config.json)
 
 | | |
 |---|---|
-| Params | 11.95B (dense, no MoE) |
+| Params | 11.95B (dense, no MoE; `enable_moe_block=false`) |
 | Layers | 48 |
-| Vocab | 262K (vs 35B's 248K, 27B's 152K) |
-| Context | **256K tokens** |
-| Attention | Hybrid: **sliding window 1024** + global attention layers |
-| Multimodal | Encoder-free: image patches + audio waveforms project via linear layers into the LLM embedding |
-| Position encoding | "Proportional RoPE" (p-RoPE) on global layers |
+| Hidden | 3840 |
+| Heads (Q/KV sliding / KV global) | 16 / 8 / 1 |
+| head_dim (sliding / global) | 256 / 512 (NEW: dual head dim) |
+| Intermediate (MLP) | 15360 |
+| Vocab | 262144 (vs 35B's 248320, 27B's 152064/248320) |
+| `max_position_embeddings` | **131072 (128K)** — the model card's "256K" appears to anticipate RoPE scaling we do NOT need for v0 |
+| Attention | Hybrid: 5 sliding (window=1024) + 1 full, repeating 8× = 48 layers. **L47 is full** |
+| Multimodal | Encoder-free; raw image/audio projected via linear into the LLM embedding. **Text-only path supported as `Gemma4UnifiedTextModel`** |
+| Position encoding (sliding) | default RoPE, theta=10000, full rotation |
+| Position encoding (global) | "proportional" p-RoPE, theta=1000000, `partial_rotary_factor=0.25` over global head_dim=512 → 128 dims rotated |
+| RMSNorm convention | **Llama-style `w`** (NOT Qwen's `(1+w)` — important distinction from 35B/27B) |
+| Decoder norms | **FOUR per layer** (input/post-attn/pre-mlp/post-mlp) — Gemma 2 pattern |
+| MLP activation | `gelu_pytorch_tanh` (gated SwiGLU shape, NOT SiLU) |
+| `attention_k_eq_v` | true (GLOBAL layers only — V := K after norm+RoPE) |
+| `tie_word_embeddings` | true — lm_head = embed.T |
+| `final_logit_softcapping` | 30.0 — `logits = 30·tanh(logits/30)` before sampling |
+| Embed scaling | `sqrt(hidden)` ≈ 61.97 at embedding lookup |
 | Weights | bf16, Apache 2.0 |
-
-Not visible on the card and need to be pulled from `config.json`
-before any code: hidden size, attention/KV head counts, head dim,
-RoPE base, MLP activation, exact per-layer attention-type schedule.
 
 ## Bringup positioning vs. existing backends
 
