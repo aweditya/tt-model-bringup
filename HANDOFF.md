@@ -66,14 +66,39 @@ Env knobs: `TT_CB_PORT=8000`, `TT_CB_SLOTS=4`, `TT_CB_MAX_NEW=1024`,
 `TT_CB_MAX_INFLIGHT=64`. Over-cap requests → HTTP 429.
 
 Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/models`,
-`/health`, `/metrics` (Prometheus).
+`/health`, `/metrics` (Prometheus), `/bootstrap` (stage + elapsed_s).
 See README §"Chat server (production)" for `curl` + `openai` client examples.
 
-**Current status (2026-06-02): 27B server is STOPPED.** qb1's mesh is
-consumed by the 35B dev harness (CB35-1 v0 work — see Roadmap §3). The
-27B production stack is feature-complete (CB + prefix caching + sampling
-+ OpenAI endpoint + metrics, all validated). Restart any time with the
-command above — exclusive of running the 35B harness on the same host.
+**Bootstrap observability** (commit `3e150c0`, 2026-06-02). Lifespan
+startup blocks uvicorn from accepting HTTP until it yields, so HTTP
+health probes can't see the 14-min 35B bootstrap. Three channels:
+- `/bootstrap` (JSON): stage + elapsed_s + ready. Only reachable AFTER
+  lifespan yields — useful for "is it ready yet" but not for "is it
+  stuck during boot".
+- `/health` enriched: 503 payload includes `{bootstrap: {…}}` once
+  reachable.
+- **Side file `~/tt-xla/.cache/server_cb.bootstrap.log`** — appended
+  with explicit fsync from the bootstrap thread. Tail-able during the
+  lifespan startup phase, when no HTTP endpoint is reachable yet.
+  This is the canonical "is it making progress?" probe.
+
+**Current status (2026-06-02 late evening): 35B HTTP server (re)bootstrapping
+on qb1**. Background poll task `bz5lcsa9n` is watching for ready. v0/v1/v2
+device primitives + cb35_prod_topk all PASS via the dev harness; the HTTP
+wrap is what's flaky to bring up (uvicorn lifespan + 14-min boot + worker-
+thread stdout buffering). Once the side-file shows `[harness ready]`, the
+chat TUI / curl should work end-to-end.
+
+## Deploy hygiene before any `serve_cb.sh start`
+
+Always sync the entire `experiments/serve/*.py` before starting the server.
+The dev harness uses `importlib.reload` per test so it only needs the file
+under test; the production server boots a fresh process and reads qb1's
+filesystem ONCE.
+- One MM1 commit (`418f9cc`) sat in local git but never reached qb1; the
+  server kept loading 27B for hours of debugging until we caught it.
+- See memory `[[deploy-serve-files-too]]`.
+- Quick command: `bash scripts/deploy.sh experiments/serve/*.py`
 
 ## What's next
 

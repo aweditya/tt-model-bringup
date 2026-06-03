@@ -213,7 +213,32 @@ If pursued: cache only attention-layer KV; explicitly mark DN layers as
 non-cacheable. Mirror the 27B implementation but with a per-layer
 "cacheable" flag.
 
-### prod — Production wire-up (task #147, NEXT)
+### prod — Production wire-up (task #147, ✅ DONE 2026-06-02)
+
+Wired and validated 2026-06-02 via three fixes:
+1. **`cb_scheduler.py` dispatch hole fixed** (`97abfab`): was hardcoded
+   to `import server_tp / server_tp_cb`; now uses BACKENDS dispatch
+   mirroring `cb_api.py`. Without this, the server bootstrapped 35B
+   weights but ran 27B forward over them.
+2. **Deploy gap fixed**: MM1's BACKENDS registry sat in local git for
+   weeks without being deployed to qb1. The user caught it via the chat
+   TUI ("i think it's still using the dense model?"). Memory entry
+   `[[deploy-serve-files-too]]` captures the rule.
+3. **35B bootstrap signature fix** (`8111d70`): `bootstrap(state, log)`
+   now defaults `log=None` to `print` since cb_api calls
+   `base.bootstrap(st)` with one arg.
+
+Plus observability (`3e150c0`): `/bootstrap` endpoint + side-file
+`~/tt-xla/.cache/server_cb.bootstrap.log` for tail-able progress
+during the lifespan startup phase when uvicorn isn't yet listening.
+
+Validation gate `cb35_prod_topk.py` (4/4 PASS) proves the
+`forward_batch_tp_inner` contract cb_scheduler expects works at B=1
+and B=2 with topk-mode + argmax-mode. **HTTP smoke through real chat
+TUI** is the final user-facing gate; pending bootstrap completion at
+the time of writing this plan.
+
+#### Legacy outline (kept for posterity)
 
 The v1 stack is functionally complete. Production wire-up means routing
 `cb_engine`/`cb_scheduler` through `forward_batch_tp_inner_batched` at
