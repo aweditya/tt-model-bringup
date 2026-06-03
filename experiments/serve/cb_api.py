@@ -71,10 +71,16 @@ def _build_sampling(body: dict) -> Optional[dict]:
     }
 
 
-def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None):
+def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None,
+               bootstrap_status: Optional[dict] = None):
     """Construct the FastAPI app whose handlers close over `state` for engine
     access. The caller MUST populate `state["engine"]`, `state["tok"]`,
-    `state["eos_id"]` before requests are served."""
+    `state["eos_id"]` before requests are served.
+
+    `bootstrap_status` is the shared dict from the lifespan; when not None it
+    powers `/bootstrap` and enriches `/health` so callers can see the current
+    bootstrap stage instead of a bare 503.
+    """
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -84,9 +90,22 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None):
     def health():
         eng = state.get("engine")
         if eng is None:
-            return JSONResponse(status_code=503, content={"ok": False, "ready": False})
+            payload = {"ok": False, "ready": False}
+            if bootstrap_status is not None:
+                payload["bootstrap"] = dict(bootstrap_status)
+            return JSONResponse(status_code=503, content=payload)
         return {"ok": True, "ready": True, "model": model_id,
                 "slots": eng.slots, "sampling": eng.sampling}
+
+    @app.get("/bootstrap")
+    def bootstrap_state():
+        """Per-stage bootstrap progress. Useful when /health is 503 to see
+        whether the server is loading, stuck, or failed. Returns
+        {stage, elapsed_s, ready, started_at} — see cb_api lifespan."""
+        if bootstrap_status is None:
+            return JSONResponse(status_code=404,
+                                content={"detail": "bootstrap_status not wired"})
+        return dict(bootstrap_status)
 
     @app.get("/metrics")
     def metrics():
@@ -211,11 +230,52 @@ def _build_app_with_default_lifespan():
 
     state: dict = {}
 
+    # Bootstrap observability: per-stage timing + a coarse status that the
+    # health endpoint can return so callers can see "stuck at <stage>" instead
+    # of just 503. The bootstrap thread updates `bootstrap_status[0]` after
+    # each `log(...)` call.
+    import time as _time
+    from pathlib import Path as _Path
+    bootstrap_status = {"stage": "not_started", "started_at": None,
+                        "elapsed_s": None, "ready": False}
+    # Side-channel: tail-able file the user can `ssh qb1 cat`/`tail -f` while
+    # uvicorn isn't yet listening (lifespan hasn't yielded so /bootstrap and
+    # /health aren't reachable). cb_api is the only writer; serve_cb.log is
+    # the official log but suffers from print-from-worker-thread buffering
+    # under uvicorn's stdout wrapping.
+    _STATUS_FILE = _Path(os.environ.get("PROJECT_ROOT", str(_Path.home() / "tt-xla"))) / ".cache" / "server_cb.bootstrap.log"
+    _STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _STATUS_FILE.write_text("")  # truncate on fresh boot
+
+    def _flush_log(msg):
+        # 1) print + flush for the main log (best-effort under uvicorn).
+        print(msg, flush=True)
+        # 2) explicit append to side-file with fsync — bypasses any
+        #    sys.stdout games and gives the user a reliable observability
+        #    channel during bootstrap.
+        try:
+            with open(_STATUS_FILE, "a") as f:
+                ts = _time.strftime("%H:%M:%S")
+                f.write(f"[{ts}] {msg}\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            pass
+        bootstrap_status["stage"] = str(msg)[:200]
+        if bootstrap_status["started_at"] is not None:
+            bootstrap_status["elapsed_s"] = round(_time.time() - bootstrap_status["started_at"], 1)
+
     @asynccontextmanager
     async def lifespan(app):
         st = base.MeshServerState() if hasattr(base, "MeshServerState") else base.State()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, base.bootstrap, st)
+        bootstrap_status["started_at"] = _time.time()
+        bootstrap_status["stage"] = "bootstrap_starting"
+        # base.bootstrap takes (state, log=None). Pass our flushing logger so
+        # stage transitions hit the log file immediately.
+        await loop.run_in_executor(None, base.bootstrap, st, _flush_log)
+        bootstrap_status["stage"] = "bootstrap_done; building engine"
+        bootstrap_status["elapsed_s"] = round(_time.time() - bootstrap_status["started_at"], 1)
         # 27B-only deltanet feature flags (the 35B path keys these via
         # getattr-default in its forward; setting them here is a no-op for 35B
         # but is incorrect-by-convention. Gate by backend.)
@@ -249,12 +309,17 @@ def _build_app_with_default_lifespan():
         state["engine"] = engine
         state["tok"] = st.tok
         state["eos_id"] = eos_id
+        bootstrap_status["stage"] = "ready"
+        bootstrap_status["ready"] = True
+        bootstrap_status["elapsed_s"] = round(_time.time() - bootstrap_status["started_at"], 1)
         try:
             yield
         finally:
+            bootstrap_status["stage"] = "shutting_down"
             engine.stop()
+            bootstrap_status["stage"] = "stopped"
 
-    return _build_app(state, lifespan=lifespan)
+    return _build_app(state, lifespan=lifespan, bootstrap_status=bootstrap_status)
 
 
 # Module-level `app` for `uvicorn experiments.serve.cb_api:app`. The env guard
