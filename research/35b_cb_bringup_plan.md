@@ -239,19 +239,19 @@ Plus observability (`3e150c0`): `/bootstrap` endpoint + side-file
 **27B smoke**: PASS end-to-end. `/v1/chat/completions` returns
 "The capital of France is Paris." in 2.4s, finish_reason=stop.
 
-**35B smoke**: bootstrap + HTTP green; inference path mechanically
-works post-`39f4663` (cb_scheduler squeeze of dangling seq dim from
-the 35B topk readback). But the OUTPUT is degenerate: two distinct
-prompts both produce `两件两特朗两特朗两特朗...` — prompt-independent
-Chinese char loop. Dev-harness 8-tok multi-step chat works via the
-SAME `step_forward_inner`, so the model code is fine; the bug is in
-how cb_scheduler integrates with 35B (probably sampler axis or DN
-state lifecycle).
+**35B smoke**: bootstrap + HTTP green; first inference crash fixed in
+`39f4663`. Degenerate output then ROOT-CAUSED to `cb_reset_slots`
+being a no-op at `cb_B > 1` (server_35b_cb.py:240, `"v1 will use
+masked multiply"` TODO that never landed). With TT_CB_SLOTS=2 every
+admit skipped state reset, so DN recurrent state carried `_warmup_decode`
+pollution into the first real request. Fix ports 27B's masked-multiply
+per-slot reset (`server_tp_cb.cb_reset_slots`) to 35B with the right
+DN tensor shapes:
+  cs per chip: `[B, CONV_DIM_CHIP, KERNEL]`     × mask `[B, 1, 1]`
+  rs per chip: `[B, NV_PER_CHIP, K, V]`         × mask `[B, 1, 1, 1]`
+KV needs no reset — cur_pos-bounded SDPA self-overwrites blocks.
 
-**Task #161** (CB35-debug) tracks the investigation. Cheapest first
-probe: log the actual `idxs[0,0]` value across 4 consecutive cb_engine
-steps — if identical, sampler is broken; if varying but small, model
-state isn't conditioning on the prompt.
+**Task #161** tracks. Smoke pending bootstrap completion.
 
 **Session lessons saved to memory**:
 - `[[cb-backend-dispatch-holes]]`: shared-contract changes in

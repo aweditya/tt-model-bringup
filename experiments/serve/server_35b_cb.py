@@ -238,11 +238,39 @@ def cb_reset_states(state):
 
 
 def cb_reset_slots(state, slot_ids):
-    """Reset specific slots' DN state. At B=1 with slot 0 in slot_ids:
-    same effect as cb_reset_states. v1 will use masked multiply."""
-    if state.cb_B == 1 and 0 in slot_ids:
+    """Reset specific slots' DN state. At B=1: global reset via dealloc path.
+    At B>1: per-slot masked multiply (keep=1 for live slots, 0 for admitted).
+
+    KV needs NO reset — the SDPA read is per-slot cur_pos-bounded so a
+    sequence restarting at pos 0 overwrites its own page-table blocks
+    as it prefills. Only the position-unbounded DN accumulator must clear.
+    """
+    B = state.cb_B
+    if B == 1 and 0 in slot_ids:
         cb_reset_states(state)
-    # else: no-op (slot 0 wasn't reset, nothing to do)
+        return
+    if B == 1 or not slot_ids:
+        return
+    mesh = state.mesh
+    keep = torch.ones(B, dtype=torch.float32)
+    for s in slot_ids:
+        keep[s] = 0.0
+    # cs per chip: [B, CONV_DIM_CHIP, KERNEL]    → mask3 [B, 1, 1]
+    # rs per chip: [B, NV_PER_CHIP, K, V]        → mask4 [B, 1, 1, 1]
+    mask3 = ttnn.from_torch(keep.reshape(B, 1, 1), dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT, device=mesh,
+                            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    mask4 = ttnn.from_torch(keep.reshape(B, 1, 1, 1), dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT, device=mesh,
+                            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    for d in state.cb_dn.values():
+        m_cs = ttnn.mul(d["cs"], mask3)
+        ttnn.copy(m_cs, d["cs"])
+        ttnn.deallocate(m_cs)
+        m_rs = ttnn.mul(d["rs"], mask4)
+        ttnn.copy(m_rs, d["rs"])
+        ttnn.deallocate(m_rs)
+    ttnn.deallocate(mask3); ttnn.deallocate(mask4)
 
 
 # ----------------------------------------------------------------------------

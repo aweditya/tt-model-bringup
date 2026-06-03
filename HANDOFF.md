@@ -18,15 +18,16 @@ Read top to bottom; everything else is linked.
   scalar; 35B's 3-D hidden activations meant the readback was
   `[B, 1, K]` and `int(row)` blew up. Fix is a generic squeeze of the
   unit-seq dim in cb_scheduler's host path. 27B unchanged.
-- **35B HTTP smoke now runs but output is degenerate** — task #161.
-  Two prompts ("Hello" 1-tok, "capital of France" 19-tok) produce
-  nearly identical garbage `两件两特朗两特朗两特朗...` (Chinese char
-  loop). Prompt-independence is the loud signal — model isn't seeing
-  the prompt. Dev-harness 8-tok multi-step chat uses the same
-  `step_forward_inner`, so the model is fine; the bug is in
-  cb_scheduler's prefill/state handling. Cheapest probe: log `idxs[0,0]`
-  across 4 steps to confirm whether the SAMPLER or the MODEL STATE is
-  the locus. Server still running on qb1 pid 1246623.
+- **35B HTTP smoke garbage output ROOT-CAUSED + FIX SHIPPED**:
+  `server_35b_cb.cb_reset_slots` was hardcoded to no-op at `cb_B > 1`
+  ("v1 will use masked multiply" — never landed). With
+  `TT_CB_SLOTS=2` every admit skipped state reset → DN recurrent
+  state carried `_warmup_decode` pollution into every real request →
+  prompt-independent Chinese-char loop. Ported 27B's masked-multiply
+  per-slot reset pattern to 35B (cs `[B, CONV_DIM_CHIP, KERNEL]` ×
+  mask `[B,1,1]`, rs `[B, NV_PER_CHIP, K, V]` × mask `[B,1,1,1]`).
+  KV needs no reset (SDPA cur_pos-bound self-overwrites). Memory:
+  `feedback_35b_cb_reset_slots_b_gt_1_noop.md`. Smoke pending bootstrap.
 - Memory: `feedback_dev_harness_vs_cb_engine_gap.md`,
   `feedback_cb_backend_dispatch_holes.md`, `feedback_deploy_serve_files_too.md`.
 - The earlier "35B bootstrap hangs at enumerate shards" hypothesis was wrong.
