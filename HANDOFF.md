@@ -32,6 +32,19 @@ Read top to bottom; everything else is linked.
   this ragged-slot case never manifested. Memory:
   `feedback_35b_batched_forward_empty_slot_poison.md`. Earlier
   cb_reset_slots fix (`1fc039c`) was necessary but not sufficient.
+- **35B long-context drift FIX SHIPPED — task #163 (`92b442f`)**.
+  qwen36_gdn_decode_owned kernel uses a single CB format for ALL
+  18 CBs (program_factory.cpp:91) — even though math is HiFi4 +
+  fp32_dest_acc internally, state packs back to bf16 per step.
+  Decay≈0.99 amplifies the quantization → coherent text degrades
+  at ~30 tokens (cos@L32 pos1 = 0.9311 per memory). Ollama
+  precedent `ollama#15865` is the same kernel-family bug.
+  Fix: TT_DN_STATE_DTYPE=fp32 env hook + ttnn.typecast all DN
+  recurrence operands (g_decay, beta, v_h, k_rep, q_rep) to fp32
+  in manual path. Owned kernel auto-disabled (it rejects fp32 state).
+  Default behavior unchanged; opt-in via env. Memory:
+  `feedback_35b_a3b_l32_dn_decode_drift`,
+  `feedback_35b_dn_h_state_drift_lever`. Smoke pending bootstrap.
 - Memory: `feedback_dev_harness_vs_cb_engine_gap.md`,
   `feedback_cb_backend_dispatch_holes.md`, `feedback_deploy_serve_files_too.md`.
 - The earlier "35B bootstrap hangs at enumerate shards" hypothesis was wrong.
