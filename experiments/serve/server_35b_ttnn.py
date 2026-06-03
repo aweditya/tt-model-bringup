@@ -607,6 +607,28 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
         state_new = H_new  # rank-4; reshape back to rank-5 in the copy-back block
     else:
         # Manual recurrence (correctness reference path).
+        # When recurrent_state_in dtype is fp32 (dn_state_dtype=fp32 hook),
+        # upcast all operands so the recurrence math runs entirely in fp32.
+        # Otherwise mixed-precision ttnn ops silently truncate intermediates
+        # to bf16 — the round-trip bug that causes long-context drift via
+        # decay-near-1.0 amplification. See [[35b-batched-forward-empty-slot-poison]]
+        # (no, the OTHER one — [[35b-dn-h-state-drift-lever]]) and
+        # ollama/ollama#15865 for the precedent. The owned_gdn kernel has the
+        # same Ollama-pattern bug (single CB format), so we route through
+        # this manual path when dn_state_dtype=fp32 (use_owned_gdn=False).
+        _state_dtype = recurrent_state_in.dtype
+        if _state_dtype != g_decay.dtype:
+            g_decay_c = ttnn.typecast(g_decay, _state_dtype)
+            ttnn.deallocate(g_decay); g_decay = g_decay_c
+            beta_c    = ttnn.typecast(beta,    _state_dtype)
+            ttnn.deallocate(beta);    beta    = beta_c
+            v_h_c     = ttnn.typecast(v_h,     _state_dtype)
+            ttnn.deallocate(v_h);     v_h     = v_h_c
+            k_rep_c   = ttnn.typecast(k_rep,   _state_dtype)
+            ttnn.deallocate(k_rep);   k_rep   = k_rep_c
+            q_rep_c   = ttnn.typecast(q_rep,   _state_dtype)
+            ttnn.deallocate(q_rep);   q_rep   = q_rep_c
+
         g_b = ttnn.reshape(g_decay, [1, NV_PER_CHIP, 1, 1])
         ttnn.deallocate(g_decay)
         state = ttnn.mul(recurrent_state_in, g_b)
@@ -641,6 +663,13 @@ def dn_forward_ttnn(h_tt, w, mesh, dn_state, dn_sub_capture=None, *,
         ttnn.deallocate(state_q)
         core_attn_out = ttnn.reshape(core_attn_out_4d, [1, NV_PER_CHIP, HEAD_V_DIM])
         ttnn.deallocate(core_attn_out_4d)
+        # If state went fp32, core_attn_out is also fp32 — downcast back to
+        # bf16 to match the downstream RMSNormGated → out_proj path (which
+        # still uses bf16 weights and z/norm_weight inputs).
+        if _state_dtype != ttnn.bfloat16:
+            core_attn_out_bf = ttnn.typecast(core_attn_out, ttnn.bfloat16)
+            ttnn.deallocate(core_attn_out)
+            core_attn_out = core_attn_out_bf
 
     # === RMSNormGated: (output / sqrt(mean(x^2)) * norm_weight) * silu(z) ===
     # per-head; norm_weight is [HEAD_V_DIM=128] replicated
@@ -1692,6 +1721,18 @@ def bootstrap(state, log=None):
     # cb_api calls bootstrap(st) without a logger; the dev path passes one.
     if log is None:
         log = print
+    # Env-var hooks for the long-context DN drift fix (task #163 / Ollama
+    # precedent ollama#15865). TT_DN_STATE_DTYPE=fp32 promotes the recurrent
+    # H_t buffer to fp32 AND forces the manual recurrence path (owned_gdn
+    # kernel only accepts bf16 state — see kernel program_factory.cpp line 91).
+    import os as _os
+    _dn_state_dtype = _os.environ.get("TT_DN_STATE_DTYPE", "bf16").lower()
+    if _dn_state_dtype == "fp32":
+        state.dn_state_dtype = ttnn.float32
+        state.dn_owned_gdn = False  # kernel requires bf16 state
+        log("[bootstrap] TT_DN_STATE_DTYPE=fp32 → manual DN recurrence + fp32 H_t")
+    else:
+        state.dn_state_dtype = ttnn.bfloat16
     log("[bootstrap] open mesh + fabric…")
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
     state.mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, NCHIPS))
