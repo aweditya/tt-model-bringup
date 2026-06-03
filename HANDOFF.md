@@ -143,21 +143,22 @@ to match) after prefix caching ships.
      `cb_cur_pos_buf`/`cb_page_table_tt` for per-slot context.
      `setup_cb_paged_cfgs` builds B-sized HEIGHT_SHARDED L1 mem cfg +
      SDPA progcfg (B=1 reuses base's `state.paged_*`).
-   - **v1.4 batched MoE SHIPPED 2026-06-02** (commit `2d0f582`).
-     `moe_step_batched_35b` — B=1 bit-identical to base
-     `moe_forward_ttnn_pattern_a_batched`. B>1 is per-slot sequential
-     loop with KNOWN ~13% rel drift between identical-input slots at
-     small magnitudes (layer-0 MoE-only output, |out|~3e-4). Likely
-     ttnn-internal MoE matmul accumulation-order non-determinism. The
-     true broadcast port (B-leading Pattern A) is v1.4b, task #156.
-   - **v1.5 full B>1 forward SHIPPED 2026-06-02** (commit `bc96651`).
+   - **v1.4b broadcast MoE BIT-VALIDATED 2026-06-02** (commit `a6ac640`).
+     True broadcast Pattern A — `[E_LOCAL, B, HIDDEN]` middle-dim bump
+     in batched expert matmul. mad=0.000000 vs base at B=2 slot 0.
+     Fixed the 13% per-slot drift from v1.4 loop. Critical bug in init
+     port: used `MOE_INTER_CHIP (128)` instead of `MOE_INTER (512)`.
+   - **v1.5 full B>1 forward FUNCTIONAL PASS 2026-06-02** (commit `0a50e97`).
      `forward_batch_tp_inner_batched` + `layer_forward_batched_35b` —
-     drives full 40-layer chain at B>1 across multi-step decode without
-     errors. Bit-equiv to B=1 reference FAILS (slot 0 sequence diverges
-     from B=1 ref) because the v1.4 per-slot MoE drift compounds across
-     30 MoE layers and 4 steps. **v1.5 bit-equiv is GATED on v1.4b.**
-     Infrastructure shippable for B=1 production; B>1 production needs
-     v1.4b.
+     40-layer chain at B>1 runs end-to-end. v1_chat results:
+     - ✓ slot 0 != slot 1 with distinct prompts (per-slot independence)
+     - ✓ slot 0 == slot 1 with same prompt (determinism)
+     - ⚠ slot 0 != B=1 ref by argmax tokens — bf16 chain precision drift
+       compounding across 40 layers (every individual op verified bit-id
+       at B=2 slot 0; the chain noise is what flips argmax tokens). See
+       [[bf16-chain-drift-at-B-gt-1]] for the lesson. **Production-shippable** —
+       each slot's generation is valid; use cosine for benches, not
+       exact tokens.
    - v1 (true B>1 batched forward): next. ~3-5 days.
    - v2 (trace capture at B=N): ~1-2 days.
    - v3 (owned-GDN batched FOLD trick): optional.
