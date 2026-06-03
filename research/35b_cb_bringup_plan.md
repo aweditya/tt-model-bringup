@@ -239,20 +239,28 @@ Plus observability (`3e150c0`): `/bootstrap` endpoint + side-file
 **27B smoke**: PASS end-to-end. `/v1/chat/completions` returns
 "The capital of France is Paris." in 2.4s, finish_reason=stop.
 
-**35B smoke**: bootstrap green (14:29, 40/40 layers), HTTP green
-(`/health` ok, /v1/models correct), but first `/v1/chat/completions`
-returns empty completion because cb-engine step crashed inside the
-backend. Suspect site: `experiments/serve/server_35b_cb.py:268`
-(`int(token_ids[0])` if token_ids[0] is a length>1 array). Validator
-`cb35_prod_topk.py` (4/4 PASS) drove `_step_sampled_topk` directly,
-skipping the cb_scheduler.advance layer where this fires. Memory
-entry `[[dev-harness-vs-cb-engine-gap]]` captures the gap class.
+**35B smoke**: bootstrap + HTTP green; inference path mechanically
+works post-`39f4663` (cb_scheduler squeeze of dangling seq dim from
+the 35B topk readback). But the OUTPUT is degenerate: two distinct
+prompts both produce `两件两特朗两特朗两特朗...` — prompt-independent
+Chinese char loop. Dev-harness 8-tok multi-step chat works via the
+SAME `step_forward_inner`, so the model code is fine; the bug is in
+how cb_scheduler integrates with 35B (probably sampler axis or DN
+state lifecycle).
 
-**Next**: task #160 — trace token_ids shape through
-`cb_scheduler.advance` → `server_35b_cb.update_input_buffers`, fix
-the shape mismatch, smoke. Avoid burning another 14-min bootstrap:
-keep the server running once the fix lands AND/OR write a stub-backend
-unit test for cb_scheduler.advance.
+**Task #161** (CB35-debug) tracks the investigation. Cheapest first
+probe: log the actual `idxs[0,0]` value across 4 consecutive cb_engine
+steps — if identical, sampler is broken; if varying but small, model
+state isn't conditioning on the prompt.
+
+**Session lessons saved to memory**:
+- `[[cb-backend-dispatch-holes]]`: shared-contract changes in
+  cb_scheduler/cb_api must land in BOTH backends.
+- `[[deploy-serve-files-too]]`: `deploy.sh experiments/serve/*.py`
+  before every `serve_cb.sh start`.
+- `[[dev-harness-vs-cb-engine-gap]]`: validators that drive
+  `_step_sampled_topk` directly skip the cb_scheduler.advance layer
+  where shape/lifecycle bugs hide.
 
 #### Legacy outline (kept for posterity)
 

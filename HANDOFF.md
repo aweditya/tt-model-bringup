@@ -13,12 +13,22 @@ Read top to bottom; everything else is linked.
 - **35B HTTP bootstrap PASSED** end-to-end on qb1 — 14:29 bootstrap, all 40
   layers + setup buffers, `/health` reports `{"ok":true,"ready":true,
   "model":"Qwen/Qwen3.6-35B-A3B","slots":2,"sampling":true}`.
-- **35B first inference step CRASHES** — task #160 `CB35-bug`. Server log:
-  `[cb-engine] step failed: TypeError: only length-1 arrays can be converted
-  to Python scalars`. Suspect site: `server_35b_cb.py:268`
-  (`int(token_ids[0])`). The dev-harness validator (`cb35_prod_topk`, 4/4 PASS)
-  drives `_step_sampled_topk` directly and skips the cb_scheduler.advance
-  layer where this fires. Memory: `feedback_dev_harness_vs_cb_engine_gap.md`.
+- **35B first inference step crash fixed** in `39f4663`: cb_scheduler
+  reads the topk handle post-mesh-concat as `idxs[s, 0]` expecting a
+  scalar; 35B's 3-D hidden activations meant the readback was
+  `[B, 1, K]` and `int(row)` blew up. Fix is a generic squeeze of the
+  unit-seq dim in cb_scheduler's host path. 27B unchanged.
+- **35B HTTP smoke now runs but output is degenerate** — task #161.
+  Two prompts ("Hello" 1-tok, "capital of France" 19-tok) produce
+  nearly identical garbage `两件两特朗两特朗两特朗...` (Chinese char
+  loop). Prompt-independence is the loud signal — model isn't seeing
+  the prompt. Dev-harness 8-tok multi-step chat uses the same
+  `step_forward_inner`, so the model is fine; the bug is in
+  cb_scheduler's prefill/state handling. Cheapest probe: log `idxs[0,0]`
+  across 4 steps to confirm whether the SAMPLER or the MODEL STATE is
+  the locus. Server still running on qb1 pid 1246623.
+- Memory: `feedback_dev_harness_vs_cb_engine_gap.md`,
+  `feedback_cb_backend_dispatch_holes.md`, `feedback_deploy_serve_files_too.md`.
 - The earlier "35B bootstrap hangs at enumerate shards" hypothesis was wrong.
   Side-file was frozen because only the FIRST log line was routed through
   the new `log` callable; layer-upload logs DID emit ("layer 10/40 uploaded"
