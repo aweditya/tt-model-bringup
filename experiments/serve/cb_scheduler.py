@@ -645,8 +645,14 @@ class Scheduler:
         idxs_t = ttnn.to_torch(idxs_h, mesh_composer=composer)
         if not self.use_trace:
             ttnn.deallocate(vals_h); ttnn.deallocate(idxs_h)
-        vals = vals_t[:self.B].float().numpy()    # [B, K]
-        idxs = idxs_t[:self.B].long().numpy()     # [B, K]
+        vals = vals_t[:self.B].float().numpy()    # [B, K] (or [B, 1, K] on 35B)
+        idxs = idxs_t[:self.B].long().numpy()     # [B, K] (or [B, 1, K] on 35B)
+        # 35B's hidden activations carry a seq dim, so its topk output is 3-D
+        # ([B, 1, K] post-mesh-concat-slice) where 27B is 2-D ([B, K]). Squeeze
+        # the dangling seq dim so `idxs[s, 0]` is a scalar (not a length-K row).
+        if vals.ndim == 3 and vals.shape[1] == 1:
+            vals = vals.squeeze(1)
+            idxs = idxs.squeeze(1)
         t1 = time.perf_counter()
         out = [DUMMY_TOK] * self.B
         for s in range(self.B):

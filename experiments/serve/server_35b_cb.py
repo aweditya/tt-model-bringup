@@ -695,21 +695,9 @@ def forward_batch_tp_inner_batched(state, return_topk=None):
         saved_topk = getattr(state, "sampler_topk", 0)
         try:
             state.sampler_topk = int(return_topk) if return_topk is not None else 0
-            result = base.step_forward_inner(state)
+            return base.step_forward_inner(state)
         finally:
             state.sampler_topk = saved_topk
-        # base returns 3-D tensors ([B, 1, K] for topk, [B, 1, 1] for argmax)
-        # because 35B's hidden activations carry a seq dim. cb_scheduler reads
-        # post-mesh-concat as `idxs[s, 0]` expecting a scalar (per [B, K]); the
-        # dangling seq dim makes that a length-K vector and `int(...)` blows up.
-        # Reshape to drop the seq dim so 35B matches the [B, K] / [B, 1] contract.
-        K = int(return_topk) if return_topk is not None else 1
-        if return_topk is not None:
-            top_vals, top_idxs = result
-            top_vals = ttnn.reshape(top_vals, [B, K])
-            top_idxs = ttnn.reshape(top_idxs, [B, K])
-            return (top_vals, top_idxs)
-        return ttnn.reshape(result, [B, 1])
 
     mesh = state.mesh
     h_tt, cos_tt, sin_tt = _batched_prelude(state)
