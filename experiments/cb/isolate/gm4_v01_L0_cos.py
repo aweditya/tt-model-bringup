@@ -139,9 +139,28 @@ def main():
     # is [HIDDEN] replicated.
     hf_mixer_p = ORACLE_DIR / "L0_mixer_out.npy"
     if hf_mixer_p.exists() and "mixer_out" in cap:
-        hf_mx = np.load(hf_mixer_p)[0]  # [3840]
+        hf_mx = np.load(hf_mixer_p)[0]
         tt_mx = cap["mixer_out"]
         results.append(("mixer_out", cos(tt_mx, hf_mx), mad(tt_mx, hf_mx)))
+
+    # v0.1.3: post_attn_norm, pre_ff_norm, mlp_out, post_ff_norm + L0 output.
+    for key, oracle_file in [
+        ("post_attn_norm", "L0_post_attn_norm.npy"),
+        ("pre_ff_norm",    "L0_pre_ff_norm.npy"),
+        ("mlp_out",        "L0_mlp_out.npy"),
+        ("post_ff_norm",   "L0_post_ff_norm.npy"),
+    ]:
+        p = ORACLE_DIR / oracle_file
+        if p.exists() and key in cap:
+            hf = np.load(p)[0]  # [3840]
+            tt = cap[key]
+            results.append((key, cos(tt, hf), mad(tt, hf)))
+
+    # L0 output: TT l0_out vs HF hidden_states[1, 0, :] (post first decoder layer).
+    if "l0_out" in cap:
+        hf_l0 = hidden_states[1, 0, :]
+        tt_l0 = cap["l0_out"]
+        results.append(("l0_out", cos(tt_l0, hf_l0), mad(tt_l0, hf_l0)))
 
     all_pass = True
     for name, c, m in results:

@@ -432,7 +432,90 @@ def step_forward_v01(state, tok_id, capture):
     ttnn.deallocate(partial)
 
     capture["mixer_out"] = _readback_replicated(mixer_out, state.mesh)
+    # KEEP mixer_out alive for the residual_1 step below — do NOT deallocate.
+
+    # ── v0.1.3: post_attention_layernorm → residual → pre_ff_norm →
+    #          MLP → post_ff_norm → residual → L0 output ──
+    #
+    # Gemma 4's "4-norm" decoder layer (plan §1.5):
+    #   residual = h
+    #   h = input_layernorm(h)
+    #   h, _ = self_attn(h)            # this is mixer_out
+    #   h = post_attention_layernorm(h)
+    #   h = residual + h
+    #   residual = h
+    #   h = pre_feedforward_layernorm(h)
+    #   h = mlp(h)
+    #   h = post_feedforward_layernorm(h)
+    #   h = residual + h
+    #
+    # NOTE: post-attn and post-ff norms are applied to the SUB-BLOCK output
+    # BEFORE the residual add — they normalize the contribution, not the
+    # combined h. Gemma 4 Llama RMSNorm: weight=`w` directly (NO +1.0).
+
+    # We need `residual_1` (= the input to the attention block at L0) for
+    # the first residual add. That's `h_scaled` (post embed-scale). But we
+    # already deallocated h_scaled — recompute embed → scale to recover it.
+    # An alternative would be to keep h_scaled alive across the entire
+    # block; that's the standard pattern and saves a recompute. Doing
+    # the keep-alive version now.
+    # (We will refactor at v0.2 once the multi-layer loop forces a clean
+    # in-place residual stream.)
+    #
+    # IMPLEMENTATION CHOICE: we re-derive `h_scaled` cheaply by running
+    # the embed → scale again. For a single token it's tiny.
+    tok_tt2 = ttnn.from_torch(
+        torch.tensor([[int(tok_id)]], dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    embed2 = ttnn.embedding(tok_tt2, state.embed_tt)
+    ttnn.deallocate(tok_tt2)
+    residual_1 = ttnn.multiply(ttnn.to_layout(embed2, ttnn.TILE_LAYOUT), EMBED_SCALE)
+    ttnn.deallocate(embed2)
+
+    # post_attention_layernorm on mixer_out (the attn output).
+    post_attn_norm = ttnn.rms_norm(mixer_out, weight=w0["post_attention_layernorm"], epsilon=EPS)
     ttnn.deallocate(mixer_out)
+    capture["post_attn_norm"] = _readback_replicated(post_attn_norm, state.mesh)
+
+    # First residual add.
+    h_after_attn = ttnn.add(residual_1, post_attn_norm)
+    ttnn.deallocate(residual_1); ttnn.deallocate(post_attn_norm)
+
+    # pre_feedforward_layernorm.
+    pre_ff_norm = ttnn.rms_norm(h_after_attn, weight=w0["pre_feedforward_layernorm"], epsilon=EPS)
+    capture["pre_ff_norm"] = _readback_replicated(pre_ff_norm, state.mesh)
+
+    # MLP: down(gelu(gate_proj(x)) * up_proj(x)).
+    # Per Step 0.2 (commit 4395b28), GELU_tanh matches
+    # ttnn.gelu(fast_and_approximate_mode=False). The fused-activation
+    # path (ttnn.mul with [UnaryOpType.GELU]) uses the APPROXIMATE kernel
+    # — DO NOT mirror 35B's SwiGLU fused pattern. Use two separate ops.
+    gate = ttnn.matmul(pre_ff_norm, w0["gate_proj"], compute_kernel_config=HIFI4)
+    up   = ttnn.matmul(pre_ff_norm, w0["up_proj"],   compute_kernel_config=HIFI4)
+    ttnn.deallocate(pre_ff_norm)
+    gelu_gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
+    ttnn.deallocate(gate)
+    mid = ttnn.mul(gelu_gate, up)
+    ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
+    # down_proj column-sharded; partial per chip, all_reduce sums.
+    mlp_partial = ttnn.matmul(mid, w0["down_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(mid)
+    mlp_out = all_reduce_tt(mlp_partial, state.mesh)
+    ttnn.deallocate(mlp_partial)
+    capture["mlp_out"] = _readback_replicated(mlp_out, state.mesh)
+
+    # post_feedforward_layernorm.
+    post_ff_norm = ttnn.rms_norm(mlp_out, weight=w0["post_feedforward_layernorm"], epsilon=EPS)
+    ttnn.deallocate(mlp_out)
+    capture["post_ff_norm"] = _readback_replicated(post_ff_norm, state.mesh)
+
+    # Second residual add → L0 output.
+    h_l0 = ttnn.add(h_after_attn, post_ff_norm)
+    ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff_norm)
+    capture["l0_out"] = _readback_replicated(h_l0, state.mesh)
+    ttnn.deallocate(h_l0)
 
 
 def _readback_replicated(t_tt, mesh):
