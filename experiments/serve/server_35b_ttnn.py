@@ -1655,10 +1655,10 @@ def step_forward_inner(state, capture=None):
     # bf16 at the final_norm input below.
     if getattr(state, "dn_state_dtype", ttnn.bfloat16) == ttnn.float32:
         h_tt_fp32 = ttnn.typecast(h_tt, ttnn.float32)
-        ttnn.deallocate(embed_out); embed_out = None
         h_tt_old = h_tt
         h_tt = h_tt_fp32
         ttnn.deallocate(h_tt_old)
+        # embed_out is deallocated by the original line below — leave it alone.
     ttnn.deallocate(embed_out)
     if capture is not None:
         capture["embed"] = _ttnn_to_numpy_replicated(h_tt, state.mesh).reshape(-1)
