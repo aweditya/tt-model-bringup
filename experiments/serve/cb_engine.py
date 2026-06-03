@@ -334,6 +334,9 @@ class CBEngine:
         running; the next admitted request gets a fresh slot pool."""
         msg = f"{type(exc).__name__}: {exc}"
         print(f"[cb-engine] step failed: {msg}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         for sched_rid in list(self._meta.keys()):
             m = self._meta.pop(sched_rid, None)
             if m is None:

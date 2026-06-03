@@ -213,30 +213,46 @@ If pursued: cache only attention-layer KV; explicitly mark DN layers as
 non-cacheable. Mirror the 27B implementation but with a per-layer
 "cacheable" flag.
 
-### prod — Production wire-up (task #147, ✅ DONE 2026-06-02)
+### prod — Production wire-up (task #147 PARTIAL; task #160 in flight)
 
-Wired and validated 2026-06-02 via three fixes:
-1. **`cb_scheduler.py` dispatch hole fixed** (`97abfab`): was hardcoded
+**Bootstrap + HTTP layer**: ✅ GREEN as of 2026-06-02 late evening.
+**First inference step**: ❌ task #160 — cb-engine crashes with
+`TypeError: only length-1 arrays can be converted to Python scalars`.
+
+Fixes that landed this session:
+1. **`cb_scheduler.py` dispatch hole** (`97abfab`): was hardcoded
    to `import server_tp / server_tp_cb`; now uses BACKENDS dispatch
-   mirroring `cb_api.py`. Without this, the server bootstrapped 35B
-   weights but ran 27B forward over them.
-2. **Deploy gap fixed**: MM1's BACKENDS registry sat in local git for
-   weeks without being deployed to qb1. The user caught it via the chat
-   TUI ("i think it's still using the dense model?"). Memory entry
-   `[[deploy-serve-files-too]]` captures the rule.
-3. **35B bootstrap signature fix** (`8111d70`): `bootstrap(state, log)`
-   now defaults `log=None` to `print` since cb_api calls
-   `base.bootstrap(st)` with one arg.
+   mirroring `cb_api.py`.
+2. **Deploy gap**: MM1's BACKENDS registry sat in local git for
+   weeks without being deployed to qb1. User caught via the chat TUI.
+   Memory entry `[[deploy-serve-files-too]]`.
+3. **35B bootstrap signature** (`8111d70`): `bootstrap(state, log=None)`
+   default-to-print, accepts cb_api's 2-arg call.
+4. **27B bootstrap signature regression** (`a7ea0fe`): same fix on
+   server_tp.py; caught by the 27B smoke after we proved 35B fixes.
+5. **35B `state.tok` alias** (`73fd269`): cb_api reads `st.tok` (27B
+   convention); 35B exposed only `state.tokenizer`. One-line alias.
 
 Plus observability (`3e150c0`): `/bootstrap` endpoint + side-file
-`~/tt-xla/.cache/server_cb.bootstrap.log` for tail-able progress
-during the lifespan startup phase when uvicorn isn't yet listening.
+`~/tt-xla/.cache/server_cb.bootstrap.log`.
 
-Validation gate `cb35_prod_topk.py` (4/4 PASS) proves the
-`forward_batch_tp_inner` contract cb_scheduler expects works at B=1
-and B=2 with topk-mode + argmax-mode. **HTTP smoke through real chat
-TUI** is the final user-facing gate; pending bootstrap completion at
-the time of writing this plan.
+**27B smoke**: PASS end-to-end. `/v1/chat/completions` returns
+"The capital of France is Paris." in 2.4s, finish_reason=stop.
+
+**35B smoke**: bootstrap green (14:29, 40/40 layers), HTTP green
+(`/health` ok, /v1/models correct), but first `/v1/chat/completions`
+returns empty completion because cb-engine step crashed inside the
+backend. Suspect site: `experiments/serve/server_35b_cb.py:268`
+(`int(token_ids[0])` if token_ids[0] is a length>1 array). Validator
+`cb35_prod_topk.py` (4/4 PASS) drove `_step_sampled_topk` directly,
+skipping the cb_scheduler.advance layer where this fires. Memory
+entry `[[dev-harness-vs-cb-engine-gap]]` captures the gap class.
+
+**Next**: task #160 — trace token_ids shape through
+`cb_scheduler.advance` → `server_35b_cb.update_input_buffers`, fix
+the shape mismatch, smoke. Avoid burning another 14-min bootstrap:
+keep the server running once the fix lands AND/OR write a stub-backend
+unit test for cb_scheduler.advance.
 
 #### Legacy outline (kept for posterity)
 
