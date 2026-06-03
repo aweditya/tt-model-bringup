@@ -1730,6 +1730,11 @@ def bootstrap(state, log=None):
     if _dn_state_dtype == "fp32":
         state.dn_state_dtype = ttnn.float32
         state.dn_owned_gdn = False  # kernel requires bf16 state
+        # owned_decay_gate also writes bf16 output via the same CB-format
+        # pattern; disable it so g_decay/beta enter the manual recurrence
+        # via the unfused chain (exp/softplus/etc) which can preserve fp32
+        # in the typecast that follows.
+        state.dn_owned_decay_gate = False
         log("[bootstrap] TT_DN_STATE_DTYPE=fp32 → manual DN recurrence + fp32 H_t")
     else:
         state.dn_state_dtype = ttnn.bfloat16
