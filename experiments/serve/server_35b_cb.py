@@ -486,46 +486,120 @@ def dn_step_batched_35b(state, h_tt, w, cb_dn_layer, *, qk_l2_weight_tt=None, qk
 
 
 def moe_step_batched_35b(state, h_tt, w):
-    """Per-slot MoE for B>1 — sequential loop over slots.
+    """Pattern A MoE with leading-B broadcast.
 
-    h_tt: [B, 1, HIDDEN] or [B, HIDDEN] replicated. Each slot routes to
-    top-8 of 256 experts independently. Returns [B, HIDDEN] replicated.
+    h_tt: [B, 1, HIDDEN] or [B, HIDDEN] replicated. Returns [B, HIDDEN]
+    replicated. At B=1 delegates to base for bit-id with v0 path.
 
-    PERF NOTE: this is a B-sequential loop calling
-    base.moe_forward_ttnn_pattern_a_batched per slot. CORRECTNESS-FIRST
-    implementation — the routing/expert-mask logic in Pattern A assumes
-    a single token per call, and a true B-broadcasting port requires
-    refactoring the per-expert matmul shape from [E_LOCAL,1,H] to
-    [B,E_LOCAL,1,H] which is a separate v1.4b project. At B=8 this loop
-    is ~8× the per-token cost; if profiling shows MoE is the bottleneck
-    we ship the broadcast variant.
-
-    At B=1: single call, identical to base path.
+    Strategy: bump the middle dim of the batched expert matmul from 1 to
+    B. ttnn.matmul([E_LOCAL, B, H] @ [E_LOCAL, H, 2I]) batches over the
+    leading E_LOCAL dim and processes B slots per expert in a single
+    dispatch — same dispatch count as base, just bigger per-matmul.
+    Routing logic broadcasts over [B, E_LOCAL, TOP_K] masks.
     """
     B = state.cb_B
     mesh = state.mesh
     if B == 1:
-        # base reshapes input to [1, 1, HIDDEN] internally — pass h_tt as-is
-        # whether rank 2 or 3. No view+dealloc dance needed.
         return base.moe_forward_ttnn_pattern_a_batched(h_tt, w, mesh)
 
-    # B>1 sequential loop. Slice one slot at a time; base handles the inner
-    # reshape. ttnn.slice returns a fresh tensor (NOT a view), so the
-    # eventual deallocate is safe.
-    slot_outs = []
-    rank = len(list(h_tt.shape))
-    for s in range(B):
-        if rank == 3:
-            h_s = ttnn.slice(h_tt, [s, 0, 0], [s + 1, 1, HIDDEN])
-        else:
-            h_s = ttnn.slice(h_tt, [s, 0], [s + 1, HIDDEN])
-        out_s = base.moe_forward_ttnn_pattern_a_batched(h_s, w, mesh)
-        ttnn.deallocate(h_s)
-        slot_outs.append(out_s)
-    out = ttnn.concat(slot_outs, dim=0)
-    for t in slot_outs:
-        ttnn.deallocate(t)
-    return out
+    HIFI4 = base.HIFI4
+    E_LOCAL = base.E_LOCAL
+    TOP_K = base.TOP_K
+    MOE_INTER = base.MOE_INTER  # 512 — full intermediate dim (per-chip slice)
+
+    # ── Router: per-slot top-K expert ids + softmaxed weights ──────────
+    # h_tt shape [B, 1, HIDDEN] or [B, HIDDEN]; matmul → [B, 1, NUM_EXPERTS]
+    # or [B, NUM_EXPERTS] per chip. topk over last dim → [B, ?, TOP_K].
+    logits = ttnn.matmul(h_tt, w["router_weight"], compute_kernel_config=HIFI4)
+    top_logits, top_idxs = ttnn.topk(logits, k=TOP_K, dim=-1)
+    ttnn.deallocate(logits)
+    weights = ttnn.softmax(top_logits, dim=-1)
+    ttnn.deallocate(top_logits)
+
+    # Normalize shapes: top_idxs / weights → [B, 1, TOP_K] for broadcast math.
+    if len(list(top_idxs.shape)) == 2:
+        top_idxs_3d = ttnn.reshape(top_idxs, [B, 1, TOP_K])
+        weights_3d = ttnn.reshape(weights, [B, 1, TOP_K])
+    else:
+        top_idxs_3d = top_idxs
+        weights_3d = weights
+
+    # ── Per-slot per-expert routing mask + weight ───────────────────────
+    # local_expert_ids per chip: [E_LOCAL, 1] (one id per local expert).
+    # eq(local_expert_ids, top_idxs_3d): broadcast [E_LOCAL, 1] with
+    # [B, 1, TOP_K] → [B, E_LOCAL, TOP_K] mask.
+    mask = ttnn.eq(w["local_expert_ids"], top_idxs_3d)
+    ttnn.deallocate(top_idxs); ttnn.deallocate(top_idxs_3d)
+    mask_f = ttnn.typecast(mask, ttnn.bfloat16)
+    ttnn.deallocate(mask)
+    # weighted_mask = mask * weights, broadcast [B, E_LOCAL, TOP_K].
+    weighted_mask = ttnn.mul(mask_f, weights_3d)
+    ttnn.deallocate(mask_f); ttnn.deallocate(weights); ttnn.deallocate(weights_3d)
+    # routing_weight per (slot, local_expert): sum over TOP_K → [B, E_LOCAL, 1]
+    routing_weight = ttnn.sum(weighted_mask, dim=-1, keepdim=True)
+    ttnn.deallocate(weighted_mask)
+    # Clone to dodge view-decay under memory pressure (base does the same).
+    routing_weight_clone = ttnn.clone(routing_weight)
+    ttnn.deallocate(routing_weight)
+
+    # ── Batched expert FFN: bump matmul middle-dim from 1 to B ─────────
+    # h_3d [1, B, HIDDEN] then concat × E_LOCAL → [E_LOCAL, B, HIDDEN].
+    # h_tt is the caller's tensor; DO NOT deallocate the reshape view (it
+    # aliases h_tt's buffer, same rule as base).
+    if len(list(h_tt.shape)) == 2:
+        h_3d_for_concat = ttnn.reshape(h_tt, [1, B, HIDDEN])
+    else:
+        # h_tt is [B, 1, HIDDEN]; need [1, B, HIDDEN] for concat across E_LOCAL.
+        # Total volume is B*HIDDEN; reshape is valid.
+        h_3d_for_concat = ttnn.reshape(h_tt, [1, B, HIDDEN])
+    h_e_repeat = ttnn.concat([h_3d_for_concat] * E_LOCAL, dim=0)  # [E_LOCAL, B, HIDDEN]
+
+    gate_up_batched = ttnn.matmul(
+        h_e_repeat, w["experts_gate_up_local"],
+        compute_kernel_config=HIFI4,
+        core_grid=ttnn.CoreGrid(y=10, x=11),
+    )  # [E_LOCAL, B, 2*MOE_INTER]
+    ttnn.deallocate(h_e_repeat)
+    gate_batched = ttnn.slice(gate_up_batched, [0, 0, 0],
+                                [E_LOCAL, B, MOE_INTER])
+    up_batched = ttnn.slice(gate_up_batched, [0, 0, MOE_INTER],
+                              [E_LOCAL, B, 2 * MOE_INTER])
+    ttnn.deallocate(gate_up_batched)
+    mid_batched = ttnn.mul(
+        gate_batched, up_batched,
+        input_tensor_a_activations=[ttnn.UnaryOpType.SILU],
+    )
+    ttnn.deallocate(gate_batched); ttnn.deallocate(up_batched)
+
+    expert_out_batched = ttnn.matmul(
+        mid_batched, w["experts_down_local"],
+        compute_kernel_config=HIFI4,
+        core_grid=ttnn.CoreGrid(y=10, x=11),
+    )  # [E_LOCAL, B, HIDDEN]
+    ttnn.deallocate(mid_batched)
+
+    # ── Combine routing × expert outputs ───────────────────────────────
+    # expert_out [E_LOCAL, B, HIDDEN]; rw [B, E_LOCAL, 1]. Want
+    # out[s, h] = sum_e(rw[s, e] * expert_out[e, s, h]).
+    # Reshape expert_out to [B, E_LOCAL, HIDDEN] via permute, then
+    # batched matmul: rw_BxK [B, 1, E_LOCAL] @ expert_out [B, E_LOCAL, H]
+    # = [B, 1, H].
+    expert_out_perm = ttnn.permute(expert_out_batched, [1, 0, 2])  # [B, E_LOCAL, H]
+    ttnn.deallocate(expert_out_batched)
+    rw_for_mm = ttnn.reshape(routing_weight_clone, [B, 1, E_LOCAL])
+    ttnn.deallocate(routing_weight_clone)
+    routed_local = ttnn.matmul(rw_for_mm, expert_out_perm,
+                                 compute_kernel_config=HIFI4)  # [B, 1, HIDDEN]
+    ttnn.deallocate(rw_for_mm); ttnn.deallocate(expert_out_perm)
+    routed_full = base.all_reduce_tt(routed_local, mesh)
+    ttnn.deallocate(routed_local)
+
+    # ── Shared expert (broadcast over B) ────────────────────────────────
+    # Reuse base helper — it operates on whatever shape h_tt has.
+    gated_shared = base._moe_shared_expert(h_tt, w, mesh)
+    final = ttnn.add(routed_full, gated_shared)
+    ttnn.deallocate(routed_full); ttnn.deallocate(gated_shared)
+    return final
 
 
 def _batched_prelude(state):
