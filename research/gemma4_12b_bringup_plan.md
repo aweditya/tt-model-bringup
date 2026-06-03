@@ -243,15 +243,25 @@ projection sub-steps.
 
 ### v0.1 STAGED sub-task breakdown (extends §4)
 
-| Stage | Adds | Validation gate |
-|---|---|---|
-| v0.1.0 | bootstrap + embed scale + L0 input_layernorm | cos ≥ 0.999 on `embed_scaled` + `in_norm` |
-| v0.1.1 | q/k/v_proj + q_norm/k_norm at L0 | cos ≥ 0.999 on `q_norm_out`, `k_norm_out`, `v_proj_out` (vs HF attn sub-hooks) |
-| v0.1.2 | attention at pos 0 (sliding) + o_proj | cos ≥ 0.999 on `mixer_out` |
-| v0.1.3 | post_attention_layernorm + residual_1 + MLP + post_ff_norm + residual_2 | cos ≥ 0.999 on all 4 remaining sub-steps + L0 output |
-| v0.2 | all 48 layers (sliding + global dispatch) + final_norm + lm_head + softcap | greedy top-1 matches HF at pos 0..4 |
-| v0.3 | KV cache + paged SDPA with `sliding_window_size=1024` | 8-tok generation matches HF token-for-token |
-| v0.4 | Trace capture | 100-step traced == eager |
+| Stage | Adds | Validation gate | Status |
+|---|---|---|---|
+| v0.1.0 | bootstrap + embed scale + L0 input_layernorm | cos ≥ 0.999 on `embed_scaled` + `in_norm` | **DONE 2026-06-03 commit `b9f3c35`** — cos 0.999996 / 0.999991 |
+| v0.1.1 | q/k/v_proj + q_norm/k_norm at L0 | cos ≥ 0.999 on `q_norm_out`, `k_norm_out`, `v_proj_out` (vs HF attn sub-hooks) | **DONE 2026-06-03 commit `a35525e`** — 7/7 PASS at cos ≥ 0.99997. Hit a sharder gotcha en route (memory `[[ttnn-shard-1d-vs-2d]]`). |
+| v0.1.2 | attention at pos 0 (sliding) + o_proj | cos ≥ 0.999 on `mixer_out` | IN FLIGHT |
+| v0.1.3 | post_attention_layernorm + residual_1 + MLP + post_ff_norm + residual_2 | cos ≥ 0.999 on all 4 remaining sub-steps + L0 output | |
+| v0.2 | all 48 layers (sliding + global dispatch) + final_norm + lm_head + softcap | greedy top-1 matches HF at pos 0..4 | |
+| v0.3 | KV cache + paged SDPA with `sliding_window_size=1024` | 8-tok generation matches HF token-for-token | |
+| v0.4 | Trace capture | 100-step traced == eager | |
+
+### Bootstrap & runtime (verified)
+
+- Bootstrap: **74-84 seconds** total on qb1 from a cold ttnn process
+  (vs 35B's 14 min — 11× faster, as the plan §0 estimate predicted).
+- 48 layer-weight uploads break down as: layer 10 at ~15s, 20 at ~30s,
+  30 at ~46s, 40 at ~60s, all done at ~72s. Linear pace ≈ 1.5 sec/layer.
+- Embed lookup + sqrt-scale + L0 forward (through Q/K/V proj + norms)
+  completes in < 1 sec post-bootstrap. JIT cache hot.
+- All computation on (1,4) P150 mesh; only readback for cosine compare.
 
 ------------------------------------------------------------------------
 

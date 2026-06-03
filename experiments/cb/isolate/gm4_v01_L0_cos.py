@@ -134,6 +134,15 @@ def main():
         c = cos(tt_kn, hf_kn)
         results.append(("k_norm_out", c, mad(tt_kn, hf_kn)))
 
+    # v0.1.2: mixer_out (post o_proj + all_reduce). HF L0_mixer_out is
+    # [seq, HIDDEN] = [6, 3840]; pos 0 slice = [3840]. TT mixer_out
+    # is [HIDDEN] replicated.
+    hf_mixer_p = ORACLE_DIR / "L0_mixer_out.npy"
+    if hf_mixer_p.exists() and "mixer_out" in cap:
+        hf_mx = np.load(hf_mixer_p)[0]  # [3840]
+        tt_mx = cap["mixer_out"]
+        results.append(("mixer_out", cos(tt_mx, hf_mx), mad(tt_mx, hf_mx)))
+
     all_pass = True
     for name, c, m in results:
         status = "PASS" if c >= PASS_THRESH else "FAIL"

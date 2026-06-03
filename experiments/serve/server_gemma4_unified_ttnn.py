@@ -82,6 +82,7 @@ EPS = 1e-6
 NCHIPS = 4
 NQ_PER_CHIP = NUM_Q_HEADS // NCHIPS  # 4
 NKV_PER_CHIP_SLIDING = NUM_KV_HEADS_SLIDING // NCHIPS  # 2
+GQA_GROUP_SLIDING = NUM_Q_HEADS // NUM_KV_HEADS_SLIDING  # 2 (Q heads per KV head)
 HIDDEN_PER_CHIP = HIDDEN // NCHIPS  # 960
 INTERMEDIATE_PER_CHIP = INTERMEDIATE // NCHIPS  # 3840
 
@@ -374,7 +375,6 @@ def step_forward_v01(state, tok_id, capture):
     ttnn.deallocate(q)
     k_h = ttnn.reshape(k, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
     ttnn.deallocate(k)
-    ttnn.deallocate(v)  # v is not normed (sliding layer; V is raw projection)
     q_n = ttnn.rms_norm(q_h, weight=w0["q_norm"], epsilon=EPS)
     k_n = ttnn.rms_norm(k_h, weight=w0["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
@@ -382,6 +382,42 @@ def step_forward_v01(state, tok_id, capture):
     capture["q_norm_out"] = _readback_sharded_head(q_n, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING)
     capture["k_norm_out"] = _readback_sharded_head(k_n, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
     ttnn.deallocate(q_n); ttnn.deallocate(k_n)
+
+    # ── v0.1.2: attention output at pos 0 (sliding L0) + o_proj ──
+    # At pos 0 with seq_len=1, softmax(QK^T/sqrt(d)) = 1 (single position
+    # attends to itself only with causal mask). RoPE at pos 0 is identity
+    # (cos[0]=1, sin[0]=0). So attn_out[q] = V[q // GQA_GROUP]. We expand
+    # v from [NKV_PER_CHIP, HEAD_DIM] to [NQ_PER_CHIP, HEAD_DIM] by
+    # interleaving each KV row GQA_GROUP_SLIDING times.
+    #
+    # v shape per chip: [NKV_PER_CHIP=2, HEAD_DIM=256]. We want
+    # [NQ_PER_CHIP=4, HEAD_DIM] = [kv0, kv0, kv1, kv1].
+    # Reshape to [NKV_PER_CHIP, 1, HEAD_DIM] then concat(dim=1) yields
+    # [NKV_PER_CHIP, GQA_GROUP_SLIDING, HEAD_DIM] = [2, 2, 256], then
+    # reshape to [NQ_PER_CHIP, HEAD_DIM] = [4, 256] — interleaved.
+    v_h = ttnn.reshape(v, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
+    ttnn.deallocate(v)
+    v_e = ttnn.reshape(v_h, [NKV_PER_CHIP_SLIDING, 1, HEAD_DIM_SLIDING])
+    ttnn.deallocate(v_h)
+    v_e2 = ttnn.concat([v_e] * GQA_GROUP_SLIDING, dim=1)  # [2, 2, 256]
+    ttnn.deallocate(v_e)
+    attn_per_head = ttnn.reshape(v_e2, [NQ_PER_CHIP, HEAD_DIM_SLIDING])  # [4, 256]
+    ttnn.deallocate(v_e2)
+
+    # Flatten to [1, NQ_PER_CHIP * HEAD_DIM] for o_proj.
+    attn_flat = ttnn.reshape(attn_per_head, [1, NQ_PER_CHIP * HEAD_DIM_SLIDING])
+    ttnn.deallocate(attn_per_head)
+
+    # o_proj per chip: [1, NQ_PER_CHIP * HEAD_DIM] @ [NQ_PER_CHIP * HEAD_DIM, HIDDEN]
+    # = [1, HIDDEN] partial per chip. All-reduce sum gives the replicated
+    # full mixer_out.
+    partial = ttnn.matmul(attn_flat, w0["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    mixer_out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+
+    capture["mixer_out"] = _readback_replicated(mixer_out, state.mesh)
+    ttnn.deallocate(mixer_out)
 
 
 def _readback_replicated(t_tt, mesh):

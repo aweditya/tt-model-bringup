@@ -38,16 +38,19 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
   6-token "The capital of France is" forward; HF predicts " a" at pos 5;
   all 6 L0 sub-captures present (in/post_attn/pre_ff/mlp/post_ff norms
   + mixer_out).
-- **v0.1.0 IN FLIGHT**: `experiments/serve/server_gemma4_unified_ttnn.py`
-  (NEW; forked from `server_35b_ttnn.py` per REUSE MANDATE) +
-  `experiments/cb/isolate/gm4_v01_L0_cos.py` validator. Scope:
-  bootstrap (open mesh, upload embed + all 48 layer weights) + L0
-  input_layernorm forward at pos 0. Gate: cos ≥ 0.999 on
-  `embed_scaled` (vs HF `hidden_states[0, 0, :]`) and `in_norm` (vs
-  HF `L0_in_norm[0, :]`). Bootstrap ~3-5 min on first run.
-- **NEXT after v0.1.0 PASS**: v0.1.1 adds q/k/v_proj + q_norm/k_norm
-  with their own cosine gates. Staged plan in
-  `research/gemma4_12b_bringup_plan.md` §"v0.1 STAGED sub-task breakdown".
+- **v0.1.0 DONE 2026-06-03 commit `b9f3c35`** — bootstrap + embed
+  scale + L0 input_layernorm. cos 0.999996 / 0.999991 vs HF oracle.
+  Bootstrap **74-84 sec** on qb1 (vs 35B's 14 min — 11× faster).
+- **v0.1.1 DONE 2026-06-03 commit `a35525e`** — Q/K/V projections +
+  q_norm/k_norm. 7/7 sub-steps PASS at cos ≥ 0.99997. Hit a sharder
+  gotcha en route (`ShardTensor2dMesh` vs the correct
+  `ShardTensorToMesh(dim=0)`) — one-line fix; memory entry
+  `[[ttnn-shard-1d-vs-2d]]`.
+- **v0.1.2 IN FLIGHT** — attention at pos 0 (sliding, GQA expansion
+  is trivial since softmax of one position = 1.0) + o_proj +
+  all_reduce. Gate: cos ≥ 0.999 on `mixer_out`.
+- **All computation on (1,4) P150 mesh on qb1**; readback only for
+  cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
   existing file it forks (or "no prior art, here's why") in its commit
   message. Deep utility shelf exists: `experiments/cb/_runner.py`,
