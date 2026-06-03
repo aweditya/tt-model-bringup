@@ -3,6 +3,25 @@
 What this project is, where the perf is now, what to run, and what is next.
 Read top to bottom; everything else is linked.
 
+## Live session state (2026-06-02 evening, may be compaction-fresh)
+
+- **35B HTTP server on qb1 is bootstrapping** — last fresh launch pid 186787
+  via `serve_cb.sh start` with `TT_BACKEND=35b TT_CB_SLOTS=2 TT_CB_TOPK_K=64`.
+  Tail `~/tt-xla/.cache/server_cb.bootstrap.log` over ssh for live progress.
+- **Bootstrap hangs at "enumerate shards"** in every recent attempt — the
+  same 35B bootstrap function runs in ~14 min under the dev harness but
+  appears stuck under uvicorn lifespan. Side-file confirms no progress.
+  Suspected cause: ttnn op behavior inside the asyncio executor thread.
+  v0/v1/v2 device primitives + `cb35_prod_topk` 4/4 PASS via dev harness;
+  the HTTP smoke is the only gate that hasn't cleared end-to-end.
+- **Background poll**: shell task `b9wcjerwb` watches for first
+  `layer 10/40 uploaded` OR `Application startup {complete,failed}`.
+- **Dev harness** previously alive in tmux session `cb35` was SIGKILLed
+  when we stopped to start serve_cb. Restart with
+  `bash scripts/run_harness_tmux.sh qb1` if you want to fall back to
+  trigger-file testing. Harness uses old `/tmp/cb35_trig/` paths in this
+  session (next bootstrap will use `~/tt-xla/.cache/cb35_runtime/`).
+
 ## Project
 
 Qwen3.6-family bringup on Tenstorrent Blackhole (P150 × 4). Production paths:
