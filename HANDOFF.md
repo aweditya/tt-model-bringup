@@ -103,8 +103,19 @@ Google released `gemma-4-12B` on 2026-06-03 (model card seen this
 session). Dense 12B / 48 layers / 262K vocab / 256K context / hybrid
 sliding-window-1024 + global attention / encoder-free multimodal /
 Apache 2.0. Architecturally closer to 27B dense than 35B MoE.
-Text-only scoping in `research/gemma4_12b_scoping.md` — ~9-12
-working days estimate, mirrors the 35B v0..v4 staging pattern.
+
+- **High-level scoping**: [`research/gemma4_12b_scoping.md`](research/gemma4_12b_scoping.md) (~9-12 day estimate).
+- **Detailed plan-of-action**: [`research/gemma4_12b_bringup_plan.md`](research/gemma4_12b_bringup_plan.md) (commit `808b4b4`) — verified `config.json` facts, code-reuse map at file:line, novel-item ranking, sub-task breakdown with cosine gates.
+
+Top NOVEL items the plan flags (need pre-implementation research):
+1. Dual head_dim per layer-type (256 sliding / 512 global) — heterogeneous KV cache + open `num_global_key_value_heads=1` on (1,4) mesh shape question.
+2. Four norms per layer + Llama-style RMSNorm (`w` not `(1+w)`) — opposite of the Qwen3.6 `+1.0` rule (see [[qwen36-qnorm-knorm-zero-centered]]).
+3. Tied embeddings + sqrt(hidden) embed scale + 30·tanh(x/30) logit softcap.
+
+Top OPEN questions (need on-device probe before code):
+1. Does qb1's ttnn expose `sliding_window_size` on `paged_scaled_dot_product_attention_decode`?
+2. `gelu_pytorch_tanh` ≡ which ttnn variant exactly?
+3. `num_global_key_value_heads=1` on a 4-chip mesh — replicate or concentrate?
 
 **Deliberately not started**: blocked on task #163 (drift cliff
 work in active investigation on the dev harness) and #164 (manual
@@ -323,7 +334,7 @@ to match) after prefix caching ships.
    - v4 (prefix cache for attn layers only): LOW PRIORITY (vllm#36493 reports
      ~0.1% hit rate on this arch class — DN layers can't be cached).
    - **Dev iteration harness** (`experiments/cb/dev/cb35_dev_harness.py`):
-     bootstrap-once long-running python on qb1, watches `/tmp/cb35_trig/`,
+     bootstrap-once long-running python on qb1, watches `~/tt-xla/.cache/cb35_runtime/trig/`,
      reloads via `importlib`. Cuts fix-test cycle from ~14 min to seconds.
      **MUST launch via `bash scripts/run_harness_tmux.sh`** — nohup + disown
      and setsid + double-fork both fail to keep the python alive after SSH
