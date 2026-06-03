@@ -62,15 +62,26 @@ def _discover_test_module(trigger_name: str):
 
 TRIG_DIR = PROJECT_ROOT / ".cache" / "cb35_runtime" / "trig"
 LOG_PATH = TRIG_DIR / "last.log"
+HARNESS_LOG_PATH = PROJECT_ROOT / ".cache" / "cb35_runtime" / "harness.log"
+HARNESS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+_HARNESS_LOG_FH = open(HARNESS_LOG_PATH, "a", buffering=1)
+_LAST_LOG_TS = time.time()
 
 
 def log(msg: str):
+    global _LAST_LOG_TS
     print(msg, flush=True)
+    try:
+        _HARNESS_LOG_FH.write(msg + "\n")
+        _HARNESS_LOG_FH.flush()
+    except Exception:
+        pass
     try:
         with open(LOG_PATH, "a") as f:
             f.write(msg + "\n")
     except Exception:
         pass
+    _LAST_LOG_TS = time.time()
 
 
 def _add_test_paths():
@@ -124,36 +135,48 @@ def main():
     log(f"[harness] special: _reload (re-import server_35b_cb), _exit (shutdown)")
 
     SKIP = {"last.log", "_reload", "_exit"}
+    START_TS = time.time()
     while True:
-        for trig in TRIG_DIR.iterdir():
-            name = trig.name
-            if name in SKIP or trig.is_dir():
-                continue
-            try:
-                trig.unlink()
-            except FileNotFoundError:
-                continue
-            run_test(state, name)
-        # Special trigger: 'reload' = importlib-reload server_35b_cb without running anything
-        reload_trig = TRIG_DIR / "_reload"
-        if reload_trig.exists():
-            reload_trig.unlink(missing_ok=True)
-            try:
-                import server_35b_cb
-                importlib.reload(server_35b_cb)
-                log("[harness] _reload: server_35b_cb reloaded")
-            except Exception:
-                log(traceback.format_exc())
-        # Special trigger: 'exit' = clean shutdown
-        if (TRIG_DIR / "_exit").exists():
-            log("[harness] _exit received; closing mesh and exiting")
-            try:
-                import ttnn
-                ttnn.close_device(state.mesh)
-            except Exception:
-                pass
-            break
-        time.sleep(0.5)
+        try:
+            for trig in TRIG_DIR.iterdir():
+                name = trig.name
+                if name in SKIP or trig.is_dir():
+                    continue
+                try:
+                    trig.unlink()
+                except FileNotFoundError:
+                    continue
+                run_test(state, name)
+            # Special trigger: 'reload' = importlib-reload server_35b_cb without running anything
+            reload_trig = TRIG_DIR / "_reload"
+            if reload_trig.exists():
+                reload_trig.unlink(missing_ok=True)
+                try:
+                    import server_35b_cb
+                    importlib.reload(server_35b_cb)
+                    log("[harness] _reload: server_35b_cb reloaded")
+                except Exception:
+                    log(traceback.format_exc())
+            # Special trigger: 'exit' = clean shutdown
+            if (TRIG_DIR / "_exit").exists():
+                log("[harness] _exit received; closing mesh and exiting")
+                try:
+                    import ttnn
+                    ttnn.close_device(state.mesh)
+                except Exception:
+                    pass
+                break
+            # Heartbeat: if no log line in >30s, emit one so hangs are visible.
+            if time.time() - _LAST_LOG_TS > 30:
+                try:
+                    qlen = len(list(TRIG_DIR.iterdir()))
+                except Exception:
+                    qlen = -1
+                log(f"[harness] tick t={int(time.time() - START_TS)} queue={qlen}")
+            time.sleep(0.5)
+        except Exception:
+            log(traceback.format_exc())
+            time.sleep(0.5)
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ tmux new-session -d -s cb35 \
    export ARCH_NAME=blackhole && \
    export PYTHONPATH=\$TT_METAL_HOME/ttnn && \
    export LD_LIBRARY_PATH=\$TT_METAL_HOME/ttnn/ttnn:\$TT_BUILD_DIR/ttnn:\$TT_BUILD_DIR/lib && \
-   exec .venv/bin/python -u experiments/cb/dev/cb35_dev_harness.py 2>&1 | tee .cache/cb35_runtime/harness.log"
+   exec .venv/bin/python -u experiments/cb/dev/cb35_dev_harness.py"
 sleep 2
 echo "=== tmux sessions ==="
 tmux ls 2>&1
