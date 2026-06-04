@@ -1,0 +1,112 @@
+{
+  "args": {
+    "url": "http://127.0.0.1:8000",
+    "model": "google/gemma-4-12B",
+    "clients": "1,2,4",
+    "max_tokens": 64,
+    "out": "/home/aditya/tt-xla/presentation/screenshots/stress_concurrent_chat_1780590685.json"
+  },
+  "rounds": [
+    {
+      "n_clients": 1,
+      "wall_s": 18.889,
+      "total_completion_tokens": 64,
+      "aggregate_tok_s": 3.388,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 18.887,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 64,
+          "total_tokens": 88,
+          "tok_s_completion": 3.388574906433279
+        }
+      ]
+    },
+    {
+      "n_clients": 2,
+      "wall_s": 19.287,
+      "total_completion_tokens": 128,
+      "aggregate_tok_s": 6.637,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 18.852,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 64,
+          "total_tokens": 88,
+          "tok_s_completion": 3.3947987196419533
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 19.286,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "For a quick weeknight pasta, the goal is **high flavor with minimal cleanup.** \n\nHere are three different \"styles\" of quick pasta depending on what you have in your pantry. All of these take about **1",
+          "prompt_tokens": 26,
+          "completion_tokens": 64,
+          "total_tokens": 90,
+          "tok_s_completion": 3.3184945425083487
+        }
+      ]
+    },
+    {
+      "n_clients": 4,
+      "wall_s": 19.475,
+      "total_completion_tokens": 256,
+      "aggregate_tok_s": 13.145,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 18.824,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 64,
+          "total_tokens": 88,
+          "tok_s_completion": 3.399949344406247
+        },
+        {
+          "idx": 2,
+          "ok": true,
+          "elapsed_s": 19.257,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "To understand a transistor, you first need to forget about complex physics for a second and think about a simple **water faucet.**\n\nA transistor is essentially an **electronic faucet.** It is a tiny s",
+          "prompt_tokens": 25,
+          "completion_tokens": 64,
+          "total_tokens": 89,
+          "tok_s_completion": 3.3234827206987307
+        },
+        {
+          "idx": 3,
+          "ok": true,
+          "elapsed_s": 19.256,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "The heavy scent of vanilla and decaying paper hung in the air of the West Wing, where the only sound was the rhythmic ticking of a grandfather clock that seemed to count down to something unseen. Elia",
+          "prompt_tokens": 25,
+          "completion_tokens": 64,
+          "total_tokens": 89,
+          "tok_s_completion": 3.3235592574311945
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 19.474,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "For a quick weeknight pasta, the goal is **high flavor with minimal cleanup.** \n\nHere are three different \"styles\" of quick pasta depending on what you have in your pantry. All of these take about **1",
+          "prompt_tokens": 26,
+          "completion_tokens": 64,
+          "total_tokens": 90,
+          "tok_s_completion": 3.2864847795984344
+        }
+      ]
+    }
+  ]
+}

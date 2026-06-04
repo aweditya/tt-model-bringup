@@ -1,0 +1,112 @@
+{
+  "args": {
+    "url": "http://127.0.0.1:8000",
+    "model": "google/gemma-4-12B",
+    "clients": "1,2,4",
+    "max_tokens": 64,
+    "out": "/home/aditya/tt-xla/presentation/screenshots/stress_concurrent_chat_1780590224.json"
+  },
+  "rounds": [
+    {
+      "n_clients": 1,
+      "wall_s": 0.324,
+      "total_completion_tokens": 0,
+      "aggregate_tok_s": 0.0,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 0.322,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "",
+          "prompt_tokens": 24,
+          "completion_tokens": 0,
+          "total_tokens": 24,
+          "tok_s_completion": 0.0
+        }
+      ]
+    },
+    {
+      "n_clients": 2,
+      "wall_s": 0.441,
+      "total_completion_tokens": 0,
+      "aggregate_tok_s": 0.0,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 0.223,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "",
+          "prompt_tokens": 24,
+          "completion_tokens": 0,
+          "total_tokens": 24,
+          "tok_s_completion": 0.0
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 0.44,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "",
+          "prompt_tokens": 26,
+          "completion_tokens": 0,
+          "total_tokens": 26,
+          "tok_s_completion": 0.0
+        }
+      ]
+    },
+    {
+      "n_clients": 4,
+      "wall_s": 0.446,
+      "total_completion_tokens": 0,
+      "aggregate_tok_s": 0.0,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 0.227,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "",
+          "prompt_tokens": 24,
+          "completion_tokens": 0,
+          "total_tokens": 24,
+          "tok_s_completion": 0.0
+        },
+        {
+          "idx": 2,
+          "ok": true,
+          "elapsed_s": 0.226,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "",
+          "prompt_tokens": 25,
+          "completion_tokens": 0,
+          "total_tokens": 25,
+          "tok_s_completion": 0.0
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 0.444,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "",
+          "prompt_tokens": 26,
+          "completion_tokens": 0,
+          "total_tokens": 26,
+          "tok_s_completion": 0.0
+        },
+        {
+          "idx": 3,
+          "ok": true,
+          "elapsed_s": 0.444,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "",
+          "prompt_tokens": 25,
+          "completion_tokens": 0,
+          "total_tokens": 25,
+          "tok_s_completion": 0.0
+        }
+      ]
+    }
+  ]
+}
