@@ -47,10 +47,8 @@ def _run_client(idx, eng, tok, n_turns, max_new, stall_s, results, errors):
             t0 = time.time()
             handle = eng.submit(prompt_ids, max_new=max_new)
             n_tok = 0
-            last_tok_time = t0
             for _tid in handle.tokens(timeout=stall_s):
                 n_tok += 1
-                last_tok_time = time.time()
             elapsed = time.time() - t0
             results.append({"client": idx, "turn": turn, "tok": n_tok,
                              "elapsed": elapsed, "final": handle.final})

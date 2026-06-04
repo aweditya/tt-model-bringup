@@ -2024,7 +2024,6 @@ def forward_prefill_chunked_traced_inner(state):
     cfg = state.cfg
     HIDDEN = cfg['hidden']
     L = state.prefill_chunk_size
-    mesh = state.mesh
 
     x_tt = ttnn.reshape(
         ttnn.embedding(state.prefill_tok_buf, state.embed_tt, layout=ttnn.TILE_LAYOUT,

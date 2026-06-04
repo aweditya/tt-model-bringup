@@ -69,9 +69,6 @@ def main():
     log("S1a prefill done; production state populated")
 
     # Snapshot post-prefill production state, layer-by-layer.
-    from full_layer_tp_probe import NV_PER_CHIP, CONV_DIM_CHIP
-    N_V_TOTAL = NV_PER_CHIP * 4
-    CONV_DIM = CONV_DIM_CHIP * 4
     cfg = state.cfg
     BLOCK_SIZE = base.BLOCK_SIZE
     n_used = (L + BLOCK_SIZE - 1) // BLOCK_SIZE

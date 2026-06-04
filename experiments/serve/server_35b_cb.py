@@ -676,7 +676,6 @@ def layer_forward_batched_35b(state, h_tt, w, layer_type, cos_tt, sin_tt,
       h = residual + moe
     Returns h_final [B, 1, HIDDEN] replicated.
     """
-    B = state.cb_B
     residual_1 = h_tt
     h_norm_1 = ttnn.rms_norm(h_tt, weight=w["input_layernorm"], epsilon=base.EPS)
     if layer_type == "linear_attention":
@@ -727,7 +726,6 @@ def forward_batch_tp_inner_batched(state, return_topk=None):
         finally:
             state.sampler_topk = saved_topk
 
-    mesh = state.mesh
     h_tt, cos_tt, sin_tt = _batched_prelude(state)
 
     n = state.text_cfg.num_hidden_layers

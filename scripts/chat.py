@@ -78,7 +78,6 @@ def panel(title: str, body: str, color=CYAN, width: int | None = None) -> str:
             width = max(40, min(120, os.get_terminal_size().columns - 2))
         except Exception:
             width = 80
-    top = color(f"{TL}{H} {title} ").ljust(width + len(color(""))*0, "")
     # Pad with H to width
     plain_title = f"{TL}{H} {title} "
     pad = max(0, width - len(plain_title) - 1)
