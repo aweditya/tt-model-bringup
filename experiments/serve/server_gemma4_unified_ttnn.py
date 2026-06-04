@@ -351,6 +351,100 @@ def bootstrap(state, log=None):
     log(f"  paged SDPA: MAX_KV={MAX_KV}, block_size={state.sdpa_block_size}, "
         f"num_blocks={num_blocks}")
 
+    # KV caches per layer. Forked from `server_35b_ttnn.py:1455-1483` —
+    # sliding layers have NKV=8 (2/chip) sharded along the chip axis; global
+    # layers have NKV=1 replicated (plan §6.8 — wastes 4× memory but is the
+    # simplest setup; revisit if memory pressures appear).
+    state.kv_caches_tt = []
+    for L in range(NUM_LAYERS):
+        if state.layer_types[L] == "sliding_attention":
+            # Logical [num_blocks, NCHIPS * NKV_PER_CHIP=8, block_size, head_dim]
+            # sharded along dim=1 → per-chip [num_blocks, NKV_PER_CHIP=2, block, head_dim].
+            cs = (state.num_blocks, NCHIPS * NKV_PER_CHIP_SLIDING,
+                  state.sdpa_block_size, HEAD_DIM_SLIDING)
+            init = np.zeros(cs, dtype=np.float32)
+            kc = ttnn.from_torch(
+                torch.from_numpy(init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+            )
+            vc = ttnn.from_torch(
+                torch.from_numpy(init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+            )
+        else:  # full_attention (global)
+            cs = (state.num_blocks, NUM_KV_HEADS_GLOBAL,
+                  state.sdpa_block_size, HEAD_DIM_GLOBAL)
+            init = np.zeros(cs, dtype=np.float32)
+            kc = ttnn.from_torch(
+                torch.from_numpy(init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=state.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            )
+            vc = ttnn.from_torch(
+                torch.from_numpy(init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=state.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            )
+        state.kv_caches_tt.append((kc, vc))
+    log(f"  KV caches: {NUM_LAYERS} layers allocated")
+
+    # SDPA program/memory/compute configs (35B-style B3 recipe — HiFi2
+    # +fp32_dest_acc_en=False per `[[fp32-sdpa-cliff-probe]]`; HiFi4+fp32
+    # has a Blackhole bug at large positions).
+    compute_grid = state.mesh.compute_with_storage_grid_size()
+    shard_grid_sliding = ttnn.num_cores_to_corerangeset(
+        NKV_PER_CHIP_SLIDING, compute_grid, row_wise=True)
+    state.paged_write_mem_cfg_sliding = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
+        ttnn.ShardSpec(shard_grid_sliding,
+                       [state.sdpa_block_size, HEAD_DIM_SLIDING],
+                       ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    shard_grid_global = ttnn.num_cores_to_corerangeset(
+        NUM_KV_HEADS_GLOBAL, compute_grid, row_wise=True)
+    state.paged_write_mem_cfg_global = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
+        ttnn.ShardSpec(shard_grid_global,
+                       [state.sdpa_block_size, HEAD_DIM_GLOBAL],
+                       ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    state.paged_sdpa_progcfg = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
+        q_chunk_size=0, k_chunk_size=0, exp_approx_mode=False,
+    )
+    state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi2, math_approx_mode=False,
+        fp32_dest_acc_en=False, packer_l1_acc=False,
+    )
+    log("  SDPA program/memory/compute configs ready")
+
+    # RoPE tables (plan §1.3) — TWO, one per layer type:
+    # Sliding: rope_type=default, theta=10000, full head_dim=256 rotated.
+    # Global:  rope_type=proportional (p-RoPE), theta=1e6, rotate first
+    #          int(0.25 * 512 // 2) * 2 = 128 dims, leave rest at zero freq.
+    positions = np.arange(MAX_KV, dtype=np.float64)
+    inv_freq_sliding = 1.0 / (ROPE_THETA_SLIDING ** (
+        np.arange(0, HEAD_DIM_SLIDING, 2, dtype=np.float64) / HEAD_DIM_SLIDING))
+    ang_sliding = np.outer(positions, inv_freq_sliding)  # [MAX_KV, HEAD_DIM_SLIDING/2]
+    cos_sliding = np.concatenate([np.cos(ang_sliding), np.cos(ang_sliding)], axis=1).astype(np.float32)
+    sin_sliding = np.concatenate([np.sin(ang_sliding), np.sin(ang_sliding)], axis=1).astype(np.float32)
+    state.cos_sliding_tt = np_to_replicated(cos_sliding, state.mesh,
+                                            layout=ttnn.ROW_MAJOR_LAYOUT)
+    state.sin_sliding_tt = np_to_replicated(sin_sliding, state.mesh,
+                                            layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    rope_angles_global = int(PARTIAL_ROTARY_GLOBAL * HEAD_DIM_GLOBAL // 2)  # = 64
+    inv_freq_rot = 1.0 / (ROPE_THETA_GLOBAL ** (
+        np.arange(0, 2 * rope_angles_global, 2, dtype=np.float64) / HEAD_DIM_GLOBAL))
+    inv_freq_global = np.concatenate(
+        [inv_freq_rot, np.zeros(HEAD_DIM_GLOBAL // 2 - rope_angles_global, dtype=np.float64)])
+    ang_global = np.outer(positions, inv_freq_global)
+    cos_global = np.concatenate([np.cos(ang_global), np.cos(ang_global)], axis=1).astype(np.float32)
+    sin_global = np.concatenate([np.sin(ang_global), np.sin(ang_global)], axis=1).astype(np.float32)
+    state.cos_global_tt = np_to_replicated(cos_global, state.mesh,
+                                           layout=ttnn.ROW_MAJOR_LAYOUT)
+    state.sin_global_tt = np_to_replicated(sin_global, state.mesh,
+                                           layout=ttnn.ROW_MAJOR_LAYOUT)
+    log(f"  RoPE tables: sliding [{cos_sliding.shape}] + global [{cos_global.shape}] (MAX_KV={MAX_KV})")
+
     log(f"[bootstrap] uploading {NUM_LAYERS} layer weights to mesh…")
     t0 = time.time()
     state.per_layer_tt = []
