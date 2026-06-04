@@ -22,6 +22,15 @@ case "$MODEL" in
   *) echo "unknown model: $MODEL (expected cb35|gm4)"; exit 1;;
 esac
 
+# Propagate select env vars into the tmux session so model-variant
+# switches don't need a code edit. Add new vars here as bringups need them.
+PASS_THROUGH_ENV=""
+for var in TT_GEMMA4_VARIANT TT_GEMMA4_MODEL_ID TT_CB_SLOTS TT_CB_TOPK_K; do
+  if [ -n "${!var:-}" ]; then
+    PASS_THROUGH_ENV="$PASS_THROUGH_ENV $var=${!var}"
+  fi
+done
+
 ssh "$HOST" bash <<REMOTE
 set -e
 pgrep -f $HARNESS_PATH | xargs -r kill -9 2>/dev/null || true
@@ -40,10 +49,12 @@ tmux new-session -d -s $MODEL \\
    export ARCH_NAME=blackhole && \\
    export PYTHONPATH=\\\$TT_METAL_HOME/ttnn && \\
    export LD_LIBRARY_PATH=\\\$TT_METAL_HOME/ttnn/ttnn:\\\$TT_BUILD_DIR/ttnn:\\\$TT_BUILD_DIR/lib && \\
-   exec .venv/bin/python -u $HARNESS_PATH"
+   $PASS_THROUGH_ENV exec .venv/bin/python -u $HARNESS_PATH"
 sleep 2
 echo "=== tmux sessions ==="
 tmux ls 2>&1
 echo "=== harness pid ==="
 pgrep -af "python.*$(basename $HARNESS_PATH)" | head -2
+echo "=== env passed ==="
+echo "$PASS_THROUGH_ENV"
 REMOTE
