@@ -48,8 +48,9 @@ from openai_endpoint import _chat_chunk, _chat_completion, _messages_to_prompt  
 # + `forward_token_tp_inner(state)` / `forward_batch_tp_inner(state)`). Adding a
 # new backend = register it here + drop a `server_*.py` in this directory.
 BACKENDS = {
-    "27b":   ("server_tp",        "Qwen/Qwen3.6-27B"),
-    "35b":   ("server_35b_ttnn",  "Qwen/Qwen3.6-35B-A3B"),
+    "27b":         ("server_tp",                    "Qwen/Qwen3.6-27B"),
+    "35b":         ("server_35b_ttnn",              "Qwen/Qwen3.6-35B-A3B"),
+    "gemma4_12b":  ("server_gemma4_unified_ttnn",   "google/gemma-4-12B"),
 }
 TT_BACKEND = os.environ.get("TT_BACKEND", "27b")
 if TT_BACKEND not in BACKENDS:

@@ -284,10 +284,18 @@ def bootstrap(state, log=None):
                                         trace_region_size=400_000_000)
     log(f"  mesh: {state.mesh}")
 
-    log("[bootstrap] config (from snapshot JSON; tokenizer deferred to v0.2)…")
+    log("[bootstrap] config + tokenizer…")
     snapshot_root = Path.home() / ".cache" / "huggingface" / "hub" / "models--google--gemma-4-12B" / "snapshots"
     snap = next(snapshot_root.iterdir())
     cfg_json = json.loads((snap / "config.json").read_text())
+    try:
+        from transformers import AutoTokenizer
+        state.tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-12B")
+        state.tok = state.tokenizer  # cb_api convention
+        log(f"  tokenizer: {state.tokenizer.__class__.__name__}, "
+            f"eos_token_id={state.tokenizer.eos_token_id}")
+    except Exception as e:
+        log(f"  tokenizer load skipped: {e!r}")
     text_cfg_json = cfg_json["text_config"]
     state.text_cfg = text_cfg_json  # dict, not pydantic
     state.layer_types = list(text_cfg_json["layer_types"])

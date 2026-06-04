@@ -169,13 +169,36 @@ def setup_cb_state(state, B, blocks_per_seq=None):
 
 
 def cb_reset_states(state):
-    """Zero ALL slots — fresh start. For v1.0 smoke; later v1 stages will
-    add cb_reset_slots(slot_ids) for selective per-slot reset (used by the
-    scheduler between distinct request lifetimes)."""
-    # cur_pos to -1 (empty) for all slots; KV caches will be overwritten
-    # on next write at each slot's cur_pos.
+    """Zero ALL slots — fresh start. cur_pos → -1 (empty); KV caches will
+    be overwritten on next write at each slot's cur_pos."""
     host = ttnn.from_torch(
         torch.full((state.cb_B,), -1, dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    ttnn.copy_host_to_device_tensor(host, state.cb_cur_pos_buf)
+
+
+def cb_reset_slots(state, slot_ids):
+    """Reset ONLY the given slot indices for mid-batch admission of a new
+    sequence. Gemma 4 has NO recurrent state to clear (no DeltaNet); the KV
+    cache needs no reset because the SDPA cur_pos bound means a sequence
+    restarting at pos=0 overwrites its own slots as it prefills and never
+    reads stale data (same logic as the 27B comment, minus the DN reset).
+    Implemented as a partial cur_pos write — set only `slot_ids` to -1 so
+    other live slots are untouched.
+    """
+    if not slot_ids:
+        return
+    # Readback current pos, mutate only the targeted slots, write back.
+    cur = ttnn.to_torch(state.cb_cur_pos_buf,
+                        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+    # to_torch over a [B] tensor replicated across mesh → [B*NCHIPS]; take
+    # the first B as the single replica copy (all chips agree).
+    cur_np = cur.reshape(-1)[:state.cb_B].clone()
+    for s in slot_ids:
+        cur_np[s] = -1
+    host = ttnn.from_torch(
+        cur_np.to(torch.int32),
         layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
     ttnn.copy_host_to_device_tensor(host, state.cb_cur_pos_buf)
@@ -430,9 +453,12 @@ def _layer_forward_batched(state, h_in, layer_idx):
     return h_out
 
 
-def forward_batch_gm4_inner(state, return_logits=False):
+def forward_batch_gm4_inner(state, return_logits=False, return_topk=None):
     """Batched B-leading decode forward. Reads cb_tok_buf, cb_cur_pos_buf,
-    cb_rot_idxs_buf. Returns per-slot argmax [B, 1] (UINT32, on-device).
+    cb_rot_idxs_buf. Returns:
+      - default (greedy): per-slot argmax tensor [B, 1] (UINT32).
+      - return_logits=True: post-softcap logits [B, vocab].
+      - return_topk=K: (top_vals, top_idxs) tensors each [B, K].
     """
     B = state.cb_B
     embed = ttnn.embedding(state.cb_tok_buf, state.embed_tt)
@@ -457,11 +483,24 @@ def forward_batch_gm4_inner(state, return_logits=False):
     ttnn.deallocate(th)
     if return_logits:
         return logits
+    if return_topk is not None:
+        # On-device top-k: smaller readback than full logits (sampling path).
+        # sorted=True so index 0 is the argmax (free greedy fallback).
+        top_vals, top_idxs = ttnn.topk(logits, k=int(return_topk), dim=-1,
+                                       largest=True, sorted=True)
+        ttnn.deallocate(logits)
+        return (top_vals, top_idxs)
     logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
     ttnn.deallocate(logits)
     argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
     ttnn.deallocate(logits_rm)
     return argmax_tt
+
+
+# Scheduler contract: cb_api/cb_scheduler call `cb.forward_batch_tp_inner`.
+# Alias the Gemma 4 name so the same scheduler binding works without per-
+# backend branching.
+forward_batch_tp_inner = forward_batch_gm4_inner
 
 
 def step_forward_cb(state, token_ids, cur_positions):

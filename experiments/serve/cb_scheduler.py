@@ -48,8 +48,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 # coherent-but-wrong-model responses).
 import importlib  # noqa: E402
 _BACKEND_MODULES = {
-    "27b":   ("server_tp",        "server_tp_cb"),
-    "35b":   ("server_35b_ttnn",  "server_35b_cb"),
+    "27b":         ("server_tp",                    "server_tp_cb"),
+    "35b":         ("server_35b_ttnn",              "server_35b_cb"),
+    "gemma4_12b":  ("server_gemma4_unified_ttnn",   "server_gemma4_unified_cb"),
 }
 _TT_BACKEND = os.environ.get("TT_BACKEND", "27b")
 if _TT_BACKEND not in _BACKEND_MODULES:
