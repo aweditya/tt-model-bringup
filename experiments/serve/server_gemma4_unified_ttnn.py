@@ -145,12 +145,28 @@ def build_key_to_shard(variant="base"):
     if not snapshot_root.exists():
         raise FileNotFoundError(f"no HF snapshot at {snapshot_root}. "
                                 f"Run hf_reference_gemma4_12b.py once to fetch.")
-    snap = next(snapshot_root.iterdir())
+    # IT variant has multiple snapshot dirs (one with just chat templates,
+    # one with weights). Pick the snapshot that actually contains weights.
+    # Bare `next(iterdir())` non-deterministically picks one — if it picks
+    # the chat-template-only dir, `next(snap.glob("*.safetensors"))` raises
+    # StopIteration which silently kills the process inside generator
+    # contexts (uvloop _set_state / harness top-level).
+    snap = None
+    for cand in snapshot_root.iterdir():
+        if not cand.is_dir():
+            continue
+        if (cand / "model.safetensors.index.json").exists() or \
+                any(cand.glob("*.safetensors")):
+            snap = cand
+            break
+    if snap is None:
+        raise FileNotFoundError(
+            f"no snapshot under {snapshot_root} contains safetensors weights "
+            f"(only chat templates / configs found)")
     index = snap / "model.safetensors.index.json"
     if index.exists():
         idx = json.loads(index.read_text())
         return {k: str(snap / v) for k, v in idx["weight_map"].items()}
-    # single-file fallback (smaller models)
     sf = next(snap.glob("*.safetensors"))
     with safe_open(sf, framework="pt") as f:
         return {k: str(sf) for k in f.keys()}
