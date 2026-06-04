@@ -33,3 +33,4 @@ research/probe_logs/qb2_tp_tracy_p25_sync_20260515_0446/
 # Local environment file — never commit secrets (HF_TOKEN, etc.).
 # Template lives at .env.example.
 .env
+.cache/tt_*.html

@@ -183,6 +183,7 @@ class Scheduler:
         self.sampling = sampling
         self.topk_k = int(topk_k) if topk_k else None
         self._trace_id = None
+        self._argmax_trace_id = None
         self._argmax_handle = None
         self._logits_handle = None
         self._topk_values_handle = None
@@ -225,7 +226,13 @@ class Scheduler:
 
     def _warmup_decode(self):
         """Phase 1 of two-phase warmup — eager forward to populate program
-        cache. NO trace capture; allocator stays in 'normal' mode."""
+        cache. NO trace capture; allocator stays in 'normal' mode.
+
+        When sampling=True, we ALSO warm the argmax tail so we can capture
+        a second trace for greedy requests (the argmax tail is a single
+        on-device argmax + 8-byte readback per slot vs a 2 MB full-vocab
+        readback; recovers ~150 ms/step at vocab=262144 per `cb_perf_regression_audit_2026-06-04.md` Fix 3).
+        """
         import ttnn
         st = self.state
         kw = self._decode_kw()
@@ -236,10 +243,20 @@ class Scheduler:
                 for h in out: ttnn.deallocate(h)
             else:
                 ttnn.deallocate(out)
+            if self.sampling:
+                # Also warm the argmax path so we can capture it later.
+                a = cb.forward_batch_tp_inner(st)
+                ttnn.deallocate(a)
 
     def _capture_decode_trace_only(self):
         """Phase 2 — capture (assumes _warmup_decode has been called +
-        synchronize_device fired). No JIT, no allocations during capture."""
+        synchronize_device fired). No JIT, no allocations during capture.
+
+        Captures the configured sampling-tail trace. When sampling=True we
+        ALSO capture an argmax trace so step() can route all-greedy turns
+        through the cheap 8-byte readback path. The two traces coexist via
+        the [[ttnn-multi-trace-two-phase-warmup]] pattern.
+        """
         import ttnn
         st = self.state
         kw = self._decode_kw()
@@ -253,6 +270,13 @@ class Scheduler:
             self._logits_handle = handle
         else:
             self._argmax_handle = handle
+        # Optional argmax-tail trace alongside the sampling-tail trace.
+        # Enables the all-greedy fast path in step() — see _step_argmax_traced.
+        if self.sampling:
+            cb.update_input_buffers_batched(st, [DUMMY_TOK] * self.B, [3] * self.B)
+            self._argmax_trace_id = ttnn.begin_trace_capture(st.mesh, cq_id=0)
+            self._argmax_handle = cb.forward_batch_tp_inner(st)
+            ttnn.end_trace_capture(st.mesh, self._argmax_trace_id, cq_id=0)
         cb.cb_reset_states(st)  # clean slate after warmup dirtied the state
 
     def release(self):
@@ -260,6 +284,9 @@ class Scheduler:
         if self._trace_id is not None:
             ttnn.release_trace(self.state.mesh, self._trace_id)
             self._trace_id = None
+        if self._argmax_trace_id is not None:
+            ttnn.release_trace(self.state.mesh, self._argmax_trace_id)
+            self._argmax_trace_id = None
         if self._prefill_trace_id is not None:
             ttnn.release_trace(self.state.mesh, self._prefill_trace_id)
             self._prefill_trace_id = None
@@ -563,7 +590,18 @@ class Scheduler:
                 r = self.reqs[rid]
                 toks[s] = r['next_tok']; curs[s] = r['cur_pos']
         if self.sampling:
-            out = self._step_sampled(toks, curs)
+            # Fast path: if every active slot is greedy (sampling=None), execute
+            # the captured argmax trace (single on-device argmax + 8 byte
+            # readback per slot) instead of the logits/topk tail. Recovers
+            # ~150 ms/step at vocab=262144 per
+            # `research/cb_perf_regression_audit_2026-06-04.md` Fix 3.
+            all_greedy = self._argmax_trace_id is not None and all(
+                self.reqs[rid].get('sampling') is None
+                for rid in self.slots if rid is not None)
+            if all_greedy:
+                out = self._step_argmax_traced(toks, curs)
+            else:
+                out = self._step_sampled(toks, curs)
         elif self.use_trace:
             import ttnn
             cb.update_input_buffers_batched(self.state, toks, curs)
@@ -592,6 +630,26 @@ class Scheduler:
                     r['cur_pos'] += 1
                     r['next_tok'] = o
         return active
+
+    def _step_argmax_traced(self, toks, curs):
+        """Argmax-tail trace fast path for all-greedy turns. Used by step()
+        when every active slot has `sampling is None`. Executes the
+        dedicated argmax trace captured alongside the sampling-tail trace
+        in `_capture_decode_trace_only`. Readback is `[B, 1]` UINT32 — 4·B
+        bytes vs the [B, vocab] readback of the logits tail.
+        """
+        import time
+        import ttnn
+        cb.update_input_buffers_batched(self.state, toks, curs)
+        t0 = time.perf_counter()
+        ttnn.execute_trace(self.state.mesh, self._argmax_trace_id, cq_id=0, blocking=False)
+        arr = ttnn.to_torch(self._argmax_handle,
+                            mesh_composer=ttnn.ConcatMeshToTensor(self.state.mesh, dim=0))
+        vals = arr.flatten().tolist()[:self.B]
+        t1 = time.perf_counter()
+        if hasattr(self, 'm_device'):
+            self.m_device.observe(t1 - t0); self.m_sample.observe(0.0)
+        return [int(v) for v in vals]
 
     def _step_sampled(self, toks, curs):
         """Sampling-mode step. Dispatches to the topk path (W2 — opt-in via
