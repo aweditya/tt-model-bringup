@@ -212,6 +212,70 @@ def _metrics(url):
     return raw if r.status == 200 else f"<HTTP {r.status}>"
 
 
+def _parse_prom(raw: str) -> dict[str, float]:
+    """Tiny Prometheus text-format parser. Returns {metric: float}."""
+    out: dict[str, float] = {}
+    for line in raw.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        # Take "name{labels} value" or "name value". We aggregate over
+        # labels by summing — the dashboard only needs the global view.
+        try:
+            key, _, val = line.rpartition(" ")
+            v = float(val)
+        except ValueError:
+            continue
+        bare = key.split("{", 1)[0]
+        out[bare] = out.get(bare, 0.0) + v
+    return out
+
+
+def _render_metrics_dashboard(url: str, refresh_s: float = 1.0,
+                              cycles: int = 10) -> None:
+    """Pretty live dashboard of key counters; refreshes every refresh_s."""
+    keys = [
+        ("cb_tokens_generated_total", "tokens generated"),
+        ("cb_step_seconds_sum",        "step time Σ (s)"),
+        ("cb_step_seconds_count",      "step count"),
+        ("cb_prefix_cache_hits_total", "prefix cache hits"),
+        ("cb_prefix_cache_misses_total", "prefix cache misses"),
+        ("cb_slots_active",            "slots active"),
+        ("cb_requests_total",          "requests served"),
+    ]
+    prev: dict[str, float] = {}
+    for i in range(cycles):
+        raw = _metrics(url)
+        m = _parse_prom(raw) if not raw.startswith("<") else {}
+        avg_ms = ""
+        if m.get("cb_step_seconds_count", 0) > 0:
+            avg_ms = f"{1000 * m['cb_step_seconds_sum'] / m['cb_step_seconds_count']:.1f}"
+        rows = []
+        for k, label in keys:
+            v = m.get(k)
+            if v is None:
+                rows.append(f"  {label:<22} {DIM('—')}")
+                continue
+            dv = v - prev.get(k, v)
+            arrow = ""
+            if i > 0 and abs(dv) > 1e-9:
+                arrow = GREEN(f" (+{dv:g})") if dv > 0 else RED(f" ({dv:+g})")
+            rows.append(f"  {label:<22} {v:>12g}{arrow}")
+            prev[k] = v
+        if avg_ms:
+            rows.append(f"  {'avg step (ms)':<22} {avg_ms:>12}")
+        body = "\n".join(rows) + f"\n  {DIM(f'refresh {i+1}/{cycles}')}"
+        # Clear-screen + home for a live feel.
+        if TTY:
+            sys.stdout.write("\x1b[2J\x1b[H")
+        print(panel(f"metrics @ {url}", body, color=CYAN))
+        sys.stdout.flush()
+        if i < cycles - 1:
+            try:
+                time.sleep(refresh_s)
+            except KeyboardInterrupt:
+                break
+
+
 # ── Markdown-ish rendering of stream chunks ────────────────────────
 # Track whether we're inside a fenced code block; flush a styled line.
 _FENCE_RE = re.compile(r"^```(\w*)\s*$")
@@ -857,7 +921,44 @@ def main():
                     messages = json.load(f)
                 print(DIM(f"loaded {len(messages)} msgs from {arg}")); continue
             elif cmd == "metrics":
-                print(DIM(_metrics(args.url))); continue
+                # `/metrics raw` → dump the raw Prometheus text.
+                if arg.strip() == "raw":
+                    print(DIM(_metrics(args.url))); continue
+                try:
+                    cyc = int(arg) if arg.isdigit() else 10
+                except ValueError:
+                    cyc = 10
+                _render_metrics_dashboard(args.url, refresh_s=1.0, cycles=cyc)
+                continue
+            elif cmd == "screenshot":
+                shot_dir = os.path.join(PROJECT_ROOT, "presentation", "screenshots")
+                os.makedirs(shot_dir, exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                out_path = os.path.join(shot_dir, f"tui_{ts}.png")
+                tool = shutil.which("screencapture") or shutil.which("grim") \
+                       or shutil.which("scrot")
+                if not tool:
+                    print(RED("  [no screenshot tool found — install "
+                              "screencapture/grim/scrot]"))
+                    continue
+                try:
+                    if tool.endswith("screencapture"):
+                        # macOS: -x silent, -T0 immediate, captures front window.
+                        p = subprocess.run([tool, "-x", out_path],
+                                           capture_output=True, timeout=5)
+                    elif tool.endswith("grim"):
+                        p = subprocess.run([tool, out_path],
+                                           capture_output=True, timeout=5)
+                    else:
+                        p = subprocess.run([tool, out_path],
+                                           capture_output=True, timeout=5)
+                    if p.returncode == 0 and os.path.exists(out_path):
+                        print(DIM(f"  [saved {out_path}]"))
+                    else:
+                        print(RED(f"  [screenshot failed: rc={p.returncode}]"))
+                except Exception as e:
+                    print(RED(f"  [screenshot error: {e}]"))
+                continue
             elif cmd == "paste":
                 pasted = _read_paste_block()
                 if not pasted:
