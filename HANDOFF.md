@@ -52,6 +52,16 @@ For Gemma 4: `TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it ...`. Do NOT pass `TT_C
 **TUI verified live on 27B 2026-06-04**: banner renders all-four-sides closed,
 `<think>` hides cleanly, multi-turn HTTP wall/prompt_t drops from 0.349 → 0.024
 across 3 turns (prefix cache hitting; same nickname/fact carry across turns).
+Streaming is now char-level (no per-line stall); readline editing (Ctrl-W,
+Option-←/→, ↑↓ history) works on both GNU readline and macOS libedit.
+
+**Gemma 4 12B IT also re-verified on TUI 2026-06-04**: streaming works, PC
+hits on T1/T2 (wall/prompt_t 0.212 → 0.075). **But** chat output still
+duplicates `thought\n` stanzas — the `<|channel>thought\n<channel|>`
+chat-template asymmetry (root-caused in `research/gemma4_pc_chat_template_asymmetry_2026-06-04.md`,
+task #176). The TUI runs fine; the noise is model-side. For the live demo
+**prefer 27B over Gemma 4 IT** — 27B's `<think>…</think>` flows cleanly and
+streams nicely.
 
 **To run TUI** (once server is back):
 ```

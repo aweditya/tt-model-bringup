@@ -434,16 +434,16 @@ def _setup_readline(history_path: str | None) -> None:
             readline.parse_and_bind("bind -e")           # emacs mode
             # Re-bind a few escapes that some macOS terminals send for
             # Option-arrows in case the user's term doesn't already map
-            # them to ESC b / ESC f. ed-prev-word / ed-next-word are
-            # libedit's emacs-mode word-motion verbs.
+            # them to ESC b / ESC f. Note the verb asymmetry: macOS
+            # libedit uses `ed-prev-word` for backward but
+            # `em-next-word` for forward (see editrc(5)).
             readline.parse_and_bind(r"bind '\e\e[D' ed-prev-word")
-            readline.parse_and_bind(r"bind '\e\e[C' ed-next-word")
+            readline.parse_and_bind(r"bind '\e\e[C' em-next-word")
             readline.parse_and_bind(r"bind '\e[1;3D' ed-prev-word")
-            readline.parse_and_bind(r"bind '\e[1;3C' ed-next-word")
-            # ESC b / ESC f are emacs defaults; rebind defensively in
-            # case the user's editrc disturbed them.
+            readline.parse_and_bind(r"bind '\e[1;3C' em-next-word")
+            # ESC b / ESC f are emacs defaults; rebind defensively.
             readline.parse_and_bind(r"bind '\eb' ed-prev-word")
-            readline.parse_and_bind(r"bind '\ef' ed-next-word")
+            readline.parse_and_bind(r"bind '\ef' em-next-word")
         else:
             # GNU readline syntax.
             readline.parse_and_bind("set editing-mode emacs")
