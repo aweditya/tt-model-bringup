@@ -338,12 +338,42 @@ def bootstrap(state, log=None):
         dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    # page_table: identity mapping [1 slot, N blocks]; one block per
-    # 32-token chunk up to MAX_KV. Replicated across chips.
+    # Page tables: identity mapping. paged_update_cache asserts
+    # `page_table.dim(0) == input.dim(1)`. 35B has NKV_PER_CHIP=1 so a
+    # `[1, num_blocks]` page table works; Gemma 4 sliding has
+    # NKV_PER_CHIP_SLIDING=2 → page table must be `[2, num_blocks]`
+    # (same physical mapping per row). Global stays at `[1, num_blocks]`.
+    # See `[[paged-update-cache-nkv-per-chip]]`.
     num_blocks = MAX_KV // state.sdpa_block_size
-    page_table_np = np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks)
-    state.page_table_tt = ttnn.from_torch(
-        torch.from_numpy(page_table_np),
+    pt_sliding = np.broadcast_to(
+        np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks),
+        (NKV_PER_CHIP_SLIDING, num_blocks),
+    ).copy()
+    state.page_table_sliding_tt = ttnn.from_torch(
+        torch.from_numpy(pt_sliding),
+        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    pt_global = np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks)
+    state.page_table_global_tt = ttnn.from_torch(
+        torch.from_numpy(pt_global),
+        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # cur_pos_buf: kernel may also tie size to input dim 1. Provide a
+    # sliding-sized one (2 entries, both 0) and a global-sized one (1).
+    # Kernel asserts update_idxs is INT32 (not uint32) at
+    # `paged_update_cache_device_operation.cpp:112`. 35B uses uint32
+    # in its bootstrap; either the API changed or 35B's bootstrap path
+    # is different (its cur_pos_buf is referenced by sdpa_decode too,
+    # which may accept both).
+    state.cur_pos_buf_sliding = ttnn.from_torch(
+        torch.zeros((NKV_PER_CHIP_SLIDING,), dtype=torch.int32),
+        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    state.cur_pos_buf_global = ttnn.from_torch(
+        torch.zeros((1,), dtype=torch.int32),
         dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
@@ -804,11 +834,21 @@ def _shard_for_paged_write(t_2d, state, n_kv_heads, head_dim, mem_cfg):
     Output: HEIGHT_SHARDED L1 [1, n_kv_heads, BLOCK_SIZE, head_dim] per chip.
     Matches 35B's `_shard_for_paged_write` helper at server_35b_ttnn.py:845-849
     extended for n_kv_heads > 1.
+
+    Detile (ROW_MAJOR) → reshape → retile. Direct TILE_LAYOUT reshape from
+    [NKV, head_dim] with NKV<32 (non-tile-aligned) to [1, NKV, 1, head_dim]
+    fails `new_volume == old_volume`; the to_layout round-trip drops the
+    TILE padding so the reshape sees physical=logical.
     """
-    t4d = ttnn.reshape(t_2d, [1, n_kv_heads, 1, head_dim])
+    t_rm = ttnn.to_layout(t_2d, ttnn.ROW_MAJOR_LAYOUT)
+    t4d = ttnn.reshape(t_rm, [1, n_kv_heads, 1, head_dim])
+    ttnn.deallocate(t_rm)
     t_pad = ttnn.pad(t4d, [[0, 0], [0, 0], [0, state.sdpa_block_size - 1], [0, 0]],
                      value=0.0)
-    return ttnn.to_memory_config(t_pad, mem_cfg)
+    ttnn.deallocate(t4d)
+    t_tile = ttnn.to_layout(t_pad, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(t_pad)
+    return ttnn.to_memory_config(t_tile, mem_cfg)
 
 
 def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
@@ -851,13 +891,13 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
     ttnn.deallocate(k_n); ttnn.deallocate(v_n)
     ttnn.experimental.paged_update_cache(
         kc, k_sharded,
-        update_idxs_tensor=state.cur_pos_buf,
-        page_table=state.page_table_tt,
+        update_idxs_tensor=state.cur_pos_buf_sliding,
+        page_table=state.page_table_sliding_tt,
     )
     ttnn.experimental.paged_update_cache(
         vc, v_sharded,
-        update_idxs_tensor=state.cur_pos_buf,
-        page_table=state.page_table_tt,
+        update_idxs_tensor=state.cur_pos_buf_sliding,
+        page_table=state.page_table_sliding_tt,
     )
     ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
 
@@ -867,8 +907,8 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
     ttnn.deallocate(q_n)
     attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
         q_for_sdpa, kc, vc,
-        cur_pos_tensor=state.cur_pos_buf,
-        page_table_tensor=state.page_table_tt,
+        cur_pos_tensor=state.cur_pos_buf_sliding,
+        page_table_tensor=state.page_table_sliding_tt,
         scale=1.0 / (HEAD_DIM_SLIDING ** 0.5),
         program_config=state.paged_sdpa_progcfg,
         compute_kernel_config=state.sdpa_compute_kernel_config,
