@@ -418,9 +418,18 @@ def bootstrap(state, log=None):
                        [state.sdpa_block_size, HEAD_DIM_GLOBAL],
                        ttnn.ShardOrientation.ROW_MAJOR),
     )
+    # Sliding (head_dim=256): CoreCoord(4,4) = 16 cores, same as 35B.
     state.paged_sdpa_progcfg = ttnn.SDPAProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
         q_chunk_size=0, k_chunk_size=0, exp_approx_mode=False,
+    )
+    # Global (head_dim=512): doubles per-head data. Grid count alone DOES NOT
+    # shrink the per-core CB (validated: 16 cores → 1.525 MB/core;
+    # 32 cores → also 1.525 MB/core). The CB size is determined by chunk
+    # sizes, not core count. Try smaller k_chunk_size to fit.
+    state.paged_sdpa_progcfg_global = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
+        q_chunk_size=1, k_chunk_size=16, exp_approx_mode=False,
     )
     state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
         math_fidelity=ttnn.MathFidelity.HiFi2, math_approx_mode=False,
@@ -986,6 +995,92 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
     return out
 
 
+def _layer_global_manual(state, h_norm, w, layer_idx):
+    """v0.3.1 global attention via MANUAL computation (no paged SDPA).
+
+    paged_scaled_dot_product_attention_decode at head_dim=512 needs ~1.5 MB
+    L1 CB per core, but P150 has only 1.5 MB available. Validated 3
+    hypotheses: more cores doesn't help (CB size is data-determined),
+    k_chunk_size must be multiple of 32 (so we can't shrink below default).
+
+    Workaround: 8 global layers per token — manual attention is bounded.
+    Maintain K/V history in Python list of ttnn tensors per layer. Eager
+    only (will refactor for trace at v0.4 if perf demands).
+
+    Math per chip:
+      Q [NQ_PER_CHIP=4, head_dim=512]  (sharded over Q heads)
+      K, V history: ttnn tensors [N+1, head_dim=512] (replicated across chips)
+      scores = Q @ K^T / sqrt(d)  [NQ_PER_CHIP, N+1]
+      softmax(scores) → attn weights
+      attn = scores @ V  [NQ_PER_CHIP, head_dim=512]
+      o_proj column-sharded + all_reduce
+    """
+    # Initialize per-layer KV history list if first call.
+    if not hasattr(state, 'global_kv_history'):
+        state.global_kv_history = {}
+    hist_key = layer_idx
+    if hist_key not in state.global_kv_history:
+        state.global_kv_history[hist_key] = {'K': [], 'V': []}
+    kv_hist = state.global_kv_history[hist_key]
+
+    # Q/K projections. V aliases K_raw (HF attention_k_eq_v=True for global).
+    q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
+    k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
+
+    q_h = ttnn.reshape(q, [NQ_PER_CHIP, HEAD_DIM_GLOBAL])
+    ttnn.deallocate(q)
+    k_h = ttnn.reshape(k, [NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL])  # [1, 512]
+    ttnn.deallocate(k)
+    v_raw = ttnn.clone(k_h)
+
+    # q_norm, k_norm, v_norm (with_scale=False for v_norm).
+    q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    k_n_pre = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
+    v_n = ttnn.rms_norm(v_raw, weight=state.ones_head_dim_global, epsilon=EPS)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h); ttnn.deallocate(v_raw)
+
+    # p-RoPE (Q, K only; V is unrotated).
+    cos_tt, sin_tt = _lookup_rope(state, state.cos_global_tt,
+                                  state.sin_global_tt, HEAD_DIM_GLOBAL)
+    q_n = _apply_full_rope(q_n_pre, cos_tt, sin_tt, NQ_PER_CHIP, HEAD_DIM_GLOBAL)
+    ttnn.deallocate(q_n_pre)
+    k_n = _apply_full_rope(k_n_pre, cos_tt, sin_tt, NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL)
+    ttnn.deallocate(k_n_pre)
+    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+
+    # Append current K, V to history (clone since we'll deallocate locals).
+    kv_hist['K'].append(ttnn.clone(k_n))
+    kv_hist['V'].append(ttnn.clone(v_n))
+    ttnn.deallocate(k_n); ttnn.deallocate(v_n)
+
+    # Concat K history: [N+1, head_dim]. Same for V.
+    k_all = ttnn.concat(kv_hist['K'], dim=0) if len(kv_hist['K']) > 1 else ttnn.clone(kv_hist['K'][0])
+    v_all = ttnn.concat(kv_hist['V'], dim=0) if len(kv_hist['V']) > 1 else ttnn.clone(kv_hist['V'][0])
+
+    # attn = softmax(Q @ K^T / sqrt(d)) @ V.
+    # Q [NQ_PER_CHIP, head_dim], K [N+1, head_dim], V [N+1, head_dim]
+    # transpose K → [head_dim, N+1], matmul Q @ K^T → [NQ_PER_CHIP, N+1]
+    k_t = ttnn.transpose(k_all, -2, -1)
+    ttnn.deallocate(k_all)
+    scores = ttnn.matmul(q_n, k_t, compute_kernel_config=HIFI4)
+    ttnn.deallocate(q_n); ttnn.deallocate(k_t)
+    scores_scaled = ttnn.multiply(scores, 1.0 / (HEAD_DIM_GLOBAL ** 0.5))
+    ttnn.deallocate(scores)
+    attn_weights = ttnn.softmax(scores_scaled, dim=-1)
+    ttnn.deallocate(scores_scaled)
+    attn = ttnn.matmul(attn_weights, v_all, compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_weights); ttnn.deallocate(v_all)
+
+    # Flatten + o_proj column-sharded + all_reduce.
+    attn_flat = ttnn.reshape(attn, [1, NQ_PER_CHIP * HEAD_DIM_GLOBAL])
+    ttnn.deallocate(attn)
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+    return out
+
+
 def _layer_pos0_global_paged(state, h_norm, w, layer_idx):
     """v0.3.1 global-attention via paged SDPA. NKV=1 (replicated across
     chips), head_dim=512, p-RoPE (rotate first 128 of 512 inline via the
@@ -1051,7 +1146,7 @@ def _layer_pos0_global_paged(state, h_norm, w, layer_idx):
         cur_pos_tensor=state.cur_pos_buf,
         page_table_tensor=state.page_table_tt,
         scale=1.0 / (HEAD_DIM_GLOBAL ** 0.5),
-        program_config=state.paged_sdpa_progcfg,
+        program_config=state.paged_sdpa_progcfg_global,  # CoreCoord(8,4) for head_dim=512 L1 budget
         compute_kernel_config=state.sdpa_compute_kernel_config,
         # No sliding_window_size — global layers attend over full context.
     )
@@ -1078,7 +1173,9 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx):
     if lt == "sliding_attention":
         mixer = _layer_pos0_sliding_paged(state, h_norm, w, layer_idx)
     else:
-        mixer = _layer_pos0_global_paged(state, h_norm, w, layer_idx)
+        # _layer_pos0_global_paged hit L1 budget at head_dim=512.
+        # Use manual attention with in-memory K/V history instead.
+        mixer = _layer_global_manual(state, h_norm, w, layer_idx)
     ttnn.deallocate(h_norm)
     post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
     ttnn.deallocate(mixer)
