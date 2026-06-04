@@ -29,7 +29,16 @@ cache (no model weights needed; tokeniser-only checkout is enough).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+
+# Skip building the FastAPI app at import time (avoids pulling fastapi /
+# uvicorn into the validator's dep closure when running locally).
+os.environ.setdefault("TT_OPENAI_BUILD_APP", "0")
+
+# Make the validator share the production token-rendering pipeline so a fix
+# in openai_endpoint immediately propagates to the regression gate.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 try:
     from transformers import AutoTokenizer
@@ -38,27 +47,22 @@ except ImportError:
           file=sys.stderr)
     sys.exit(2)
 
-
-# Match the kwargs in experiments/serve/openai_endpoint.py:_messages_to_prompt
-_TEMPLATE_KW = dict(
-    tokenize=True,
-    add_generation_prompt=True,
-    enable_thinking=False,
-    preserve_thinking=True,
-)
-
-
-def _ids(raw):
-    """Normalise apply_chat_template return — dict-like (Gemma BatchEncoding)
-    or bare list (Qwen). Mirrors openai_endpoint._messages_to_prompt."""
-    if isinstance(raw, dict) or hasattr(raw, "input_ids"):
-        return list(raw["input_ids"])
-    return list(raw)
+try:
+    from experiments.serve.openai_endpoint import _messages_to_prompt
+except Exception as e:
+    print(f"FATAL: cannot import _messages_to_prompt from openai_endpoint: {e}",
+          file=sys.stderr)
+    sys.exit(2)
 
 
 def render(tok, messages):
-    """messages → list[int] via apply_chat_template, normalised."""
-    return _ids(tok.apply_chat_template(messages, **_TEMPLATE_KW))
+    """messages → list[int] via the production endpoint helper.
+
+    Mirrors what `experiments/serve/openai_endpoint._messages_to_prompt`
+    does exactly — including the active-prompt suffix strip — so this
+    validator gates the same code path that the live server uses.
+    """
+    return _messages_to_prompt(tok, messages)
 
 
 def canonicalise_gen(tok, gen_ids, eos_id):
@@ -107,12 +111,40 @@ def _fmt_slice(tok, ids, around, k=6):
 
 
 def _resolve_eos(tok):
-    """Pick a single EOS id consistent with cb_scheduler's eos_id set.
-    Prefers the chat-end token (`<|im_end|>` for Qwen, `<end_of_turn>` for
-    Gemma) over the corpus-end token (`<eos>`). Falls back to tok.eos_token_id.
+    """Pick the chat-end token id, i.e. the SAME one the model is trained
+    to emit at the close of an assistant turn (and the same one the chat
+    template puts at the boundary of past-assistant turns).
+
+    Robust detection: render `[user, asst]` with add_generation_prompt=False.
+    The trailing tokens past the assistant content end at the chat-end
+    marker — look at the LAST token to identify it. This sidesteps the
+    "what's it called in this tokenizer's vocab" question (Qwen
+    `<|im_end|>` id 151645, Gemma `<turn|>` id 106, etc.).
+
+    Falls back to common named tokens, then to `tok.eos_token_id`.
     """
-    # Try named special tokens
-    for name in ("<|im_end|>", "<end_of_turn>"):
+    try:
+        raw = tok.apply_chat_template(
+            [{"role": "user", "content": "x"},
+             {"role": "assistant", "content": "y"}],
+            tokenize=True, add_generation_prompt=False,
+        )
+        ids = list(raw["input_ids"]) if (isinstance(raw, dict) or
+                                          hasattr(raw, "input_ids")) else list(raw)
+        # The very last token is usually a trailing newline; walk back one
+        # to land on the chat-end marker.
+        for tid in reversed(ids):
+            try:
+                txt = tok.decode([tid], skip_special_tokens=False)
+            except Exception:
+                txt = ""
+            if any(s in (txt or "") for s in ("<", "|", "turn", "end", "im_end")):
+                return int(tid)
+    except Exception:
+        pass
+    # Fallback by name.
+    for name in ("<|im_end|>", "<end_of_turn>", "<turn|>",
+                 "<|end_of_turn|>", "<eot_id>"):
         try:
             tid = tok.convert_tokens_to_ids(name)
             if tid is not None and tid != tok.unk_token_id and tid >= 0:

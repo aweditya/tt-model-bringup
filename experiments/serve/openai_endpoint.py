@@ -29,7 +29,73 @@ SOCKET_PATH = os.path.join(PROJECT_ROOT, ".cache", "server_tp.sock")
 
 
 # ── Pure translation helpers (no FastAPI / socket; unit-tested) ───────────────
-_THINK_SUFFIX = "<think>\n\n</think>\n\n"
+
+# Memoised per-tokenizer active-prompt suffix. See _active_prompt_suffix
+# for the detection mechanism and why we strip it.
+_SUFFIX_CACHE: dict[int, list[int]] = {}
+
+
+def _normalise_template_output(raw) -> list[int]:
+    """`apply_chat_template(tokenize=True)` returns either a bare list[int]
+    (Qwen / PreTrainedTokenizerFast default) or a dict-like BatchEncoding
+    with `input_ids` (Gemma). Normalise to a plain list."""
+    if isinstance(raw, dict) or hasattr(raw, "input_ids"):
+        return list(raw["input_ids"])
+    return list(raw)
+
+
+def _active_prompt_suffix(tokenizer, base_kw: dict) -> list[int]:
+    """Detect the trailing tokens that ONLY appear in the ACTIVE assistant
+    prompt (`add_generation_prompt=True`) but NOT in PAST-assistant renders.
+
+    Examples of this asymmetry:
+    - Qwen3.6 + `enable_thinking=False`: active suffix is the
+      `<think>\\n\\n</think>\\n\\n` "no-think" marker block.
+    - Gemma 4 IT: active suffix is `<|channel>thought\\n<channel|>` —
+      a channel-switch marker the past-assistant render omits.
+
+    Both classes cause turn-1's `prompt_1` to NOT be a byte-prefix of
+    turn-2's `prompt_2`, defeating slot-level prefix caching. The
+    universal fix is to strip the suffix from `prompt_1` before storing
+    so the next turn's prompt aligns.
+
+    Detection: render the same user message twice — once as a turn-1
+    active prompt, once as `[user, assistant, user_2]` passively with
+    `add_generation_prompt=False`. The first divergence point in the
+    active render is where the suffix starts. Memoised by `id(tokenizer)`
+    so this is a one-shot cost per process.
+    """
+    key = id(tokenizer)
+    cached = _SUFFIX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    # Rare-but-valid 1-char content so the template renders the
+    # passive past-assistant slot to something other than the active
+    # suffix's first token.
+    PROBE_USR = "x"
+    PROBE_ASS = "y"
+    kw_active = dict(base_kw, tokenize=True, add_generation_prompt=True)
+    kw_passive = dict(base_kw, tokenize=True, add_generation_prompt=False)
+    try:
+        active = _normalise_template_output(tokenizer.apply_chat_template(
+            [{"role": "user", "content": PROBE_USR}], **kw_active))
+        passive = _normalise_template_output(tokenizer.apply_chat_template(
+            [{"role": "user", "content": PROBE_USR},
+             {"role": "assistant", "content": PROBE_ASS}], **kw_passive))
+    except Exception:
+        # Template/kwarg unsupported — assume no suffix.
+        _SUFFIX_CACHE[key] = []
+        return []
+    n = min(len(active), len(passive))
+    div = n
+    for i in range(n):
+        if active[i] != passive[i]:
+            div = i
+            break
+    suffix = active[div:]
+    _SUFFIX_CACHE[key] = suffix
+    return suffix
 
 
 def _messages_to_prompt(tokenizer, messages: list[dict],
@@ -45,49 +111,24 @@ def _messages_to_prompt(tokenizer, messages: list[dict],
     straight to tokens makes the same template+tokenizer pair the single
     source of truth for the cache key.
 
-    Qwen3.6-specific patches (preserve_thinking, trailing-suffix strip)
-    still apply via jinja kwargs; the trailing-suffix strip is now done
-    in token space.
+    Active-prompt suffix strip (covers Qwen3.6 + Gemma 4 IT + any future
+    template with the same asymmetry): see `_active_prompt_suffix`.
 
-    Quirk 1 (Qwen3.6): the ACTIVE assistant prompt always gets a
-    `<think>\\n\\n</think>\\n\\n` block appended (with
-    `enable_thinking=False`). We strip those tokens off the end.
-    Quirk 2 (Qwen3.6): when rendering a PAST assistant message whose
-    content contains `</think>`, the template by default DROPS the
-    `<think>...</think>` block. `preserve_thinking=True` re-wraps the
-    extracted reasoning so past renders match what the model emitted.
+    Qwen3.6-specific jinja kwarg `preserve_thinking=True` re-wraps past
+    assistant `<think>` blocks so past renders match what the model
+    emitted. Silently ignored by templates that don't define it.
     """
-    # Qwen-specific kwargs are silently-unused by templates that don't
-    # define them (jinja forwards through).
-    kw = dict(tokenize=True, add_generation_prompt=True,
-              enable_thinking=False, preserve_thinking=True)
+    base_kw = dict(enable_thinking=False, preserve_thinking=True)
+    kw = dict(base_kw, tokenize=True, add_generation_prompt=True)
     if tools:
         kw["tools"] = tools
-    raw = tokenizer.apply_chat_template(messages, **kw)
-    # HF tokenizers are inconsistent: some return a bare list[int] (Qwen2/
-    # PreTrainedTokenizerFast in default mode), some return a dict-like
-    # BatchEncoding with 'input_ids' (Gemma's GemmaTokenizer often does).
-    # Normalise.
-    if isinstance(raw, dict) or hasattr(raw, "input_ids"):
-        ids = list(raw["input_ids"])
-    else:
-        ids = list(raw)
-    # Strip the Qwen3.6 trailing `<think>\n\n</think>\n\n` (active-prompt
-    # suffix). This pattern WOULDN'T break Gemma 4 quality: Qwen3.6 ships a
-    # well-defined "no-think" semantics for the active-prompt suffix where
-    # stripping it leaves the model in clean response mode.
-    #
-    # Gemma 4 IT has a SECOND-tier asymmetry: a `<|channel>thought\n<channel|>`
-    # active-prompt suffix (tokens [100, 45518, 107, 101]) emitted only when
-    # `enable_thinking=False`. Stripping it would tell the model "no
-    # suppression marker" and potentially alter response style. We document
-    # that path in research/gemma4_pc_chat_template_asymmetry_2026-06-04.md
-    # and don't auto-strip here. The proper fix is scheduler-side
-    # (strip-from-cache-only, keep full prompt for engine).
-    suffix_ids = tokenizer.encode(_THINK_SUFFIX, add_special_tokens=False)
-    if suffix_ids and len(ids) >= len(suffix_ids) \
-            and ids[-len(suffix_ids):] == list(suffix_ids):
-        ids = ids[:-len(suffix_ids)]
+    ids = _normalise_template_output(
+        tokenizer.apply_chat_template(messages, **kw))
+    # Universal active-prompt suffix strip — handles Qwen <think>, Gemma
+    # <|channel>...<channel|>, and any future template-level asymmetry.
+    suffix = _active_prompt_suffix(tokenizer, base_kw)
+    if suffix and len(ids) >= len(suffix) and ids[-len(suffix):] == suffix:
+        ids = ids[:-len(suffix)]
     return ids
 
 
