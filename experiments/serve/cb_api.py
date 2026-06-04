@@ -167,14 +167,21 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None,
             return "stop"
         return "length"
 
-    async def _complete(prompt: str, body: dict):
+    async def _complete(prompt, body: dict):
+        """Internal entry point. `prompt` is either a list[int] (already-tokenised
+        — what chat_completions passes; bypasses the chat-template
+        re-encode round-trip that defeated slot-level PC for Gemma 4)
+        or a str (raw /v1/completions input — we tokenise here)."""
         eng = state.get("engine")
         if eng is None:
             return JSONResponse(status_code=503, content={"error": "engine not ready"})
         tok = state["tok"]
         eos_id = state["eos_id"]
 
-        prompt_ids = tok.encode(prompt)
+        if isinstance(prompt, str):
+            prompt_ids = tok.encode(prompt)
+        else:
+            prompt_ids = list(prompt)
         max_tokens = int(body.get("max_tokens", 256))
         stream = bool(body.get("stream", False))
         model = body.get("model", model_id)

@@ -33,47 +33,46 @@ _THINK_SUFFIX = "<think>\n\n</think>\n\n"
 
 
 def _messages_to_prompt(tokenizer, messages: list[dict],
-                         tools: list[dict] | None = None) -> str:
-    """OpenAI chat `messages` -> a prompt string via the model's chat template.
+                         tools: list[dict] | None = None) -> list[int]:
+    """OpenAI chat `messages` -> list of token ids via the model's chat template.
 
-    Qwen3.6's chat template has two asymmetries that break slot-level prefix
-    caching by default; we patch both here so a turn-2 prompt re-tokenizes to
-    the exact tokens cached at the end of turn 1.
+    Returns tokens DIRECTLY (apply_chat_template(tokenize=True)) instead of
+    rendering to a string and re-encoding. The re-encode step is where
+    invisible BPE-boundary / whitespace differences between turn N and
+    turn N+1 sneak in — that defeated Gemma 4's slot-level prefix cache
+    (chat template applies `| trim` to past assistant content; the trimmed
+    string re-tokenises to FEWER tokens than what we generated). Going
+    straight to tokens makes the same template+tokenizer pair the single
+    source of truth for the cache key.
 
-    Quirk 1: the ACTIVE assistant prompt always gets a `<think>\\n\\n</think>\\n\\n`
-    block appended (with `enable_thinking=False`). The model emits its
-    response (which often contains literal `<think>...</think>` markers
-    because `<think>` is NOT special in Qwen3.6 — `skip_special_tokens=True`
-    does NOT strip it from the decoded text), then `<|im_end|>` at the end.
+    Qwen3.6-specific patches (preserve_thinking, trailing-suffix strip)
+    still apply via jinja kwargs; the trailing-suffix strip is now done
+    in token space.
 
-    Quirk 2: when rendering a PAST assistant message whose content contains
-    `</think>`, the template by default DROPS the `<think>...</think>` block
-    from the rendered output. `preserve_thinking=True` re-wraps the
-    extracted reasoning as `<think>...</think>` so past renders match what
-    the model actually emitted.
-
-    Patch: pass `enable_thinking=False, preserve_thinking=True`, then strip
-    ONLY the trailing `<think>\\n\\n</think>\\n\\n` (the active-prompt suffix).
-    Past messages keep their `<think>...</think>` content for the cache match.
-
-    Validated via experiments/cb/isolate/chat_template_inspect.py — turn 1
-    cached vs turn 2 prompt: 69/69 prefix match (was 44/69 before fix).
+    Quirk 1 (Qwen3.6): the ACTIVE assistant prompt always gets a
+    `<think>\\n\\n</think>\\n\\n` block appended (with
+    `enable_thinking=False`). We strip those tokens off the end.
+    Quirk 2 (Qwen3.6): when rendering a PAST assistant message whose
+    content contains `</think>`, the template by default DROPS the
+    `<think>...</think>` block. `preserve_thinking=True` re-wraps the
+    extracted reasoning so past renders match what the model emitted.
     """
-    # Build kwargs defensively. Qwen-specific (enable_thinking,
-    # preserve_thinking) only apply when the template's signature has
-    # them — apply_chat_template forwards through jinja so unknown
-    # kwargs become silently-unused variables. Add `tools` only when
-    # the caller supplied them; OpenAI-style function definitions are
-    # rendered into the prompt by the chat template if it supports
-    # them (Gemma IT + Qwen3.6 both do; base models don't).
-    kw = dict(tokenize=False, add_generation_prompt=True,
+    # Qwen-specific kwargs are silently-unused by templates that don't
+    # define them (jinja forwards through).
+    kw = dict(tokenize=True, add_generation_prompt=True,
               enable_thinking=False, preserve_thinking=True)
     if tools:
         kw["tools"] = tools
-    text = tokenizer.apply_chat_template(messages, **kw)
-    if text.endswith(_THINK_SUFFIX):
-        text = text[:-len(_THINK_SUFFIX)]
-    return text
+    ids = list(tokenizer.apply_chat_template(messages, **kw))
+    # Strip the Qwen3.6 trailing `<think>\n\n</think>\n\n` (active-prompt
+    # suffix). Tokenise the suffix once; if the last len(suffix) tokens
+    # match, drop them. No-op for tokenizers that don't emit the suffix
+    # (Gemma 4, base models).
+    suffix_ids = tokenizer.encode(_THINK_SUFFIX, add_special_tokens=False)
+    if suffix_ids and len(ids) >= len(suffix_ids) \
+            and ids[-len(suffix_ids):] == list(suffix_ids):
+        ids = ids[:-len(suffix_ids)]
+    return ids
 
 
 def _chat_completion(text: str, model: str, prompt_toks: int, gen_toks: int,
