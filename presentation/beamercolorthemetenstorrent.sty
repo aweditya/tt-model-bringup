@@ -1,71 +1,69 @@
 % Gemini theme - Tenstorrent color scheme
 % https://github.com/anishathalye/gemini
 %
-% Colors extracted from the live tenstorrent.com homepage (2026-06-04)
-% via frequency analysis of inline hex codes in the rendered HTML.
-% See presentation/THEME_NOTES.md for the audit trail and discrepancies.
+% Palette derived from tenstorrent.com's "Buy Blackhole" CTA button
+% (light sky blue) plus the cream + ink (near-black green) tones used
+% across the marketing pages.
 
 % ====================
 % Definitions
 % ====================
 
-% Primary palette --- pulled from tenstorrent.com (homepage, 2026-06-04).
-% These are the four highest-frequency hex codes in the rendered HTML.
-\definecolor{ttdarkteal}{HTML}{335C4B}   % primary brand --- headers, structure, item bullets
-\definecolor{ttnearblack}{HTML}{1B3527}  % deepest accent --- separators, headline rule
-\definecolor{ttcream}{HTML}{EEEAE0}      % off-white page tone --- block bodies
-\definecolor{ttgold}{HTML}{EDBE5A}       % warm accent --- alerted-block tint, callouts
+% Primary palette
+\definecolor{ttsky}{HTML}{8FC6E8}        % CTA sky blue --- block titles, separators, rules
+\definecolor{ttdeepblue}{HTML}{3A78A6}   % darker shade --- headline text, structural fg
+\definecolor{ttcream}{HTML}{EEEAE0}      % page tone --- block bodies / headline bg
+\definecolor{ttink}{HTML}{1B3527}        % near-black green --- body text
 
-% Secondary accent --- the recurring TT cyan/blue on hardware product pages
-% (Blackhole page, /hardware/blackhole, same audit). Lower frequency on the
-% homepage but it is the most product-identifying accent across the site.
-\definecolor{ttcyan}{HTML}{3EB7DE}       % example-block accent
-
-% Extra tones for the alert/example backgrounds, derived by lightening
-% the brand palette toward ttcream so block bodies stay readable.
-\definecolor{ttlightgray}{RGB}{240, 240, 240}
+% Light tints derived from the primary blue for example/alert backgrounds.
+\definecolor{ttskytint}{HTML}{DDEEF8}    % sky washed toward cream
+\definecolor{ttgold}{HTML}{EDBE5A}       % warm accent --- alerted block tint
 \definecolor{ttlightgold}{HTML}{FAF1DE}  % gold washed toward cream
-\definecolor{ttlightteal}{HTML}{CFEEE8}  % observed on tenstorrent.com (light teal tint)
+\definecolor{ttlightgray}{RGB}{240, 240, 240}
 
 % ====================
 % Theme
 % ====================
 
 % Basic colors
-\setbeamercolor{palette primary}{fg=black,bg=white}
-\setbeamercolor{palette secondary}{fg=black,bg=white}
-\setbeamercolor{palette tertiary}{bg=ttnearblack,fg=white}
-\setbeamercolor{palette quaternary}{fg=black,bg=white}
-\setbeamercolor{structure}{fg=ttdarkteal}
+\setbeamercolor{palette primary}{fg=ttdeepblue,bg=ttcream}
+\setbeamercolor{palette secondary}{fg=ttink,bg=ttcream}
+\setbeamercolor{palette tertiary}{bg=ttdeepblue,fg=ttcream}
+\setbeamercolor{palette quaternary}{fg=ttink,bg=ttcream}
+\setbeamercolor{structure}{fg=ttdeepblue}
 
-% Headline
-\setbeamercolor{headline}{fg=ttcream,bg=ttdarkteal}
-\setbeamercolor{headline rule}{bg=ttnearblack}
+% Headline --- deep blue band with cream text
+\setbeamercolor{headline}{fg=ttcream,bg=ttdeepblue}
+\setbeamercolor{headline rule}{bg=ttsky}
 
-% Block
-\setbeamercolor{block title}{fg=ttdarkteal,bg=white}
-\setbeamercolor{block separator}{bg=ttnearblack}
-\setbeamercolor{block body}{fg=black,bg=white}
+% Normal text --- ink on cream page
+\setbeamercolor{normal text}{fg=ttink,bg=ttcream}
+\setbeamercolor{background canvas}{bg=ttcream}
+
+% Block --- sky-blue title bar over ink-on-cream body
+\setbeamercolor{block title}{fg=ttink,bg=ttsky}
+\setbeamercolor{block separator}{bg=ttdeepblue}
+\setbeamercolor{block body}{fg=ttink,bg=ttcream}
 
 % Alert Block (warm gold accent)
-\setbeamercolor{block title alerted}{fg=ttnearblack,bg=ttlightgold}
+\setbeamercolor{block title alerted}{fg=ttink,bg=ttlightgold}
 \setbeamercolor{block separator alerted}{bg=ttgold}
-\setbeamercolor{block body alerted}{fg=black,bg=ttlightgold}
+\setbeamercolor{block body alerted}{fg=ttink,bg=ttlightgold}
 
-% Example Block (cyan accent --- the TT product cyan)
-\setbeamercolor{block title example}{fg=ttdarkteal,bg=ttlightteal}
-\setbeamercolor{block separator example}{bg=ttcyan}
-\setbeamercolor{block body example}{fg=black,bg=ttlightteal}
+% Example Block (light sky tint)
+\setbeamercolor{block title example}{fg=ttdeepblue,bg=ttskytint}
+\setbeamercolor{block separator example}{bg=ttsky}
+\setbeamercolor{block body example}{fg=ttink,bg=ttskytint}
 
 % Heading
-\setbeamercolor{heading}{fg=ttnearblack}
+\setbeamercolor{heading}{fg=ttdeepblue}
 
-% Itemize
-\setbeamercolor{item}{fg=ttdarkteal}
+% Itemize bullets in sky blue for accent
+\setbeamercolor{item}{fg=ttdeepblue}
 
 % Bibliography
-\setbeamercolor{bibliography item}{fg=black}
-\setbeamercolor{bibliography entry author}{fg=black}
-\setbeamercolor{bibliography entry title}{fg=black}
-\setbeamercolor{bibliography entry location}{fg=black}
-\setbeamercolor{bibliography entry note}{fg=black}
+\setbeamercolor{bibliography item}{fg=ttink}
+\setbeamercolor{bibliography entry author}{fg=ttink}
+\setbeamercolor{bibliography entry title}{fg=ttink}
+\setbeamercolor{bibliography entry location}{fg=ttink}
+\setbeamercolor{bibliography entry note}{fg=ttink}

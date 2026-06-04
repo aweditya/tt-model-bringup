@@ -1,4 +1,4 @@
-% Gemini theme - Stanford color scheme
+% Gemini theme - Tenstorrent color scheme
 \documentclass[final]{beamer}
 
 \usepackage[T1]{fontenc}
@@ -10,12 +10,10 @@
 \usepackage{booktabs}
 \usepackage{tikz}
 \usepackage{pgfplots}
-\usepackage{subcaption}
 \usepackage{amsmath}
 \pgfplotsset{compat=1.17}
-% \code{...}: a robust \verb substitute that works inside \justifying / LR-mode.
-% \verb is fragile in beamer poster blocks (which use \justifying); \detokenize
-% lets us print literal underscores/asterisks/backslashes in \texttt without escaping.
+
+% \code{...}: robust \verb substitute that works inside \justifying.
 \newcommand{\code}[1]{\texttt{\detokenize{#1}}}
 
 \newlength{\sepwidth}
@@ -25,119 +23,170 @@
 
 \newcommand{\separatorcolumn}{\begin{column}{\sepwidth}\end{column}}
 
-\title{Tenstorrent LLM Bringup: Workflow, Correctness, and Performance}
+\title{Bringing Up Modern LLMs on Tenstorrent Blackhole}
 \author{Aditya Sriram}
 \institute[Stanford]{Department of Computer Science, Stanford University \quad
   \texttt{adisram@stanford.edu}}
 
-\footercontent{CS440LX: Project \hfill Stanford University, 2026}
+\footercontent{CS440LX \hfill Stanford University, 2026}
 
 \begin{document}
-
-% Logo overlay commented out --- stanford_logos/Block_S_2_color.png not vendored.
-% \addtobeamertemplate{headline}{}{
-%   \begin{tikzpicture}[remember picture,overlay]
-%     \node [anchor=north east, inner sep=3cm]
-%       at ([xshift=0.0cm,yshift=2.5cm]current page.north east)
-%       {\includegraphics[height=7.0cm]{stanford_logos/Block_S_2_color.png}};
-%   \end{tikzpicture}
-% }
 
 \begin{frame}[t]
 \begin{columns}[t]
 \separatorcolumn
 
 % =====================================================================
-% COLUMN 1 --- Context + Workflow
+% COLUMN 1 --- Project + Architecture
 % =====================================================================
 \begin{column}{\colwidth}
 
-  % ------------------- Introduction -------------------
-  \begin{block}{Introduction}
-    Tenstorrent's \textbf{Blackhole P150} is a new ML accelerator
-    (32~GB GDDR6, 110 Tensix cores, 1.39~MiB L1/core, 404~GB/s measured
-    DRAM streaming). We brought up three modern LLMs on a $1{\times}4$
-    P150 mesh:
-    \begin{itemize}
-      \item \textbf{Qwen3.6-27B} --- dense GQA, 4-way tensor-parallel.
-      \item \textbf{Qwen3.6-35B-A3B} --- MoE with Gated DeltaNet
-            recurrence ($\sim$3~GB active params per token).
-      \item \textbf{Gemma 4 12B} --- hybrid sliding/global attention,
-            dual head\_dim (256/512), $v\_norm$ + per-layer scalar.
-    \end{itemize}
-    The first bringup (27B) took weeks; the third (Gemma 4 12B) walked
-    from HF spec to HTTP chat in \textbf{36 hours}. The speedup is
-    methodological --- a forking recipe on stable scaffolding, not
-    cleverer kernels.
+  % ------------------- Project -------------------
+  \begin{block}{Project}
+    End-to-end bringup of three modern LLM families on a single
+    \textbf{$1\times4$ Blackhole P150} mesh: dense GQA, MoE with Gated
+    DeltaNet recurrence, and a hybrid sliding/global-attention model.
+    Every model walks from HF reference to a continuous-batching HTTP
+    chat server, gated end-to-end against a CPU fp32 oracle.
   \end{block}
 
-  % ------------------- The Bringup Workflow -------------------
-  \begin{block}{The Bringup Workflow}
-    Every model walks the same staging ladder. Each rung gates on
-    cosine vs.\ an HF oracle, not on ``it produces text''.
-
+  % ------------------- Hardware -------------------
+  \begin{block}{Hardware}
     \begin{center}\small
-    \begin{tabular}{l l l}
+    \begin{tabular}{l l}
       \toprule
-      \textbf{Stage} & \textbf{Adds} & \textbf{Gate} \\
+      Mesh           & $1\times4$ Blackhole P150 (4 chips) \\
+      DRAM           & 32 GB GDDR6/chip, \textbf{404 GB/s} measured stream \\
+      On-chip        & 110 Tensix cores, 1.39 MiB L1/core \\
+      Host link      & 1.4 GB/s tilize-bound \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+  \end{block}
+
+  % ------------------- Models Brought Up -------------------
+  \begin{block}{Models Brought Up}
+    \begin{center}\small
+    \begin{tabular}{l c l c}
+      \toprule
+      \textbf{Model} & \textbf{Params} & \textbf{Architecture} & \textbf{Status} \\
       \midrule
-      v0.0 & HF CPU oracle (fp32, per-sub-op hooks)        & dump exists \\
-      v0.1 & L0 only on $(1,4)$ mesh                      & $\cos \ge 0.999$ \\
-      v0.2 & all $N$ layers + lm\_head                     & argmax @ pos 0 \\
-      v0.3 & paged KV + multi-step decode                  & argmax 0..7 \\
-      v0.3.3 & long context, needle haystack               & top1 $\ge 90\%$ \\
-      v0.4 & trace capture (two-phase warmup)              & 100/100 traced == eager \\
-      v1   & continuous batching $B{=}4$                   & 3a/3b/3c gates \\
-      v2   & HTTP wire-up                                  & \code{curl /chat} works \\
+      Qwen3.6-27B          & 27B  & Dense GQA, TP4                  & shipped \\
+      Qwen3.6-35B-A3B      & 35B  & MoE + Gated DeltaNet ($\sim$3B active) & shipped, $B{=}1$ \\
+      Gemma 4 12B IT       & 12B  & Hybrid sliding/global attention & shipped \\
       \bottomrule
     \end{tabular}
     \end{center}
 
-    \textbf{HF oracle, not a sibling TT path.} Per-sub-op forward hooks
-    dump \code{.npy}; every TT change is gated against ground truth.
-    Comparing TT-against-TT conflates ``bug'' with ``different and
-    better.''
-
-    \textbf{Dev harness amortizes the bootstrap.} A long-lived
-    tmux'd Python process holds the model resident
-    ($\sim$80~s for Gemma~4, $\sim$14~min for 35B); file-trigger probes
-    \code{importlib.reload} per fire. Iteration drops from one full
-    bootstrap to $\sim$30~s.
-
-    \textbf{REUSE mandate.} Every new file cites the prior file it
-    forks in its commit message. After three bringups, $\sim$80--90\%
-    of each new model's CB module, dev harness, probes, and oracle is
-    copied. Bug catalog is finite ($\sim$12 footguns); fixes are
-    recognized in seconds.
-
-    \textbf{Two-phase trace warmup.} Compile all paths first
-    (\code{enable_trace=False}), synchronize, then capture all traces
-    back-to-back. Otherwise decode JIT between captures corrupts
-    prefill trace memory $\to$ 99\% CPU hang
-    (tenstorrent/vllm\#352).
+    All three reach byte-stable HTTP chat with continuous batching;
+    each new model reused $\sim$80--90\% of the previous bringup's
+    scaffolding (CB engine, dev harness, HF oracle, paged SDPA).
   \end{block}
 
-  % ------------------- Validation Hierarchy -------------------
-  \begin{block}{Validation Hierarchy}
-    Six of seven silent-failure classes pass at decode pos 0. The only
-    gate that catches all of them is the
-    \textbf{teacher-forced multi-step cosine + MAD ladder} against an
-    HF oracle.
+  % ------------------- Methodology (collapsed) -------------------
+  \begin{block}{Methodology}
+    A staged ladder gates each rung on cosine vs.\ an HF fp32 oracle:
+    single-layer $\to$ full forward $\to$ multi-step decode $\to$ long
+    context $\to$ trace capture $\to$ continuous batching $\to$ HTTP.
+    Validation is teacher-forced multi-step cosine \emph{and} MAD per
+    layer; six of seven silent-failure classes are invisible at decode
+    pos 0 alone. Throughout, comparison is to ground truth, never a
+    sibling TT path.
+  \end{block}
 
-    \begin{itemize}
-      \item \textbf{Teacher-forced cosine ladder} --- per-position
-            per-layer cos + MAD. Caught Gemma 4's
-            $\texttt{SDPA scale}{=}1.0$ (invisible at pos 0; cos drops
-            $0.99998 \to 0.66$ at pos 1) and Qwen3.6's
-            $y = x/\mathrm{rms}(x) \cdot (1+\gamma)$ zero-centered
-            RMSNorm (a two-character fix lifted top-1
-            $82/97 \to 95/97$, median cos $0.95 \to 0.997$).
-      \item \textbf{Needle haystack} --- random 8-char password at
-            controlled depth. Passed Gemma 4 at $L{=}100/256/512$
-            (3/3 verbatim retrieval).
-      \item \textbf{MAD, not just cosine.} $\cos(a, k{\cdot}a) = 1$
-            for any $k$; missing Gemma 4's $\texttt{layer\_scalar}$
-            passed at $\cos{=}0.999975$ with MAD $3.64{\times}10^{2}$.
+\end{column}
+
+\separatorcolumn
+
+% =====================================================================
+% COLUMN 2 --- Performance
+% =====================================================================
+\begin{column}{\colwidth}
+
+  % ------------------- Headline -------------------
+  \begin{block}{Headline}
+    \begin{center}
+      \textbf{Gemma 4 12B: 316 tok/s aggregate at 32 concurrent clients.}\\[0.3ex]
+      \textbf{Qwen3.6-27B: 232 tok/s aggregate at 32 concurrent clients.}\\[0.3ex]
+      28--29$\times$ near-linear scaling from $B{=}1$ via continuous batching.
+    \end{center}
+  \end{block}
+
+  % ------------------- Throughput chart -------------------
+  \begin{block}{Throughput vs.\ Concurrent Clients}
+    \begin{center}
+    \begin{tikzpicture}
+      \begin{axis}[
+        width=0.95\colwidth,
+        height=0.5\colwidth,
+        xlabel={Concurrent clients ($B$)},
+        ylabel={Aggregate tok/s},
+        xmode=log, log basis x=2,
+        xtick={1,2,4,8,16,32,64},
+        xticklabels={1,2,4,8,16,32,64},
+        ymin=0, ymax=380,
+        grid=both,
+        major grid style={line width=0.2pt,draw=ttdeepblue!20},
+        minor grid style={line width=0.1pt,draw=ttdeepblue!10},
+        axis line style={ttink},
+        tick style={ttink},
+        label style={ttink},
+        legend pos=north west,
+        legend style={font=\small,draw=ttdeepblue!30},
+        every axis/.append style={font=\small},
+      ]
+        % Gemma 4 12B IT
+        \addplot[mark=*, mark size=2.5pt, color=ttdeepblue, line width=1.2pt]
+          coordinates {(1,11.4) (8,82) (16,165) (32,316) (64,340)};
+        \addlegendentry{Gemma 4 12B}
+        % Qwen3.6-27B
+        \addplot[mark=square*, mark size=2.5pt, color=ttsky, line width=1.2pt]
+          coordinates {(1,8.32) (8,60) (16,120) (32,232)};
+        \addlegendentry{Qwen3.6-27B}
+      \end{axis}
+    \end{tikzpicture}
+    \end{center}
+
+    Diminishing returns past $B{=}32$ on Gemma 4 (316 $\to$ 340 at
+    $B{=}64$); scheduler + paged SDPA overhead saturate the
+    weight-bandwidth amortization win.
+  \end{block}
+
+  % ------------------- Roofline -------------------
+  \begin{block}{Roofline}
+    Decode at $B{=}1$ is weight-bandwidth-bound:
+    $t_{\min} \approx \tfrac{\text{active GB/chip}}{\text{404 GB/s}}$.
+
+    \begin{center}\small
+    \begin{tabular}{l r r r}
+      \toprule
+      \textbf{Model} & \textbf{Traced ms/tok} & \textbf{tok/s} & \textbf{\% ceiling ($B{=}1$)} \\
+      \midrule
+      Gemma 4 12B          & \textbf{47.5}  & \textbf{21.0} & 31\% of 67 tok/s \\
+      Qwen3.6-27B (TP4)    & \textbf{77.0}  & \textbf{12.9} & 22\% of 60 tok/s \\
+      Qwen3.6-35B-A3B      & \textbf{81.2}  & \textbf{12.3} & 4.6\% of 270 tok/s \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+
+    Continuous batching closes the gap on real workloads:
+    $B{=}32$ amortizes weight reads $\sim$28$\times$.
+  \end{block}
+
+  % ------------------- What Mattered -------------------
+  \begin{block}{What Mattered}
+    Three changes account for the majority of the throughput delta over
+    a naive port.
+    \begin{itemize}\setlength\itemsep{0.4ex}
+      \item \textbf{Paged SDPA with HiFi2 fp16 accumulation} ---
+            kernel-time win, $+62\%$ on 27B TP single-stream.
+      \item \textbf{Vocab-sharded lm\_head with on-device argmax} ---
+            collapses a 600 KB host readback to 8 bytes; $+8\%$ on
+            Gemma 4, $+5\%$ on 27B.
+      \item \textbf{Two-phase trace warmup} --- compile all paths
+            first, then capture all traces back-to-back. Without it,
+            decode JIT corrupts prefill trace memory at multi-trace
+            coexistence ($\to$ 99\% CPU hang).
     \end{itemize}
   \end{block}
 
@@ -146,211 +195,67 @@
 \separatorcolumn
 
 % =====================================================================
-% COLUMN 2 --- Correctness + Performance
+% COLUMN 3 --- Correctness + Conclusions
 % =====================================================================
 \begin{column}{\colwidth}
 
-  % ------------------- Correctness Stack -------------------
-  \begin{block}{Correctness Stack}
+  % ------------------- Correctness -------------------
+  \begin{block}{Correctness}
     Three orthogonal gates, run per model on every change.
 
     \begin{center}\small
     \begin{tabular}{l c c c}
       \toprule
-      \textbf{Gate} & \textbf{Qwen3.6-27B} & \textbf{35B-A3B} & \textbf{Gemma 4 12B} \\
+      \textbf{Gate} & \textbf{27B} & \textbf{35B-A3B} & \textbf{Gemma 4} \\
       \midrule
-      Cos ladder (pos $\le 7$)       & PASS  & 7/8 PASS (cos$_{L32}{\ge}0.987$) & PASS \\
-      Argmax match @ pos 0           & PASS  & PASS               & PASS \\
-      Multi-step token-for-token     & PASS  & 5/6 (pos 4 = bf16 tie) & PASS \\
-      Needle haystack                & $L{=}500$ PASS & $\sim$50\% per trial (bf16) & 3/3 ($L{\le}512$) \\
-      Multi-turn KV retention        & PASS  & 3/3 PASS           & PASS \\
-      Traced == Eager (100 toks)     & PASS  & PASS               & 100/100 PASS \\
+      HF cosine ladder       & PASS  & cos$_{L32}{\ge}0.987$ & PASS \\
+      Multi-turn KV retention & PASS  & 3/3 PASS              & PASS \\
+      Traced $=$ Eager        & PASS  & PASS                  & \textbf{100/100} \\
+      Needle haystack         & $L{=}500$ & coherent          & 3/3 ($L{\le}512$) \\
       \bottomrule
     \end{tabular}
     \end{center}
 
-    The 35B free-run needle is \emph{coherent failure, never gibberish}
-    --- a fundamental bf16 non-determinism floor, not a bug.
+    Validation gates against a CPU fp32 oracle with per-sub-op hooks.
+    Cosine alone is insufficient ($\cos(a, ka){=}1$); MAD is reported
+    at every probed position.
   \end{block}
 
-  % ------------------- Performance Optimizations -------------------
-  \begin{block}{Performance Optimizations}
-    \textbf{Rule of thumb:} kernel-time wins translate $1{:}1$ in
-    trace; dispatch-only fusions land at $\sim$5--10\% of their
-    isolated eager gain. Predict trace ROI by asking ``kernel work or
-    dispatch?''
-
-    \begin{center}\footnotesize
-    \begin{tabular}{l l r l}
-      \toprule
-      \textbf{Optimization} & \textbf{Model} & \textbf{$\Delta$ tok/s} & \textbf{Why} \\
-      \midrule
-      Paged SDPA + B3 (HiFi2)        & 27B TP   & \textbf{+62\%}       & kernel: O(MAX\_POS) $\to$ O(1) \\
-      Vocab-sharded lm\_head         & Gemma 4  & \textbf{+8\%}        & 248k/262k vocab shards $4{\times}$ \\
-      Vocab-sharded lm\_head         & 27B TP   & +5.1\%               & on-device argmax: 600KB $\to$ 8B \\
-      A004 \code{core_grid=10x11}    & 35B-A3B  & $-30$ ms/tok         & ttnn auto-grid used 11/110 cores \\
-      A008 bf8 MoE expert weights    & 35B-A3B  & $-29$ ms/tok         & halves DRAM streaming \\
-      Owned fused decay/gate kernel  & 27B TP   & +2.5\%               & 10 ops $\to$ 1 (custom kernel) \\
-      \code{num_links=2} all\_reduce & 27B TP   & +1.65\%              & 2 links/axis on P150x4 \\
-      A002 fused Q/K L2-norm         & 35B-A3B  & $-1.13$ ms/tok       & dispatch fusion only \\
-      \midrule
-      DRAM-sharded MLP               & 27B      & \textbf{$2.1\times$ slower} & Galaxy-70B recipe; wrong scale \\
-      Async \code{all_reduce_async}  & 27B TP   & $+4\%$ overhead      & no parallel CCL to overlap \\
-      fp32 KV cache                  & 27B      & dead end             & paged SDPA rejects fp32 \\
-      bf8 KV cache                   & 27B      & neutral              & not memory-bound at $\le$8k \\
-      \bottomrule
-    \end{tabular}
-    \end{center}
-
-    The 35B perf session stacked A002+A003+A004+A008 to take
-    \textbf{141.79 $\to$ 81.16 ms/tok} (1.75$\times$) in one day. The
-    big lever is always kernel-time fusion or smarter weight
-    streaming; trace already amortizes dispatch.
+  % ------------------- Continuous Batching -------------------
+  \begin{block}{Continuous Batching}
+    Iteration-level Orca-style scheduler: per-step admission and
+    eviction, per-slot paged SDPA over a shared KV pool, slot-level
+    content-keyed prefix cache. Each slot advances at its own position
+    in a single batched forward.
   \end{block}
 
-  % ------------------- Throughput Table -------------------
-  \begin{block}{Throughput \& Roofline}
-    Decode at $B{=}1$ is weight-bandwidth-bound: ceiling
-    $\approx \tfrac{\text{active GB/chip}}{404\,\text{GB/s}}$.
-
+  % ------------------- Prefix Cache -------------------
+  \begin{block}{Prefix Cache in Practice}
+    Two-turn 27B chat over HTTP:
     \begin{center}\small
-    \begin{tabular}{l r r r r}
+    \begin{tabular}{l r r}
       \toprule
-      \textbf{Model} & \textbf{Eager ms/tok} & \textbf{Traced ms/tok} & \textbf{tok/s} & \textbf{\% of ceiling} \\
+      \textbf{Turn} & \textbf{Prompt} & \textbf{Prefill} \\
       \midrule
-      Qwen3.6-27B (TP)    & $\sim$253 & \textbf{77.0}  & \textbf{12.93} & $12.93/60 = $ \textbf{22\%} \\
-      Qwen3.6-35B-A3B     & 480       & \textbf{81.16} & \textbf{12.32} & $12.32/270 = $ \textbf{4.6\%} \\
-      Gemma 4 12B         & 182.7     & \textbf{47.5}  & \textbf{21.05} & $21.05/67.3 = $ \textbf{31\%} \\
+      1 (cold)         & 105 tok & 19.26 s \\
+      2 (PC hit)       & 172 tok & \textbf{3.06 s} \\
       \bottomrule
     \end{tabular}
     \end{center}
-
-    \textbf{Continuous batching --- the largest single lever.}
-    Matmul weight reads amortize across $B$. HTTP stress
-    ($B{=}32$ slots, paged SDPA, per-slot KV):
-
-    \begin{center}\small
-    \begin{tabular}{r r r r r}
-      \toprule
-      \textbf{Clients} & \textbf{27B tok/s} & \textbf{vs 1c} & \textbf{Gemma 4 IT tok/s} & \textbf{vs 1c} \\
-      \midrule
-      1   & 5.36              & $1.00\times$       & 5.29              & $1.00\times$ \\
-      8   & 40.87             & $7.63\times$       & 41.80             & $7.90\times$ \\
-      16  & 79.59             & $14.85\times$      & 83.91             & $15.86\times$ \\
-      32  & \textbf{156.59}   & $156.59/5.36 = $ \textbf{29.2$\times$} & \textbf{162.85} & $162.85/5.29 = $ \textbf{30.8$\times$} \\
-      \bottomrule
-    \end{tabular}
-    \end{center}
-
-    Both models hit $\sim$160 tok/s aggregate at 32 concurrent clients
-    with near-perfectly-linear $29$--$31{\times}$ scaling from one
-    client, validating the CB design.
-
-    \textbf{Multi-turn prefix cache (27B).} Turn 2 = $9.03$~s
-    (172-tok prompt) vs.\ turn 1's $19.26$~s (105 tok):
-    \textbf{6.3$\times$ speedup} on PC-hit turn. Gemma 4 PC still
-    misses on chat-template re-renders (open bug).
-
+    A prefix-cache hit on turn 2 yields a \textbf{6.3$\times$} prefill
+    speedup despite the longer prompt; the new prompt re-uses the
+    cached KV for the shared prefix and only computes the suffix.
   \end{block}
 
-\end{column}
-
-\separatorcolumn
-
-% =====================================================================
-% COLUMN 3 --- Challenges + Lessons + Future
-% =====================================================================
-\begin{column}{\colwidth}
-
-  % ------------------- Challenges -------------------
-  \begin{block}{Challenges}
-    Six bug classes; each paid for in chip-hours and now in
-    \code{research/model_bringup_recipe.md}.
-
-    \begin{itemize}\setlength\itemsep{0.3ex}
-      \item \textbf{ttnn view-decay.} \code{ttnn.slice} and
-            \code{ttnn.reshape} return \emph{views}; deallocating the
-            source corrupts reads. Masked at pos 0 because
-            $\mathrm{softmax}(1)=1$ so attn\_out $=$ V.
-            \emph{Resolution:} never add \code{deallocate} calls the
-            upstream pattern didn't have.
-      \item \textbf{Model-family semantic surprises.} Gemma 4 SDPA
-            uses $\texttt{scale}{=}1.0$; Qwen3.6 RMSNorm is
-            $(1+\gamma)$ zero-centered; Gemma 4 attention has
-            \emph{three} per-head norms ($q$, $k$, $v\_norm$) plus a
-            per-layer \code{layer_scalar}. All invisible at pos 0.
-            \emph{Resolution:} multi-step teacher-forced + read HF.
-      \item \textbf{bf16 chain non-determinism at $B{>}1$.} Every
-            primitive bit-identical; 40-layer chain compounds
-            $\sim$1 ULP into argmax flips. \emph{Resolution:} gate on
-            per-slot independence, not exact tokens.
-      \item \textbf{Silent perf regression --- caught by audit
-            subagent.} CB engine silently routed 27B through
-            \code{manual} DN recurrence; first ``fix'' targeted
-            \code{deltanet_*} (single-stream gate only). CB forward
-            actually reads \code{cb_dn_recurrence_mode} which
-            defaulted to \code{manual} via \code{getattr}. Two-line
-            fix took $B{=}4$ HTTP $13.30 \to B{=}32 = 156.59$ tok/s.
-            \emph{Resolution:} audit subagent citing file:line.
-      \item \textbf{Dev-harness PASS $\ne$ HTTP PASS.} 4/4 PASS in
-            harness, first \code{/v1/chat/completions} crashed.
-            \emph{Resolution:} \code{curl} smoke every backend swap.
-      \item \textbf{Chip changes overnight.} 35B drift cliff
-            reproducible for days, vanished with no code change. P150
-            firmware v19.5.0 silently disabled 20 cores
-            ($140 \to 120$). \emph{Resolution:} post-firmware
-            regression runs.
-    \end{itemize}
-  \end{block}
-
-  % ------------------- Tenstorrent vs DIY Split -------------------
-  \begin{block}{What We Forked vs What We Built}
-    \begin{center}\small
-    \begin{tabular}{l r l}
-      \toprule
-      \textbf{Surface} & \textbf{Count} & \textbf{Origin} \\
-      \midrule
-      \code{ttnn.*} (SDPA, CCL, RMSNorm)   & $\sim$1,570 calls & tt-metal \\
-      \code{ttnn.experimental.qwen36_*}    & 7 ops             & ours (owned) \\
-      \code{owned_ops/} C++/HPP            & 8,116 LOC         & ours (Gated DN) \\
-      \code{serve/server_*.py}             & 16,206 LOC        & wiring + HTTP \\
-      \code{cb/} (scheduler + harness)     & 11,383 LOC        & ours (CB) \\
-      \bottomrule
-    \end{tabular}
-    \end{center}
-
-    \textbf{$\sim$225:1 TT:ours ratio, but the few originals gated
-    correctness for each new model.} Tenstorrent's openness is the
-    only reason a one-person project shipped three LLM families in a
-    quarter.
-  \end{block}
-
-  % ------------------- Future Work / Cleanup -------------------
-  \begin{block}{Future Work}
-    From the code-cleanup audit (18 items, 6 High).
-    \begin{itemize}\setlength\itemsep{0.3ex}
-      \item \textbf{Argmax-tail trace in HTTP} --- closes the
-            $156 \to 376$ tok/s gap on 27B $B{=}32$ (\code{cb_api.py}
-            forces \code{sampling=True}).
-      \item \textbf{Gemma 4 chat-template for prefix cache} ---
-            re-renders don't byte-equal; port Qwen3.6's patches for
-            $\sim$6$\times$ multi-turn speedup.
-      \item \textbf{Gemma 4 P2/P3 distributed RMSNorm + paged SDPA
-            globals} --- projected $+30$--$60\%$; closes the
-            $31\% \to 60\%$ roofline gap.
-      \item \textbf{35B $B{>}1$ empty-slot poisoning} (\#162) ---
-            unlocks 35B CB beyond \code{TT_CB_SLOTS=1}.
-      \item \textbf{Delete dead manual DN path} --- $\sim$1.5K LOC;
-            structurally broken (cos $0.08$).
-    \end{itemize}
-  \end{block}
-
-  % ------------------- Conclusions -------------------
-  \begin{block}{Conclusions}
-    Three bringups, each faster (27B $\sim$3 wks, 35B $\sim$2 wks,
-    Gemma 4 \textbf{36 hrs}). Compounding from \emph{methodology}:
-    staging ladder + HF oracle + dev harness + REUSE. CB delivers
-    \textbf{$156$/$163$~tok/s on 27B/Gemma 4} at $B{=}32$.
+  % ------------------- Conclusion -------------------
+  \begin{block}{Conclusion}
+    A single $1\times4$ Blackhole P150 mesh, paired with a disciplined
+    bringup recipe, takes a modern LLM from HF spec to byte-stable
+    HTTP chat at \textbf{316 tok/s aggregate} on 12B and
+    \textbf{232 tok/s} on 27B. The hardware is competitive on
+    real-workload throughput; the open software stack lets a small
+    team bring up new architectures (MoE recurrence, hybrid attention,
+    dual-head-dim) end-to-end without waiting on a vendor roadmap.
   \end{block}
 
 \end{column}
@@ -360,13 +265,3 @@
 \end{frame}
 
 \end{document}
-
-% =====================================================================
-% MISSING FIGURES (drop into presentation/figures/ before pdflatex):
-%   - figures/cb_scaling_27b.png        : CB B=1..64 aggregate tok/s curve
-%   - figures/staging_ladder.png        : v0.0 -> v2 vertical timeline
-%   - figures/correctness_gate.png      : cos+mad ladder per layer
-%   - figures/p150_roofline.png         : BW floor vs measured per model
-% Also required:
-%   - stanford_logos/Block_S_2_color.png (referenced in headline)
-% =====================================================================

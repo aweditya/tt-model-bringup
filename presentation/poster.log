@@ -1,4 +1,4 @@
-This is LuaHBTeX, Version 1.21.0 (TeX Live 2025)  (format=lualatex 2025.3.8)  4 JUN 2026 11:31
+This is LuaHBTeX, Version 1.21.0 (TeX Live 2025)  (format=lualatex 2025.3.8)  4 JUN 2026 11:38
  restricted system commands enabled.
 **poster.tex
 (./poster.tex
@@ -1269,68 +1269,31 @@ File: tikzlibraryplotmarks.code.tex 2023-01-15 v3.1.10 (3.1.10)
 ks.code.tex
 File: pgflibraryplotmarks.code.tex 2023-01-15 v3.1.10 (3.1.10)
 )))
-(/usr/local/texlive/2025/texmf-dist/tex/latex/caption/subcaption.sty
-Package: subcaption 2023/07/28 v1.6b Sub-captions (AR)
-
-(/usr/local/texlive/2025/texmf-dist/tex/latex/caption/caption.sty
-Package: caption 2023/08/05 v3.6o Customizing captions (AR)
-
-(/usr/local/texlive/2025/texmf-dist/tex/latex/caption/caption3.sty
-Package: caption3 2023/07/31 v2.4d caption3 kernel (AR)
-\caption@tempdima=\dimen340
-\captionmargin=\dimen341
-\caption@leftmargin=\dimen342
-\caption@rightmargin=\dimen343
-\caption@width=\dimen344
-\caption@indent=\dimen345
-\caption@parindent=\dimen346
-\caption@hangindent=\dimen347
-Package caption Info: beamer document class detected.
-
-(/usr/local/texlive/2025/texmf-dist/tex/latex/caption/caption-beamer.sto
-File: caption-beamer.sto 2022/01/06 v2.0c Adaption of the caption package to th
-e beamer document classes (AR)
-))
-\c@caption@flags=\count392
-\c@continuedfloat=\count393
-Package caption Info: changepage package is loaded.
-\caption@adjustwidth@hsize=\dimen348
-\caption@adjustwidth@linewidth=\dimen349
-Package caption Info: hyperref package is loaded.
-Package caption Info: Hyperref support is turned off
-(caption)             because hyperref has stopped early.
-)
-Package caption Info: New subtype `subfigure' on input line 238.
-\c@subfigure=\count394
-Package caption Info: New subtype `subtable' on input line 238.
-\c@subtable=\count395
-)
 \sepwidth=\skip86
 \colwidth=\skip87
-
-(./poster.aux)
+ (./poster.aux)
 \openout1 = poster.aux
 
-LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
-LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
-LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
-LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
-LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
-LaTeX Font Info:    Checking defaults for TU/lmr/m/n on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
-LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
-LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
-LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
-LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 35.
-LaTeX Font Info:    ... okay on input line 35.
+LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for TU/lmr/m/n on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 33.
+LaTeX Font Info:    ... okay on input line 33.
 
 *geometry* driver: auto-detecting
 *geometry* detected driver: luatex
@@ -1368,16 +1331,16 @@ LaTeX Font Info:    ... okay on input line 35.
 
 (/usr/local/texlive/2025/texmf-dist/tex/context/base/mkii/supp-pdf.mkii
 [Loading MPS to PDF converter (version 2006.09.02).]
-\scratchcounter=\count396
-\scratchdimen=\dimen350
+\scratchcounter=\count392
+\scratchdimen=\dimen340
 \scratchbox=\box84
-\nofMPsegments=\count397
-\nofMParguments=\count398
+\nofMPsegments=\count393
+\nofMParguments=\count394
 \everyMPshowfont=\toks58
-\MPscratchCnt=\count399
-\MPscratchDim=\dimen351
-\MPnumerator=\count400
-\makeMPintoPDFobject=\count401
+\MPscratchCnt=\count395
+\MPscratchDim=\dimen341
+\MPnumerator=\count396
+\makeMPintoPDFobject=\count397
 \everyMPtoPDFconversion=\toks59
 ) (/usr/local/texlive/2025/texmf-dist/tex/latex/epstopdf-pkg/epstopdf-base.sty
 Package: epstopdf-base 2020-01-24 v2.11 Base part for package epstopdf
@@ -1388,7 +1351,7 @@ Package epstopdf-base Info: Redefining graphics rule for `.eps' on input line 4
 File: epstopdf-sys.cfg 2010/07/13 v1.3 Configuration of (r)epstopdf for TeX Liv
 e
 ))
-Package hyperref Info: Link coloring OFF on input line 35.
+Package hyperref Info: Link coloring OFF on input line 33.
 
 (./poster.out) (./poster.out)
 \@outlinefile=\write5
@@ -1422,30 +1385,30 @@ Dictionary: translator-theorem-dictionary, Language: English
 Package pgfplots notification 'compat/show suggested version=true': you might b
 enefit from \pgfplotsset{compat=1.18} (current compat level: 1.17).
 
-Package caption Info: Begin \AtBeginDocument code.
-Package caption Info: End \AtBeginDocument code.
 (./poster.nav)
 LaTeX Font Info:    Trying to load font information for OT1+lmr on input line 3
-5.
+3.
  (/usr/local/texlive/2025/texmf-dist/tex/latex/lm/ot1lmr.fd
 File: ot1lmr.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 LaTeX Font Info:    Trying to load font information for OML+lmm on input line 3
-5.
+3.
 
 (/usr/local/texlive/2025/texmf-dist/tex/latex/lm/omllmm.fd
 File: omllmm.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 LaTeX Font Info:    Trying to load font information for OMS+lmsy on input line 
-35.
+33.
 
 (/usr/local/texlive/2025/texmf-dist/tex/latex/lm/omslmsy.fd
 File: omslmsy.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 LaTeX Font Info:    External font `cmex7' loaded for size
-(Font)              <6> on input line 35.
+(Font)              <6> on input line 33.
+Package pgfplots info on input line 265: Using 'lua backend=false' for axis: xm
+ode=log unsupported (yet).
 
-Overfull \vbox (50.4978pt too high) detected at line 360
+Overfull \vbox (21.8551pt too high) detected at line 265
  []
 
 
@@ -1473,22 +1436,22 @@ Package rerunfilecheck Info: File `poster.out' has not changed.
 )
 
 Here is how much of LuaTeX's memory you used:
- 40869 strings out of 475506
- 476945,1648299 words of node,token memory allocated
- 106883 words of node memory still in use:
-   712 hlist, 55 vlist, 125 rule, 432 disc, 98 local_par, 208 math, 3039 glue, 1
-359 kern, 243 penalty, 7594 glyph, 1894 attribute, 82 glue_spec, 1894 attribute_
-list, 4 write, 208 pdf_literal, 354 pdf_colorstack nodes
-   avail lists: 2:416,3:1383,4:1233,5:4143,6:303,7:32869,8:19,9:2835,10:19,11:13
-05
- 62693 multiletter control sequences out of 65536+600000
- 111 fonts using 18523991 bytes
- 128i,18n,128p,724b,979s stack positions out of 10000i,1000n,20000p,200000b,200000s
-</usr/local/texlive/2025/texmf-dist/fonts/truetype/typoland/lato/Lato-LightItali
-c.ttf>{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-rm.enc}{/usr/loc
-al/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-mathit.enc}{/usr/local/texlive/
-2025/texmf-dist/fonts/enc/dvips/lm/lm-mathsy.enc}</usr/local/texlive/2025/texmf-
-dist/fonts/truetype/typoland/lato/Lato-Regular.ttf></usr/local/texlive/2025/texm
+ 39867 strings out of 475506
+ 305233,1648299 words of node,token memory allocated
+ 75231 words of node memory still in use:
+   752 hlist, 61 vlist, 90 rule, 270 disc, 88 local_par, 124 math, 2409 glue, 75
+8 kern, 158 penalty, 3804 glyph, 2572 attribute, 82 glue_spec, 2572 attribute_li
+st, 4 write, 909 pdf_literal, 370 pdf_colorstack nodes
+   avail lists: 2:416,3:3231,4:1281,5:2337,6:273,7:19330,8:22,9:2868,10:19,11:81
+9
+ 61711 multiletter control sequences out of 65536+600000
+ 102 fonts using 17393423 bytes
+ 128i,23n,116p,721b,3023s stack positions out of 10000i,1000n,20000p,200000b,200000s
+{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-rm.enc}</usr/local/tex
+live/2025/texmf-dist/fonts/truetype/typoland/lato/Lato-LightItalic.ttf>{/usr/loc
+al/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-mathit.enc}</usr/local/texlive/
+2025/texmf-dist/fonts/truetype/typoland/lato/Lato-Regular.ttf>{/usr/local/texliv
+e/2025/texmf-dist/fonts/enc/dvips/lm/lm-mathsy.enc}</usr/local/texlive/2025/texm
 f-dist/fonts/truetype/typoland/lato/Lato-Light.ttf></usr/local/texlive/2025/texm
 f-dist/fonts/opentype/public/lm/lmmono12-regular.otf></usr/local/texlive/2025/te
 xmf-dist/fonts/opentype/impallari/raleway/Raleway-Regular.otf></usr/local/texliv
@@ -1497,7 +1460,7 @@ texlive/2025/texmf-dist/fonts/type1/public/lm/lmmi12.pfb></usr/local/texlive/202
 5/texmf-dist/fonts/type1/public/lm/lmr12.pfb></usr/local/texlive/2025/texmf-dist
 /fonts/type1/public/lm/lmr17.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1
 /public/lm/lmsy10.pfb>
-Output written on poster.pdf (1 page, 139913 bytes).
+Output written on poster.pdf (1 page, 121846 bytes).
 
 PDF statistics: 84 PDF objects out of 1000 (max. 8388607)
  52 compressed objects within 1 object stream
