@@ -3,6 +3,96 @@
 What this project is, where the perf is now, what to run, and what is next.
 Read top to bottom; everything else is linked.
 
+---
+
+## 🔥 COMPACTION-READY STATUS (2026-06-04) — read this first
+
+**The user wants you to keep going through the queue below without
+asking; they're not stopping for status updates.**
+
+### Live RIGHT NOW on qb1
+- **Server**: `serve_cb.sh start` is running with **Gemma 4 12B
+  Instruct** (`TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it TT_MODEL_ID=google/gemma-4-12B-it`)
+  on port 8000. PID ~517177 (check `bash experiments/serve/scripts/serve_cb.sh status`).
+- **Stack on disk**: HEAD is `a24f2ea` "perf(gm4): P1 — vocab-sharded
+  lm_head". The vocab-sharded change is deployed but **PERF NUMBER
+  NOT YET MEASURED** — see "in-flight" below.
+
+### What's queued (do these in order — recipe at `research/model_bringup_recipe.md`)
+
+| # | Task | State | Briefing / file |
+|---|---|---|---|
+| 1 | **Gemma 4 perf opt P1** (vocab-shard) | code SHIPPED, **measurement IN FLIGHT** | `research/gemma4_perf_briefing_2026-06-04.md` |
+| 2 | **Gemma 4 perf opt P2** (distributed RMSNorm) | not started; design in briefing | same |
+| 3 | **Gemma 4 perf opt P3** (paged SDPA on global layers) | not started; design in briefing | same |
+| 4 | **35B-A3B drift overnight** | server hook ALREADY exists (no diff); design ready | `research/35b_drift_briefing_2026-06-04.md` |
+
+### In-flight as of right now (compaction-resilient: re-check these after compaction)
+- **Server bootstrap measurement** — `serve_cb.sh` is bootstrapping IT
+  with the vocab-sharded lm_head. Once `/health` returns 200,
+  curl `/v1/chat/completions` and read TTFT/tok_per_sec. **Baseline
+  before vocab-shard: 51.3 ms/tok traced single-seq (19.5 tok/s).**
+  Expected post-shard: ~48 ms/tok (+5-8%). Capture in
+  `feedback_p22_gm4_vocab_shard_result.md` memory after measuring.
+- **No subagents running** — both finished. Briefings saved:
+  - `research/gemma4_perf_briefing_2026-06-04.md` — TOP-3 perf opts
+    + Tracy capture commands + roofline. Read this first when starting perf.
+  - `research/35b_drift_briefing_2026-06-04.md` — drift cliff bisection
+    plan (3 steps: P_cliff search → per-layer L_locus → sub-op at
+    (L_locus, P_cliff)). Read first when starting 35B drift.
+  - The 35B sub-agent confirmed: `server_35b_ttnn.step_forward_inner`
+    already writes `capture[f"layer_{L}"]` per layer (no server-side
+    diff needed). Just need to write
+    `experiments/cb/isolate/cb35_per_layer_drift_pos1.py` (fork
+    `gm4_per_layer_drift_pos1.py`, swap to 35B oracle + cb35 harness).
+    Use `owned_gdn=ON` ALWAYS — manual path is broken
+    ([[feedback-35b-manual-recurrence-path-broken]]).
+
+### What's shipped this session you might lose track of
+- **Gemma 4 12B (base + IT)** end-to-end: bootstrap → forward →
+  multi-step → long-context (3/3 needle haystack) → trace (3.56×) →
+  CB B=4 → HTTP chat. Memory: `[[project-gm4-pos1-cliff]]` (resolved),
+  `[[feedback-gemma4-sdpa-scale-1]]`, `[[reference-gm4-dev-harness]]`,
+  `[[feedback-harness-state-version-skew]]`.
+- **Multi-EOS support** across cb_engine + cb_scheduler + cb_api: reads
+  generation_config.json + tokenizer.eos_token_id, accepts list/set.
+  Driver: Gemma IT EOS list `[1, 106, 50]`. Smoke result: IT chat now
+  has `finish_reason=stop` at 26 tokens (was 80, finish=length).
+- **scripts/chat.py rewritten Claude-Code-style**: ANSI panels,
+  markdown rendering, slash commands (/save /load /history /tools),
+  multi-line input via trailing `\\`, **built-in tool calling** (shell
+  /read_file/calc) with `--tools` flag.
+- **Model bringup recipe** at `research/model_bringup_recipe.md`
+  ([[reference-model-bringup-recipe]]) — the staging ladder, REUSE
+  rules, bug catalog, and meta-lesson on why bringup got 10× faster.
+  Read FIRST when starting a new model.
+- **Allowlist hardened** at `.claude/settings.local.json` — tmux:*,
+  env-prefix patterns, deny block for rm -rf / force push / reset
+  --hard. (.gitignored)
+- **Variant-aware bootstrap** for Gemma 4: `TT_GEMMA4_VARIANT={base, it}`.
+  Tokenizer config differs (IT ships a real chat template + eos
+  token list); same arch / shapes / weights structure.
+- **Dev harness reload extended**: `gm4_dev_harness.py` reloads
+  `server_gemma4_*` sibling modules so CB edits land without
+  re-bootstrap.
+
+### How to read this back together (90-sec rehydration)
+1. `git log --oneline -30` to see this session's commits.
+2. Skim `research/model_bringup_recipe.md` (1 page) — what we know about doing bringup fast.
+3. Skim `research/gemma4_perf_briefing_2026-06-04.md` (1 page) — the perf attack.
+4. Skim `research/35b_drift_briefing_2026-06-04.md` (1 page) — the drift attack.
+5. `ssh qb1 'bash experiments/serve/scripts/serve_cb.sh status'` — is the IT server still up?
+6. Resume from the queue table above.
+
+### Hard rules (`CLAUDE.md` non-negotiables — restate yourself before each major action)
+1. Plan, then act. No hand-wavy claims.
+2. Remote-only execution (`ssh qb1` / `qb2`). Never local device code.
+3. No `python -c`; no `/tmp`. Permanent files under `experiments/`.
+4. Frequent commits.
+5. REUSE before write. Every new file cites the existing pattern it forks in the commit message.
+
+---
+
 ## Live session state (2026-06-03 — Gemma 4 12B is the active priority)
 
 **Pivot 2026-06-03**: paused 35B drift (#163) and pivoted to Gemma 4 12B
