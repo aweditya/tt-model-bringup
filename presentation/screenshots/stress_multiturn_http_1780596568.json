@@ -1,0 +1,35 @@
+{
+  "args": {
+    "url": "http://127.0.0.1:8000",
+    "model": "Qwen/Qwen3.6-27B",
+    "turns": 3,
+    "max_tokens": 48,
+    "out": "/home/aditya/tt-xla/presentation/screenshots/stress_multiturn_http_1780596568.json"
+  },
+  "rows": [
+    {
+      "turn": 0,
+      "prompt_tokens": 32,
+      "completion_tokens": 48,
+      "wall_s": 6.848,
+      "user": "Hello! My name is Aditya. Could you suggest a 4-character abbreviation I can use as a nickname?",
+      "assistant": "<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - Name: Aditya\n   - Request: 4-character abbreviation/nickname\n   - Language: English\n\n2.  **"
+    },
+    {
+      "turn": 1,
+      "prompt_tokens": 105,
+      "completion_tokens": 38,
+      "wall_s": 12.275,
+      "user": "Tell me a one-sentence interesting fact about chess.",
+      "assistant": "<think>\n\n</think>\n\nThe number of possible legal chess positions is estimated to be around 10^43, which is significantly larger than the number of atoms in the observable universe."
+    },
+    {
+      "turn": 2,
+      "prompt_tokens": 172,
+      "completion_tokens": 41,
+      "wall_s": 5.986,
+      "user": "Now combine both \u2014 write a one-sentence chess strategy named after the nickname you suggested for me.",
+      "assistant": "<think>\n\n</think>\n\nThe **ADTY** Strategy involves controlling the center with pawns on d4 and e4 while rapidly developing your knights to f3 and c3 to dominate the board early."
+    }
+  ]
+}
