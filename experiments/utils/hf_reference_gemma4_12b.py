@@ -35,6 +35,7 @@ Run (qb1):
   python -u experiments/utils/hf_reference_gemma4_12b.py
 """
 import json
+import os
 import sys
 import argparse
 import time
@@ -45,7 +46,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MODEL_ID = "google/gemma-4-12B"
+MODEL_ID = os.environ.get("TT_GEMMA4_MODEL_ID", "google/gemma-4-12B")
 DEFAULT_OUT_DIR = PROJECT_ROOT / ".cache" / "hf_oracle_gemma4_12b"
 
 # Same canonical 5-tok smoke prompt the 27B/35B oracles use, for symmetry.

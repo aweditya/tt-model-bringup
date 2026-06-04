@@ -134,9 +134,14 @@ def load_t(key_to_shard, key):
         return f.get_tensor(key).float().numpy()
 
 
-def build_key_to_shard():
-    """Build {key -> shard_path} index for google/gemma-4-12B safetensors."""
-    snapshot_root = Path.home() / ".cache" / "huggingface" / "hub" / "models--google--gemma-4-12B" / "snapshots"
+def build_key_to_shard(variant="base"):
+    """Build {key -> shard_path} index for google/gemma-4-12B (or its -it
+    variant) safetensors. Variant selected by TT_GEMMA4_VARIANT in
+    bootstrap; both variants share the same architecture so the keys
+    are identical, only the snapshot directory changes.
+    """
+    cache_dirname = "models--google--gemma-4-12B-it" if variant == "it" else "models--google--gemma-4-12B"
+    snapshot_root = Path.home() / ".cache" / "huggingface" / "hub" / cache_dirname / "snapshots"
     if not snapshot_root.exists():
         raise FileNotFoundError(f"no HF snapshot at {snapshot_root}. "
                                 f"Run hf_reference_gemma4_12b.py once to fetch.")
@@ -284,16 +289,55 @@ def bootstrap(state, log=None):
                                         trace_region_size=400_000_000)
     log(f"  mesh: {state.mesh}")
 
-    log("[bootstrap] config + tokenizer…")
-    snapshot_root = Path.home() / ".cache" / "huggingface" / "hub" / "models--google--gemma-4-12B" / "snapshots"
+    # Variant select: base (default) or instruct (TT_GEMMA4_VARIANT=it).
+    # Same architecture / shapes; the IT variant has different weights, a
+    # real chat template, and <end_of_turn> as a proper special token.
+    import os as _os
+    variant = _os.environ.get("TT_GEMMA4_VARIANT", "base").lower()
+    if variant not in ("base", "it"):
+        raise ValueError(f"TT_GEMMA4_VARIANT must be 'base' or 'it', got {variant!r}")
+    if variant == "it":
+        hf_model_id = "google/gemma-4-12B-it"
+        hf_cache_dirname = "models--google--gemma-4-12B-it"
+    else:
+        hf_model_id = "google/gemma-4-12B"
+        hf_cache_dirname = "models--google--gemma-4-12B"
+    state.variant = variant
+    state.hf_model_id = hf_model_id
+
+    log(f"[bootstrap] variant={variant} model={hf_model_id} — config + tokenizer…")
+    snapshot_root = Path.home() / ".cache" / "huggingface" / "hub" / hf_cache_dirname / "snapshots"
     snap = next(snapshot_root.iterdir())
     cfg_json = json.loads((snap / "config.json").read_text())
     try:
         from transformers import AutoTokenizer
-        state.tokenizer = AutoTokenizer.from_pretrained("google/gemma-4-12B")
+        state.tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
         state.tok = state.tokenizer  # cb_api convention
+        # The base model doesn't ship a chat template (that's the instruct
+        # variant). cb_api always calls apply_chat_template, so install a
+        # minimal Gemma-style template — `<start_of_turn>{role}\n{message}<end_of_turn>\n`
+        # with `<start_of_turn>model\n` appended when add_generation_prompt=True.
+        if variant == "base":
+            # The BASE model doesn't ship a chat template; install a minimal
+            # Gemma-style one. The IT variant has its own — leave it.
+            if not getattr(state.tokenizer, "chat_template", None):
+                state.tokenizer.chat_template = (
+                    "{% for message in messages %}"
+                    "<start_of_turn>{{ message['role'] }}\n"
+                    "{{ message['content'] }}<end_of_turn>\n"
+                    "{% endfor %}"
+                    "{% if add_generation_prompt %}<start_of_turn>model\n{% endif %}"
+                )
+            # For chat with the BASE model, the response should stop on
+            # <end_of_turn>, not <eos>. The IT variant uses <end_of_turn>
+            # as a proper special-token EOS already.
+            eot_id = state.tokenizer.convert_tokens_to_ids("<end_of_turn>")
+            if eot_id is not None and eot_id != state.tokenizer.unk_token_id:
+                state.tokenizer.eos_token = "<end_of_turn>"
         log(f"  tokenizer: {state.tokenizer.__class__.__name__}, "
-            f"eos_token_id={state.tokenizer.eos_token_id}")
+            f"eos_token={state.tokenizer.eos_token!r} "
+            f"id={state.tokenizer.eos_token_id}, "
+            f"chat_template_installed={state.tokenizer.chat_template is not None}")
     except Exception as e:
         log(f"  tokenizer load skipped: {e!r}")
     text_cfg_json = cfg_json["text_config"]
@@ -304,7 +348,7 @@ def bootstrap(state, log=None):
         f"{sum(1 for t in state.layer_types if t == 'full_attention')} global")
 
     log("[bootstrap] enumerate shards + load top-level weights to mesh…")
-    key_to_shard = build_key_to_shard()
+    key_to_shard = build_key_to_shard(variant=variant)
     log(f"  {len(key_to_shard)} keys total")
 
     # Gemma 4's v_norm is `RMSNorm(head_dim, with_scale=False)` — pure
