@@ -895,13 +895,18 @@ def _shard_for_paged_write(t_2d, state, n_kv_heads, head_dim, mem_cfg, dbg=False
     return out
 
 
-def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
+def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None):
     """v0.3.0.1 sliding-attention via TWO paged SDPA calls (one per KV head).
 
     Each call uses NKV_PER_CHIP=1 effective — matches 35B's clean contract.
     HF GQA mapping: Q heads (4c, 4c+1) → KV head 2c (cache_0); Q heads
     (4c+2, 4c+3) → KV head 2c+1 (cache_1). Output [1, 1, 4, head_dim]
     assembled via concat along the Q-head axis.
+
+    capture (optional dict): if provided, captures L0-style sub-op
+    readbacks (q_proj_out, k_proj_out, v_proj_out, q_norm_out, k_norm_out,
+    v_norm_out, q_rope_out, k_rope_out, mixer_out). Used by
+    gm4_v031_L0_subops_pos1.py to bisect sub-ops at pos 0 vs pos 1.
     """
     layer_caches = state.kv_caches_tt[layer_idx]  # list of 2 (kc, vc) tuples
 
@@ -909,6 +914,11 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
     q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
     k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
     v = ttnn.matmul(h_norm, w["v_proj"], compute_kernel_config=HIFI4)
+
+    if capture is not None:
+        capture["q_proj_out"] = _readback_sharded_head(q, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING)
+        capture["k_proj_out"] = _readback_sharded_head(k, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+        capture["v_proj_out"] = _readback_sharded_head(v, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
 
     q_h = ttnn.reshape(q, [NQ_PER_CHIP, HEAD_DIM_SLIDING])  # [4, 256] per chip
     ttnn.deallocate(q)
@@ -923,6 +933,11 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
     v_n = ttnn.rms_norm(v_h, weight=state.ones_head_dim_sliding, epsilon=EPS)
     ttnn.deallocate(v_h)
+
+    if capture is not None:
+        capture["q_norm_out"] = _readback_sharded_head(q_n_pre, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING)
+        capture["k_norm_out"] = _readback_sharded_head(k_n_pre, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+        capture["v_norm_out"] = _readback_sharded_head(v_n, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
 
     # RoPE on Q and K (NOT V). v0.3.1.0: at pos 0 cos=1, sin=0, so RoPE
     # is identity — this validates the plumbing without changing the
@@ -978,7 +993,7 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
             q_for_sdpa, kc, vc,
             cur_pos_tensor=state.cur_pos_buf,
             page_table_tensor=state.page_table_tt,
-            scale=1.0 / (HEAD_DIM_SLIDING ** 0.5),
+            scale=1.0,  # Gemma 4 text attention sets self.scaling=1.0 (modeling_gemma4.py:1178); does NOT use 1/sqrt(d_k). Tenstorrent demo confirms (decode.py:144). Bug was masked at pos 0 (single-token softmax = 1.0 regardless of scale).
             program_config=state.paged_sdpa_progcfg,
             compute_kernel_config=state.sdpa_compute_kernel_config,
             sliding_window_size=SLIDING_WINDOW,
@@ -1067,7 +1082,7 @@ def _layer_pos0_global_paged(state, h_norm, w, layer_idx):
         q_for_sdpa, kc, vc,
         cur_pos_tensor=state.cur_pos_buf,
         page_table_tensor=state.page_table_tt,
-        scale=1.0 / (HEAD_DIM_GLOBAL ** 0.5),
+        scale=1.0,  # Gemma 4: self.scaling=1.0 (see sliding SDPA above).
         program_config=state.paged_sdpa_progcfg_global,
         compute_kernel_config=state.sdpa_compute_kernel_config,
     )
