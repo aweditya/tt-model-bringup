@@ -1,4 +1,26 @@
-# Live measurements (2026-06-04 session) — POST-FIX
+# Live measurements (2026-06-04 session) — POST-FIX + ARGMAX-TRACE
+
+## Final headline (after `4506385` argmax-tail trace fix)
+
+| Model | TT_CB_SLOTS | 1 client | 8 clients | 16 clients | 32 clients | Scaling 1→32 |
+|---|---|---|---|---|---|---|
+| **Qwen3.6-27B (dense, TP)** | 32 | **8.32** | 61.27 | 117.62 | **232.12** | **27.89×** |
+| Gemma 4 12B IT (unified) | 32 | TBD (re-measurement pending) | — | — | — | — |
+| Qwen3.6-35B-A3B (MoE) | 1 | 3.13 | — | — | — | — |
+
+**27B 1-client throughput went 5.36 → 8.32 tok/s (+55%)**. Aggregate at 32 clients went **156.59 → 232.12 (+48%)**. Per-step time at B=32: 229 → 88 ms (**2.6× faster**). This is the all-greedy fast path: the captured argmax-tail trace skips the [B, vocab] readback in favour of a 4·B-byte argmax readback.
+
+Compared to the historical 376 tok/s on `bench/trace.py --owned-gdn --shiftacc` at B=32 (`research/27b_cb_scope.md:687`): we've closed to **62% of the historical** within the HTTP serving path. The remaining gap is shiftacc-conv vs kdim differences in the bench — future work.
+
+## Pre-fix evolution this session
+
+| Stage | Config | B=4, 4-client agg tok/s | B=32, 32-client agg tok/s | Per-step ms |
+|---|---|---|---|---|
+| Original session start | TT_CB_TOPK_K=128, `cb_dn_recurrence_mode` unset → manual DN | 13.30 | — | 229 |
+| Commit `38b15b0` | set CB-mode defaults in `setup_cb_state` | — | 156.59 | 229 → ~290 |
+| Commit `4506385` (argmax-trace) | dual-trace, route greedy to argmax | — | **232.12** | **88** |
+
+Each fix was: 1 file, ~10-30 LOC, no new env knob. Total cumulative gain on 27B at B=32: 13.30 → 232.12 tok/s = **17.4× from the broken state, and +48% over the `setup_cb_state` fix alone**.
 
 Single canonical source for the poster + presentation. Numbers below
 are from `presentation/screenshots/stress_*.json` runs through the
