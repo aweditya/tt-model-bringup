@@ -55,13 +55,42 @@ across 3 turns (prefix cache hitting; same nickname/fact carry across turns).
 Streaming is now char-level (no per-line stall); readline editing (Ctrl-W,
 Option-←/→, ↑↓ history) works on both GNU readline and macOS libedit.
 
+**Demo path RE-VERIFIED 2026-06-04 with PC metric inspection**:
+- Qwen 27B + TT_CB_PREFIX_CACHE=1, 3-turn coding chat:
+  - T0 (36 tok, cold): 8.69 s, wall/prompt_t = 0.241
+  - T1 (125 tok, **PC HIT**): 5.84 s, wall/prompt_t = 0.047 (5.1× per-tok speedup)
+  - T2 (201 tok, **PC HIT**): 5.92 s, wall/prompt_t = 0.030 (8.0× per-tok speedup)
+- Metric delta: pc_hits +2, pc_misses +1, evictions +0 — clean PC story
+- Carries the "ADIT" nickname from T0 → T2 chess strategy. Coherent.
+
 **Gemma 4 12B IT also re-verified on TUI 2026-06-04**: streaming works, PC
 hits on T1/T2 (wall/prompt_t 0.212 → 0.075). **But** chat output still
 duplicates `thought\n` stanzas — the `<|channel>thought\n<channel|>`
 chat-template asymmetry (root-caused in `research/gemma4_pc_chat_template_asymmetry_2026-06-04.md`,
-task #176). The TUI runs fine; the noise is model-side. For the live demo
-**prefer 27B over Gemma 4 IT** — 27B's `<think>…</think>` flows cleanly and
-streams nicely.
+task #176).
+
+**Demo plan (user-decided 2026-06-04)**:
+- **27B hot** the whole talk — that's the multi-turn / prefix-cache story.
+  Demo PC by sending a 2-or-3-turn coding chat; show the wall_s drop on T2.
+- **Swap to Gemma 4 12B IT** mid-talk to show insane first-prompt speed
+  (~17 tok/s single-client decode, 316 tok/s aggregate at B=32). The
+  server restart takes ~1.5 min for Gemma 4 (fast — used as time to talk
+  through what's happening on stage). Gemma PC is parked — use cold
+  first-prompt only.
+
+**Gemma 4 PC: validator fixed, live still misses (parked)**:
+- Validator-level: 3/3 PASS on both Qwen 27B and Gemma 4 12B IT after
+  commit `184753d` (`fix(pc): dynamic active-prompt suffix strip`).
+- Live HTTP: pc_hits=0, pc_misses=3 across 3 turns. Remaining gap is in
+  `cb_scheduler._finish` — when the model hits `max_tokens` instead of
+  emitting a natural EOS, the canonical EOS is selected via
+  `next(iter(self.eos_ids))` (frozenset hash order, non-deterministic).
+  For Gemma {1, 50, 106} this may pick id 1 (`<eos>`) instead of id 106
+  (`<turn|>`), which is what the chat template puts at past-asst
+  boundaries. Fix is to add a `chat_end_id` attribute to the scheduler
+  that's set explicitly from the tokenizer at bootstrap. Two-line edit,
+  but needs scheduler + server restart cycle. Deprioritised for the
+  Qwen-led demo.
 
 **To run TUI** (once server is back):
 ```
