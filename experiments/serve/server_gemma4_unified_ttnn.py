@@ -986,10 +986,91 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
     return out
 
 
+def _layer_pos0_global_paged(state, h_norm, w, layer_idx):
+    """v0.3.1 global-attention via paged SDPA. NKV=1 (replicated across
+    chips), head_dim=512, p-RoPE (rotate first 128 of 512 inline via the
+    global cos/sin tables), attention_k_eq_v=True (V aliases K post-norm).
+    Single SDPA call (no GQA split — NKV=1 already matches kernel contract).
+    """
+    layer_caches = state.kv_caches_tt[layer_idx]  # [(kc, vc)] — single-entry list
+    kc, vc = layer_caches[0]
+
+    # Q/K projections. V is aliased from K_raw (pre-norm, pre-RoPE) per HF.
+    # attention_k_eq_v=True for global means v_proj is None in the weights.
+    q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
+    k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
+
+    q_h = ttnn.reshape(q, [NQ_PER_CHIP, HEAD_DIM_GLOBAL])
+    ttnn.deallocate(q)
+    k_h = ttnn.reshape(k, [NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL])  # [1, 512]
+    ttnn.deallocate(k)
+    # V aliases K_raw (pre-norm). Clone before any K-normalization op.
+    v_raw = ttnn.clone(k_h)
+
+    # q_norm, k_norm. v_norm applied to V = K_raw (HF aliases V from K_raw
+    # then v_norm normalizes it).
+    q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    k_n_pre = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
+    v_n = ttnn.rms_norm(v_raw, weight=state.ones_head_dim_global, epsilon=EPS)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h); ttnn.deallocate(v_raw)
+
+    # p-RoPE applied to Q and K (NOT V). The global cos/sin tables encode
+    # the partial-RoPE structure inline (last 384 dims have inv_freq=0 so
+    # cos=1, sin=0 acts as identity).
+    cos_tt, sin_tt = _lookup_rope(state, state.cos_global_tt,
+                                  state.sin_global_tt, HEAD_DIM_GLOBAL)
+    q_n = _apply_full_rope(q_n_pre, cos_tt, sin_tt, NQ_PER_CHIP, HEAD_DIM_GLOBAL)
+    ttnn.deallocate(q_n_pre)
+    k_n = _apply_full_rope(k_n_pre, cos_tt, sin_tt, NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL)
+    ttnn.deallocate(k_n_pre)
+    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+
+    # Write K_rope, V to cache (NKV=1).
+    k_sharded = _shard_for_paged_write(k_n, state, NUM_KV_HEADS_GLOBAL,
+                                        HEAD_DIM_GLOBAL, state.paged_write_mem_cfg_global)
+    v_sharded = _shard_for_paged_write(v_n, state, NUM_KV_HEADS_GLOBAL,
+                                        HEAD_DIM_GLOBAL, state.paged_write_mem_cfg_global)
+    ttnn.deallocate(k_n); ttnn.deallocate(v_n)
+    ttnn.experimental.paged_update_cache(
+        kc, k_sharded,
+        update_idxs_tensor=state.cur_pos_buf,
+        page_table=state.page_table_tt,
+    )
+    ttnn.experimental.paged_update_cache(
+        vc, v_sharded,
+        update_idxs_tensor=state.cur_pos_buf,
+        page_table=state.page_table_tt,
+    )
+    ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
+
+    # Single SDPA call — NKV=1 = clean kernel contract.
+    q_for_sdpa = ttnn.reshape(q_n, [1, 1, NQ_PER_CHIP, HEAD_DIM_GLOBAL])
+    ttnn.deallocate(q_n)
+    attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+        q_for_sdpa, kc, vc,
+        cur_pos_tensor=state.cur_pos_buf,
+        page_table_tensor=state.page_table_tt,
+        scale=1.0 / (HEAD_DIM_GLOBAL ** 0.5),
+        program_config=state.paged_sdpa_progcfg,
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+        # No sliding_window_size — global layers attend over full context.
+    )
+    ttnn.deallocate(q_for_sdpa)
+    attn_flat = ttnn.reshape(attn_out, [1, NQ_PER_CHIP * HEAD_DIM_GLOBAL])
+    ttnn.deallocate(attn_out)
+
+    # o_proj column-sharded + all_reduce.
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+    return out
+
+
 def _layer_forward_pos0_paged(state, h_in, layer_idx):
-    """v0.3.0 layer forward — uses paged SDPA on sliding layers; falls back to
-    the v0.2 global helper for global layers (v0.3.0 scope is sliding only;
-    v0.3.1 ports global as well)."""
+    """v0.3.1 layer forward — uses paged SDPA on BOTH sliding and global
+    layers. Sliding has 2 caches (per-KV-head, NKV=1 each); global has 1
+    cache (NKV=1 replicated)."""
     w = state.per_layer_tt[layer_idx]
     lt = state.layer_types[layer_idx]
     residual_1 = ttnn.clone(h_in)
@@ -997,8 +1078,7 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx):
     if lt == "sliding_attention":
         mixer = _layer_pos0_sliding_paged(state, h_norm, w, layer_idx)
     else:
-        # v0.3.0 still uses v0.2 global helper; v0.3.1 will port to paged.
-        mixer = _layer_pos0_global(state, h_norm, w)
+        mixer = _layer_pos0_global_paged(state, h_norm, w, layer_idx)
     ttnn.deallocate(h_norm)
     post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
     ttnn.deallocate(mixer)
