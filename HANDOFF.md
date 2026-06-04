@@ -25,14 +25,17 @@ asking; they're not stopping for status updates.**
 | # | Task | State | Briefing / file |
 |---|---|---|---|
 | 1 | **Gemma 4 perf opt P1** (vocab-shard) | ✅ DONE — 47.5 ms/tok traced (+8%) | `[[feedback-p22-gm4-vocab-shard-result]]` |
-| 2 | **35B-A3B drift bisection** | ✅ DONE — drift GONE, see `[[35b-drift-resolved-2026-06-04]]` | resolved memory |
-| 3 | **35B needle-haystack sanity** | 🔄 IN FLIGHT — bf16 free-run is non-deterministic (Y↔N flip per trial); multi-trial average ~50-70% retrieval | `experiments/cb/isolate/cb35_needle_*.py` |
-| 4 | **35B stress tests** (task #173) | ⏳ blocked on #3 verdict | multi-turn Q&A + concurrent CB load |
-| 5 | **Gemma 4 perf opt P2** (distributed RMSNorm) | task #178 | `research/gemma4_perf_briefing_2026-06-04.md` |
-| 6 | **Gemma 4 perf opt P3** (paged SDPA on global) | task #179 | same |
-| 7 | **Presentation prep** (task #172) | 🔄 IN FLIGHT — 1/5 subagent reports done | `presentation/00_outline.md` |
-| 8 | **Chat TUI stretch goals** (tasks #174-176) | ⏳ | web_search tool, cli_nav tool, Gemma vision input |
-| 9 | **TUI screenshots** (task #177) | ⏳ for presentation demo | `presentation/screenshots/` |
+| 2 | **35B-A3B drift bisection** | ✅ DONE — drift GONE | `[[35b-drift-resolved-2026-06-04]]` |
+| 3 | **35B needle-haystack** | ✅ DONE — bf16 non-deterministic, ~50/50 per trial, coherent failures | `[[35b-needle-haystack-2026-06-04]]` |
+| 4 | **35B multi-turn Q&A** | ✅ DONE — 3/3 retention works | `[[35b-multiturn-qa-2026-06-04]]` |
+| 5 | **Server stress (Gemma 4 IT, traced, B=4)** | ✅ DONE — 1.96×/3.88× scaling at 2/4 clients | `presentation/screenshots/stress_concurrent_chat_*.json` |
+| 6 | **Multi-turn HTTP (PC demo)** | ⚠️ BUG FOUND — 0 PC hits in chat-template multi-turn; matcher requires byte-exact prefix | `[[prefix-cache-multiturn-miss-2026-06-04]]` |
+| 7 | **27B HTTP perf baseline** | 🔄 BOOTSTRAPPING — first run after cb_api.py override deletion (was silently routing through manual DN path) | `[[cb-api-clobbered-27b-owned-gdn]]` |
+| 8 | **35B HTTP stress** | ⏳ after 27B | same script, restart with TT_BACKEND=35b |
+| 9 | **Code cleanup execution** (18 items) | ⏳ from `research/code_cleanup_plan_2026-06-04.md` — 6 High severity | top-3 leverage: A1 delete 35B manual DN, A2 fix B>1 empty-slot poison, B1 already done (cb_api override) |
+| 10 | **Gemma 4 perf P2/P3** (tasks #178/179) | ⏳ design ready | `research/gemma4_perf_briefing_2026-06-04.md` |
+| 11 | **Presentation deck assembly** (task #172) | 5/5 subagent reports IN — assemble next | `presentation/01..05_*.md` |
+| 12 | **Stretch: chat TUI tools + Gemma vision** (#174-176) | ⏳ | scripts/chat.py + Gemma vision wiring |
 
 ### In-flight as of right now (compaction-resilient: re-check these after compaction)
 - **35B per-layer drift probe** — `cb35` tmux harness bootstrapping
