@@ -124,6 +124,16 @@ def run_test(state, trigger_name: str) -> int:
     sys.stderr = _TeeStdout(orig_err, log_fh)
     try:
         importlib.reload(base)
+        # Also reload any sibling Gemma 4 server modules already imported
+        # (e.g., server_gemma4_unified_cb). Without this, a test pulls the
+        # cached version from sys.modules and silently runs against stale
+        # code. Captures the most common case (server_gemma4_*).
+        for name in list(sys.modules):
+            if name.startswith("server_gemma4_") and name != base.__name__:
+                try:
+                    importlib.reload(sys.modules[name])
+                except Exception:
+                    pass
         mod = _discover_test_module(trigger_name)
         if mod is None:
             log(f"  ✗ {trigger_name}: no matching test module in {TEST_SEARCH_DIRS}")
