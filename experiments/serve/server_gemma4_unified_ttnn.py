@@ -810,6 +810,53 @@ def _layer_forward_pos0(state, h_in, layer_idx):
 # reason; v0.3.1 applies it at pos > 0.
 
 
+def _apply_full_rope(x, cos_tt, sin_tt, n_heads, head_dim):
+    """Apply RoPE (rotate-half) to x [n_heads, head_dim] using cos/sin tables.
+
+    Gemma 4 sliding rotates the full head_dim (rope_type=default).
+    Gemma 4 global rotates the first 128 of 512 dims (p-RoPE,
+    partial_rotary_factor=0.25). But OUR cos/sin tables already encode
+    p-RoPE structure inline: non-rotated dims have `inv_freq=0` so
+    `cos=1, sin=0` there — RoPE on those dims is identity. So we can
+    safely apply the SAME "rotate full head_dim" math to both layer
+    types and the global identity-region just passes through.
+
+    Math: x_rope = x * cos + rotate_half(x) * sin
+          where rotate_half([a, b]) = [-b, a], a,b each = head_dim/2.
+
+    At pos 0 cos = 1, sin = 0 → x_rope = x (identity). v0.3.1.0 uses
+    this to validate the RoPE plumbing without changing the answer.
+    """
+    half = head_dim // 2
+    x1 = ttnn.slice(x, [0, 0], [n_heads, half])
+    x2 = ttnn.slice(x, [0, half], [n_heads, head_dim])
+    neg_x2 = ttnn.neg(x2)
+    ttnn.deallocate(x2)
+    rotated = ttnn.concat([neg_x2, x1], dim=-1)
+    ttnn.deallocate(neg_x2); ttnn.deallocate(x1)
+    x_cos = ttnn.mul(x, cos_tt)            # cos [1, head_dim] broadcasts over n_heads
+    rotated_sin = ttnn.mul(rotated, sin_tt)
+    ttnn.deallocate(rotated)
+    x_rope = ttnn.add(x_cos, rotated_sin)
+    ttnn.deallocate(x_cos); ttnn.deallocate(rotated_sin)
+    return x_rope
+
+
+def _lookup_rope(state, cos_table_tt, sin_table_tt, head_dim):
+    """Index the precomputed cos/sin tables by state.rot_idxs_buf (current
+    position). Returns (cos_tt, sin_tt) shape [1, head_dim] TILE_LAYOUT,
+    ready to broadcast over n_heads in _apply_full_rope.
+    """
+    cos_row = ttnn.embedding(state.rot_idxs_buf, cos_table_tt)  # [1, 1, head_dim]
+    sin_row = ttnn.embedding(state.rot_idxs_buf, sin_table_tt)
+    cos_tt = ttnn.to_layout(cos_row, ttnn.TILE_LAYOUT)
+    sin_tt = ttnn.to_layout(sin_row, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(cos_row); ttnn.deallocate(sin_row)
+    cos_tt = ttnn.reshape(cos_tt, [1, head_dim])
+    sin_tt = ttnn.reshape(sin_tt, [1, head_dim])
+    return cos_tt, sin_tt
+
+
 def _shard_for_paged_write(t_2d, state, n_kv_heads, head_dim, mem_cfg, dbg=False):
     """Reshape + pad a [n_kv_heads, head_dim] per-chip tensor for paged_update_cache.
 
@@ -856,13 +903,23 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
     ttnn.deallocate(v)
 
     # q_norm, k_norm (learned weight) + v_norm (all-ones).
-    q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
-    k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
+    q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    k_n_pre = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
     v_n = ttnn.rms_norm(v_h, weight=state.ones_head_dim_sliding, epsilon=EPS)
     ttnn.deallocate(v_h)
 
-    # RoPE at pos 0 is identity. Skip; v0.3.1 will add it for pos > 0.
+    # RoPE on Q and K (NOT V). v0.3.1.0: at pos 0 cos=1, sin=0, so RoPE
+    # is identity — this validates the plumbing without changing the
+    # answer. v0.3.1.1 will advance rot_idxs_buf per step for non-trivial
+    # rotation at pos > 0.
+    cos_tt, sin_tt = _lookup_rope(state, state.cos_sliding_tt,
+                                  state.sin_sliding_tt, HEAD_DIM_SLIDING)
+    q_n = _apply_full_rope(q_n_pre, cos_tt, sin_tt, NQ_PER_CHIP, HEAD_DIM_SLIDING)
+    ttnn.deallocate(q_n_pre)
+    k_n = _apply_full_rope(k_n_pre, cos_tt, sin_tt, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+    ttnn.deallocate(k_n_pre)
+    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
 
     # Two SDPA passes — one per (cache, KV-head, Q-half) trio.
     attn_outs = []
