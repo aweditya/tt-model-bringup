@@ -10,6 +10,7 @@ Run on qb1 (no env block needed; pure host code):
 """
 import asyncio
 import os
+import queue
 
 # Don't let the side-effecting module-level apps build (they import transformers
 # and FastAPI fully, which we don't need for routing tests).

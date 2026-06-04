@@ -31,6 +31,7 @@ sys.path.insert(0, str(_PROJECT / "experiments" / "cb"))
 sys.path.insert(0, str(_PROJECT / "experiments" / "serve"))
 
 from _runner import bootstrap_27b_cb, log  # noqa: E402
+import server_tp as base                     # noqa: E402  (prod_logits_seq uses base.*)
 import server_tp_cb as cb                    # noqa: E402
 
 
