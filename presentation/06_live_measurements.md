@@ -5,8 +5,10 @@
 | Model | TT_CB_SLOTS | 1 client | 8 clients | 16 clients | 32 clients | Scaling 1→32 |
 |---|---|---|---|---|---|---|
 | **Qwen3.6-27B (dense, TP)** | 32 | **8.32** | 61.27 | 117.62 | **232.12** | **27.89×** |
-| Gemma 4 12B IT (unified) | 32 | TBD (re-measurement pending) | — | — | — | — |
+| **Gemma 4 12B IT (unified)** | 32 | **11.40** | 89.25 | 172.52 | **316.12** | **27.73×** |
 | Qwen3.6-35B-A3B (MoE) | 1 | 3.13 | — | — | — | — |
+
+**Gemma 4 hits 316 tok/s at 32 clients (+94% over the cb_dn fix-only baseline).** Faster than 27B because the model is smaller (12B vs 27B), and the vocab-shard lm_head already wins on the readback side.
 
 **27B 1-client throughput went 5.36 → 8.32 tok/s (+55%)**. Aggregate at 32 clients went **156.59 → 232.12 (+48%)**. Per-step time at B=32: 229 → 88 ms (**2.6× faster**). This is the all-greedy fast path: the captured argmax-tail trace skips the [B, vocab] readback in favour of a 4·B-byte argmax readback.
 
