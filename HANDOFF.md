@@ -141,7 +141,7 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
     [[ttnn-multi-trace-two-phase-warmup]]. `trace_region_size=400_000_000`
     on the mesh (default 50 MB OOMs the 48-layer decode trace).
     Validator: `gm4_v04_trace_validate.py`.
-  - **v1 CB DONE 2026-06-04 commit `<v1-final>`** — `server_gemma4_unified_cb.py`
+  - **v1 CB DONE 2026-06-04** — `server_gemma4_unified_cb.py`
     (forks `server_tp_cb.py`) ships `setup_cb_state`,
     `update_input_buffers_batched`, batched sliding+global layer
     forward (2 SDPA per sliding layer with NKV=1 each), batched
@@ -151,12 +151,28 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
     4 slots in B=4 all match their B=1 references. Validators:
     `gm4_v1_0_alloc_smoke.py`, `gm4_v1_4_3a.py`, `gm4_v1_5_3bc.py`,
     `gm4_v1_6_b4.py`. B=4 eager forward ~1.0s/step.
+  - **v2 HTTP wire-up DONE 2026-06-04 commit `9a1e45a`** —
+    `gemma4_12b` registered in `cb_api.BACKENDS` +
+    `cb_scheduler._BACKEND_MODULES`. CB module also exposes
+    `cb_reset_slots`, `forward_batch_tp_inner` alias, and `return_topk`
+    support to match the scheduler contract. Bootstrap loads the HF
+    tokenizer and installs a minimal Gemma chat template
+    (`<start_of_turn>{role}\n{content}<end_of_turn>\n`) since the BASE
+    model ships no chat template. Logits readback forced to rank-2
+    `[B, vocab]` so the scheduler's `t[:B]` works. `curl
+    /v1/chat/completions` with `"The capital of France is"` returns
+    `"Paris"`. **Known limitation of the BASE model**: `<end_of_turn>`
+    is multi-token text (not a special token), so the model emits
+    chat-template-echo noise after the answer and runs to `max_tokens`.
+    Strip client-side on `<end_of_turn>` until we bring up the
+    instruct variant.
 
-  **~1 day of focused work remaining** to ship `TT_BACKEND=gemma4_12b
-  serve_cb.sh start` chat: v2 HTTP wire-up — drop the backend into
-  `cb_api.BACKENDS` + `cb_scheduler._BACKEND_MODULES`, audit
-  cb_api defaults per [[cb-backend-dispatch-holes]], then smoke
-  `/v1/chat/completions` with "Hello".
+  **Gemma 4 12B bringup COMPLETE end-to-end** —
+  bootstrap → forward → multi-step decode → long-context → traced
+  decode → continuous batching → HTTP chat. Stack is hot on qb1 for
+  experimentation (`TT_BACKEND=gemma4_12b bash experiments/serve/scripts/serve_cb.sh
+  start`). Per-token decode at **19.5 tok/s single-seq traced**;
+  19.5 → projected ~55-65 tok/s aggregate at B=4 traced.
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
