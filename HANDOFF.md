@@ -78,19 +78,46 @@ task #176).
   through what's happening on stage). Gemma PC is parked — use cold
   first-prompt only.
 
-**Gemma 4 PC: validator fixed, live still misses (parked)**:
-- Validator-level: 3/3 PASS on both Qwen 27B and Gemma 4 12B IT after
-  commit `184753d` (`fix(pc): dynamic active-prompt suffix strip`).
-- Live HTTP: pc_hits=0, pc_misses=3 across 3 turns. Remaining gap is in
-  `cb_scheduler._finish` — when the model hits `max_tokens` instead of
-  emitting a natural EOS, the canonical EOS is selected via
-  `next(iter(self.eos_ids))` (frozenset hash order, non-deterministic).
-  For Gemma {1, 50, 106} this may pick id 1 (`<eos>`) instead of id 106
-  (`<turn|>`), which is what the chat template puts at past-asst
-  boundaries. Fix is to add a `chat_end_id` attribute to the scheduler
-  that's set explicitly from the tokenizer at bootstrap. Two-line edit,
-  but needs scheduler + server restart cycle. Deprioritised for the
-  Qwen-led demo.
+**Gemma 4 PC: validator GREEN, live still misses (~80% done, parked)**:
+
+Trail so far (2026-06-04):
+- Step 1 ✅ Generic active-prompt suffix detector (commit `184753d`,
+  `experiments/serve/openai_endpoint.py:_active_prompt_suffix`).
+  Renders the same probe message twice (`add_generation_prompt=True`
+  vs `=False`); the divergent tail is the active-only suffix to strip.
+  Covers Qwen's `<think>\\n\\n</think>\\n\\n` (5 tokens), Gemma's
+  `<|channel>thought\\n<channel|>` (4 tokens), and any future template
+  with the same asymmetry. Memoised by `id(tokenizer)`.
+- Step 2 ✅ Validator unification (`experiments/cb/validate/pc_token_match.py`):
+  imports `_messages_to_prompt` directly so the gate tests the SAME
+  code path the live server uses. No more drift between validator and
+  prod logic.
+- Step 3 ✅ Validator EOS auto-detection: walks the trailing tokens of
+  `[user, asst]` rendered with `add_generation_prompt=False` to find the
+  chat-end marker. Discovers Gemma's `<turn|>` (id 106) without a
+  hard-coded name list; works for any tokenizer.
+- Step 4 ✅ Validator result: **3/3 PASS** for both `google/gemma-4-12B-it`
+  and `Qwen/Qwen3.6-27B`.
+
+What's left (the ~20%, shovel-ready):
+- Step 5 ❌ Live HTTP shows pc_hits=0 / pc_misses=3 / evictions=3.
+  Root cause: when the model hits `max_tokens` instead of emitting a
+  natural EOS, `cb_scheduler._finish` falls back to
+  `next(iter(self.eos_ids))` for the canonical EOS. `self.eos_ids` is
+  a `frozenset` — Python's hash-order iteration may land on id 1
+  (`<eos>`) for Gemma `{1, 50, 106}`. But the chat template inserts
+  id 106 (`<turn|>`) at past-asst boundaries, so the cached
+  `prompt + canonical` is one byte off from the next turn's prompt.
+- Fix design: add a `chat_end_id` scheduler attribute set at bootstrap
+  via the same trailing-token-of-passive-render trick the validator
+  uses (so it works for any future backend). Replace the
+  `next(iter(eos_ids))` fallback in `_finish` AND `cancel(mark_live=True)`
+  with `self.chat_end_id`. Two ~5-line edits, plus a deploy +
+  server restart cycle (~6 min for 27B, ~2 min for Gemma 4) to verify
+  live. Deprioritised because the demo plan uses Qwen-hot for the
+  PC story (Qwen has worked since the 8aeeb53 canonicalise fix on
+  2026-06-04 — it picks 151645 as `next(iter({151645}))` from a
+  1-element set, which happens to match its chat-end token).
 
 **To run TUI** (once server is back):
 ```
