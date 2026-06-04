@@ -250,8 +250,28 @@ projection sub-steps.
 | v0.1.2 | attention at pos 0 (sliding) + v_norm + o_proj | cos ≥ 0.999 on `mixer_out` | **DONE 2026-06-03** — cos 0.999990 mad 0.0625; found Gemma 4 has v_norm RMSNorm(with_scale=False) NOT in 27B/35B, memory `[[gemma4-v-norm]]`. Numpy reproducer `experiments/cb/isolate/gm4_v012_oproj_sanity.py` isolated the math-model bug from any TT impl issue. |
 | v0.1.3 | post_attention_layernorm + residual_1 + MLP + post_ff_norm + residual_2 | cos ≥ 0.999 on all 4 remaining sub-steps + L0 output | **DONE 2026-06-03 commit `7f9f396`** — 13/13 PASS at cos ≥ 0.999958; L0 output cos 0.999975 vs HF hidden_states[1, 0, :]. Two-op GELU works per Step 0.2; both Gemma post-norms correct. |
 | v0.2 | all 48 layers (sliding + global dispatch) + final_norm + lm_head + softcap | greedy top-1 matches HF at pos 0 (= 258882 `<image|>`) | **DONE 2026-06-03** — TT argmax=258882 = HF argmax=258882 PASS. final_norm cos=0.999563, logits cos=0.999137. Two more Gemma 4 novelties surfaced and fixed: per-layer `layer_scalar` ([[gemma4-layer-scalar]]) + the diagnostic discipline lesson ([[cos-not-enough-also-check-mad]]). L=47 cos shows an anomaly (0.237) but downstream PASS — likely measurement-timing; flag for v0.3 follow-up if it recurs. |
-| v0.3 | KV cache + paged SDPA with `sliding_window_size=1024` | 8-tok generation matches HF token-for-token | |
+| v0.3 | KV cache + paged SDPA with `sliding_window_size=1024` | 8-tok generation matches HF token-for-token | IN FLIGHT — bootstrap scaffolding added (cur_pos_buf, rot_idxs_buf, page_table_tt). See sub-staging below. |
 | v0.4 | Trace capture | 100-step traced == eager | |
+
+### v0.3 sub-staging (extends §4)
+
+| Sub-stage | Adds | Gate |
+|---|---|---|
+| v0.3.0 | KV cache allocator (sliding + global), SDPA program configs + memory configs, ones-table per head_dim, full Q/K/V projection + q_norm + k_norm + v_norm in the forward, RoPE table precompute, RoPE application (identity at pos 0). `paged_update_cache` + `paged_scaled_dot_product_attention_decode` with `sliding_window_size=1024` on sliding, no kwarg on global. | cos ≥ 0.999 on mixer_out + final_norm + argmax matches HF at pos 0 (= v0.2 result, but via the paged path) |
+| v0.3.1 | Multi-step decode loop: pre-allocated `tok_buf` written out-of-trace; update_input_buffers advances tok+cur_pos+rot_idxs per step. Maintain KV cache across steps. RoPE at pos > 0 (non-trivial). | TT tokens 0..7 match HF teacher-forced argmax_per_position[0..7] |
+| v0.3.2 | (optional) Free-run greedy from pos 5 — use TT's own previous token as input. | TT generates same trajectory as HF greedy for ≥ 16 tokens |
+
+### v0.3 design notes (file:line references)
+
+- **Fork base**: `experiments/serve/server_35b_ttnn.py:842-917` (paged SDPA path) + `:1455-1483` (KV cache allocator) + `:1860-1886` (program config setup).
+- **Two head_dim variants**: separate `paged_sdpa_progcfg_sliding` (head_dim=256, CoreCoord(4,4)) and `paged_sdpa_progcfg_global` (head_dim=512). Same for `paged_write_mem_cfg_{sliding,global}`.
+- **KV cache shapes** (per-chip):
+  - Sliding: `[num_blocks, NKV_PER_CHIP_SLIDING=2, BLOCK_SIZE=32, HEAD_DIM_SLIDING=256]` per layer (sharded across mesh dim=1 like 35B).
+  - Global: `[num_blocks, NUM_KV_HEADS_GLOBAL=1, BLOCK_SIZE=32, HEAD_DIM_GLOBAL=512]` replicated across chips (NKV=1 can't be sharded across 4 chips — plan §6.8 open question; replicated wastes 4× but is simplest).
+- **RoPE table setup**: TWO tables — sliding uses `rope_theta=10000.0, rotary_dim=256` (full head_dim); global uses `rope_theta=1e6, rotary_dim=128` (partial_rotary_factor=0.25 of 512). At pos 0: cos=1, sin=0; identity. Memory for tables: 4096×256×2 + 4096×128×2 ≈ 3 MB per chip; trivial.
+- **`sliding_window_size=1024`**: confirmed kwarg in qb1's ttnn build (Step 0.1, commit `4395b28`).
+- **`cur_pos=-1` skip-compute**: documented in the SDPA op help (Step 0.1 bonus finding). Could be used by Gemma 4 #165 v1 multi-slot CB to fix the 35B-style #162 empty-slot poison.
+- **B3 compute config**: HiFi2 + fp32_dest_acc=False (matches 35B; HiFi4 has a Blackhole bug at high positions per `[[fp32-sdpa-cliff-probe]]`).
 
 ### Bootstrap & runtime (verified)
 

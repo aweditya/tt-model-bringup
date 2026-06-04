@@ -319,6 +319,38 @@ def bootstrap(state, log=None):
     state.lm_head_tt = np_to_replicated(embed_w_np.T, state.mesh)
     log(f"  lm_head (tied, replicated): {embed_w_np.T.shape}")
 
+    # v0.3: KV cache + paged SDPA infrastructure (forked from 35B
+    # `server_35b_ttnn.py:1700-1820` setup). Two head_dim variants —
+    # sliding (256) and global (512); allocate caches and pos buffers
+    # for each per layer.
+    state.MAX_KV = MAX_KV
+    state.sdpa_block_size = 32  # tile-height; matches 35B
+    # cur_pos_buf: int32 [1] device-resident, written before each step
+    # via update_input_buffers (v0.3.1+). For v0.3.0 we hard-set pos=0.
+    state.cur_pos_buf = ttnn.from_torch(
+        torch.zeros((1,), dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # rot_idxs_buf: int32 [1] for RoPE cos/sin table indexing per step.
+    state.rot_idxs_buf = ttnn.from_torch(
+        torch.zeros((1,), dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # page_table: identity mapping [1 slot, N blocks]; one block per
+    # 32-token chunk up to MAX_KV. Replicated across chips.
+    num_blocks = MAX_KV // state.sdpa_block_size
+    page_table_np = np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks)
+    state.page_table_tt = ttnn.from_torch(
+        torch.from_numpy(page_table_np),
+        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    state.num_blocks = num_blocks
+    log(f"  paged SDPA: MAX_KV={MAX_KV}, block_size={state.sdpa_block_size}, "
+        f"num_blocks={num_blocks}")
+
     log(f"[bootstrap] uploading {NUM_LAYERS} layer weights to mesh…")
     t0 = time.time()
     state.per_layer_tt = []

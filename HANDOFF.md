@@ -66,9 +66,15 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
   multiplied at end of each decoder layer, AND the cosine-is-not-enough
   diagnostic discipline ([[cos-not-enough-also-check-mad]]) — direction
   passed at L0 but magnitude was 18× off, propagating to L1 collapse.
-- **v0.3 NEXT** — KV cache + paged SDPA with `sliding_window_size=1024`
-  kwarg (verified available in Step 0.1). Gate: 8-tok generation matches
-  HF token-for-token.
+- **v0.3 IN FLIGHT** — bootstrap scaffolding committed (cur_pos_buf,
+  rot_idxs_buf, page_table_tt). Plan §"v0.3 sub-staging" has detailed
+  design notes with 35B `file:line` references and TWO head_dim
+  variants (sliding=256 / global=512) breakdown.
+  - v0.3.0: full Q/K/V + q_norm/k_norm/v_norm + RoPE + paged SDPA at
+    pos 0. Gate: matches v0.2 result via paged path.
+  - v0.3.1: multi-step decode + KV cache across steps + non-trivial
+    RoPE. Gate: 8-tok teacher-forced matches HF.
+  - v0.3.2 (optional): free-run greedy ≥ 16 tokens.
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
