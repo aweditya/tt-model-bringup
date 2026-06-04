@@ -63,11 +63,17 @@ def _messages_to_prompt(tokenizer, messages: list[dict],
               enable_thinking=False, preserve_thinking=True)
     if tools:
         kw["tools"] = tools
-    ids = list(tokenizer.apply_chat_template(messages, **kw))
+    raw = tokenizer.apply_chat_template(messages, **kw)
+    # HF tokenizers are inconsistent: some return a bare list[int] (Qwen2/
+    # PreTrainedTokenizerFast in default mode), some return a dict-like
+    # BatchEncoding with 'input_ids' (Gemma's GemmaTokenizer often does).
+    # Normalise.
+    if isinstance(raw, dict) or hasattr(raw, "input_ids"):
+        ids = list(raw["input_ids"])
+    else:
+        ids = list(raw)
     # Strip the Qwen3.6 trailing `<think>\n\n</think>\n\n` (active-prompt
-    # suffix). Tokenise the suffix once; if the last len(suffix) tokens
-    # match, drop them. No-op for tokenizers that don't emit the suffix
-    # (Gemma 4, base models).
+    # suffix). No-op for tokenizers that don't emit the suffix.
     suffix_ids = tokenizer.encode(_THINK_SUFFIX, add_special_tokens=False)
     if suffix_ids and len(ids) >= len(suffix_ids) \
             and ids[-len(suffix_ids):] == list(suffix_ids):
