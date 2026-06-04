@@ -105,7 +105,10 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
     scale=1.0. None of those earlier fixes moved the 3/6 number, but
     each closed a real Tenstorrent anti-pattern that would have masked
     the real bug, so they ship.
-  - v0.3.2 (optional): free-run greedy ≥ 16 tokens.
+  - **v0.3.2 DONE 2026-06-03 commit `acb20a6`** — 16-token free-run
+    coherent: "The capital of France is a city of art, culture, and
+    history." End-to-end forward composition validated. Probe:
+    `gm4_v032_freerun.py`.
 
   **~4-5 days of focused work remaining** to ship `TT_BACKEND=gemma4_12b
   serve_cb.sh start` chat working end-to-end:
