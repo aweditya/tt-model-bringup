@@ -1,0 +1,401 @@
+% Gemini theme - Stanford color scheme
+\documentclass[final]{beamer}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[size=custom,width=120,height=72,scale=1.0]{beamerposter}
+\usetheme{gemini}
+\usecolortheme{stanford}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepackage{subcaption}
+\usepackage{amsmath}
+\pgfplotsset{compat=1.17}
+
+\newlength{\sepwidth}
+\newlength{\colwidth}
+\setlength{\sepwidth}{0.022\paperwidth}
+\setlength{\colwidth}{0.304\paperwidth}
+
+\newcommand{\separatorcolumn}{\begin{column}{\sepwidth}\end{column}}
+
+\title{Tenstorrent LLM Bringup: Workflow, Correctness, and Performance}
+\author{Aditya Sriram}
+\institute[Stanford]{Department of Computer Science, Stanford University \quad
+  \texttt{adisram@stanford.edu}}
+
+\footercontent{CS440LX: Project \hfill Stanford University, 2026}
+
+\begin{document}
+
+\addtobeamertemplate{headline}{}{
+  \begin{tikzpicture}[remember picture,overlay]
+    \node [anchor=north east, inner sep=3cm]
+      at ([xshift=0.0cm,yshift=2.5cm]current page.north east)
+      {\includegraphics[height=7.0cm]{stanford_logos/Block_S_2_color.png}};
+  \end{tikzpicture}
+}
+
+\begin{frame}[t]
+\begin{columns}[t]
+\separatorcolumn
+
+% =====================================================================
+% COLUMN 1 --- Context + Workflow
+% =====================================================================
+\begin{column}{\colwidth}
+
+  % ------------------- Introduction -------------------
+  \begin{block}{Introduction}
+    Tenstorrent's \textbf{Blackhole P150} is a new ML accelerator
+    (32~GB GDDR6, 110 Tensix cores, 1.39~MiB L1/core, 404~GB/s measured
+    DRAM streaming). We brought up three modern LLMs on a $1{\times}4$
+    P150 mesh:
+    \begin{itemize}
+      \item \textbf{Qwen3.6-27B} --- dense GQA, 4-way tensor-parallel.
+      \item \textbf{Qwen3.6-35B-A3B} --- MoE with Gated DeltaNet
+            recurrence ($\sim$3~GB active params per token).
+      \item \textbf{Gemma 4 12B} --- hybrid sliding/global attention,
+            dual head\_dim (256/512), $v\_norm$ + per-layer scalar.
+    \end{itemize}
+    The first bringup (27B) took weeks; the third (Gemma 4 12B) walked
+    from HF spec to HTTP chat in \textbf{36 hours}. The speedup is
+    methodological --- a forking recipe on stable scaffolding, not
+    cleverer kernels.
+  \end{block}
+
+  % ------------------- The Bringup Workflow -------------------
+  \begin{block}{The Bringup Workflow}
+    Every model walks the same staging ladder. Each rung gates on
+    cosine vs.\ an HF oracle, not on ``it produces text''.
+
+    \begin{center}\small
+    \begin{tabular}{l l l}
+      \toprule
+      \textbf{Stage} & \textbf{Adds} & \textbf{Gate} \\
+      \midrule
+      v0.0 & HF CPU oracle (fp32, per-sub-op hooks)        & dump exists \\
+      v0.1 & L0 only on $(1,4)$ mesh                      & $\cos \ge 0.999$ \\
+      v0.2 & all $N$ layers + lm\_head                     & argmax @ pos 0 \\
+      v0.3 & paged KV + multi-step decode                  & argmax 0..7 \\
+      v0.3.3 & long context, needle haystack               & top1 $\ge 90\%$ \\
+      v0.4 & trace capture (two-phase warmup)              & 100/100 traced == eager \\
+      v1   & continuous batching $B{=}4$                   & 3a/3b/3c gates \\
+      v2   & HTTP wire-up                                  & \verb|curl /chat| works \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+
+    \textbf{HF oracle, not a sibling TT path.} Per-sub-op forward hooks
+    dump \verb|.npy|; every TT change is gated against ground truth.
+    Comparing TT-against-TT conflates ``bug'' with ``different and
+    better.''
+
+    \textbf{Dev harness amortizes the bootstrap.} A long-lived
+    tmux'd Python process holds the model resident
+    ($\sim$80~s for Gemma~4, $\sim$14~min for 35B); file-trigger probes
+    \verb|importlib.reload| per fire. Iteration drops from one full
+    bootstrap to $\sim$30~s.
+
+    \textbf{REUSE mandate.} Every new file cites the prior file it
+    forks in its commit message. After three bringups, $\sim$80--90\%
+    of each new model's CB module, dev harness, probes, and oracle is
+    copied. Bug catalog is finite ($\sim$12 footguns); fixes are
+    recognized in seconds.
+
+    \textbf{Two-phase trace warmup.} Compile all paths first
+    (\verb|enable_trace=False|), synchronize, then capture all traces
+    back-to-back. Otherwise decode JIT between captures corrupts
+    prefill trace memory $\to$ 99\% CPU hang
+    (tenstorrent/vllm\#352).
+  \end{block}
+
+  % ------------------- Validation Hierarchy -------------------
+  \begin{block}{Validation Hierarchy}
+    Six of seven silent-failure classes pass at decode pos 0. The only
+    gate that catches all of them is the
+    \textbf{teacher-forced multi-step cosine + MAD ladder} against an
+    HF oracle.
+
+    \begin{itemize}
+      \item \textbf{Teacher-forced cosine ladder} --- per-position
+            per-layer cos + MAD. Caught Gemma 4's
+            $\texttt{SDPA scale}{=}1.0$ (invisible at pos 0; cos drops
+            $0.99998 \to 0.66$ at pos 1) and Qwen3.6's
+            $y = x/\mathrm{rms}(x) \cdot (1+\gamma)$ zero-centered
+            RMSNorm (a two-character fix lifted top-1
+            $82/97 \to 95/97$, median cos $0.95 \to 0.997$).
+      \item \textbf{Needle haystack} --- random 8-char password at
+            controlled depth. Passed Gemma 4 at $L{=}100/256/512$
+            (3/3 verbatim retrieval).
+      \item \textbf{Free-run with EOS} --- last gate. bf16 chain noise
+            at 40 layers can flip argmax even when every primitive is
+            bit-identical; gate on per-slot independence and
+            determinism, not exact tokens.
+      \item \textbf{MAD, not just cosine.} $\cos(a, k{\cdot}a) = 1$
+            for any $k$; missing Gemma 4's $\texttt{layer\_scalar}$
+            passed at $\cos{=}0.999975$ with MAD $3.64{\times}10^{2}$.
+            Always print \verb|cos=X.XXXX mad=Y.YYYY|.
+    \end{itemize}
+  \end{block}
+
+\end{column}
+
+\separatorcolumn
+
+% =====================================================================
+% COLUMN 2 --- Correctness + Performance
+% =====================================================================
+\begin{column}{\colwidth}
+
+  % ------------------- Correctness Stack -------------------
+  \begin{block}{Correctness Stack}
+    Three orthogonal gates, run per model on every change.
+
+    \begin{center}\small
+    \begin{tabular}{l c c c}
+      \toprule
+      \textbf{Gate} & \textbf{Qwen3.6-27B} & \textbf{35B-A3B} & \textbf{Gemma 4 12B} \\
+      \midrule
+      Cos ladder (pos $\le 7$)       & PASS  & 7/8 PASS (cos$_{L32}{\ge}0.987$) & PASS \\
+      Argmax match @ pos 0           & PASS  & PASS               & PASS \\
+      Multi-step token-for-token     & PASS  & 5/6 (pos 4 = bf16 tie) & PASS \\
+      Needle haystack                & $L{=}500$ PASS & $\sim$50\% per trial (bf16) & 3/3 ($L{\le}512$) \\
+      Multi-turn KV retention        & PASS  & 3/3 PASS           & PASS \\
+      Traced == Eager (100 toks)     & PASS  & PASS               & 100/100 PASS \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+
+    The 35B free-run needle is \emph{coherent failure, never gibberish}
+    --- a fundamental bf16 non-determinism floor, not a bug.
+  \end{block}
+
+  % ------------------- Performance Optimizations -------------------
+  \begin{block}{Performance Optimizations}
+    \textbf{Rule of thumb:} kernel-time wins translate $1{:}1$ in
+    trace; dispatch-only fusions land at $\sim$5--10\% of their
+    isolated eager gain. Predict trace ROI by asking ``kernel work or
+    dispatch?''
+
+    \begin{center}\footnotesize
+    \begin{tabular}{l l r l}
+      \toprule
+      \textbf{Optimization} & \textbf{Model} & \textbf{$\Delta$ tok/s} & \textbf{Why} \\
+      \midrule
+      Paged SDPA + B3 (HiFi2)        & 27B TP   & \textbf{+62\%}       & kernel: O(MAX\_POS) $\to$ O(1) \\
+      Vocab-sharded lm\_head         & Gemma 4  & \textbf{+8\%}        & 248k/262k vocab shards $4{\times}$ \\
+      Vocab-sharded lm\_head         & 27B TP   & +5.1\%               & on-device argmax: 600KB $\to$ 8B \\
+      A004 \verb|core_grid=10x11|    & 35B-A3B  & $-30$ ms/tok         & ttnn auto-grid used 11/110 cores \\
+      A008 bf8 MoE expert weights    & 35B-A3B  & $-29$ ms/tok         & halves DRAM streaming \\
+      Owned fused decay/gate kernel  & 27B TP   & +2.5\%               & 10 ops $\to$ 1 (custom kernel) \\
+      \verb|num_links=2| all\_reduce & 27B TP   & +1.65\%              & 2 links/axis on P150x4 \\
+      A002 fused Q/K L2-norm         & 35B-A3B  & $-1.13$ ms/tok       & dispatch fusion only \\
+      \midrule
+      DRAM-sharded MLP               & 27B      & \textbf{$2.1\times$ slower} & Galaxy-70B recipe; wrong scale \\
+      Async \verb|all_reduce_async|  & 27B TP   & $+4\%$ overhead      & no parallel CCL to overlap \\
+      fp32 KV cache                  & 27B      & dead end             & paged SDPA rejects fp32 \\
+      bf8 KV cache                   & 27B      & neutral              & not memory-bound at $\le$8k \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+
+    The 35B perf session stacked A002+A003+A004+A008 to take
+    \textbf{141.79 $\to$ 81.16 ms/tok} (1.75$\times$) in one day. The
+    big lever is always kernel-time fusion or smarter weight
+    streaming; trace already amortizes dispatch.
+  \end{block}
+
+  % ------------------- Throughput Table -------------------
+  \begin{block}{Throughput \& Roofline}
+    Decode at $B{=}1$ is weight-bandwidth-bound: ceiling
+    $\approx \tfrac{\text{active GB/chip}}{404\,\text{GB/s}}$.
+
+    \begin{center}\small
+    \begin{tabular}{l r r r r}
+      \toprule
+      \textbf{Model} & \textbf{Eager ms/tok} & \textbf{Traced ms/tok} & \textbf{tok/s} & \textbf{\% of ceiling} \\
+      \midrule
+      Qwen3.6-27B (TP)    & $\sim$253 & \textbf{77.0}  & \textbf{12.93} & $12.93/60 = $ \textbf{22\%} \\
+      Qwen3.6-35B-A3B     & 480       & \textbf{81.16} & \textbf{12.32} & $12.32/270 = $ \textbf{4.6\%} \\
+      Gemma 4 12B         & 182.7     & \textbf{47.5}  & \textbf{21.05} & $21.05/67.3 = $ \textbf{31\%} \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+
+    \textbf{Continuous batching --- the largest single lever.}
+    Matmul weight reads amortize across $B$. Measured
+    $\text{step\_ms} \approx 73 + 4.3{\cdot}B$ on 27B.
+
+    \begin{center}\small
+    \begin{tabular}{r r r r}
+      \toprule
+      $B$ & \textbf{27B agg tok/s} & \textbf{vs $B{=}1$} & \textbf{Gemma 4 IT HTTP agg} \\
+      \midrule
+      1   & 12.96             & $1.00\times$       & \textbf{3.39} \\
+      2   & ---               & ---                & \textbf{6.64} ($1.96\times$) \\
+      4   & ---               & ---                & \textbf{13.14} ($3.88\times$) \\
+      8   & 75                & $5.8\times$        & --- \\
+      32  & \textbf{150.5}    & $11.6\times$       & --- \\
+      64  & 183.5             & $14.2\times$       & --- \\
+      64* & \textbf{593.1}    & $\mathbf{45.8\times}$ & * shift-acc conv1d \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+
+    Per-client tok/s stays flat under load; CB carries the scaling.
+    Naive 27B asymptote $\sim 232$ tok/s; with shift-acc conv1d the
+    per-slot vector slope drops $3.6 \to 0.71$ ms/seq.
+  \end{block}
+
+\end{column}
+
+\separatorcolumn
+
+% =====================================================================
+% COLUMN 3 --- Challenges + Lessons + Future
+% =====================================================================
+\begin{column}{\colwidth}
+
+  % ------------------- Challenges -------------------
+  \begin{block}{Challenges}
+    Six representative bug classes; each paid for in chip-hours and
+    now load-bearing in \verb|research/model_bringup_recipe.md|.
+
+    \begin{itemize}
+      \item \textbf{ttnn view-decay.} \verb|ttnn.slice| and
+            \verb|ttnn.reshape| return \emph{views}; deallocating the
+            source while a view is live silently corrupts reads.
+            Masked at pos 0 because $\mathrm{softmax}(1\text{ score})=1$
+            so attn\_out $=$ V. \emph{Resolution:} never add
+            \verb|deallocate| calls the upstream pattern didn't have.
+      \item \textbf{Model-family semantic surprises.} Gemma 4's SDPA
+            uses $\texttt{scale}{=}1.0$ (not $1/\sqrt{d_k}$);
+            Qwen3.6 RMSNorm is $(1+\gamma)$ zero-centered; Gemma 4
+            attention has \emph{three} per-head norms ($q$, $k$,
+            $v\_norm$ with \verb|with_scale=False|) plus a per-layer
+            \verb|layer_scalar|. All invisible at pos 0.
+            \emph{Resolution:} multi-step teacher-forced + read the
+            HF source.
+      \item \textbf{bf16 chain non-determinism at $B{>}1$.} Every
+            primitive bit-identical $B{=}1$ vs.\ $B{=}2$ slot 0;
+            40-layer chain compounds $\sim$1 ULP into argmax flips.
+            \emph{Resolution:} gate on per-slot independence and
+            determinism, not exact tokens.
+      \item \textbf{Silent perf regression --- caught by audit.} The
+            code-cleanup pass found \verb|cb_api.py| was overriding
+            \verb|st.deltanet_recurrence_mode = "manual"| \emph{after}
+            bootstrap, silently disabling the owned\_gdn fast path
+            for every 27B HTTP request (commit \verb|017665e|).
+            \emph{Resolution:} subagent audit \emph{before} every
+            perf measurement.
+      \item \textbf{Dev-harness PASS $\ne$ HTTP PASS.} cb35\_prod\_topk
+            shipped 4/4 PASS; first \verb|/v1/chat/completions| crashed
+            with \verb|TypeError: only length-1 arrays...| because
+            cb\_scheduler wraps the per-slot call differently.
+            \emph{Resolution:} \verb|curl| smoke + \verb|/v1/models|
+            on every backend swap.
+      \item \textbf{The chip changes results overnight.} The 35B
+            drift cliff (cos$_{L32}$ pos 5 = 0.32) was reproducible
+            for days, then disappeared with no code change ---
+            7/8 PASS on rerun. Chip-state / firmware drift. P150
+            firmware v19.5.0 had also silently disabled 20 cores
+            ($140 \to 120$). \emph{Resolution:} bake regression runs
+            after every ttnn/firmware bump.
+    \end{itemize}
+  \end{block}
+
+  % ------------------- Tenstorrent vs DIY Split -------------------
+  \begin{block}{What We Forked vs What We Built}
+    Most attention/CCL ops are direct \verb|ttnn.*| calls; the
+    custom kernels are few but correctness-gating.
+
+    \begin{center}\small
+    \begin{tabular}{l r l}
+      \toprule
+      \textbf{Surface} & \textbf{Calls} & \textbf{Origin} \\
+      \midrule
+      \verb|ttnn.*| (SDPA, CCL, RMSNorm, matmul) & $\sim$1,570 & forked from tt-metal \\
+      \verb|ttnn.experimental.qwen36_*| (ours)   & 7           & custom owned ops \\
+      \verb|owned_ops/| C++/HPP                  & 8,116 LOC   & ours (Gated DeltaNet) \\
+      \verb|serve/server_*.py|                   & 16,206 LOC  & model wiring + HTTP \\
+      \verb|cb/| (scheduler + probes + harness)  & 11,383 LOC  & ours (CB + dev infra) \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+
+    \textbf{$\sim$225:1 kernel-count ratio TT:ours, but the few
+    originals --- $\texttt{owned\_gdn}$, owned decay/gate fusion, the CB
+    scheduler, the dev harness, the HF oracle --- were what gated
+    correctness for each new model.} Tenstorrent's openness (all of
+    tt-metal + Llama-70B-Galaxy + DeepSeek-V3 + Gemma 4 demos) is the
+    only reason a one-person Stanford project could bring up three LLM
+    families in a quarter.
+  \end{block}
+
+  % ------------------- Future Work / Cleanup -------------------
+  \begin{block}{Future Work}
+    Identified by the code-cleanup audit
+    (\verb|research/code_cleanup_plan_2026-06-04.md|, 18 items, 6 High).
+
+    \begin{itemize}
+      \item \textbf{Gemma 4 P2 distributed RMSNorm} --- projected
+            $+12$--$15$ ms/tok ($21$ tok/s $\to \sim$28 tok/s).
+      \item \textbf{Gemma 4 P3 paged SDPA on global layers} ---
+            $+20$--$40\%$ on attention; closes the $31\% \to 60\%$ gap
+            to roofline.
+      \item \textbf{Prefix-cache matcher} --- chat-template multi-turn
+            currently misses (byte-exact prefix required); fix lifts
+            turn-2+ TTFT from $\sim$5.3~s to $\sim$2.7~s
+            ($1.97\times$ already validated on raw prompts).
+      \item \textbf{35B $B{>}1$ empty-slot poisoning} (\#162) ---
+            unlocks 35B CB beyond \verb|TT_CB_SLOTS=1|.
+      \item \textbf{35B determinism} --- tie-breaking argmax + fp32
+            \verb|lm_head|, brings free-run needle from
+            $\sim$50\% per-trial to deterministic retrieval.
+      \item \textbf{Delete dead manual DN path} --- $\sim$1.5K LOC;
+            the manual recurrence is structurally broken
+            (cos $0.08$ at pos 0) and shadows the owned\_gdn fast path.
+    \end{itemize}
+  \end{block}
+
+  % ------------------- Conclusions -------------------
+  \begin{block}{Conclusions}
+    Three model bringups on a new accelerator in one quarter, each
+    faster than the last: 27B took $\sim$3 weeks, 35B-A3B took
+    $\sim$2 weeks, Gemma 4 12B took \textbf{36 hours}. The compounding
+    came from \emph{methodology}, not kernels --- the staging ladder,
+    HF oracle, isolation probes, dev harness, and REUSE mandate are
+    architecture-agnostic and pay off forever. \textbf{bf16 has a
+    fundamental non-determinism floor} at 40-layer depth; correctness
+    gates must account for it. Per-token throughput tracks the
+    $1{\times}4$ P150 BW ceiling ($21$ tok/s = $31\%$ of $67$ tok/s
+    BW floor on Gemma 4); continuous batching delivers the headline
+    aggregate numbers ($150$~tok/s at $B{=}32$, $593$~tok/s at
+    $B{=}64$ with shift-acc conv1d). Most kernels we used came from
+    tt-metal; the kernels we wrote --- owned\_gdn, owned decay/gate,
+    the CB scheduler --- were correctness-gating. An audit subagent
+    catches silent perf regressions a human reviewer misses (the
+    \verb|cb_api.py| owned\_gdn override was live in prod for days
+    before the audit surfaced it).
+  \end{block}
+
+\end{column}
+
+\separatorcolumn
+\end{columns}
+\end{frame}
+
+\end{document}
+
+% =====================================================================
+% MISSING FIGURES (drop into presentation/figures/ before pdflatex):
+%   - figures/cb_scaling_27b.png        : CB B=1..64 aggregate tok/s curve
+%   - figures/staging_ladder.png        : v0.0 -> v2 vertical timeline
+%   - figures/correctness_gate.png      : cos+mad ladder per layer
+%   - figures/p150_roofline.png         : BW floor vs measured per model
+% Also required:
+%   - stanford_logos/Block_S_2_color.png (referenced in headline)
+% =====================================================================
