@@ -75,18 +75,20 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
   0.25). v0.2 probe re-runs with these in place: STILL PASSES.
   Only FORWARD changes remain. Plan §"v0.3 sub-staging" has detailed
   design notes with 35B `file:line` references.
-  - v0.3.0 **ARGMAX PASS 2026-06-03 commit `01c88d6`** — paged
-    SDPA pipeline runs end-to-end; TT argmax=258882 = HF 258882.
-    cos 0.9965 (just below 0.999) due to wrong-GQA workaround
-    (batch-0 slice of [1, 2, NQ, head_dim] kernel output).
+  - v0.3.0 ARGMAX PASS commit `01c88d6` (batch-0 hack)
+  - v0.3.0.1 **FULL PASS** commit `e2ae9f2` (2 SDPA calls per
+    sliding layer, NKV=1 each, proper GQA). final_norm cos 0.999601,
+    logits cos 0.999370, argmax matches HF.
     Memorialized: [[paged-update-cache-nkv-per-chip]],
     [[read-kernel-source-first]], [[use-existing-isolation-probes]].
-  - v0.3.0.1 NEXT: split sliding SDPA into 2 calls per layer with
-    Q halves + 1-KV-head caches each (matches 35B's clean
-    NKV_PER_CHIP=1 contract). Gate: cos ≥ 0.999.
-  - v0.3.1: multi-step decode + non-trivial RoPE. Gate: 8-tok
-    teacher-forced matches HF.
+  - **v0.3.1 IN FLIGHT** — multi-step decode + RoPE at pos > 0.
+    Sub-staging: v0.3.1.0 (RoPE wiring at pos 0 keeps v0.3.0.1 PASS),
+    v0.3.1.1 (multi-step pos > 0), v0.3.1.2 (8-tok teacher-forced).
   - v0.3.2 (optional): free-run greedy ≥ 16 tokens.
+
+  **~5-7 days of focused work** to ship `TT_BACKEND=gemma4_12b
+  serve_cb.sh start` chat working end-to-end. Remaining: v0.3.1 (~1 day)
+  + v0.4 trace (~1 day) + v1 CB (~2-3 days) + v2 HTTP (~1 day).
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
