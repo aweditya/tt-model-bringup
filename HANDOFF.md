@@ -141,10 +141,22 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
     [[ttnn-multi-trace-two-phase-warmup]]. `trace_region_size=400_000_000`
     on the mesh (default 50 MB OOMs the 48-layer decode trace).
     Validator: `gm4_v04_trace_validate.py`.
+  - **v1 CB DONE 2026-06-04 commit `<v1-final>`** — `server_gemma4_unified_cb.py`
+    (forks `server_tp_cb.py`) ships `setup_cb_state`,
+    `update_input_buffers_batched`, batched sliding+global layer
+    forward (2 SDPA per sliding layer with NKV=1 each), batched
+    paged_update_cache + paged SDPA over per-slot KV. **All gates PASS
+    at B=1, B=2, B=4**: 3a B=1 == single-slot bit-identical; 3b
+    identical-slot bit-identical; 3c distinct-slot with no cross-talk;
+    4 slots in B=4 all match their B=1 references. Validators:
+    `gm4_v1_0_alloc_smoke.py`, `gm4_v1_4_3a.py`, `gm4_v1_5_3bc.py`,
+    `gm4_v1_6_b4.py`. B=4 eager forward ~1.0s/step.
 
-  **~3-4 days of focused work remaining** to ship `TT_BACKEND=gemma4_12b
-  serve_cb.sh start` chat working end-to-end:
-  v1 CB (~2-3 days) + v2 HTTP (~1 day).
+  **~1 day of focused work remaining** to ship `TT_BACKEND=gemma4_12b
+  serve_cb.sh start` chat: v2 HTTP wire-up — drop the backend into
+  `cb_api.BACKENDS` + `cb_scheduler._BACKEND_MODULES`, audit
+  cb_api defaults per [[cb-backend-dispatch-holes]], then smoke
+  `/v1/chat/completions` with "Hello".
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
