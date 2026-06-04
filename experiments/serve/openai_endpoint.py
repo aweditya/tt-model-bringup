@@ -73,7 +73,17 @@ def _messages_to_prompt(tokenizer, messages: list[dict],
     else:
         ids = list(raw)
     # Strip the Qwen3.6 trailing `<think>\n\n</think>\n\n` (active-prompt
-    # suffix). No-op for tokenizers that don't emit the suffix.
+    # suffix). This pattern WOULDN'T break Gemma 4 quality: Qwen3.6 ships a
+    # well-defined "no-think" semantics for the active-prompt suffix where
+    # stripping it leaves the model in clean response mode.
+    #
+    # Gemma 4 IT has a SECOND-tier asymmetry: a `<|channel>thought\n<channel|>`
+    # active-prompt suffix (tokens [100, 45518, 107, 101]) emitted only when
+    # `enable_thinking=False`. Stripping it would tell the model "no
+    # suppression marker" and potentially alter response style. We document
+    # that path in research/gemma4_pc_chat_template_asymmetry_2026-06-04.md
+    # and don't auto-strip here. The proper fix is scheduler-side
+    # (strip-from-cache-only, keep full prompt for engine).
     suffix_ids = tokenizer.encode(_THINK_SUFFIX, add_special_tokens=False)
     if suffix_ids and len(ids) >= len(suffix_ids) \
             and ids[-len(suffix_ids):] == list(suffix_ids):
