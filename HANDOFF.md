@@ -5,6 +5,60 @@ Read top to bottom; everything else is linked.
 
 ---
 
+## POST-COMPACTION QUICK-START (2026-06-04 11:55 PT)
+
+**User's current priorities (in order)**:
+1. **Get the chat TUI rock-solid** — this is the live demo. 27B + Gemma 4 12B are the demo models. Hardening already shipped (commits `c523d28`, `c88f6d5`, `f20bb81`, `0e5a8f5`, `ee7cd20`). Test it live as soon as server is back.
+2. **Make sure the server runs perfectly on 27B + 12B**. Existing perf numbers are great (see headline below); just verify nothing broke and screenshots get captured for the poster.
+3. **De-prioritise 35B work**. 35B perf/drift/PC fixes can wait — user explicitly said "we can do performance and drift checking for the 35b model haha" meaning skip it.
+
+**Server state**: STOPPED (qb1 in use by a colleague). Restart with the FINAL fast-path config:
+```
+ssh qb1 'cd ~/tt-xla && rm -f .cache/server_cb.pid && HF_HUB_OFFLINE=1 \
+    TT_BACKEND=27b TT_CB_SLOTS=32 TT_CB_PREFIX_CACHE=1 \
+    bash experiments/serve/scripts/serve_cb.sh start'
+```
+For Gemma 4: `TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it ...`. Do NOT pass `TT_CB_TOPK_K` — the default (0 = logits trace or argmax-tail) is what wins.
+
+**Headline perf (HTTP CB, traced, owned_gdn, argmax-tail trace)**:
+- Gemma 4 12B IT B=32: **316 tok/s aggregate at 32 clients** (8.35 → 316 = 27.7×)
+- Qwen3.6-27B B=32: **232 tok/s aggregate at 32 clients** (8.32 → 232 = 27.9×)
+- Single-client streaming: gm4 TTFT 1.40s decode 17.4 tok/s; 27B TTFT 1.70s decode 11.5 tok/s
+- Multi-turn HTTP with PC on 27B: turn 2 = 5.99s for 172-tok prompt (PC hit, 6.3× speedup)
+- 35B at TT_CB_SLOTS=1: 3.13 tok/s (B>1 blocked by task #162 — won't fix this session)
+
+**TUI is ready** (`scripts/chat.py`, README at `scripts/CHAT_TUI.md`). Key new features:
+- `/paste` multi-line mode (with bracketed paste + burst heuristic fallback)
+- `/yank` copies last assistant reply / code block to system clipboard
+- `/metrics [N]` live Prometheus dashboard for N refresh cycles
+- `/screenshot` saves to `presentation/screenshots/tui_<ts>.png`
+- Expanded shell allow-list (`git`, `grep`, `find`, `python -V/-c`, etc.) with strict deny-list
+- `write_file(path, content, mode)` and line-ranged `read_file(path, start=N, n=M)` tools
+- Graceful HTTP-error recovery + terminal-state reset on exit
+
+**To run TUI** (once server is back):
+```
+python3 scripts/chat.py --url http://qb1:8000 --model 'Qwen/Qwen3.6-27B'
+# or
+python3 scripts/chat.py --url http://qb1:8000 --model 'google/gemma-4-12B' --tools
+```
+
+**Open code-only items (parked pending server)**:
+- Gemma 4 multi-turn PC: 2nd asymmetry root-caused (`<|channel>thought\n<channel|>` suffix); fix designed in `research/gemma4_pc_chat_template_asymmetry_2026-06-04.md`. Strip-from-cache-only requires scheduler plumbing. PARKED.
+- `use_multicore=False` on lm_head argmax (commit `918c025`) — needs server test to confirm perf cost + determinism win.
+- TUI screenshots for poster (task #177) — needs server up to demonstrate.
+
+**Poster**: v3 at `presentation/poster.pdf`. Sky-blue Tenstorrent theme, columns rebalanced, both models' streaming numbers in. Compile with `presentation/compile.sh` (lualatex 2-pass) if you edit `poster.tex`.
+
+**Key reference files** (read first if confused):
+- `presentation/06_live_measurements.md` — single source of truth for all measurements
+- `research/tokenizer_chat_template_reference.md` — universal tokenizer/chat-template gotchas (so we never re-debug this)
+- `research/cb_perf_regression_audit_2026-06-04.md` — explains the 13 → 232 tok/s recovery
+- `scripts/CHAT_TUI.md` — TUI commands + tools
+
+---
+
+## OLD COMPACTION-READY STATUS (kept for reference)
 ## 🔥 COMPACTION-READY STATUS (2026-06-04) — read this first
 
 **The user wants you to keep going through the queue below without
