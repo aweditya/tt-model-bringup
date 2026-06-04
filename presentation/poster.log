@@ -1,4 +1,4 @@
-This is LuaHBTeX, Version 1.21.0 (TeX Live 2025)  (format=lualatex 2025.3.8)  4 JUN 2026 14:01
+This is LuaHBTeX, Version 1.21.0 (TeX Live 2025)  (format=lualatex 2025.3.8)  4 JUN 2026 14:54
  restricted system commands enabled.
 **poster.tex
 (./poster.tex
@@ -1269,31 +1269,168 @@ File: tikzlibraryplotmarks.code.tex 2023-01-15 v3.1.10 (3.1.10)
 ks.code.tex
 File: pgflibraryplotmarks.code.tex 2023-01-15 v3.1.10 (3.1.10)
 )))
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcolorbox.sty
+Package: tcolorbox 2024/10/22 version 6.4.1 text color boxes
+
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tools/verbatim.sty
+Package: verbatim 2024-01-22 v1.5x LaTeX2e package for verbatim enhancements
+\every@verbatim=\toks58
+\verbatim@line=\toks59
+\verbatim@in@stream=\read3
+)
+(/usr/local/texlive/2025/texmf-dist/tex/latex/environ/environ.sty
+Package: environ 2014/05/04 v0.3 A new way to define environments
+
+(/usr/local/texlive/2025/texmf-dist/tex/latex/trimspaces/trimspaces.sty
+Package: trimspaces 2009/09/17 v1.1 Trim spaces around a token list
+))
+\tcb@titlebox=\box84
+\tcb@upperbox=\box85
+\tcb@lowerbox=\box86
+\tcb@phantombox=\box87
+\c@tcbbreakpart=\count392
+\c@tcblayer=\count393
+\c@tcolorbox@number=\count394
+\l__tcobox_tmpa_box=\box88
+\l__tcobox_tmpa_dim=\dimen340
+\tcb@temp=\box89
+\tcb@temp=\box90
+\tcb@temp=\box91
+\tcb@temp=\box92
+
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbraster.code.tex
+Library (tcolorbox): 'tcbraster.code.tex' version '6.4.1'
+\c@tcbrastercolumn=\count395
+\c@tcbrasterrow=\count396
+\c@tcbrasternum=\count397
+\c@tcbraster=\count398
+) (/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbskins.code.tex
+Library (tcolorbox): 'tcbskins.code.tex' version '6.4.1'
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tikzfill/tikzfill.image.sty
+Package: tikzfill.image 2023/08/08 v1.0.1 Image filling library for TikZ
+
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tikzfill/tikzfill-common.sty
+Package: tikzfill-common 2023/08/08 v1.0.1 Auxiliary code for tikzfill
+)
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tikzfill/tikzlibraryfill.image.co
+de.tex
+File: tikzlibraryfill.image.code.tex 2023/08/08 v1.0.1 Image filling library
+\l__tikzfill_img_box=\box93
+))
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbskinsjigsaw.code.tex
+Library (tcolorbox): 'tcbskinsjigsaw.code.tex' version '6.4.1'
+))
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbbreakable.code.tex
+Library (tcolorbox): 'tcbbreakable.code.tex' version '6.4.1'
+(/usr/local/texlive/2025/texmf-dist/tex/latex/pdfcol/pdfcol.sty
+Package: pdfcol 2022-09-21 v1.7 Handle new color stacks for pdfTeX (HO)
+)
+Package pdfcol Info: New color stack `tcb@breakable' = 1 on input line 23.
+\tcb@testbox=\box94
+\tcb@totalupperbox=\box95
+\tcb@totallowerbox=\box96
+
+(/usr/local/texlive/2025/texmf-dist/tex/generic/iftex/ifluatex.sty
+Package: ifluatex 2019/10/25 v1.5 ifluatex legacy package. Use iftex instead.
+))
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbhooks.code.tex
+Library (tcolorbox): 'tcbhooks.code.tex' version '6.4.1'
+) (/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbtheorems.code.tex
+Library (tcolorbox): 'tcbtheorems.code.tex' version '6.4.1'
+) (/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbfitting.code.tex
+Library (tcolorbox): 'tcbfitting.code.tex' version '6.4.1'
+\tcbfitdim=\dimen341
+\tcb@lowerfitdim=\dimen342
+\tcb@upperfitdim=\dimen343
+\tcb@cur@hbadness=\count399
+)
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcblistingsutf8.code.te
+x
+Library (tcolorbox): 'tcblistingsutf8.code.tex' version '6.4.1'
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcblistings.code.tex
+Library (tcolorbox): 'tcblistings.code.tex' version '6.4.1'
+(/usr/local/texlive/2025/texmf-dist/tex/latex/listings/listings.sty
+\lst@mode=\count400
+\lst@gtempboxa=\box97
+\lst@token=\toks60
+\lst@length=\count401
+\lst@currlwidth=\dimen344
+\lst@column=\count402
+\lst@pos=\count403
+\lst@lostspace=\dimen345
+\lst@width=\dimen346
+\lst@newlines=\count404
+\lst@lineno=\count405
+\lst@maxwidth=\dimen347
+
+(/usr/local/texlive/2025/texmf-dist/tex/latex/listings/lstpatch.sty
+File: lstpatch.sty 2024/09/23 1.10c (Carsten Heinz)
+)
+(/usr/local/texlive/2025/texmf-dist/tex/latex/listings/lstmisc.sty
+File: lstmisc.sty 2024/09/23 1.10c (Carsten Heinz)
+\c@lstnumber=\count406
+\lst@skipnumbers=\count407
+\lst@framebox=\box98
+)
+(/usr/local/texlive/2025/texmf-dist/tex/latex/listings/listings.cfg
+File: listings.cfg 2024/09/23 1.10c listings configuration
+))
+Package: listings 2024/09/23 1.10c (Carsten Heinz)
+
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcblistingscore.code.te
+x
+Library (tcolorbox): 'tcblistingscore.code.tex' version '6.4.1'
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbprocessing.code.tex
+Library (tcolorbox): 'tcbprocessing.code.tex' version '6.4.1'
+)
+\c@tcblisting=\count408
+))
+Package tcolorbox Info: Library `listingsutf8' is compatible with pdftex only. 
+Library `listings` is loaded instead. on input line 29.
+)
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbexternal.code.tex
+Library (tcolorbox): 'tcbexternal.code.tex' version '6.4.1'
+) (/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbmagazine.code.tex
+Library (tcolorbox): 'tcbmagazine.code.tex' version '6.4.1'
+) (/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbvignette.code.tex
+Library (tcolorbox): 'tcbvignette.code.tex' version '6.4.1'
+
+(/usr/local/texlive/2025/texmf-dist/tex/generic/pgf/frontendlayer/tikz/librarie
+s/tikzlibraryfadings.code.tex
+File: tikzlibraryfadings.code.tex 2023-01-15 v3.1.10 (3.1.10)
+
+(/usr/local/texlive/2025/texmf-dist/tex/generic/pgf/libraries/pgflibraryfadings
+.code.tex
+File: pgflibraryfadings.code.tex 2023-01-15 v3.1.10 (3.1.10)
+)))
+(/usr/local/texlive/2025/texmf-dist/tex/latex/tcolorbox/tcbposter.code.tex
+Library (tcolorbox): 'tcbposter.code.tex' version '6.4.1'
+))
 \sepwidth=\skip86
 \colwidth=\skip87
  (./poster.aux)
 \openout1 = poster.aux
 
-LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
-LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
-LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
-LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
-LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
-LaTeX Font Info:    Checking defaults for TU/lmr/m/n on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
-LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
-LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
-LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
-LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 33.
-LaTeX Font Info:    ... okay on input line 33.
+LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
+LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
+LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
+LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
+LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
+LaTeX Font Info:    Checking defaults for TU/lmr/m/n on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
+LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
+LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
+LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 92.
+LaTeX Font Info:    ... okay on input line 92.
 
 *geometry* driver: auto-detecting
 *geometry* detected driver: luatex
@@ -1331,17 +1468,17 @@ LaTeX Font Info:    ... okay on input line 33.
 
 (/usr/local/texlive/2025/texmf-dist/tex/context/base/mkii/supp-pdf.mkii
 [Loading MPS to PDF converter (version 2006.09.02).]
-\scratchcounter=\count392
-\scratchdimen=\dimen340
-\scratchbox=\box84
-\nofMPsegments=\count393
-\nofMParguments=\count394
-\everyMPshowfont=\toks58
-\MPscratchCnt=\count395
-\MPscratchDim=\dimen341
-\MPnumerator=\count396
-\makeMPintoPDFobject=\count397
-\everyMPtoPDFconversion=\toks59
+\scratchcounter=\count409
+\scratchdimen=\dimen348
+\scratchbox=\box99
+\nofMPsegments=\count410
+\nofMParguments=\count411
+\everyMPshowfont=\toks61
+\MPscratchCnt=\count412
+\MPscratchDim=\dimen349
+\MPnumerator=\count413
+\makeMPintoPDFobject=\count414
+\everyMPtoPDFconversion=\toks62
 ) (/usr/local/texlive/2025/texmf-dist/tex/latex/epstopdf-pkg/epstopdf-base.sty
 Package: epstopdf-base 2020-01-24 v2.11 Base part for package epstopdf
 Package epstopdf-base Info: Redefining graphics rule for `.eps' on input line 4
@@ -1351,7 +1488,7 @@ Package epstopdf-base Info: Redefining graphics rule for `.eps' on input line 4
 File: epstopdf-sys.cfg 2010/07/13 v1.3 Configuration of (r)epstopdf for TeX Liv
 e
 ))
-Package hyperref Info: Link coloring OFF on input line 33.
+Package hyperref Info: Link coloring OFF on input line 92.
 
 (./poster.out) (./poster.out)
 \@outlinefile=\write5
@@ -1385,84 +1522,85 @@ Dictionary: translator-theorem-dictionary, Language: English
 Package pgfplots notification 'compat/show suggested version=true': you might b
 enefit from \pgfplotsset{compat=1.18} (current compat level: 1.17).
 
+\c@lstlisting=\count415
 (./poster.nav)
-LaTeX Font Info:    Calculating math sizes for size <12.6> on input line 33.
-LaTeX Font Info:    Trying to load font information for OT1+lmr on input line 3
-3.
+LaTeX Font Info:    Calculating math sizes for size <12.6> on input line 92.
+LaTeX Font Info:    Trying to load font information for OT1+lmr on input line 9
+2.
  (/usr/local/texlive/2025/texmf-dist/tex/latex/lm/ot1lmr.fd
 File: ot1lmr.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
-LaTeX Font Info:    Trying to load font information for OML+lmm on input line 3
-3.
+LaTeX Font Info:    Trying to load font information for OML+lmm on input line 9
+2.
 
 (/usr/local/texlive/2025/texmf-dist/tex/latex/lm/omllmm.fd
 File: omllmm.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 LaTeX Font Info:    Trying to load font information for OMS+lmsy on input line 
-33.
+92.
 
 (/usr/local/texlive/2025/texmf-dist/tex/latex/lm/omslmsy.fd
 File: omslmsy.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <12.6> not available
-(Font)              size <12> substituted on input line 33.
+(Font)              size <12> substituted on input line 92.
 
 LaTeX Font Info:    External font `cmex7' loaded for size
-(Font)              <6.3> on input line 33.
-LaTeX Font Info:    Calculating math sizes for size <26.12> on input line 312.
+(Font)              <6.3> on input line 92.
+LaTeX Font Info:    Calculating math sizes for size <26.12> on input line 372.
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <26.12> not available
-(Font)              size <24.88> substituted on input line 312.
+(Font)              size <24.88> substituted on input line 372.
 
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <18.2839> not available
-(Font)              size <17.28> substituted on input line 312.
+(Font)              size <17.28> substituted on input line 372.
 
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <13.06> not available
-(Font)              size <12> substituted on input line 312.
+(Font)              size <12> substituted on input line 372.
 
-LaTeX Font Info:    Calculating math sizes for size <21.78> on input line 312.
+LaTeX Font Info:    Calculating math sizes for size <21.78> on input line 372.
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <21.78> not available
-(Font)              size <20.74> substituted on input line 312.
+(Font)              size <20.74> substituted on input line 372.
 
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <15.24593> not available
-(Font)              size <14.4> substituted on input line 312.
+(Font)              size <14.4> substituted on input line 372.
 
-Package pgfplots info on input line 312: Using 'lua backend=false' for axis: xm
+Package pgfplots info on input line 372: Using 'lua backend=false' for axis: xm
 ode=log unsupported (yet).
-LaTeX Font Info:    Calculating math sizes for size <31.35> on input line 312.
+LaTeX Font Info:    Calculating math sizes for size <31.35> on input line 372.
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <31.35> not available
-(Font)              size <24.88> substituted on input line 312.
+(Font)              size <24.88> substituted on input line 372.
 
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <21.9449> not available
-(Font)              size <20.74> substituted on input line 312.
+(Font)              size <20.74> substituted on input line 372.
 
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <15.675> not available
-(Font)              size <14.4> substituted on input line 312.
+(Font)              size <14.4> substituted on input line 372.
 
-Package pgfplots info on input line 312: Using 'lua backend=false' for axis: x 
+Package pgfplots info on input line 372: Using 'lua backend=false' for axis: x 
 coord trafo unsupported.
-LaTeX Font Info:    Calculating math sizes for size <15.12> on input line 312.
+LaTeX Font Info:    Calculating math sizes for size <15.12> on input line 372.
 
 LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <15.12> not available
-(Font)              size <14.4> substituted on input line 312.
+(Font)              size <14.4> substituted on input line 372.
 
 LaTeX Font Info:    External font `cmex7' loaded for size
-(Font)              <7.56> on input line 312.
+(Font)              <7.56> on input line 372.
 
-Overfull \hbox (18.13245pt too wide) in paragraph at lines 312--312
+Overfull \hbox (18.13245pt too wide) in paragraph at lines 372--372
  [] 
  []
 
 
-Overfull \hbox (20.52675pt too wide) detected at line 312
+Overfull \hbox (20.52675pt too wide) detected at line 372
 [][][] [][][][][][][][][] [][][][][][][][][] [][][][][][][][][] [][][][][][][][
 ][] [][][][][][][][][] [][][][][][][][][] [][][][][][][] 
  []
@@ -1497,17 +1635,17 @@ Package rerunfilecheck Info: File `poster.out' has not changed.
 )
 
 Here is how much of LuaTeX's memory you used:
- 40011 strings out of 475506
- 305224,1648299 words of node,token memory allocated
- 75337 words of node memory still in use:
-   835 hlist, 65 vlist, 99 rule, 213 disc, 92 local_par, 113 math, 2601 glue, 67
-7 kern, 166 penalty, 3261 glyph, 3035 attribute, 82 glue_spec, 3035 attribute_li
-st, 4 write, 1129 pdf_literal, 432 pdf_colorstack nodes
-   avail lists: 2:416,3:3915,4:1467,5:2094,6:285,7:18244,8:13,9:3156,10:17,11:64
-8
- 61855 multiletter control sequences out of 65536+600000
- 145 fonts using 20656679 bytes
- 128i,23n,116p,721b,3082s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 46471 strings out of 475506
+ 305247,1977958 words of node,token memory allocated
+ 83569 words of node memory still in use:
+   1008 hlist, 66 vlist, 112 rule, 206 disc, 93 local_par, 129 math, 2857 glue, 
+669 kern, 163 penalty, 3241 glyph, 3846 attribute, 82 glue_spec, 3846 attribute_
+list, 4 write, 1624 pdf_literal, 476 pdf_colorstack nodes
+   avail lists: 2:416,3:5319,4:1527,5:2070,6:288,7:19000,8:13,9:3609,10:17,11:62
+7
+ 68159 multiletter control sequences out of 65536+600000
+ 146 fonts using 21141967 bytes
+ 128i,23n,116p,721b,3084s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/local/texlive/2025/texmf-dist/fonts/truetype/typoland/lato/Lato-LightItali
 c.ttf>{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-mathit.enc}</usr
 /local/texlive/2025/texmf-dist/fonts/truetype/typoland/lato/Lato-Regular.ttf>{/u
@@ -1519,11 +1657,12 @@ xmf-dist/fonts/opentype/impallari/raleway/Raleway-Regular.otf></usr/local/texliv
 e/2025/texmf-dist/fonts/opentype/impallari/raleway/Raleway-Bold.otf></usr/local/
 texlive/2025/texmf-dist/fonts/type1/public/lm/lmmi12.pfb></usr/local/texlive/202
 5/texmf-dist/fonts/type1/public/lm/lmr17.pfb></usr/local/texlive/2025/texmf-dist
-/fonts/type1/public/lm/lmsy10.pfb>
-Output written on poster.pdf (1 page, 102030 bytes).
+/fonts/type1/public/lm/lmsy10.pfb></usr/local/texlive/2025/texmf-dist/fonts/type
+1/public/amsfonts/symbols/msam10.pfb>
+Output written on poster.pdf (1 page, 115937 bytes).
 
-PDF statistics: 80 PDF objects out of 1000 (max. 8388607)
- 49 compressed objects within 1 object stream
+PDF statistics: 120 PDF objects out of 1000 (max. 8388607)
+ 64 compressed objects within 1 object stream
  3 named destinations out of 1000 (max. 131072)
- 16 words of extra memory for PDF output out of 10000 (max. 100000000)
+ 256 words of extra memory for PDF output out of 10000 (max. 100000000)
 

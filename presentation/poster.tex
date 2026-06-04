@@ -11,10 +11,69 @@
 \usepackage{tikz}
 \usepackage{pgfplots}
 \usepackage{amsmath}
+\usepackage[most]{tcolorbox}
 \pgfplotsset{compat=1.17}
 
 % \code{...}: robust \verb substitute that works inside \justifying.
 \newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+% ---------------------------------------------------------------------
+% Add breathing room under every block title.
+% Override gemini's block-begin template so the body starts ~0.6ex lower.
+% (Original ends in \vskip-2ex; we shave that to \vskip-0.8ex.)
+% ---------------------------------------------------------------------
+\makeatletter
+\setbeamertemplate{block begin}
+{
+  \begin{beamercolorbox}[colsep*=0ex,dp=2ex,center]{block title}
+    \vskip0pt
+    \usebeamerfont{block title}\insertblocktitle
+    \vskip-1.25ex
+    \begin{beamercolorbox}[colsep=0.025ex]{block separator}\end{beamercolorbox}
+  \end{beamercolorbox}
+  {\parskip0pt\par}
+  \usebeamerfont{block body}
+  \vskip-0.5ex
+  \begin{beamercolorbox}[colsep*=0ex]{block body}
+  \justifying
+  \setlength{\parskip}{1ex}
+  \vskip-2ex
+  \vspace{0.6ex}
+}
+\makeatother
+
+% ---------------------------------------------------------------------
+% Coloured callout boxes for headline numbers + key takeaways.
+% Uses palette macros from beamercolorthemetenstorrent.sty.
+% \headline{}{} : big headline box (sky tint, deep-blue rule)
+% \callout{}   : inline tint highlight for a single number/phrase
+% \pass        : green PASS pill for the correctness table
+% ---------------------------------------------------------------------
+\definecolor{ttgreen}{HTML}{2E7D5B}     % muted forest green for PASS pills
+\definecolor{ttgreenbg}{HTML}{D9EBE0}   % pale-green fill
+
+\newtcolorbox{headlinebox}{
+  enhanced, sharp corners, boxrule=0.8pt,
+  colback=ttsky!22, colframe=ttdeepblue,
+  left=2ex, right=2ex, top=1.2ex, bottom=1.2ex,
+  boxsep=0pt,
+}
+
+% Inline tint highlight — fcolorbox-like but plays nicely with bf/text.
+\newcommand{\callout}[1]{%
+  \tikz[baseline=(X.base)]
+    \node[rectangle, fill=ttsky!28, draw=ttdeepblue, line width=0.4pt,
+          inner xsep=4pt, inner ysep=1.5pt, rounded corners=1.5pt]
+    (X) {\textbf{#1}};%
+}
+
+% Green "PASS" pill (very compact — tikz node with tight insets)
+\newcommand{\pass}{%
+  \tikz[baseline=(X.base)]
+    \node[rectangle, fill=ttgreenbg, draw=ttgreen, line width=0.3pt,
+          inner xsep=2.5pt, inner ysep=0pt, rounded corners=1.2pt]
+    (X) {\small\textbf{\textcolor{ttgreen}{\checkmark\ PASS}}};%
+}
 
 \newlength{\sepwidth}
 \newlength{\colwidth}
@@ -99,7 +158,7 @@
     naive port.
     \begin{itemize}\setlength\itemsep{0.7ex}\setlength\parskip{0pt}
       \item \textbf{Paged SDPA, HiFi2 fp16 accumulation} --- kernel-time
-            win; $+62\%$ on 27B TP single-stream.
+            win; \callout{$+62\%$} on 27B TP single-stream.
       \item \textbf{Vocab-sharded lm\_head, on-device argmax} --- a 600
             KB host readback collapses to 8 bytes; $+8\%$ Gemma 4,
             $+5\%$ 27B.
@@ -120,11 +179,12 @@
 
   % ------------------- Headline -------------------
   \begin{block}{Headline}
-    \begin{center}
-      \textbf{Gemma 4 12B: 316 tok/s aggregate at 32 concurrent clients.}\\[0.3ex]
-      \textbf{Qwen3.6-27B: 232 tok/s aggregate at 32 concurrent clients.}\\[0.3ex]
-      28--29$\times$ near-linear scaling from $B{=}1$ via continuous batching.
-    \end{center}
+    \begin{headlinebox}
+      \centering
+      {\color{ttdeepblue}\textbf{Gemma 4 12B: \Large 316 tok/s}} aggregate at 32 clients.\\[0.4ex]
+      {\color{ttdeepblue}\textbf{Qwen3.6-27B: \Large 232 tok/s}} aggregate at 32 clients.\\[0.4ex]
+      \small 28--29$\times$ near-linear scaling from $B{=}1$ via continuous batching.
+    \end{headlinebox}
   \end{block}
 
   % ------------------- Throughput chart -------------------
@@ -191,7 +251,7 @@
       \toprule
       \textbf{Model} & \textbf{ms/tok} & \textbf{tok/s} & \textbf{\% ceiling} \\
       \midrule
-      Gemma 4 12B        & \textbf{47.5} & \textbf{21.0} & 31\% \\
+      Gemma 4 12B        & \textbf{47.5} & \textbf{21.0} & \callout{31\%} \\
       Qwen3.6-27B (TP4)  & \textbf{77.0} & \textbf{12.9} & 22\% \\
       Qwen3.6-35B-A3B    & \textbf{81.2} & \textbf{12.3} & 4.6\% \\
       \bottomrule
@@ -250,59 +310,59 @@
 
     \begin{center}\small
     \setlength{\tabcolsep}{5pt}
-    \renewcommand{\arraystretch}{1.15}
+    \renewcommand{\arraystretch}{1.05}
     \begin{tabular}{l c c c}
       \toprule
       \textbf{Gate} & \textbf{27B} & \textbf{35B-A3B} & \textbf{Gemma 4} \\
       \midrule
-      HF cosine ladder        & PASS      & cos$_{L32}{\ge}0.987$ & PASS \\
-      Multi-turn KV retention & PASS      & 3/3 PASS              & PASS \\
-      Traced $=$ Eager        & PASS      & PASS                  & \textbf{100/100} \\
+      HF cosine ladder        & \pass     & cos$_{L32}{\ge}0.987$ & \pass \\
+      Multi-turn KV retention & \pass     & 3/3 \pass             & \pass \\
+      Traced $=$ Eager        & \pass     & \pass                 & \textbf{100/100} \\
       Needle haystack         & $L{=}500$ & coherent              & 3/3 ($L{\le}512$) \\
       \bottomrule
     \end{tabular}
     \end{center}
 
-    Validation is against a CPU fp32 oracle with per-sub-op hooks.
-    Cosine alone is insufficient ($\cos(a,ka){=}1$); MAD is reported at
-    every probed position.
+    Validated against a CPU fp32 oracle with per-sub-op hooks. Cosine
+    alone is insufficient ($\cos(a,ka){=}1$); MAD is reported at every
+    probed position.
   \end{block}
 
   % ------------------- Continuous Batching -------------------
   \begin{block}{Continuous Batching}
-    Iteration-level Orca-style scheduler: per-step admission and
-    eviction, per-slot paged SDPA over a shared KV pool, slot-level
-    content-keyed prefix cache. Each slot advances at its own position
-    in a single batched forward.
+    Iteration-level Orca-style scheduler: per-step admission/eviction,
+    per-slot paged SDPA over a shared KV pool, slot-level content-keyed
+    prefix cache. Each slot advances at its own position in one batched
+    forward.
   \end{block}
 
   % ------------------- Prefix Cache -------------------
   \begin{block}{Prefix Cache in Practice}
-    Two-turn 27B chat over HTTP:
+    Three-turn 27B chat over HTTP (\code{TT_CB_PREFIX_CACHE=1}):
     \begin{center}\small
-    \setlength{\tabcolsep}{8pt}
-    \renewcommand{\arraystretch}{1.15}
-    \begin{tabular}{l r r}
+    \setlength{\tabcolsep}{5pt}
+    \renewcommand{\arraystretch}{1.05}
+    \begin{tabular}{l r r r l}
       \toprule
-      \textbf{Turn} & \textbf{Prompt} & \textbf{Prefill} \\
+      \textbf{Turn} & \textbf{Prompt} & \textbf{Wall} & \textbf{s/tok} & \textbf{Speedup} \\
       \midrule
-      1 (cold)   & 105 tok & 19.26 s \\
-      2 (PC hit) & 172 tok & \textbf{3.06 s} \\
+      0 (cold)   & 36 tok  & 8.69 s & 0.241 & --- \\
+      1 (PC hit) & 125 tok & 5.84 s & 0.047 & \callout{5.1$\times$} \\
+      2 (PC hit) & 201 tok & 5.92 s & 0.030 & \callout{8.0$\times$} \\
       \bottomrule
     \end{tabular}
     \end{center}
-    Turn 2 is a \textbf{6.3$\times$} prefill speedup despite a longer
-    prompt: the cached KV is reused for the shared prefix and only the
-    suffix is computed.
+    Per-token cost \emph{drops} as the prompt grows. Metric delta:
+    \code{pc_hits +2, pc_misses +1}.
   \end{block}
 
   % ------------------- Conclusion -------------------
   \begin{block}{Conclusion}
     A single $1\times4$ Blackhole P150 mesh, with a disciplined bringup
     recipe, takes a modern LLM from spec to byte-stable HTTP chat at
-    \textbf{316 tok/s} on 12B and \textbf{232 tok/s} on 27B. The open
-    stack lets a small team bring up new architectures (MoE, hybrid
-    attention) without a vendor roadmap.
+    \textbf{316 tok/s} on 12B and \textbf{232 tok/s} on 27B --- letting
+    a small team bring up MoE and hybrid attention without a vendor
+    roadmap.
   \end{block}
 
 \end{column}
