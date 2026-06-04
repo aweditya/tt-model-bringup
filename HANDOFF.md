@@ -29,13 +29,21 @@ asking; they're not stopping for status updates.**
 | 4 | **Gemma 4 perf opt P3** (paged SDPA on global layers) | not started; design in briefing | same |
 
 ### In-flight as of right now (compaction-resilient: re-check these after compaction)
-- **35B per-layer drift probe** — `cb35` tmux harness bootstrapping.
-  Once `[harness] ready. Drop trigger files` appears in
-  `~/tt-xla/.cache/cb35_runtime/harness.log`, run:
+- **35B per-layer drift probe** — `cb35` tmux harness bootstrapping
+  (35B = ~14 min bootstrap; ~20/40 layers @ 7 min when last checked).
+  Check status: `ssh qb1 'tmux capture-pane -t cb35 -p | tail -10'`.
+  Once `[harness] ready. Drop trigger files` appears:
   `ssh qb1 'touch ~/tt-xla/.cache/cb35_runtime/trig/per_layer_drift_pos1'`
-  Watches `~/tt-xla/.cache/cb35_runtime/trig/last.log` for verdict.
-  Output JSON: `~/tt-xla/.cache/cb35_runtime/per_layer_drift_pos1.json`.
+  Result: `ssh qb1 'cat ~/tt-xla/.cache/cb35_runtime/trig/last.log'`.
+  JSON: `~/tt-xla/.cache/cb35_runtime/per_layer_drift_pos1.json`.
   Pins owned_gdn=ON + dn_state_dtype=bf16 (manual path broken).
+  Note: the dev harness file `harness.log` may not get written for cb35
+  (open-path quirk under tmux); use `tmux capture-pane` as the live
+  source of truth for bootstrap progress.
+- **Tracy probe for Gemma 4 perf** — `experiments/utils/tracy_profile_one_gemma4_layer.py`
+  shipped (commit `2610ef3`). Run AFTER the 35B drift probe finishes
+  and the gm4 harness is back up, to find what's bottlenecking P2/P3.
+  Capture cmd in the file's docstring + `research/gemma4_perf_briefing_2026-06-04.md`.
 - **No subagents running** — both finished. Briefings saved:
   - `research/gemma4_perf_briefing_2026-06-04.md` — TOP-3 perf opts
     + Tracy capture commands + roofline. Read this first when starting perf.
