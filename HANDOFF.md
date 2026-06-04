@@ -99,43 +99,17 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
     gm4_global_write_read, gm4_rope_lookup, gm4_per_layer_drift_pos1)
     for future bringup work.
 
-    **Below: full v0.3.1 debug session writeup retained for the
-    learning-by-building wiki — the 5-hour bisection burned several
-    "masked-at-pos-0" hypotheses (view-decay, in-place buffer update,
-    canonical SDPA config) BEFORE landing on scale=1.0. None of those
-    earlier fixes moved the 3/6 number, but each closed a real
-    Tenstorrent anti-pattern that would have masked the real bug.
-
-    ORIGINAL DIAGNOSTIC:
-    `gm4_v031_multistep_cos` on 6-tok prompt gives `pos 0 cos_final=0.9995
-    (bit-clean)`, `pos 1 cos_final=0.2618` (catastrophic — looks like
-    residual pass-through; TT predicts the input token verbatim), pos 2-5
-    cos_final 0.42-0.62 (medium drift, argmax matches HF on 2 of 4 by luck).
-    Ruled out by isolation probes — paged write/read at sliding shape
-    (`gm4_sliding_write_read.py` 6/6 cos 0.9996+), paged write/read at
-    global shape (`gm4_global_write_read.py` 6/6 cos 0.9996+), ttnn
-    `embedding` row lookup (`gm4_rope_lookup.py`), on-device cur_pos_buf /
-    rot_idxs_buf values (GM4_DEBUG_POS verified [1,1,1,1] across mesh),
-    RoPE math (GM4_ROPE_ZERO=1 gives same 3/6 pattern — RoPE is not
-    the cause). **Code hardening landed in commit `5c96abb`** —
-    canonical Tenstorrent in-tree Gemma 4 SDPA config for head_dim=512
-    global (CoreCoord(8,4), q_chunk=32, k_chunk=64) replacing the 70-LOC
-    manual-attention fallback, view-decay cleanup in `_apply_full_rope`
-    and the sliding 2-call loop, and in-place buffer updates via
-    `copy_host_to_device_tensor` (27B prod pattern at
-    `server_tp.py:1607-1619`) — none of which moved the 3/6 number,
-    but each closes a [[ttnn-slice-view-decay]] / [[ttnn-list-rebinding-leaks]]
-    anti-pattern that would have masked the real bug. **Next session
-    bisection**: capture per-layer h cosines through all 48 layers at
-    pos 1 to find the layer where TT-vs-HF drift starts — that's the
-    only signal that distinguishes "broken at pos 1 alone" from
-    "broken at pos > 0 generally". Debug knobs in place: GM4_DEBUG_POS,
-    GM4_ROPE_ZERO, GM4_SKIP_SLIDING, GM4_SKIP_GLOBAL.
+    Full debug writeup in memory `[[project-gm4-pos1-cliff]]` — the
+    bisection burned several "masked-at-pos-0" hypotheses (view-decay,
+    in-place buffer update, canonical SDPA config) BEFORE landing on
+    scale=1.0. None of those earlier fixes moved the 3/6 number, but
+    each closed a real Tenstorrent anti-pattern that would have masked
+    the real bug, so they ship.
   - v0.3.2 (optional): free-run greedy ≥ 16 tokens.
 
-  **~5-7 days of focused work** to ship `TT_BACKEND=gemma4_12b
-  serve_cb.sh start` chat working end-to-end. Remaining: v0.3.1 (~1 day)
-  + v0.4 trace (~1 day) + v1 CB (~2-3 days) + v2 HTTP (~1 day).
+  **~4-5 days of focused work remaining** to ship `TT_BACKEND=gemma4_12b
+  serve_cb.sh start` chat working end-to-end:
+  v0.4 trace (~1 day) + v1 CB (~2-3 days) + v2 HTTP (~1 day).
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
