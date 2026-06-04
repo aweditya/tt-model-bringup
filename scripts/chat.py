@@ -491,16 +491,39 @@ def _last_code_block(text: str) -> str | None:
 
 
 # ── Built-in safe toolbox ─────────────────────────────────────────
+# Project CWD-jail: everything write_file / read_file (with no explicit
+# path prefix) does is relative to the directory the TUI was launched from.
+PROJECT_ROOT = os.path.realpath(os.getcwd())
+
+# Allow-listed shell binaries. Anything else is REFUSED outright.
+SHELL_ALLOW = {
+    "git", "ls", "cat", "head", "tail", "grep", "egrep", "fgrep",
+    "find", "wc", "echo", "pwd", "date", "stat", "file", "which",
+    "tree", "diff", "python", "python3",
+}
+SHELL_DENY_TOKENS = (
+    "rm ", " rm", "kill", "shutdown", "reboot", "mkfs", "dd ",
+    "curl", "wget", "nc ", "ncat", "ssh", "scp", "rsync",
+    ">", ">>", "|", ";", "&&", "||", "&", "$(", "`",
+)
+# Sensitive path substrings: write_file refuses any path containing these.
+SENSITIVE_PATH_TOKENS = (".env", "secret", "key", "token", "credential",
+                         ".pem", ".p12", ".pfx")
+MAX_FILE_BYTES = 64 * 1024  # 64 KB cap on read_file
+
+
 BUILTIN_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "shell",
-            "description": "Run a SHORT shell command (read-only / safe). 5-second timeout. Returns stdout+stderr.",
+            "description": ("Run a SHORT read-only shell command. Allow-listed "
+                            "binaries only: " + ", ".join(sorted(SHELL_ALLOW)) +
+                            ". No pipes/redirects/network. 5-second timeout."),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "cmd": {"type": "string", "description": "Command to run, e.g. 'ls -la' or 'date'"}
+                    "cmd": {"type": "string", "description": "e.g. 'git status' or 'grep -n foo file.py'"}
                 },
                 "required": ["cmd"],
             },
@@ -510,13 +533,36 @@ BUILTIN_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a UTF-8 text file under the user's home directory. Returns up to 4 KB.",
+            "description": ("Read a numbered slice of a UTF-8 text file. "
+                            "Returns the lines [start, start+n) as 'NNN: text' "
+                            "for easy citation. Default start=1, n=200."),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Absolute path to the file"}
+                    "path":  {"type": "string", "description": "Absolute or project-relative path"},
+                    "start": {"type": "integer", "description": "1-based first line (default 1)"},
+                    "n":     {"type": "integer", "description": "max lines to return (default 200, cap 1000)"},
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": ("Create or append to a text file inside the project. "
+                            "Refuses to overwrite existing files — for existing "
+                            "files use mode='append' or read+rewrite. Refuses "
+                            "any path containing 'secret', 'key', '.env', etc."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string", "description": "Project-relative or absolute path inside the project root"},
+                    "content": {"type": "string", "description": "File contents (UTF-8)"},
+                    "mode":    {"type": "string", "enum": ["write", "append"], "description": "'write' (create new) or 'append'"},
+                },
+                "required": ["path", "content"],
             },
         },
     },
@@ -537,26 +583,112 @@ BUILTIN_TOOLS = [
 ]
 
 
+def _resolve_in_project(path: str) -> tuple[str | None, str | None]:
+    """Resolve a path; return (abs_path, err). abs_path is None on refusal."""
+    if not path:
+        return None, "empty path"
+    p = os.path.expanduser(path)
+    if not os.path.isabs(p):
+        p = os.path.join(PROJECT_ROOT, p)
+    real = os.path.realpath(p)
+    if not (real == PROJECT_ROOT or real.startswith(PROJECT_ROOT + os.sep)):
+        return None, f"path outside project root ({PROJECT_ROOT}): {real}"
+    low = real.lower()
+    for tok in SENSITIVE_PATH_TOKENS:
+        if tok in low:
+            return None, f"path contains sensitive token {tok!r}"
+    return real, None
+
+
 def _exec_tool(name: str, args: dict) -> str:
     """Execute a built-in tool. Always returns a string (the model sees it)."""
     try:
         if name == "shell":
-            cmd = str(args.get("cmd", ""))
-            forbid = ("rm ", "sudo", "shutdown", "reboot", "mkfs", "dd ", ">", ">>", "|", ";", "&&", "&", "$(")
-            if any(s in cmd for s in forbid):
-                return f"REFUSED: shell command contains forbidden token: {cmd!r}"
-            r = subprocess.run(shlex.split(cmd), capture_output=True, timeout=5, text=True)
-            return f"exit={r.returncode}\n{r.stdout[:2000]}\n{r.stderr[:1000]}"
+            cmd = str(args.get("cmd", "")).strip()
+            if not cmd:
+                return "REFUSED: empty command"
+            for tok in SHELL_DENY_TOKENS:
+                if tok in cmd:
+                    return f"REFUSED: forbidden token {tok!r} in {cmd!r}"
+            try:
+                argv = shlex.split(cmd)
+            except ValueError as e:
+                return f"REFUSED: unparseable shell: {e}"
+            if not argv:
+                return "REFUSED: empty command"
+            head = os.path.basename(argv[0])
+            if head not in SHELL_ALLOW:
+                return (f"REFUSED: {head!r} not on allow-list. "
+                        f"Allowed: {', '.join(sorted(SHELL_ALLOW))}")
+            # python is allow-listed but restricted to --version or -c
+            # snippets that don't try to escape CWD.
+            if head in ("python", "python3"):
+                if len(argv) < 2 or argv[1] not in ("--version", "-V", "-c"):
+                    return ("REFUSED: python only allowed with --version or "
+                            "-c <snippet>")
+                if argv[1] == "-c" and len(argv) >= 3:
+                    snippet = argv[2]
+                    bad = ("open(", "subprocess", "os.system", "import os",
+                           "socket", "urllib", "requests", "http.client",
+                           "shutil")
+                    for b in bad:
+                        if b in snippet:
+                            return f"REFUSED: python snippet uses {b!r}"
+            r = subprocess.run(argv, capture_output=True, timeout=5,
+                               text=True, cwd=PROJECT_ROOT)
+            out = (r.stdout or "")[:4000]
+            err = (r.stderr or "")[:1000]
+            return f"exit={r.returncode}\n--stdout--\n{out}\n--stderr--\n{err}"
+
         elif name == "read_file":
-            p = os.path.expanduser(str(args.get("path", "")))
-            if not p.startswith(os.path.expanduser("~")):
-                return f"REFUSED: path outside HOME: {p}"
-            with open(p, "rb") as f:
-                data = f.read(4096)
-            return data.decode("utf-8", errors="replace")
+            real, err = _resolve_in_project(str(args.get("path", "")))
+            if err:
+                return f"REFUSED: {err}"
+            try:
+                start = int(args.get("start", 1) or 1)
+                n     = int(args.get("n", 200) or 200)
+            except (TypeError, ValueError):
+                return "REFUSED: start/n must be integers"
+            if start < 1: start = 1
+            n = max(1, min(n, 1000))
+            try:
+                with open(real, "rb") as f:
+                    raw = f.read(MAX_FILE_BYTES + 1)
+            except OSError as e:
+                return f"read error: {e}"
+            truncated = len(raw) > MAX_FILE_BYTES
+            text = raw[:MAX_FILE_BYTES].decode("utf-8", errors="replace")
+            lines = text.splitlines()
+            end = min(len(lines), start - 1 + n)
+            sliced = lines[start-1:end]
+            header = (f"path={real}\nlines={start}..{end} of {len(lines)}"
+                      f"{' (file truncated at 64KB)' if truncated else ''}\n")
+            body = "\n".join(f"{i+start:>5}: {ln}"
+                             for i, ln in enumerate(sliced))
+            return header + body
+
+        elif name == "write_file":
+            real, err = _resolve_in_project(str(args.get("path", "")))
+            if err:
+                return f"REFUSED: {err}"
+            content = args.get("content", "")
+            if not isinstance(content, str):
+                content = json.dumps(content)
+            mode = (args.get("mode") or "write").lower()
+            if mode not in ("write", "append"):
+                return f"REFUSED: mode must be 'write' or 'append', got {mode!r}"
+            exists = os.path.exists(real)
+            if exists and mode == "write":
+                return (f"REFUSED: {real} already exists; use mode='append' "
+                        "or read+rewrite explicitly")
+            os.makedirs(os.path.dirname(real) or ".", exist_ok=True)
+            with open(real, "a" if mode == "append" else "w") as f:
+                f.write(content)
+            return (f"ok mode={mode} bytes={len(content.encode('utf-8'))} "
+                    f"path={real}")
+
         elif name == "calc":
             expr = str(args.get("expr", ""))
-            # No names / no calls — only literals + operators.
             if re.search(r"[A-Za-z_]", expr):
                 return f"REFUSED: only arithmetic literals allowed: {expr!r}"
             return str(eval(expr, {"__builtins__": {}}, {}))
@@ -803,17 +935,30 @@ def main():
                     calls = _parse_tool_calls(full)
                     if calls:
                         for call in calls:
+                            name = call.get("name", "?")
+                            cargs = call.get("arguments", {})
+                            try:
+                                args_pretty = json.dumps(cargs, indent=2)
+                            except Exception:
+                                args_pretty = repr(cargs)
+                            # Truncate very long arg dumps.
+                            if len(args_pretty) > 600:
+                                args_pretty = args_pretty[:600] + "\n  …"
+                            result = _exec_tool(name, cargs)
+                            disp = result if len(result) <= 1200 else \
+                                   result[:1200] + f"\n… [+{len(result)-1200} chars]"
+                            body = (DIM("args:") + "\n" + args_pretty
+                                    + "\n" + DIM("output:") + "\n" + disp)
                             print()
-                            print(MAGE(BOLD("tool ")) + MAGE(call.get("name", "?"))
-                                  + " " + DIM(json.dumps(call.get("arguments", {}))))
-                            result = _exec_tool(call["name"], call.get("arguments", {}))
-                            print(DIM(textwrap.indent(result[:800], "  ")))
+                            print(panel(f"tool: {name}", body, color=MAGE))
                             messages.append({
                                 "role": "tool",
-                                "name": call["name"],
+                                "name": name,
                                 "content": result,
                             })
-                        # Loop back to model so it can use the tool result.
+                        # Loop back to model so it can use the tool result;
+                        # the prompt prefix will redraw at the top of the
+                        # outer while-loop next iteration.
                         continue
             else:
                 messages.pop()  # roll back failed user turn
