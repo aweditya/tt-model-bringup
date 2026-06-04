@@ -273,16 +273,152 @@ class StreamRenderer:
         sys.stdout.flush()
 
 
-# ── Multi-line input ──────────────────────────────────────────────
+# ── Multi-line input + bracketed paste ────────────────────────────
+# We use bracketed paste mode (\x1b[?2004h) so a pasted block arrives
+# wrapped as \x1b[200~ ... \x1b[201~ and contained newlines do NOT
+# submit. For terminals that don't honour bracketed paste, a 50 ms
+# inter-byte timeout collapses bursts into a single paste-equivalent.
+BRACKETED_PASTE_ON  = "\x1b[?2004h"
+BRACKETED_PASTE_OFF = "\x1b[?2004l"
+PASTE_START = "\x1b[200~"
+PASTE_END   = "\x1b[201~"
+PASTE_BURST_MS = 50
+
+try:
+    import termios  # type: ignore
+    import tty      # type: ignore
+    import select   # type: ignore
+    _HAVE_TERMIOS = True
+except Exception:
+    _HAVE_TERMIOS = False
+
+
+def _read_input_raw(prompt: str) -> str | None:
+    """Raw-mode prompt with bracketed-paste + burst-detection support.
+
+    Returns the assembled line on Enter (outside a paste), None on Ctrl-D
+    / Ctrl-C. Inside a bracketed paste (or a fast burst), newlines are
+    kept as literal '\\n' in the buffer instead of submitting.
+
+    Falls back to plain input() if stdin is not a TTY or termios isn't
+    available (e.g. piped stdin, Windows).
+    """
+    if not (_HAVE_TERMIOS and sys.stdin.isatty() and TTY):
+        try:
+            return input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+    sys.stdout.write(prompt); sys.stdout.flush()
+    sys.stdout.write(BRACKETED_PASTE_ON); sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    buf: list[str] = []
+    in_paste = False
+    last_byte_t = 0.0
+    burst_mode = False  # heuristic for terminals w/o bracketed paste
+    pending = ""        # rolling tail to spot \x1b[200~ / \x1b[201~
+
+    def _redraw_tail(n_keep: int = 80) -> None:
+        # Cheap redraw: erase line, reprint prompt + last n_keep chars of buf.
+        s = "".join(buf)
+        tail = s[-n_keep:] if len(s) > n_keep else s
+        # Replace literal newlines with a visible glyph so the prompt
+        # row doesn't actually wrap.
+        tail_disp = tail.replace("\n", DIM("↵"))
+        sys.stdout.write("\r\x1b[2K" + prompt + tail_disp)
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)
+        while True:
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if not r:
+                # Idle: if we were in a burst, end it.
+                if burst_mode and (time.time() - last_byte_t) * 1000 > PASTE_BURST_MS:
+                    burst_mode = False
+                continue
+            ch = os.read(fd, 1).decode("utf-8", errors="replace")
+            if not ch:
+                return None  # EOF
+            now = time.time()
+            # Detect rapid arrival → likely paste.
+            if last_byte_t and (now - last_byte_t) * 1000 < PASTE_BURST_MS:
+                burst_mode = True
+            last_byte_t = now
+
+            # ESC sequence buffering for bracketed paste markers.
+            if ch == "\x1b" or pending:
+                pending += ch
+                if pending.endswith(PASTE_START):
+                    in_paste = True
+                    pending = ""
+                    continue
+                if pending.endswith(PASTE_END):
+                    in_paste = False
+                    pending = ""
+                    continue
+                # Bail out of escape buffering once it's clearly not a
+                # paste marker (any other escape we silently drop — keeps
+                # arrow keys etc. from polluting the buffer).
+                if len(pending) > 8 or (len(pending) >= 2 and pending[1] not in "[" ):
+                    pending = ""
+                continue
+
+            # Ctrl-C cancels the line; Ctrl-D on empty buf → EOF.
+            if ch == "\x03":  # Ctrl-C
+                sys.stdout.write("\n"); sys.stdout.flush()
+                return ""
+            if ch == "\x04":  # Ctrl-D
+                if not buf:
+                    return None
+                continue
+            # Enter: submit only when NOT in a paste / burst.
+            if ch in ("\r", "\n"):
+                if in_paste or burst_mode:
+                    buf.append("\n")
+                    sys.stdout.write(DIM("↵"))
+                    sys.stdout.flush()
+                    continue
+                sys.stdout.write("\n"); sys.stdout.flush()
+                return "".join(buf)
+            # Backspace / DEL.
+            if ch in ("\x7f", "\x08"):
+                if buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b"); sys.stdout.flush()
+                continue
+            buf.append(ch)
+            sys.stdout.write(ch); sys.stdout.flush()
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+        try:
+            sys.stdout.write(BRACKETED_PASTE_OFF); sys.stdout.flush()
+        except Exception:
+            pass
+
+
 def _read_input(prompt: str) -> str | None:
-    """Read possibly-multi-line input. Lines ending with `\\` continue."""
+    """Read possibly-multi-line input.
+
+    Path A (TTY + termios): raw-mode reader with bracketed-paste +
+    burst detection — newlines inside a paste/burst become literal '\\n'.
+    Path B (fallback): legacy line-mode where trailing '\\' continues
+    onto the next line.
+    """
+    if _HAVE_TERMIOS and sys.stdin.isatty() and TTY:
+        s = _read_input_raw(prompt)
+        return None if s is None else s.strip()
     try:
         first = input(prompt)
     except (EOFError, KeyboardInterrupt):
         return None
     if not first.endswith("\\"):
         return first.strip()
-    # Accumulate until a line WITHOUT trailing backslash.
     buf = [first.rstrip("\\")]
     while True:
         try:
@@ -294,6 +430,64 @@ def _read_input(prompt: str) -> str | None:
             break
         buf.append(nxt.rstrip("\\"))
     return "\n".join(buf).strip()
+
+
+def _read_paste_block(sentinels=(":end:",)) -> str:
+    """Read a multi-line block in cooked mode until a sentinel line.
+
+    Triple-blank-line is also a valid terminator. Returns the joined
+    text WITHOUT the sentinel line.
+    """
+    print(DIM("  paste mode — end with ':end:' on its own line "
+              "(or three blank lines)"))
+    lines: list[str] = []
+    blank_run = 0
+    while True:
+        try:
+            ln = input(DIM("  ¶ "))
+        except (EOFError, KeyboardInterrupt):
+            break
+        if ln.strip() in sentinels:
+            break
+        if not ln.strip():
+            blank_run += 1
+            if blank_run >= 3:
+                lines = lines[:-2]  # drop the prior two blanks
+                break
+        else:
+            blank_run = 0
+        lines.append(ln)
+    return "\n".join(lines).rstrip()
+
+
+# ── Clipboard ────────────────────────────────────────────────────
+def _clipboard_copy(text: str) -> tuple[bool, str]:
+    """Copy text to the system clipboard. Returns (ok, tool_used)."""
+    candidates = [
+        ("pbcopy", ["pbcopy"]),
+        ("wl-copy", ["wl-copy"]),
+        ("xclip", ["xclip", "-selection", "clipboard"]),
+        ("xsel", ["xsel", "--clipboard", "--input"]),
+    ]
+    for name, argv in candidates:
+        if not shutil.which(argv[0]):
+            continue
+        try:
+            p = subprocess.run(argv, input=text.encode("utf-8"),
+                               timeout=2, check=False)
+            if p.returncode == 0:
+                return True, name
+        except Exception:
+            continue
+    return False, ""
+
+
+_CODE_BLOCK_RE = re.compile(r"```(?:\w+)?\s*\n(.*?)```", re.DOTALL)
+
+
+def _last_code_block(text: str) -> str | None:
+    matches = _CODE_BLOCK_RE.findall(text)
+    return matches[-1].rstrip() if matches else None
 
 
 # ── Built-in safe toolbox ─────────────────────────────────────────
@@ -412,17 +606,22 @@ COMMANDS
   /continue             resume after a finish=length cut
   /show /history        show params / transcript
   /save /load <file>    persist transcript to JSON
-  /metrics              fetch server /metrics
+  /metrics              fetch server /metrics (live dashboard)
+  /paste [header]       multi-line paste mode (end with ':end:' or 3 blanks)
+  /yank [code]          copy last reply (or its last code block) to clipboard
+  /screenshot           save a screenshot of the terminal (presentation/)
   /help                 this
   /exit  /quit          leave
 
 INPUT
-  Plain text → user turn.
-  Trailing \\ → multi-line continuation; empty line ends input.
+  Plain text → user turn. Paste a block: bracketed paste is auto-detected;
+  fall back to /paste for terminals that don't pass paste reliably.
+  Trailing \\ → multi-line continuation (line-mode fallback only).
 
 TOOLS (when --tools / /tools enabled)
-  shell <cmd>           safe read-only shell command (5s timeout)
-  read_file <path>      read up to 4 KB from a file in $HOME
+  shell <cmd>           allow-listed read-only shell command (5s timeout)
+  read_file path,start,n read a numbered line range from a project file
+  write_file path,text   create/append a file inside the project (CWD-jail)
   calc <expr>           safe arithmetic eval
 """
 
@@ -527,6 +726,36 @@ def main():
                 print(DIM(f"loaded {len(messages)} msgs from {arg}")); continue
             elif cmd == "metrics":
                 print(DIM(_metrics(args.url))); continue
+            elif cmd == "paste":
+                pasted = _read_paste_block()
+                if not pasted:
+                    print(DIM("paste cancelled")); continue
+                # If user supplied an argument, treat it as a header.
+                user = (arg + "\n\n" + pasted) if arg else pasted
+                print(DIM(f"  [pasted {len(pasted)} chars, "
+                          f"{pasted.count(chr(10))+1} lines]"))
+                # fall through into the "send turn" path
+            elif cmd == "yank":
+                last_assistant = next(
+                    (m["content"] for m in reversed(messages)
+                     if m["role"] == "assistant" and m.get("content")),
+                    None,
+                )
+                if not last_assistant:
+                    print(DIM("nothing to yank")); continue
+                want_code = arg.strip() in ("code", "block", "last")
+                target = _last_code_block(last_assistant) if want_code else None
+                if want_code and not target:
+                    print(DIM("no code block in last reply")); continue
+                if target is None:
+                    target = last_assistant
+                ok, tool = _clipboard_copy(target)
+                if ok:
+                    print(DIM(f"  [copied {len(target)} chars via {tool}]"))
+                else:
+                    print(RED("  [no clipboard tool found — install "
+                              "pbcopy/xclip/wl-copy/xsel]"))
+                continue
             else:
                 print(RED(f"unknown command /{cmd}")); continue
 
