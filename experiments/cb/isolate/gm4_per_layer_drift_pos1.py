@@ -20,7 +20,6 @@ Run on qb1:  bash scripts/run_remote.sh experiments/cb/isolate/gm4_per_layer_dri
 """
 from __future__ import annotations
 
-import json
 import sys
 import time
 from pathlib import Path

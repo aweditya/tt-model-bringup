@@ -389,7 +389,6 @@ def bootstrap(state, log=None):
     # Gemma 4 12B's VOCAB=262144 is cleanly divisible by 4 (=65536) and
     # tile-aligned (65536 % 32 = 0). Pre-fix this was REPLICATED, costing
     # ~2 GB/chip and forcing a [1, 262144] readback per token.
-    NCHIPS = 4
     VOCAB = int(embed_w_np.shape[0])
     assert VOCAB % NCHIPS == 0, f"VOCAB {VOCAB} not divisible by NCHIPS {NCHIPS}"
     state.vocab_size = VOCAB  # cb_api / scheduler expect this attr

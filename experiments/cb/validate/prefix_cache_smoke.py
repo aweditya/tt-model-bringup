@@ -146,7 +146,7 @@ def main():
         print("  ⚠ turn 2 not faster than turn 1 — investigate")
     else:
         print(f"  ✓ turn 2 faster ({t1_latency - t2_latency:.2f}s shaved)")
-    print(f"  qualitative   : turn 2 response should mention Berlin / Germany capital")
+    print("  qualitative   : turn 2 response should mention Berlin / Germany capital")
 
     return 0 if ok else 1
 

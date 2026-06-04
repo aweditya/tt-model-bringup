@@ -8,7 +8,6 @@ Run on qb1:
   cd ~/tt-xla && .venv/bin/python experiments/cb/isolate/chat_template_roundtrip.py
 """
 
-import sys
 
 from transformers import AutoTokenizer
 

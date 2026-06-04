@@ -21,7 +21,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-import numpy as np  # noqa: E402
 import ttnn  # noqa: E402
 
 import server_35b_ttnn as base  # noqa: E402
@@ -92,7 +91,7 @@ def main(state=None) -> int:
     seq_ref = generate_b1(state, PROMPT_TOK, N_STEPS)
     log(f"  B=1 reference sequence: {seq_ref}")
 
-    log(f"[cb35-v1-chat] DIAG: B=2 with DISTINCT prompts [100, 200] step 0 only")
+    log("[cb35-v1-chat] DIAG: B=2 with DISTINCT prompts [100, 200] step 0 only")
     cb.setup_cb_state(state, B=2)
     cb.cb_reset_states(state)
     cb.update_input_buffers_batched(state, [100, 200], [0, 0])
@@ -101,11 +100,11 @@ def main(state=None) -> int:
     ttnn.deallocate(am_tt)
     log(f"  diag slot0={int(flat[0])}, slot1={int(flat[1])}")
     if int(flat[0]) == int(flat[1]):
-        log(f"  ⚠ DIAGNOSIS: argmax kernel returns SAME value for all slots — broken at B>1")
+        log("  ⚠ DIAGNOSIS: argmax kernel returns SAME value for all slots — broken at B>1")
     else:
-        log(f"  ✓ slot 0 != slot 1 with distinct inputs (chain is per-slot)")
+        log("  ✓ slot 0 != slot 1 with distinct inputs (chain is per-slot)")
 
-    log(f"[cb35-v1-chat] B=2 batched (both slots = same prompt)")
+    log("[cb35-v1-chat] B=2 batched (both slots = same prompt)")
     seq_s0, seq_s1 = generate_b2(state, PROMPT_TOK, N_STEPS)
     log(f"  slot 0 sequence: {seq_s0}")
     log(f"  slot 1 sequence: {seq_s1}")
@@ -126,15 +125,15 @@ def main(state=None) -> int:
     if seq_s0 == seq_ref:
         log("  ✓ slot 0 == B=1 reference (bit-equiv across chain)")
     else:
-        log(f"  ⚠ slot 0 differs from B=1 ref (precision drift across 40 layers)")
+        log("  ⚠ slot 0 differs from B=1 ref (precision drift across 40 layers)")
         log(f"      ref     = {seq_ref}")
         log(f"      slot 0  = {seq_s0}")
-        log(f"      Acceptable: forward is FUNCTIONALLY correct; diag above proves per-slot logits.")
+        log("      Acceptable: forward is FUNCTIONALLY correct; diag above proves per-slot logits.")
 
     if fails:
         log(f"\n[cb35-v1-chat] {fails} case(s) FAILED")
         return 1
-    log(f"\n[cb35-v1-chat] FUNCTIONAL PASS — v1 batched forward is shippable")
+    log("\n[cb35-v1-chat] FUNCTIONAL PASS — v1 batched forward is shippable")
     return 0
 
 

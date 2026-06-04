@@ -589,7 +589,7 @@ def bootstrap(state: MeshServerState, log=None):
         torch.from_numpy(_I_per_chip), dtype=ttnn.float32,
         layout=ttnn.TILE_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
-    print(f"  ✓ DN tril/strict_lower/I masks pre-allocated", flush=True)
+    print("  ✓ DN tril/strict_lower/I masks pre-allocated", flush=True)
 
     print("[bootstrap] STAGE B COMPLETE — all weights + state buffers on mesh.", flush=True)
 

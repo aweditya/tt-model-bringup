@@ -65,10 +65,10 @@ def main(state=None) -> int:
     log(f"  alias cs={cs_alias} rs={rs_alias} kc={kc_alias} vc={vc_alias}")
     log(f"  cb_page_table_tt is None: {state.cb_page_table_tt is None}")
     if not (cs_alias and rs_alias and kc_alias and vc_alias and state.cb_page_table_tt is None):
-        log(f"  ✗ FAIL: B=1 alias contract broken")
+        log("  ✗ FAIL: B=1 alias contract broken")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
 
     # ── Case 2: B=4 separate-alloc shapes ──────────────────────────────
     log("[cb35-v1-alloc] case 2: B=4 alloc + shapes")
@@ -107,10 +107,10 @@ def main(state=None) -> int:
     nb = state.sdpa_num_blocks
     expected_pt = np.stack([np.arange(s*nb, (s+1)*nb) for s in range(B)], axis=0)
     if not np.array_equal(pt_chip0, expected_pt):
-        log(f"  ✗ FAIL: page_table doesn't match expected per-slot block ranges")
+        log("  ✗ FAIL: page_table doesn't match expected per-slot block ranges")
         fails += 1
     else:
-        log(f"  ✓ page_table matches per-slot block ranges")
+        log("  ✓ page_table matches per-slot block ranges")
 
     # ── Case 3: cb_reset_states zeros the B>1 caches ───────────────────
     log("[cb35-v1-alloc] case 3: cb_reset_states zero contract at B=4")
@@ -126,12 +126,12 @@ def main(state=None) -> int:
         log(f"  ✗ FAIL: rs not zero after reset (max={rs_arr.max():.4f} min={rs_arr.min():.4f})")
         fails += 1
     else:
-        log(f"  ✓ PASS: rs all zero")
+        log("  ✓ PASS: rs all zero")
 
     if fails:
         log(f"\n[cb35-v1-alloc] {fails} case(s) FAILED")
         return 1
-    log(f"\n[cb35-v1-alloc] ALL cases PASS — B-leading allocator works")
+    log("\n[cb35-v1-alloc] ALL cases PASS — B-leading allocator works")
     return 0
 
 

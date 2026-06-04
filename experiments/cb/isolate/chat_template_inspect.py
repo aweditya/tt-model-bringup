@@ -7,8 +7,6 @@ Run on qb1:
   cd ~/tt-xla && .venv/bin/python experiments/cb/isolate/chat_template_inspect.py
 """
 
-import os
-import sys
 from transformers import AutoTokenizer
 
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.6-27B", trust_remote_code=True)
@@ -33,7 +31,7 @@ print("=" * 72)
 print(f"eos_token_id: {tok.eos_token_id} ({tok.decode([tok.eos_token_id])!r})")
 print(f"all_special_ids: {tok.all_special_ids}")
 print(f"all_special_tokens: {tok.all_special_tokens}")
-print(f"added_tokens_decoder (selected):")
+print("added_tokens_decoder (selected):")
 for tid, t in (tok.added_tokens_decoder or {}).items():
     if hasattr(t, 'content'):
         content = t.content

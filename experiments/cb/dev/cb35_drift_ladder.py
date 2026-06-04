@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -175,6 +174,6 @@ def main(state):
                   "PARTIAL" if L32_pos1_cos > 0.95 else "NO-MOVE"
         _log("=" * 60)
         _log(f"HEADLINE: cos@L32 pos 1 = {L32_pos1_cos:.4f}  [{verdict}]")
-        _log(f"          (bf16 baseline = 0.9311; H1 target ≥ 0.99)")
+        _log("          (bf16 baseline = 0.9311; H1 target ≥ 0.99)")
         _log("=" * 60)
     return 0

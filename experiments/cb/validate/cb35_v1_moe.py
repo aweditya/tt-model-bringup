@@ -64,10 +64,10 @@ def main(state=None) -> int:
     rel_mad = mad / max(norm_a, 1e-9)
     log(f"  |a|={norm_a:.6e}, max_abs_diff = {mad:.6e}, rel_mad = {rel_mad:.4f}")
     if rel_mad > 0.05:
-        log(f"  ✗ FAIL: cb output != base output at B=1 (rel_mad > 5%)")
+        log("  ✗ FAIL: cb output != base output at B=1 (rel_mad > 5%)")
         fails += 1
     else:
-        log(f"  ✓ PASS (mad/|a| < 5%)")
+        log("  ✓ PASS (mad/|a| < 5%)")
 
     # ── Case 2: B=2 → slot 0 == base ref + slot 0 == slot 1 (same input) ─
     log("[cb35-v1-moe] case 2: B=2 [42,42] → slot 0 == base ref + slot 0 == slot 1")
@@ -95,24 +95,24 @@ def main(state=None) -> int:
     # rel < 0.20 here; the v1.5 full-forward gate (which runs MoE in the
     # proper layernorm+residual chain) is the real correctness check.
     if rel01 > 0.20:
-        log(f"  ✗ FAIL: identical-input slots differ (rel > 20%)")
+        log("  ✗ FAIL: identical-input slots differ (rel > 20%)")
         fails += 1
     else:
-        log(f"  ⚠ PASS (rel < 20%, expected 0%) — known ttnn-internal drift in per-slot MoE loop")
+        log("  ⚠ PASS (rel < 20%, expected 0%) — known ttnn-internal drift in per-slot MoE loop")
 
     mad_b = float(np.abs(slot0 - b).max())
     rel_b = mad_b / max(norm0, 1e-9)
     log(f"  slot0 vs base ref mad = {mad_b:.6e}, rel = {rel_b:.4f}")
     if rel_b > 0.20:
-        log(f"  ✗ FAIL: B=2 slot 0 != base reference (rel > 20%)")
+        log("  ✗ FAIL: B=2 slot 0 != base reference (rel > 20%)")
         fails += 1
     else:
-        log(f"  ⚠ PASS (rel < 20%) — same drift as above")
+        log("  ⚠ PASS (rel < 20%) — same drift as above")
 
     if fails:
         log(f"\n[cb35-v1-moe] {fails} case(s) FAILED")
         return 1
-    log(f"\n[cb35-v1-moe] ALL cases PASS — batched MoE bit-equivalent to base")
+    log("\n[cb35-v1-moe] ALL cases PASS — batched MoE bit-equivalent to base")
     return 0
 
 

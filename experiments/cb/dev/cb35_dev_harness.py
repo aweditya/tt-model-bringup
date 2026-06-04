@@ -26,7 +26,6 @@ Usage:
 from __future__ import annotations
 
 import importlib
-import os
 import sys
 import time
 import traceback
@@ -132,7 +131,7 @@ def main():
     base.bootstrap(state, log)
     log(f"[harness] ready. Drop trigger files into {TRIG_DIR}/")
     log(f"[harness] examples: touch {TRIG_DIR}/v0_smoke  or  touch {TRIG_DIR}/v0_chat")
-    log(f"[harness] special: _reload (re-import server_35b_cb), _exit (shutdown)")
+    log("[harness] special: _reload (re-import server_35b_cb), _exit (shutdown)")
 
     SKIP = {"last.log", "_reload", "_exit"}
     START_TS = time.time()

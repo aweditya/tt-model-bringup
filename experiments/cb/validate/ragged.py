@@ -32,7 +32,6 @@ Run on qb1:
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 _PROJECT = next(p for p in Path(__file__).resolve().parents if (p / "experiments" / "cb").is_dir())

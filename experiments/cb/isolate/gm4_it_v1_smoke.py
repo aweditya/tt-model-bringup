@@ -23,7 +23,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "cb" / "isolate"))
 
 import server_gemma4_unified_ttnn as base  # noqa: E402
-import server_gemma4_unified_cb as cb      # noqa: E402
 
 # Point the v0.3.1 / v0.3.2 / v1.6 probes at the IT oracle by importing
 # them and rewriting their module-level ORACLE_DIR before calling main().

@@ -20,7 +20,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))                 # .../cb/isol
 _SERVE = os.path.normpath(os.path.join(_HERE, '..', '..', 'serve'))  # .../experiments/serve
 sys.path.insert(0, _SERVE)
 
-from live_slot_store import LiveSlotStore, LiveEntry
+from live_slot_store import LiveSlotStore
 
 
 def assert_eq(actual, expected, msg=""):

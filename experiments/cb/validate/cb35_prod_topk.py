@@ -19,7 +19,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-import numpy as np  # noqa: E402
 import ttnn  # noqa: E402
 
 import server_35b_ttnn as base  # noqa: E402
@@ -86,7 +85,7 @@ def main(state=None) -> int:
     s0_top1 = int(idxs[0].flatten()[0])
     s1_top1 = int(idxs[1].flatten()[0])
     if not (0 <= s0_top1 < cb.VOCAB and 0 <= s1_top1 < cb.VOCAB):
-        log(f"  ✗ FAIL: top-1 out of vocab range")
+        log("  ✗ FAIL: top-1 out of vocab range")
         fails += 1
     elif s0_top1 == s1_top1:
         log(f"  ✗ FAIL: distinct prompts produced same top-1 ({s0_top1})")
@@ -107,7 +106,7 @@ def main(state=None) -> int:
         log(f"  ✗ FAIL: argmax {am} out of vocab range")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
 
     # ── Case 4: B=2 default argmax via unified entry ──────────────────
     log("[cb35-prod-topk] case 4: B=2 forward_batch_tp_inner() default (argmax)")
@@ -119,15 +118,15 @@ def main(state=None) -> int:
     ttnn.deallocate(am_tt)
     log(f"  B=2 argmax slot 0 = {int(am_arr[0])}, slot 1 = {int(am_arr[1])}")
     if int(am_arr[0]) == int(am_arr[1]):
-        log(f"  ✗ FAIL: B=2 distinct prompts produced same argmax")
+        log("  ✗ FAIL: B=2 distinct prompts produced same argmax")
         fails += 1
     else:
-        log(f"  ✓ PASS — slots distinct")
+        log("  ✓ PASS — slots distinct")
 
     if fails:
         log(f"\n[cb35-prod-topk] {fails} case(s) FAILED")
         return 1
-    log(f"\n[cb35-prod-topk] ALL cases PASS — production wire-up gate clear")
+    log("\n[cb35-prod-topk] ALL cases PASS — production wire-up gate clear")
     return 0
 
 

@@ -63,7 +63,7 @@ def main(state=None):
     else:
         log("using harness state")
 
-    log(f"--- v1.6 B=4 acceptance gate ---")
+    log("--- v1.6 B=4 acceptance gate ---")
     _ensure_B(state, 4)
     t0 = time.time()
     out = _run_seq(state, PROMPTS)

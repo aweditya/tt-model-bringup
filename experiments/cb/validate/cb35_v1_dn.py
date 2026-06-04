@@ -30,7 +30,6 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 import numpy as np  # noqa: E402
-import torch  # noqa: E402
 import ttnn  # noqa: E402
 
 import server_35b_ttnn as base  # noqa: E402
@@ -102,10 +101,10 @@ def main(state=None) -> int:
     mad = float(np.abs(a - b).max())
     log(f"  cosine = {cos:.6f}, max_abs_diff = {mad:.6f}")
     if cos < 0.9999 or mad > 0.05:
-        log(f"  ✗ FAIL: cb output != base output at B=1")
+        log("  ✗ FAIL: cb output != base output at B=1")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
 
     # ── Case 2a: B=2 same-input both slots → slot 0 == slot 1 (sanity) ─
     log("[cb35-v1-dn] case 2a: B=2 [42,42] → slot 0 output == slot 1 output")
@@ -125,26 +124,26 @@ def main(state=None) -> int:
     mad01 = float(np.abs(slot0 - slot1).max())
     log(f"  slot0 vs slot1 cosine = {cos01:.6f}, max_abs_diff = {mad01:.6f}")
     if cos01 < 0.9999 or mad01 > 0.05:
-        log(f"  ✗ FAIL: identical input slots produce different outputs")
+        log("  ✗ FAIL: identical input slots produce different outputs")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
 
     # Also compare slot 0 to base ref (since input is the same as case 1's [42]).
     cos_b = float(np.dot(slot0, b) / (np.linalg.norm(slot0) * np.linalg.norm(b) + 1e-9))
     mad_b = float(np.abs(slot0 - b).max())
     log(f"  slot0 vs base   cosine = {cos_b:.6f}, max_abs_diff = {mad_b:.6f}")
     if cos_b < 0.9999 or mad_b > 0.05:
-        log(f"  ✗ FAIL: B=2 slot 0 != case-1 base reference")
+        log("  ✗ FAIL: B=2 slot 0 != case-1 base reference")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
     ttnn.deallocate(out_cb); ttnn.deallocate(h_tt); ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
 
     if fails:
         log(f"\n[cb35-v1-dn] {fails} case(s) FAILED")
         return 1
-    log(f"\n[cb35-v1-dn] ALL cases PASS — batched DN bit-equivalent to base")
+    log("\n[cb35-v1-dn] ALL cases PASS — batched DN bit-equivalent to base")
     return 0
 
 

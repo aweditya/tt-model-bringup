@@ -169,7 +169,7 @@ def main():
     base.bootstrap(state, log)
     log(f"[harness] ready. Drop trigger files into {TRIG_DIR}/")
     log(f"[harness] e.g.: touch {TRIG_DIR}/v031_multistep_cos")
-    log(f"[harness] special: _reload, _exit")
+    log("[harness] special: _reload, _exit")
 
     SKIP = {"last.log", "_reload", "_exit"}
     START_TS = time.time()

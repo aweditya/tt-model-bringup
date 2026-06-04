@@ -26,7 +26,6 @@ Exits 0 on success.
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -112,10 +111,10 @@ def main(state=None) -> int:
     ttnn.deallocate(am_cb_tt)
     log(f"  cb argmax   = {am_cb}")
     if am_base != am_cb:
-        log(f"  ✗ FAIL: argmax mismatch")
+        log("  ✗ FAIL: argmax mismatch")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
 
     # ── Case 2: logits mode (NOT SUPPORTED IN v0) ───────────────────────
     # v0 doesn't implement return_logits — 35B's [1, VOCAB] bulk readback
@@ -129,7 +128,7 @@ def main(state=None) -> int:
     try:
         logits_tt = cb.forward_batch_tp_inner(state, return_logits=True)
         ttnn.deallocate(logits_tt)
-        log(f"  ✗ FAIL: return_logits=True should raise NotImplementedError")
+        log("  ✗ FAIL: return_logits=True should raise NotImplementedError")
         fails += 1
     except NotImplementedError as e:
         log(f"  ✓ PASS: raised NotImplementedError ({str(e)[:60]}…)")
@@ -143,15 +142,15 @@ def main(state=None) -> int:
     ttnn.deallocate(top_vals_tt); ttnn.deallocate(top_idxs_tt)
     log(f"  topk indices = {top_idxs}")
     if top_idxs[0] != am_base:
-        log(f"  ✗ FAIL: topk[0] != base argmax")
+        log("  ✗ FAIL: topk[0] != base argmax")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
 
     if fails:
         log(f"\n[cb35-v0-smoke] {fails} case(s) FAILED")
         return 1
-    log(f"\n[cb35-v0-smoke] ALL 3 cases PASS — v0 wrapper bit-equivalent to base")
+    log("\n[cb35-v0-smoke] ALL 3 cases PASS — v0 wrapper bit-equivalent to base")
     return 0
 
 

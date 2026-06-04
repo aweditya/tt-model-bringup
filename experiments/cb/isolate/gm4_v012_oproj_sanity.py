@@ -13,7 +13,6 @@ Run via main venv (no transformers needed; just safetensors + numpy):
 
     bash scripts/run_remote.sh experiments/cb/isolate/gm4_v012_oproj_sanity.py
 """
-import json
 import sys
 from pathlib import Path
 

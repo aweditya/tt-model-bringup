@@ -370,14 +370,14 @@ def main():
     code, body = _health(args.url)
     if code != 200:
         print(RED(f"[chat] cannot reach {args.url}: {body!r}"))
-        print(DIM(f"[chat] is the daemon up and your ssh tunnel open?"))
+        print(DIM("[chat] is the daemon up and your ssh tunnel open?"))
         sys.exit(1)
 
     # Banner
     print()
     print(CYAN(BOLD(f"  tt-chat → {args.url}")))
     print(DIM(f"  server: {body}"))
-    print(DIM(f"  /help for commands · multi-line: end with \\"))
+    print(DIM("  /help for commands · multi-line: end with \\"))
     print(DIM(f"  tools: {'ON' if tools_on else 'OFF'}"))
     print()
 

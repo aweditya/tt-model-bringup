@@ -220,7 +220,7 @@ def main():
             log(f"  error sample: client={e['client']} n={e['n']} {e['error'][:120]!r}")
 
     m_end = snapshots[-1][1]
-    log(f"\n  /metrics delta over the run:")
+    log("\n  /metrics delta over the run:")
     for k in ("cb_requests_submitted_total", "cb_requests_done_total",
               "cb_requests_cancelled_total", "cb_requests_rejected_total",
               "cb_tokens_generated_total", "cb_step_seconds_count"):

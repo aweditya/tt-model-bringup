@@ -125,7 +125,7 @@ def main(state=None) -> int:
     if speedup < 2.0:
         log(f"  ⚠ speedup {speedup:.2f}× below 2× threshold — investigate")
     else:
-        log(f"  ✓ trace capture + replay viable")
+        log("  ✓ trace capture + replay viable")
 
     log(f"\n[cb35-v2-trace] {fails} case(s) FAILED" if fails else
         "\n[cb35-v2-trace] capture + replay OK — v2 viable")

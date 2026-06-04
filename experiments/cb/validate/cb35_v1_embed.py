@@ -68,10 +68,10 @@ def main(state=None) -> int:
     diff = np.abs(h_cb_np[:cb.HIDDEN] - h_base_np[:cb.HIDDEN]).max()
     log(f"  max |h_cb - h_base| = {diff:.6f}")
     if diff > 0:
-        log(f"  ✗ FAIL: B=1 prelude diverges from base prelude")
+        log("  ✗ FAIL: B=1 prelude diverges from base prelude")
         fails += 1
     else:
-        log(f"  ✓ PASS: bit-identical")
+        log("  ✓ PASS: bit-identical")
     ttnn.deallocate(h_cb); ttnn.deallocate(cos_cb); ttnn.deallocate(sin_cb)
     ttnn.deallocate(h_base)
 
@@ -89,10 +89,10 @@ def main(state=None) -> int:
     diff = np.abs(h_slot0 - h_slot1).max()
     log(f"  max |slot0 - slot1| = {diff:.6f}")
     if diff != 0:
-        log(f"  ✗ FAIL: same-token slots should be identical")
+        log("  ✗ FAIL: same-token slots should be identical")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
     ttnn.deallocate(h_cb); ttnn.deallocate(cos_cb); ttnn.deallocate(sin_cb)
 
     # ── Case 3: B=2 distinct-token sanity ─────────────────────────────
@@ -106,10 +106,10 @@ def main(state=None) -> int:
     diff = np.abs(h_slot0 - h_slot1).max()
     log(f"  max |slot0 - slot1| = {diff:.6f}")
     if diff == 0:
-        log(f"  ✗ FAIL: distinct-token slots should differ")
+        log("  ✗ FAIL: distinct-token slots should differ")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
     ttnn.deallocate(h_cb); ttnn.deallocate(cos_cb); ttnn.deallocate(sin_cb)
 
     # ── Case 4: B=2 distinct-position RoPE ────────────────────────────
@@ -124,16 +124,16 @@ def main(state=None) -> int:
     diff = np.abs(c0 - c1).max()
     log(f"  max |cos[0] - cos[1]| = {diff:.6f}")
     if diff == 0:
-        log(f"  ✗ FAIL: distinct-pos RoPE rows should differ")
+        log("  ✗ FAIL: distinct-pos RoPE rows should differ")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
     ttnn.deallocate(h_cb); ttnn.deallocate(cos_cb); ttnn.deallocate(sin_cb)
 
     if fails:
         log(f"\n[cb35-v1-embed] {fails} case(s) FAILED")
         return 1
-    log(f"\n[cb35-v1-embed] ALL cases PASS — batched embed+RoPE prelude works")
+    log("\n[cb35-v1-embed] ALL cases PASS — batched embed+RoPE prelude works")
     return 0
 
 

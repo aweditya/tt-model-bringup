@@ -74,7 +74,7 @@ def main():
     log(f"  REF_A last-pos argmax = {refA_argmax} ({tok.decode([refA_argmax])!r})")
 
     # === REFERENCE B: legacy 1-tok/iter stub — informational only (S1a drifts ~0.95 vs stub) ===
-    log(f"=== REF_B (informational): legacy 1-tok/iter forward_prefill_tp_inner ===")
+    log("=== REF_B (informational): legacy 1-tok/iter forward_prefill_tp_inner ===")
     base._reset_state_buffers(state)
     refB_logits = base.forward_prefill_tp_inner(state, actual_ids, capture_logits=True)
     refB_last = refB_logits[L - 1]
@@ -116,7 +116,7 @@ def main():
         f"for production chat (greedy decode bit-equivalent at first token).")
 
     # === T1: capture trace + replay; verify replay output matches eager ===
-    log(f"=== T1: capture forward_prefill_chunked_traced_inner + replay ===")
+    log("=== T1: capture forward_prefill_chunked_traced_inner + replay ===")
     base._reset_state_buffers(state)
 
     # JIT warmup — capture-during-JIT hangs on Blackhole (feedback_c4v4_validated).
@@ -212,13 +212,13 @@ def main():
 
     if any_fail:
         ttnn.release_trace(state.mesh, trace_id)
-        log(f"FAIL T2: at least one replay disagreed with eager same-input reference")
+        log("FAIL T2: at least one replay disagreed with eager same-input reference")
         raise SystemExit(1)
     log(f"PASS T2: {len(t2_prompts)} different prompts all replay correctly. "
         f"Median replay time {sorted(rep_times)[len(rep_times)//2]*1000:.0f}ms.")
 
     # === T4: TTFT bench — traced replay vs legacy 1-tok/iter at L sweep ===
-    log(f"=== T4: TTFT bench legacy vs traced at L in {{8, 32, 64, 100, 128}} ===")
+    log("=== T4: TTFT bench legacy vs traced at L in {8, 32, 64, 100, 128} ===")
     bench_ids = tok.encode(("The history of computing spans many centuries from the abacus "
                             "to modern silicon chips. Early mechanical calculators gave way "
                             "to electromechanical machines and eventually fully electronic "
@@ -262,8 +262,8 @@ def main():
     ttnn.release_trace(state.mesh, trace_id)
     crossover = next((r[0] for r in rows if r[3] >= 1.0), None)
     if crossover is None:
-        log(f"INFO T4: traced never beats legacy in tested L range. Trace bootstrap "
-            f"cost not amortised. Reconsider chunk_size or skip tracing for L<= max tested.")
+        log("INFO T4: traced never beats legacy in tested L range. Trace bootstrap "
+            "cost not amortised. Reconsider chunk_size or skip tracing for L<= max tested.")
     else:
         log(f"PASS T4: traced wins starting at L={crossover}. "
             f"For L<{crossover}, legacy is faster. Integration plan: dispatch on L.")

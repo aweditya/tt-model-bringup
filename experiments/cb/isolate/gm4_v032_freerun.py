@@ -79,7 +79,7 @@ def main(state=None):
 
     text = tok.decode(generated)
     log("=" * 78)
-    log(f"Generated text:")
+    log("Generated text:")
     log(f"  {text!r}")
     log("=" * 78)
 

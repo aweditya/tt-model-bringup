@@ -81,10 +81,10 @@ def main(state=None) -> int:
     mad = float(np.abs(a - b).max())
     log(f"  cosine = {cos:.6f}, max_abs_diff = {mad:.6f}")
     if cos < 0.9999 or mad > 0.05:
-        log(f"  ✗ FAIL: cb output != base output at B=1")
+        log("  ✗ FAIL: cb output != base output at B=1")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
 
     # ── Case 2: B=2 same input → slot 0 == slot 1 + slot 0 == base ref ─
     log("[cb35-v1-attn] case 2: B=2 [42,42]@[0,0] → slot 0 == slot 1 + slot 0 == base ref")
@@ -102,25 +102,25 @@ def main(state=None) -> int:
     mad01 = float(np.abs(slot0 - slot1).max())
     log(f"  slot0 vs slot1 cosine = {cos01:.6f}, max_abs_diff = {mad01:.6f}")
     if cos01 < 0.9999 or mad01 > 0.05:
-        log(f"  ✗ FAIL: identical-input slots differ")
+        log("  ✗ FAIL: identical-input slots differ")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
 
     cos_b = float(np.dot(slot0, b) / (np.linalg.norm(slot0) * np.linalg.norm(b) + 1e-9))
     mad_b = float(np.abs(slot0 - b).max())
     log(f"  slot0 vs base cosine = {cos_b:.6f}, max_abs_diff = {mad_b:.6f}")
     if cos_b < 0.9999 or mad_b > 0.05:
-        log(f"  ✗ FAIL: B=2 slot 0 != base reference")
+        log("  ✗ FAIL: B=2 slot 0 != base reference")
         fails += 1
     else:
-        log(f"  ✓ PASS")
+        log("  ✓ PASS")
     ttnn.deallocate(out_cb); ttnn.deallocate(h_tt); ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
 
     if fails:
         log(f"\n[cb35-v1-attn] {fails} case(s) FAILED")
         return 1
-    log(f"\n[cb35-v1-attn] ALL cases PASS — batched attention bit-equivalent to base")
+    log("\n[cb35-v1-attn] ALL cases PASS — batched attention bit-equivalent to base")
     return 0
 
 

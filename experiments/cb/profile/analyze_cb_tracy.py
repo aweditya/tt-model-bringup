@@ -156,7 +156,7 @@ def main():
           f"({o2o_ns / max(total_ns, 1) * 100:.1f}% of device-busy)")
     print(f"  device utilization estimate:  {util_pct:.1f}% of "
           f"({region_wall_s:.2f} s × {n_devices} chips = {capacity_s:.2f} chip-s)")
-    print(f"  per-device FW totals:")
+    print("  per-device FW totals:")
     for dev in sorted(per_device_ns):
         print(f"    device {dev}: {per_device_ns[dev] / 1e9:.3f} s  "
               f"({per_device_ns[dev] / 1e9 / region_wall_s * 100:.1f}% busy)")
