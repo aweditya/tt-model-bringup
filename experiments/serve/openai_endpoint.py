@@ -32,7 +32,8 @@ SOCKET_PATH = os.path.join(PROJECT_ROOT, ".cache", "server_tp.sock")
 _THINK_SUFFIX = "<think>\n\n</think>\n\n"
 
 
-def _messages_to_prompt(tokenizer, messages: list[dict]) -> str:
+def _messages_to_prompt(tokenizer, messages: list[dict],
+                         tools: list[dict] | None = None) -> str:
     """OpenAI chat `messages` -> a prompt string via the model's chat template.
 
     Qwen3.6's chat template has two asymmetries that break slot-level prefix
@@ -58,9 +59,18 @@ def _messages_to_prompt(tokenizer, messages: list[dict]) -> str:
     Validated via experiments/cb/isolate/chat_template_inspect.py — turn 1
     cached vs turn 2 prompt: 69/69 prefix match (was 44/69 before fix).
     """
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-        enable_thinking=False, preserve_thinking=True)
+    # Build kwargs defensively. Qwen-specific (enable_thinking,
+    # preserve_thinking) only apply when the template's signature has
+    # them — apply_chat_template forwards through jinja so unknown
+    # kwargs become silently-unused variables. Add `tools` only when
+    # the caller supplied them; OpenAI-style function definitions are
+    # rendered into the prompt by the chat template if it supports
+    # them (Gemma IT + Qwen3.6 both do; base models don't).
+    kw = dict(tokenize=False, add_generation_prompt=True,
+              enable_thinking=False, preserve_thinking=True)
+    if tools:
+        kw["tools"] = tools
+    text = tokenizer.apply_chat_template(messages, **kw)
     if text.endswith(_THINK_SUFFIX):
         text = text[:-len(_THINK_SUFFIX)]
     return text

@@ -97,7 +97,19 @@ class CBEngine:
         self.state = state
         self.slots = slots
         self.max_new_cap = int(max_new_cap)
+        # eos_id may be a single int (legacy) or an iterable of ints. The
+        # Scheduler normalises both forms; we pass through and also expose
+        # a scalar alias for callers that read .eos_id.
         self.eos_id = eos_id
+        if isinstance(eos_id, (list, tuple, set, frozenset)):
+            self.eos_ids = frozenset(int(x) for x in eos_id if x is not None)
+            self.eos_id = next(iter(self.eos_ids), -1)
+        elif eos_id is None:
+            self.eos_ids = frozenset()
+            self.eos_id = -1
+        else:
+            self.eos_ids = frozenset({int(eos_id)})
+            self.eos_id = int(eos_id)
         self.use_trace = use_trace
         # sampling=True → per-slot host temp/top-p/top-k each step.
         #   topk_k=None  → logits trace + full-vocab sample (default; best for
@@ -251,7 +263,7 @@ class CBEngine:
     def _run(self):
         try:
             self._sched = Scheduler(self.state, self.slots, self.max_new_cap,
-                                    self.eos_id, use_trace=self.use_trace,
+                                    self.eos_ids, use_trace=self.use_trace,
                                     sampling=self.sampling, topk_k=self.topk_k,
                                     chunked_prefill=self.chunked_prefill,
                                     prefix_cache=self.prefix_cache)

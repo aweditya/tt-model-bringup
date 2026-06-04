@@ -131,7 +131,18 @@ class Scheduler:
         self.state = state
         self.B = B
         self.max_new = max_new
-        self.eos_id = eos_id
+        # Accept either a single int or an iterable of ints. Some chat-tuned
+        # tokenizers (Gemma IT lists [1, 106, 50] in generation_config) match
+        # multiple EOS-class tokens; cb_engine only ever passed one. Normalise
+        # to a frozenset for O(1) membership in the hot path.
+        if isinstance(eos_id, (list, tuple, set, frozenset)):
+            self.eos_ids = frozenset(int(x) for x in eos_id if x is not None)
+        elif eos_id is None:
+            self.eos_ids = frozenset()
+        else:
+            self.eos_ids = frozenset({int(eos_id)})
+        # Keep scalar alias for legacy callers that read .eos_id.
+        self.eos_id = next(iter(self.eos_ids), -1)
         self.use_trace = use_trace
         # prefix_cache: slot-level content-keyed prefix caching. When a request
         # completes, its slot is kept "live" indexed by hash(tokens_so_far)
@@ -441,7 +452,7 @@ class Scheduler:
         return True
 
     def _finish(self, r, s, last_out):
-        done = (len(r['gen']) >= self.max_new) or (last_out == self.eos_id)
+        done = (len(r['gen']) >= self.max_new) or (last_out in self.eos_ids)
         if done:
             r['status'] = 'DONE'
             self.slots[s] = None

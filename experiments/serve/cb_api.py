@@ -153,7 +153,15 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None,
             raise
 
     def _finish_reason(eos_id, handle, gen_ids) -> str:
-        if eos_id is not None and gen_ids and gen_ids[-1] == eos_id:
+        # eos_id may be a scalar (legacy) or a list/set (multi-EOS-id
+        # models like Gemma IT). Normalise to a frozenset for membership.
+        if isinstance(eos_id, (list, tuple, set, frozenset)):
+            eos_set = frozenset(int(x) for x in eos_id if x is not None and x >= 0)
+        elif eos_id is not None and int(eos_id) >= 0:
+            eos_set = frozenset({int(eos_id)})
+        else:
+            eos_set = frozenset()
+        if eos_set and gen_ids and gen_ids[-1] in eos_set:
             return "stop"
         if handle.final in ("cancelled", "error"):
             return "stop"
@@ -208,7 +216,8 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None,
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict):
         tok = state["tok"]
-        prompt = _messages_to_prompt(tok, body.get("messages", []))
+        prompt = _messages_to_prompt(tok, body.get("messages", []),
+                                      tools=body.get("tools"))
         return await _complete(prompt, body)
 
     @app.post("/v1/completions")
@@ -284,8 +293,35 @@ def _build_app_with_default_lifespan():
             st.deltanet_recurrence_mode = "manual"
             st.deltanet_decay_gate_mode = "manual"
             st.deltanet_decay_mode = "native_softplus"
-        eos_id = getattr(st.tok, "eos_token_id", None)
-        eos_id = int(eos_id) if eos_id is not None else -1
+        # Tokenizer reports a single eos_token_id; the model's
+        # generation_config may list multiple (Gemma IT: [1, 106, 50] — the
+        # dialog stop is 106, the corpus stop is 1, and 50 is rare-but-
+        # legal). cb_engine now matches a SET, so collect every plausible
+        # EOS id we can find. Also include any model-set state.eos_ids.
+        _eos_set = set()
+        _t_eos = getattr(st.tok, "eos_token_id", None)
+        if _t_eos is not None:
+            _eos_set.add(int(_t_eos))
+        try:
+            import json as _json
+            from pathlib import Path as _P
+            for snap_dir in (_P.home() / ".cache" / "huggingface" / "hub").glob(
+                    f"models--{DEFAULT_MODEL_ID.replace('/', '--')}/snapshots/*"):
+                gc = snap_dir / "generation_config.json"
+                if gc.exists():
+                    cfg = _json.loads(gc.read_text())
+                    extra = cfg.get("eos_token_id")
+                    if isinstance(extra, list):
+                        _eos_set.update(int(x) for x in extra)
+                    elif extra is not None:
+                        _eos_set.add(int(extra))
+                    break
+        except Exception:
+            pass
+        _state_eos = getattr(st, "eos_ids", None)
+        if _state_eos:
+            _eos_set.update(int(x) for x in _state_eos)
+        eos_id = sorted(_eos_set) if _eos_set else -1
         # 35B's B>1 batched forward path through cb_scheduler produces
         # prompt-independent degenerate output when only a subset of slots is
         # active (empty-slot inputs poison batched ops — likely SDPA mask or
