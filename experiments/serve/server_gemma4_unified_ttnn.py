@@ -1192,6 +1192,8 @@ def step_forward_v03(state, tok_id, capture=None):
         h_new = _layer_forward_pos0_paged(state, h, L)
         ttnn.deallocate(h)
         h = h_new
+        if capture is not None and capture.get("per_layer", False):
+            capture.setdefault("layer_h", {})[L] = _readback_replicated(h, state.mesh)
 
     final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
     ttnn.deallocate(h)
