@@ -11,22 +11,28 @@ Read top to bottom; everything else is linked.
 asking; they're not stopping for status updates.**
 
 ### Live RIGHT NOW on qb1
-- **cb35 dev harness** is bootstrapping (~14 min). After ready, will run
-  `experiments/cb/isolate/cb35_per_layer_drift_pos1.py` — the per-layer
-  cosine ladder bisecting the pos1→pos5 drift cliff.
-- **Stack on disk**: HEAD is `0418e83` "fix(gm4): build_key_to_shard
-  tolerates IT-variant multi-snapshot layout". P1 vocab-shard ALREADY
-  MEASURED — `47.5 ms/tok traced (+8.0%)`, see
-  `[[feedback-p22-gm4-vocab-shard-result]]`.
+- **cb35 dev harness** RESIDENT (~22 min in). Per-layer drift probe ran,
+  found NO cliff. drift_ladder reran 7/8 pass. Needle-haystack sanity
+  sweep IN FLIGHT (L=100/200/300/460 × 2 trials), confirmed
+  **bf16 free-run non-determinism** — same seed flips Y↔N.
+- **5 presentation subagents** dispatched in background — workstream
+  `presentation/` (writes to feed slides on branch `presentation/cs440lx-prep`).
+  Agent #1 (workflow) completed → `presentation/01_workflow.md`.
+  Agents 2-5 (perf catalog / TT-reuse / throughput / challenges) still running.
 
 ### What's queued (do these in order — recipe at `research/model_bringup_recipe.md`)
 
 | # | Task | State | Briefing / file |
 |---|---|---|---|
 | 1 | **Gemma 4 perf opt P1** (vocab-shard) | ✅ DONE — 47.5 ms/tok traced (+8%) | `[[feedback-p22-gm4-vocab-shard-result]]` |
-| 2 | **35B-A3B drift bisection** | probe deployed, harness bootstrapping | `research/35b_drift_briefing_2026-06-04.md` |
-| 3 | **Gemma 4 perf opt P2** (distributed RMSNorm) | not started; design in briefing | `research/gemma4_perf_briefing_2026-06-04.md` |
-| 4 | **Gemma 4 perf opt P3** (paged SDPA on global layers) | not started; design in briefing | same |
+| 2 | **35B-A3B drift bisection** | ✅ DONE — drift GONE, see `[[35b-drift-resolved-2026-06-04]]` | resolved memory |
+| 3 | **35B needle-haystack sanity** | 🔄 IN FLIGHT — bf16 free-run is non-deterministic (Y↔N flip per trial); multi-trial average ~50-70% retrieval | `experiments/cb/isolate/cb35_needle_*.py` |
+| 4 | **35B stress tests** (task #173) | ⏳ blocked on #3 verdict | multi-turn Q&A + concurrent CB load |
+| 5 | **Gemma 4 perf opt P2** (distributed RMSNorm) | task #178 | `research/gemma4_perf_briefing_2026-06-04.md` |
+| 6 | **Gemma 4 perf opt P3** (paged SDPA on global) | task #179 | same |
+| 7 | **Presentation prep** (task #172) | 🔄 IN FLIGHT — 1/5 subagent reports done | `presentation/00_outline.md` |
+| 8 | **Chat TUI stretch goals** (tasks #174-176) | ⏳ | web_search tool, cli_nav tool, Gemma vision input |
+| 9 | **TUI screenshots** (task #177) | ⏳ for presentation demo | `presentation/screenshots/` |
 
 ### In-flight as of right now (compaction-resilient: re-check these after compaction)
 - **35B per-layer drift probe** — `cb35` tmux harness bootstrapping
