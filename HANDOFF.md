@@ -130,14 +130,20 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
       Launch: `bash scripts/run_harness_tmux.sh gm4`. Run probes via
       `touch tt-xla/.cache/gm4_runtime/trig/<short_name>` (matches any
       probe whose filename ends in `_<short_name>.py`).
-    - v0.3.3.b sliding-window invariance at pos > 1024 — pending;
-      needs a > 1024-token HF oracle which is expensive to generate
-      on CPU.
+    - v0.3.3.b sliding-window invariance at pos > 1024 — pending; not
+      blocking (v0.4 trace shipping first).
+  - **v0.4 traced decode IN FLIGHT 2026-06-03** — `update_input_buffers`,
+    `forward_token_gm4_inner` (reads ONLY tok_buf/cur_pos_buf/rot_idxs_buf),
+    `ensure_decode_trace` (two-phase warmup per [[ttnn-multi-trace-two-phase-warmup]]),
+    `step_forward_traced` shipped. Bootstrap bumped to
+    `trace_region_size=400_000_000` (default 50 MB too small for 48-layer
+    decode trace). Validator: `gm4_v04_trace_validate.py` — 100 traced
+    steps must equal 100 eager steps token-for-token. Running via the
+    dev harness.
 
-  **~5-6 days of focused work remaining** to ship `TT_BACKEND=gemma4_12b
+  **~3-4 days of focused work remaining** to ship `TT_BACKEND=gemma4_12b
   serve_cb.sh start` chat working end-to-end:
-  v0.3.3 long-context (~1 day) + v0.4 trace (~1 day) + v1 CB (~2-3 days)
-  + v2 HTTP (~1 day).
+  v0.4 trace gate (in flight) + v1 CB (~2-3 days) + v2 HTTP (~1 day).
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the

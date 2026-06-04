@@ -259,6 +259,13 @@ class State:
         # No separate lm_head_tt — tied embeddings; we'll materialize as
         # transposed embed at v0.2 when we add lm_head.
         self.per_layer_tt = []  # [{...}, ...] per-layer weight dicts
+        # v0.4 trace state. tok_buf is the trace-resident token input;
+        # cur_pos_buf / rot_idxs_buf are already in the v0.3 set. trace_id
+        # is the captured-decode-trace handle; traced_argmax_tt is the
+        # on-device argmax tensor produced by the captured forward.
+        self.tok_buf = None
+        self.trace_id = None
+        self.traced_argmax_tt = None
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────
@@ -268,7 +275,13 @@ def bootstrap(state, log=None):
 
     log("[bootstrap] open mesh + fabric…")
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-    state.mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, NCHIPS))
+    # trace_region_size: the v0.4 decode trace (48 layers × paged SDPA
+    # + MLP per layer + lm_head + argmax) needs ~250 MB by analogy with
+    # 27B's 0.2 GB decode trace. Use 400 MB to leave headroom for chunked
+    # prefill later. 27B uses 800 MB (decode + chunked prefill); 35B is
+    # larger still. Default 50 MB triggers TT_THROW.
+    state.mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, NCHIPS),
+                                        trace_region_size=400_000_000)
     log(f"  mesh: {state.mesh}")
 
     log("[bootstrap] config (from snapshot JSON; tokenizer deferred to v0.2)…")
@@ -338,6 +351,13 @@ def bootstrap(state, log=None):
     )
     state.rot_idxs_buf = ttnn.from_torch(
         torch.zeros((1,), dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # tok_buf: uint32 [1, 1] for ttnn.embedding(tok_buf, embed_tt) inside
+    # the traced forward. Updated out-of-trace via copy_host_to_device_tensor.
+    state.tok_buf = ttnn.from_torch(
+        torch.zeros((1, 1), dtype=torch.int32),
         dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
@@ -1295,6 +1315,115 @@ def step_forward_v02(state, tok_id, capture=None):
     if capture is not None:
         capture["argmax"] = argmax
     return argmax
+
+
+# ── v0.4 traced decode ────────────────────────────────────────────────
+# Mirrors 27B prod (`experiments/serve/server_tp.py:1587-1694, 2142-2186`).
+# Pre-allocate `tok_buf` + `cur_pos_buf` + `rot_idxs_buf` in bootstrap;
+# `update_input_buffers` writes them out-of-trace via
+# `copy_host_to_device_tensor`; `forward_token_gm4_inner` reads ONLY from
+# those buffers and returns an on-device argmax tensor; capture once, then
+# `execute_trace` per token. Two-phase warmup (2 eager forwards to JIT-compile
+# all kernels before capture) — JIT inside `begin_trace_capture` hangs
+# Blackhole per [[ttnn-multi-trace-two-phase-warmup]].
+
+
+def update_input_buffers(state, token_id, cur_pos):
+    """Host→device write to tok_buf, cur_pos_buf, rot_idxs_buf. Outside any
+    captured trace. Three tiny index writes (no embeds, no logits).
+
+    Lazy-allocates `state.tok_buf` if absent — defensive for the dev
+    harness, which keeps state alive across `importlib.reload(base)` and
+    so may have a state object that pre-dates a bootstrap-added buffer.
+    """
+    if getattr(state, "tok_buf", None) is None:
+        state.tok_buf = ttnn.from_torch(
+            torch.zeros((1, 1), dtype=torch.int32),
+            dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+    tok_host = ttnn.from_torch(
+        torch.tensor([[int(token_id)]], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(tok_host, state.tok_buf)
+    _set_pos(state, cur_pos)  # writes cur_pos_buf + rot_idxs_buf in place
+
+
+def forward_token_gm4_inner(state):
+    """Trace-captureable forward — reads ONLY state.tok_buf / cur_pos_buf /
+    rot_idxs_buf, does the embed + RoPE-table-row lookup on-device via
+    ttnn.embedding, runs all 48 layers, final_norm + lm_head + softcap +
+    argmax. Returns an on-device UINT32 [1, 1] argmax tensor.
+
+    Bit-equivalent to `step_forward_v03` modulo the tok-input plumbing
+    (tok_buf vs the from_torch+embedding inside step_forward_v03). v0.4
+    validator gate: 100 traced steps produce the same argmax sequence as
+    100 eager steps.
+    """
+    embed = ttnn.embedding(state.tok_buf, state.embed_tt)
+    h = ttnn.multiply(ttnn.to_layout(embed, ttnn.TILE_LAYOUT), EMBED_SCALE)
+    ttnn.deallocate(embed)
+    for L in range(NUM_LAYERS):
+        h_new = _layer_forward_pos0_paged(state, h, L)
+        ttnn.deallocate(h)
+        h = h_new
+    final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
+    ttnn.deallocate(h)
+    logits_raw = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
+    ttnn.deallocate(final)
+    inv = ttnn.multiply(logits_raw, 1.0 / FINAL_LOGIT_SOFTCAP)
+    ttnn.deallocate(logits_raw)
+    th = ttnn.tanh(inv)
+    ttnn.deallocate(inv)
+    logits = ttnn.multiply(th, FINAL_LOGIT_SOFTCAP)
+    ttnn.deallocate(th)
+    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+    ttnn.deallocate(logits)
+    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
+    ttnn.deallocate(logits_rm)
+    return argmax_tt
+
+
+def ensure_decode_trace(state, log=print):
+    """Capture the decode forward once. Subsequent calls reuse the captured
+    trace. Two warmup forwards JIT all kernels FIRST (the trace capture
+    cannot tolerate JIT — [[ttnn-multi-trace-two-phase-warmup]]).
+    """
+    if getattr(state, "trace_id", None) is not None:
+        return
+    log("[trace] warmup + capture decode trace…")
+    t0 = time.time()
+    # Warmup eager twice — JIT-compile all kernel programs the inner forward
+    # touches. Use BOS (token=2) at pos=0,1 so the cache lookups stay valid.
+    update_input_buffers(state, token_id=2, cur_pos=0)
+    a = forward_token_gm4_inner(state); ttnn.deallocate(a)
+    ttnn.synchronize_device(state.mesh)
+    update_input_buffers(state, token_id=2, cur_pos=1)
+    a = forward_token_gm4_inner(state); ttnn.deallocate(a)
+    ttnn.synchronize_device(state.mesh)
+    # Capture. Pre-set buffers to the position we'll never replay at, so
+    # the first execute_trace call sees only the new values that
+    # update_input_buffers writes.
+    update_input_buffers(state, token_id=2, cur_pos=2)
+    state.trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
+    state.traced_argmax_tt = forward_token_gm4_inner(state)
+    ttnn.end_trace_capture(state.mesh, state.trace_id, cq_id=0)
+    log(f"[trace] captured in {(time.time()-t0)*1000:.0f} ms "
+        f"(id={state.trace_id})")
+
+
+def step_forward_traced(state, token_id, cur_pos):
+    """Equivalent to step_forward_v031 but uses the captured trace. Caller
+    must have run `ensure_decode_trace(state)` once before the first call.
+    Reads back the argmax via to_torch (small UINT32 [1, 1] tensor).
+    """
+    update_input_buffers(state, token_id, cur_pos)
+    ttnn.execute_trace(state.mesh, state.trace_id, cq_id=0, blocking=False)
+    arr = ttnn.to_torch(state.traced_argmax_tt,
+                        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+    return int(arr.reshape(-1)[0].item())
 
 
 if __name__ == "__main__":
