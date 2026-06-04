@@ -1,4 +1,4 @@
-This is LuaHBTeX, Version 1.21.0 (TeX Live 2025)  (format=lualatex 2025.3.8)  4 JUN 2026 11:57
+This is LuaHBTeX, Version 1.21.0 (TeX Live 2025)  (format=lualatex 2025.3.8)  4 JUN 2026 14:01
  restricted system commands enabled.
 **poster.tex
 (./poster.tex
@@ -854,14 +854,14 @@ ut line 130.
 Package beamerposter Info: finished size input check. on input line 130.
 Package beamerposter Info: custom poster width=120 on input line 130.
 Package beamerposter Info: custom poster height=72 on input line 130.
-Package beamerposter Info: myfontscale=1.0 on input line 130.
+Package beamerposter Info: myfontscale=1.05 on input line 130.
  ( FP-UPN
 ( FP-MUL ) ( FP-ROUND ) ) ( FP-UPN ( FP-SUB ) ) ( FP-UPN ( FP-SUB ) )
 Package beamerposter Info: paperwidth=3414.3307pt, paperheight=2048.59842pt on 
 input line 173.
 Package beamerposter Info: textwidth=3385.87794pt, textheight=2020.14566pt on i
 nput line 174.
-Package beamerposter Info: fontscale=1.0, myfontscale=1.00 on input line 175.
+Package beamerposter Info: fontscale=1.0, myfontscale=1.05 on input line 175.
  ( FP-UPN
 ( FP-MUL ) ( FP-ROUND ) ) ( FP-UPN ( FP-MUL ) ( FP-ROUND ) ) ( FP-UPN ( FP-MUL
 ) ( FP-ROUND ) ) ( FP-UPN ( FP-MUL ) ( FP-ROUND ) ) ( FP-UPN ( FP-MUL )
@@ -1386,6 +1386,7 @@ Package pgfplots notification 'compat/show suggested version=true': you might b
 enefit from \pgfplotsset{compat=1.18} (current compat level: 1.17).
 
 (./poster.nav)
+LaTeX Font Info:    Calculating math sizes for size <12.6> on input line 33.
 LaTeX Font Info:    Trying to load font information for OT1+lmr on input line 3
 3.
  (/usr/local/texlive/2025/texmf-dist/tex/latex/lm/ot1lmr.fd
@@ -1403,19 +1404,68 @@ LaTeX Font Info:    Trying to load font information for OMS+lmsy on input line
 (/usr/local/texlive/2025/texmf-dist/tex/latex/lm/omslmsy.fd
 File: omslmsy.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <12.6> not available
+(Font)              size <12> substituted on input line 33.
+
 LaTeX Font Info:    External font `cmex7' loaded for size
-(Font)              <6> on input line 33.
-Package pgfplots info on input line 280: Using 'lua backend=false' for axis: xm
+(Font)              <6.3> on input line 33.
+LaTeX Font Info:    Calculating math sizes for size <26.12> on input line 312.
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <26.12> not available
+(Font)              size <24.88> substituted on input line 312.
+
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <18.2839> not available
+(Font)              size <17.28> substituted on input line 312.
+
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <13.06> not available
+(Font)              size <12> substituted on input line 312.
+
+LaTeX Font Info:    Calculating math sizes for size <21.78> on input line 312.
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <21.78> not available
+(Font)              size <20.74> substituted on input line 312.
+
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <15.24593> not available
+(Font)              size <14.4> substituted on input line 312.
+
+Package pgfplots info on input line 312: Using 'lua backend=false' for axis: xm
 ode=log unsupported (yet).
-LaTeX Font Info:    Calculating math sizes for size <29.86> on input line 280.
+LaTeX Font Info:    Calculating math sizes for size <31.35> on input line 312.
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <31.35> not available
+(Font)              size <24.88> substituted on input line 312.
 
 
-LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <29.86> not available
-(Font)              size <24.88> substituted on input line 280.
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <21.9449> not available
+(Font)              size <20.74> substituted on input line 312.
 
 
-LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <14.93> not available
-(Font)              size <14.4> substituted on input line 280.
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <15.675> not available
+(Font)              size <14.4> substituted on input line 312.
+
+Package pgfplots info on input line 312: Using 'lua backend=false' for axis: x 
+coord trafo unsupported.
+LaTeX Font Info:    Calculating math sizes for size <15.12> on input line 312.
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <15.12> not available
+(Font)              size <14.4> substituted on input line 312.
+
+LaTeX Font Info:    External font `cmex7' loaded for size
+(Font)              <7.56> on input line 312.
+
+Overfull \hbox (18.13245pt too wide) in paragraph at lines 312--312
+ [] 
+ []
+
+
+Overfull \hbox (20.52675pt too wide) detected at line 312
+[][][] [][][][][][][][][] [][][][][][][][][] [][][][][][][][][] [][][][][][][][
+][] [][][][][][][][][] [][][][][][][][][] [][][][][][][] 
+ []
 
 
 
@@ -1440,41 +1490,40 @@ L3 programming layer <2025-01-18>
 
 
 LaTeX Font Warning: Size substitutions with differences
-(Font)              up to 4.98pt have occurred.
+(Font)              up to 6.47pt have occurred.
 
 Package rerunfilecheck Info: File `poster.out' has not changed.
 (rerunfilecheck)             Checksum: D41D8CD98F00B204E9800998ECF8427E;0.
 )
 
 Here is how much of LuaTeX's memory you used:
- 39891 strings out of 475506
- 305222,1648299 words of node,token memory allocated
- 74989 words of node memory still in use:
-   786 hlist, 65 vlist, 100 rule, 242 disc, 93 local_par, 123 math, 2496 glue, 7
-27 kern, 166 penalty, 3600 glyph, 2678 attribute, 82 glue_spec, 2678 attribute_l
-ist, 4 write, 920 pdf_literal, 396 pdf_colorstack nodes
-   avail lists: 2:416,3:3288,4:1359,5:2244,6:288,7:18976,8:21,9:3012,10:17,11:73
-5
- 61735 multiletter control sequences out of 65536+600000
- 123 fonts using 18781287 bytes
- 128i,23n,116p,721b,3023s stack positions out of 10000i,1000n,20000p,200000b,200000s
-{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-rm.enc}</usr/local/tex
-live/2025/texmf-dist/fonts/truetype/typoland/lato/Lato-LightItalic.ttf>{/usr/loc
-al/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-mathit.enc}</usr/local/texlive/
-2025/texmf-dist/fonts/truetype/typoland/lato/Lato-Regular.ttf>{/usr/local/texliv
-e/2025/texmf-dist/fonts/enc/dvips/lm/lm-mathsy.enc}</usr/local/texlive/2025/texm
+ 40011 strings out of 475506
+ 305224,1648299 words of node,token memory allocated
+ 75337 words of node memory still in use:
+   835 hlist, 65 vlist, 99 rule, 213 disc, 92 local_par, 113 math, 2601 glue, 67
+7 kern, 166 penalty, 3261 glyph, 3035 attribute, 82 glue_spec, 3035 attribute_li
+st, 4 write, 1129 pdf_literal, 432 pdf_colorstack nodes
+   avail lists: 2:416,3:3915,4:1467,5:2094,6:285,7:18244,8:13,9:3156,10:17,11:64
+8
+ 61855 multiletter control sequences out of 65536+600000
+ 145 fonts using 20656679 bytes
+ 128i,23n,116p,721b,3082s stack positions out of 10000i,1000n,20000p,200000b,200000s
+</usr/local/texlive/2025/texmf-dist/fonts/truetype/typoland/lato/Lato-LightItali
+c.ttf>{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-mathit.enc}</usr
+/local/texlive/2025/texmf-dist/fonts/truetype/typoland/lato/Lato-Regular.ttf>{/u
+sr/local/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-mathsy.enc}{/usr/local/te
+xlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-rm.enc}</usr/local/texlive/2025/texm
 f-dist/fonts/truetype/typoland/lato/Lato-Light.ttf></usr/local/texlive/2025/texm
 f-dist/fonts/opentype/public/lm/lmmono12-regular.otf></usr/local/texlive/2025/te
 xmf-dist/fonts/opentype/impallari/raleway/Raleway-Regular.otf></usr/local/texliv
 e/2025/texmf-dist/fonts/opentype/impallari/raleway/Raleway-Bold.otf></usr/local/
 texlive/2025/texmf-dist/fonts/type1/public/lm/lmmi12.pfb></usr/local/texlive/202
-5/texmf-dist/fonts/type1/public/lm/lmr12.pfb></usr/local/texlive/2025/texmf-dist
-/fonts/type1/public/lm/lmr17.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1
-/public/lm/lmsy10.pfb>
-Output written on poster.pdf (1 page, 121539 bytes).
+5/texmf-dist/fonts/type1/public/lm/lmr17.pfb></usr/local/texlive/2025/texmf-dist
+/fonts/type1/public/lm/lmsy10.pfb>
+Output written on poster.pdf (1 page, 102030 bytes).
 
-PDF statistics: 84 PDF objects out of 1000 (max. 8388607)
- 52 compressed objects within 1 object stream
+PDF statistics: 80 PDF objects out of 1000 (max. 8388607)
+ 49 compressed objects within 1 object stream
  3 named destinations out of 1000 (max. 131072)
  16 words of extra memory for PDF output out of 10000 (max. 100000000)
 

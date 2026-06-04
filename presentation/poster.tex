@@ -3,7 +3,7 @@
 
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
-\usepackage[size=custom,width=120,height=72,scale=1.0]{beamerposter}
+\usepackage[size=custom,width=120,height=72,scale=1.05]{beamerposter}
 \usetheme{gemini}
 \usecolortheme{tenstorrent}
 \usepackage{graphicx}
@@ -18,12 +18,12 @@
 
 \newlength{\sepwidth}
 \newlength{\colwidth}
-\setlength{\sepwidth}{0.022\paperwidth}
-\setlength{\colwidth}{0.304\paperwidth}
+\setlength{\sepwidth}{0.028\paperwidth}
+\setlength{\colwidth}{0.298\paperwidth}
 
 \newcommand{\separatorcolumn}{\begin{column}{\sepwidth}\end{column}}
 
-\title{Bringing Up Modern LLMs on Tenstorrent Blackhole}
+\title{Three LLMs on Four Blackhole Chips}
 \author{Aditya Sriram}
 \institute[Stanford]{Department of Computer Science, Stanford University \quad
   \texttt{adisram@stanford.edu}}
@@ -52,8 +52,9 @@
 
   % ------------------- Hardware -------------------
   \begin{block}{Hardware}
-    \begin{center}\footnotesize
-    \setlength{\tabcolsep}{4pt}
+    \begin{center}\small
+    \setlength{\tabcolsep}{6pt}
+    \renewcommand{\arraystretch}{1.15}
     \begin{tabular}{l l}
       \toprule
       Mesh      & $1\times4$ Blackhole P150 (4 chips) \\
@@ -67,8 +68,9 @@
 
   % ------------------- Models Brought Up -------------------
   \begin{block}{Models Brought Up}
-    \begin{center}\footnotesize
-    \setlength{\tabcolsep}{3pt}
+    \begin{center}\small
+    \setlength{\tabcolsep}{5pt}
+    \renewcommand{\arraystretch}{1.15}
     \begin{tabular}{l c l c}
       \toprule
       \textbf{Model} & \textbf{Params} & \textbf{Architecture} & \textbf{Status} \\
@@ -83,12 +85,11 @@
 
   % ------------------- Methodology -------------------
   \begin{block}{Methodology}
-    A staged ladder gates each rung on cosine vs.\ a CPU fp32 oracle:
+    A staged ladder, each rung gated on cosine vs.\ a CPU fp32 oracle:
     single-layer $\to$ full forward $\to$ multi-step decode $\to$ long
     context $\to$ trace $\to$ continuous batching $\to$ HTTP. Each new
-    model reused $\sim$80--90\% of the prior bringup (CB engine, dev
-    harness, HF oracle, paged SDPA). Validation is teacher-forced
-    multi-step cosine \emph{and} MAD per layer; six of seven
+    model reused $\sim$80--90\% of the prior bringup. Validation is
+    teacher-forced cosine \emph{and} MAD per layer; six of seven
     silent-failure classes are invisible at decode pos 0 alone.
   \end{block}
 
@@ -96,7 +97,7 @@
   \begin{block}{What Mattered}
     Three changes account for most of the throughput delta over a
     naive port.
-    \begin{itemize}\setlength\itemsep{0.3ex}\setlength\parskip{0pt}
+    \begin{itemize}\setlength\itemsep{0.7ex}\setlength\parskip{0pt}
       \item \textbf{Paged SDPA, HiFi2 fp16 accumulation} --- kernel-time
             win; $+62\%$ on 27B TP single-stream.
       \item \textbf{Vocab-sharded lm\_head, on-device argmax} --- a 600
@@ -132,7 +133,7 @@
     \begin{tikzpicture}
       \begin{axis}[
         width=0.95\colwidth,
-        height=0.48\colwidth,
+        height=0.34\colwidth,
         xlabel={Concurrent clients ($B$)},
         ylabel={Aggregate tok/s},
         xmode=log, log basis x=2,
@@ -161,15 +162,14 @@
     \end{tikzpicture}
     \end{center}
 
-    Diminishing returns past $B{=}32$ on Gemma 4 (316 $\to$ 340 at
-    $B{=}64$): scheduler + paged SDPA overhead saturate the
-    weight-bandwidth amortization win.
+    Diminishing returns past $B{=}32$ (316 $\to$ 340 at $B{=}64$).
   \end{block}
 
   % ------------------- Single-client streaming (NEW) -------------------
   \begin{block}{Single-Client Streaming (HTTP, $B{=}32$ traced)}
-    \begin{center}\footnotesize
-    \setlength{\tabcolsep}{5pt}
+    \begin{center}\small
+    \setlength{\tabcolsep}{7pt}
+    \renewcommand{\arraystretch}{1.15}
     \begin{tabular}{l r r}
       \toprule
       \textbf{Model} & \textbf{Prefill} & \textbf{Decode} \\
@@ -179,30 +179,60 @@
       \bottomrule
     \end{tabular}
     \end{center}
-    Decode at 17.4 tok/s is 83\% of the $B{=}1$ dev-harness ceiling;
-    the small gap is HTTP + scheduler overhead on otherwise idle slots.
+    Decode is 83\% of the $B{=}1$ dev-harness ceiling.
   \end{block}
 
   % ------------------- Roofline -------------------
-  \begin{block}{Roofline}
-    Decode at $B{=}1$ is weight-bandwidth-bound:
-    $t_{\min} \approx \tfrac{\text{active GB/chip}}{\text{404 GB/s}}$.
-
-    \begin{center}\footnotesize
-    \setlength{\tabcolsep}{4pt}
+  \begin{block}{Roofline: Measured vs.\ BW Ceiling ($B{=}1$)}
+    \begin{center}\small
+    \setlength{\tabcolsep}{6pt}
+    \renewcommand{\arraystretch}{1.15}
     \begin{tabular}{l r r r}
       \toprule
       \textbf{Model} & \textbf{ms/tok} & \textbf{tok/s} & \textbf{\% ceiling} \\
       \midrule
-      Gemma 4 12B        & \textbf{47.5} & \textbf{21.0} & 31\% of 67 \\
-      Qwen3.6-27B (TP4)  & \textbf{77.0} & \textbf{12.9} & 22\% of 60 \\
-      Qwen3.6-35B-A3B    & \textbf{81.2} & \textbf{12.3} & 4.6\% of 270 \\
+      Gemma 4 12B        & \textbf{47.5} & \textbf{21.0} & 31\% \\
+      Qwen3.6-27B (TP4)  & \textbf{77.0} & \textbf{12.9} & 22\% \\
+      Qwen3.6-35B-A3B    & \textbf{81.2} & \textbf{12.3} & 4.6\% \\
       \bottomrule
     \end{tabular}
     \end{center}
 
-    Continuous batching closes the gap on real workloads: $B{=}32$
-    amortizes weight reads $\sim$28$\times$.
+    \begin{center}
+    \begin{tikzpicture}
+      \begin{axis}[
+        width=0.95\colwidth,
+        height=0.22\colwidth,
+        xbar,
+        bar width=5pt,
+        enlarge y limits=0.40,
+        xmin=0, xmax=320,
+        xtick={0,100,200,300},
+        xlabel={tok/s ($B{=}1$) vs.\ 404 GB/s ceiling},
+        symbolic y coords={35B-A3B, 27B, 12B},
+        ytick=data,
+        xticklabel style={font=\small},
+        yticklabel style={font=\small},
+        xlabel style={font=\small},
+        grid=both,
+        major grid style={line width=0.2pt,draw=ttdeepblue!20},
+        minor grid style={line width=0.1pt,draw=ttdeepblue!10},
+        axis line style={ttink},
+        tick style={ttink},
+        label style={ttink},
+        legend style={font=\footnotesize,draw=ttdeepblue!30,at={(0.98,0.05)},anchor=south east},
+        nodes near coords,
+        nodes near coords style={font=\scriptsize, color=ttink},
+      ]
+        \addplot[fill=ttsky!30, draw=ttdeepblue]
+          coordinates {(67,12B) (60,27B) (270,35B-A3B)};
+        \addlegendentry{BW ceiling}
+        \addplot[fill=ttdeepblue, draw=ttink]
+          coordinates {(21.0,12B) (12.9,27B) (12.3,35B-A3B)};
+        \addlegendentry{Measured}
+      \end{axis}
+    \end{tikzpicture}
+    \end{center}
   \end{block}
 
 \end{column}
@@ -218,8 +248,9 @@
   \begin{block}{Correctness}
     Three orthogonal gates, run per model on every change.
 
-    \begin{center}\footnotesize
-    \setlength{\tabcolsep}{4pt}
+    \begin{center}\small
+    \setlength{\tabcolsep}{5pt}
+    \renewcommand{\arraystretch}{1.15}
     \begin{tabular}{l c c c}
       \toprule
       \textbf{Gate} & \textbf{27B} & \textbf{35B-A3B} & \textbf{Gemma 4} \\
@@ -248,8 +279,9 @@
   % ------------------- Prefix Cache -------------------
   \begin{block}{Prefix Cache in Practice}
     Two-turn 27B chat over HTTP:
-    \begin{center}\footnotesize
-    \setlength{\tabcolsep}{6pt}
+    \begin{center}\small
+    \setlength{\tabcolsep}{8pt}
+    \renewcommand{\arraystretch}{1.15}
     \begin{tabular}{l r r}
       \toprule
       \textbf{Turn} & \textbf{Prompt} & \textbf{Prefill} \\
@@ -269,8 +301,8 @@
     A single $1\times4$ Blackhole P150 mesh, with a disciplined bringup
     recipe, takes a modern LLM from spec to byte-stable HTTP chat at
     \textbf{316 tok/s} on 12B and \textbf{232 tok/s} on 27B. The open
-    stack lets a small team bring up new architectures (MoE recurrence,
-    hybrid attention, dual-head-dim) without a vendor roadmap.
+    stack lets a small team bring up new architectures (MoE, hybrid
+    attention) without a vendor roadmap.
   \end{block}
 
 \end{column}
