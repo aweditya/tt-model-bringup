@@ -53,16 +53,29 @@ def main():
     srv.bootstrap(state, log=log)
     log(f"bootstrap took {time.time()-t0:.1f}s")
 
+    # HF hidden_states shape [n_layers+1, seq, HIDDEN]. Last index is the
+    # post-final-norm hidden state at each sequence position.
+    hf_hidden = np.load(ORACLE_DIR / "hidden_states.npy")
+    hf_final_per_pos = hf_hidden[-1]  # [seq, HIDDEN]
+
+    def cos_(a, b):
+        a = a.reshape(-1).astype(np.float64); b = b.reshape(-1).astype(np.float64)
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        return float(a @ b / (na * nb)) if (na and nb) else 0.0
+
     log("running teacher-forced multi-step decode…")
     results = []
     for pos in range(seq_len):
         tok_id = int(prompt_ids[pos])
-        argmax_tt = srv.step_forward_v031(state, tok_id, pos)
+        cap = {}
+        argmax_tt = srv.step_forward_v031(state, tok_id, pos, capture=cap)
         hf_arg = int(hf_argmax[pos])
         match = (argmax_tt == hf_arg)
         results.append((pos, tok_id, argmax_tt, hf_arg, match))
+        c_final = cos_(cap["final_norm"], hf_final_per_pos[pos])
         log(f"  pos={pos} in_tok={tok_id:>6d} TT_argmax={argmax_tt:>6d} "
-            f"HF_argmax={hf_arg:>6d} {'PASS' if match else 'FAIL'}")
+            f"HF_argmax={hf_arg:>6d} cos_final={c_final:.4f} "
+            f"{'PASS' if match else 'FAIL'}")
 
     log("=" * 64)
     log("Gemma 4 12B v0.3.1 multi-step teacher-forced gate")

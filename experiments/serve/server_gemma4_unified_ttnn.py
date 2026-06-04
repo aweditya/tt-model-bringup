@@ -1090,10 +1090,22 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx):
     lt = state.layer_types[layer_idx]
     residual_1 = ttnn.clone(h_in)
     h_norm = ttnn.rms_norm(h_in, weight=w["input_layernorm"], epsilon=EPS)
+    # DEBUG: GM4_SKIP_SLIDING=1 / GM4_SKIP_GLOBAL=1 short-circuit one
+    # attention type to a zero-mixer (residual passes through). Used to
+    # bisect which layer-type contributes the pos > 0 drift.
+    import os as _os
+    skip_sliding = bool(_os.environ.get("GM4_SKIP_SLIDING"))
+    skip_global = bool(_os.environ.get("GM4_SKIP_GLOBAL"))
     if lt == "sliding_attention":
-        mixer = _layer_pos0_sliding_paged(state, h_norm, w, layer_idx)
+        if skip_sliding:
+            mixer = ttnn.mul(h_norm, 0.0)
+        else:
+            mixer = _layer_pos0_sliding_paged(state, h_norm, w, layer_idx)
     else:
-        mixer = _layer_pos0_global_paged(state, h_norm, w, layer_idx)
+        if skip_global:
+            mixer = ttnn.mul(h_norm, 0.0)
+        else:
+            mixer = _layer_pos0_global_paged(state, h_norm, w, layer_idx)
     ttnn.deallocate(h_norm)
     post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
     ttnn.deallocate(mixer)

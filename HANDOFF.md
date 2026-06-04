@@ -81,9 +81,31 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
     logits cos 0.999370, argmax matches HF.
     Memorialized: [[paged-update-cache-nkv-per-chip]],
     [[read-kernel-source-first]], [[use-existing-isolation-probes]].
-  - **v0.3.1 IN FLIGHT** — multi-step decode + RoPE at pos > 0.
-    Sub-staging: v0.3.1.0 (RoPE wiring at pos 0 keeps v0.3.0.1 PASS),
-    v0.3.1.1 (multi-step pos > 0), v0.3.1.2 (8-tok teacher-forced).
+  - **v0.3.1 STUCK at 3/6 PASS — diagnostic cliff at pos 1** (2026-06-03):
+    `gm4_v031_multistep_cos` on 6-tok prompt gives `pos 0 cos_final=0.9995
+    (bit-clean)`, `pos 1 cos_final=0.2618` (catastrophic — looks like
+    residual pass-through; TT predicts the input token verbatim), pos 2-5
+    cos_final 0.42-0.62 (medium drift, argmax matches HF on 2 of 4 by luck).
+    Ruled out by isolation probes — paged write/read at sliding shape
+    (`gm4_sliding_write_read.py` 6/6 cos 0.9996+), paged write/read at
+    global shape (`gm4_global_write_read.py` 6/6 cos 0.9996+), ttnn
+    `embedding` row lookup (`gm4_rope_lookup.py`), on-device cur_pos_buf /
+    rot_idxs_buf values (GM4_DEBUG_POS verified [1,1,1,1] across mesh),
+    RoPE math (GM4_ROPE_ZERO=1 gives same 3/6 pattern — RoPE is not
+    the cause). **Code hardening landed in commit `5c96abb`** —
+    canonical Tenstorrent in-tree Gemma 4 SDPA config for head_dim=512
+    global (CoreCoord(8,4), q_chunk=32, k_chunk=64) replacing the 70-LOC
+    manual-attention fallback, view-decay cleanup in `_apply_full_rope`
+    and the sliding 2-call loop, and in-place buffer updates via
+    `copy_host_to_device_tensor` (27B prod pattern at
+    `server_tp.py:1607-1619`) — none of which moved the 3/6 number,
+    but each closes a [[ttnn-slice-view-decay]] / [[ttnn-list-rebinding-leaks]]
+    anti-pattern that would have masked the real bug. **Next session
+    bisection**: capture per-layer h cosines through all 48 layers at
+    pos 1 to find the layer where TT-vs-HF drift starts — that's the
+    only signal that distinguishes "broken at pos 1 alone" from
+    "broken at pos > 0 generally". Debug knobs in place: GM4_DEBUG_POS,
+    GM4_ROPE_ZERO, GM4_SKIP_SLIDING, GM4_SKIP_GLOBAL.
   - v0.3.2 (optional): free-run greedy ≥ 16 tokens.
 
   **~5-7 days of focused work** to ship `TT_BACKEND=gemma4_12b
