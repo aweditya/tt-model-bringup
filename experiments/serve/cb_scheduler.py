@@ -487,14 +487,37 @@ class Scheduler:
             # full token sequence so a returning chat can resume from cur_pos
             # without re-prefill.
             #
-            # IMPORTANT: do NOT strip the trailing EOS. For Qwen3.6 chat the
-            # "EOS" detected here is usually <|im_end|>, which the chat
-            # template ALSO emits between turns. If we strip it, turn 2's
-            # tokenization (which includes <|im_end|> after assistant_1) won't
-            # match the cached prefix. The slot's DN+KV state already processed
-            # that token, so storing it in tokens_so_far is correct.
+            # Cache key canonicalisation. The chat template will rebuild the
+            # assistant turn on the NEXT turn as `decode(gen) | trim` (Jinja
+            # filter) re-tokenised + EOS. If we naively store `prompt + gen`
+            # and the model emitted trailing whitespace before EOS, `| trim`
+            # drops it at rebuild time and the byte-exact prefix match in
+            # `live_slot_store.find_longest_match` fails by 1+ tokens. Caught
+            # on Gemma 4 (0/60 PC hits before this fix). See
+            # `research/tokenizer_chat_template_reference.md` §5.
+            #
+            # Canonical form: decode the generated tokens (with the trailing
+            # EOS stripped from the text) → `rstrip()` → re-tokenise without
+            # special tokens (no stray BOS) → re-append the EOS we saw.
+            # For Qwen3.6 where the model rarely emits trailing whitespace
+            # this is a no-op equivalent of `prompt + gen`; for Gemma 4 it
+            # matches what the template's `| trim` produces on the next
+            # turn's render.
             if self.prefix_cache:
-                tokens_so_far = list(r['prompt']) + list(r['gen'])
+                tok = getattr(self.state, 'tokenizer', None)
+                eos_id = (int(r['gen'][-1])
+                          if r['gen'] and r['gen'][-1] in self.eos_ids
+                          else next(iter(self.eos_ids), None))
+                if tok is not None and r['gen'] and eos_id is not None:
+                    body_ids = (r['gen'][:-1]
+                                if r['gen'][-1] in self.eos_ids
+                                else r['gen'])
+                    canon_text = tok.decode(body_ids, skip_special_tokens=True).rstrip()
+                    canon_ids = list(tok.encode(canon_text, add_special_tokens=False))
+                    canon_ids.append(int(eos_id))
+                    tokens_so_far = list(r['prompt']) + canon_ids
+                else:
+                    tokens_so_far = list(r['prompt']) + list(r['gen'])
                 if len(tokens_so_far) >= PREFIX_CACHE_MIN_MATCH:
                     self.live_slots.mark_live(s, tokens_so_far)
         return done
@@ -518,7 +541,21 @@ class Scheduler:
         if s is not None and self.slots[s] == rid:
             self.slots[s] = None
             if mark_live and self.prefix_cache:
-                tokens_so_far = list(r['prompt']) + list(r['gen'])
+                # Same canonicalisation as _finish — see comment there.
+                tok = getattr(self.state, 'tokenizer', None)
+                eos_id = (int(r['gen'][-1])
+                          if r['gen'] and r['gen'][-1] in self.eos_ids
+                          else next(iter(self.eos_ids), None))
+                if tok is not None and r['gen'] and eos_id is not None:
+                    body_ids = (r['gen'][:-1]
+                                if r['gen'][-1] in self.eos_ids
+                                else r['gen'])
+                    canon_text = tok.decode(body_ids, skip_special_tokens=True).rstrip()
+                    canon_ids = list(tok.encode(canon_text, add_special_tokens=False))
+                    canon_ids.append(int(eos_id))
+                    tokens_so_far = list(r['prompt']) + canon_ids
+                else:
+                    tokens_so_far = list(r['prompt']) + list(r['gen'])
                 if len(tokens_so_far) >= PREFIX_CACHE_MIN_MATCH:
                     self.live_slots.mark_live(s, tokens_so_far)
         if rid in self.waiting:
