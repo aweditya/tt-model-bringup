@@ -837,6 +837,14 @@ def _lm_head_argmax(state, final, capture_logits=False):
         ttnn.deallocate(gathered)
     argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
     ttnn.deallocate(rm)
+    # Normalize rank to match the 27B contract that cb_scheduler expects:
+    # argmax → [B, 1]; full_logits → [B, vocab_size]. Gemma 4's activations
+    # carry a seq dim of 1, so without this reshape both are rank-3
+    # `[1, B, ...]`, which breaks `idxs[s, 0]` in cb_scheduler._step_sampled_topk.
+    if argmax_tt.shape[0] == 1 and len(argmax_tt.shape) == 3:
+        argmax_tt = ttnn.reshape(argmax_tt, [argmax_tt.shape[1], argmax_tt.shape[2]])
+    if full_logits is not None and len(full_logits.shape) == 3 and full_logits.shape[0] == 1:
+        full_logits = ttnn.reshape(full_logits, [full_logits.shape[1], full_logits.shape[2]])
     return argmax_tt, full_logits
 
 
