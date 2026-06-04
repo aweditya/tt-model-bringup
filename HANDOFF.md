@@ -81,7 +81,32 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
     logits cos 0.999370, argmax matches HF.
     Memorialized: [[paged-update-cache-nkv-per-chip]],
     [[read-kernel-source-first]], [[use-existing-isolation-probes]].
-  - **v0.3.1 STUCK at 3/6 PASS — diagnostic cliff at pos 1** (2026-06-03):
+  - **v0.3.1 FIXED 2026-06-03 commit `c97bf15`** — root cause was
+    SDPA `scale=1.0/sqrt(head_dim)` (wrong); Gemma 4 text attention
+    sets `self.scaling = 1.0` (HF `modeling_gemma4.py:1178`),
+    confirmed in Tenstorrent's in-tree demo (`decode.py:144`). The
+    wrong scale was MASKED at pos 0 because a single-token softmax
+    is 1.0 regardless of scale. After-fix multi-step: pos 0..5
+    cos_final all ≥ 0.997 (was 0.26 at pos 1); 5/6 argmax PASS (pos
+    4 cos=0.9984 but argmax differs — bf16 tie noise per
+    [[bf16-chain-drift-at-B-gt-1]]). Per-layer drift ladder
+    L0-L46 cos > 0.996 at both pos 0 and pos 1. Memory rule:
+    [[feedback-gemma4-sdpa-scale-1]].
+
+    The debug ladder remains useful — keep the env knobs
+    (GM4_DEBUG_POS, GM4_ROPE_ZERO, GM4_SKIP_SLIDING, GM4_SKIP_GLOBAL)
+    and the four isolation probes (gm4_sliding_write_read,
+    gm4_global_write_read, gm4_rope_lookup, gm4_per_layer_drift_pos1)
+    for future bringup work.
+
+    **Below: full v0.3.1 debug session writeup retained for the
+    learning-by-building wiki — the 5-hour bisection burned several
+    "masked-at-pos-0" hypotheses (view-decay, in-place buffer update,
+    canonical SDPA config) BEFORE landing on scale=1.0. None of those
+    earlier fixes moved the 3/6 number, but each closed a real
+    Tenstorrent anti-pattern that would have masked the real bug.
+
+    ORIGINAL DIAGNOSTIC:
     `gm4_v031_multistep_cos` on 6-tok prompt gives `pos 0 cos_final=0.9995
     (bit-clean)`, `pos 1 cos_final=0.2618` (catastrophic — looks like
     residual pass-through; TT predicts the input token verbatim), pos 2-5
