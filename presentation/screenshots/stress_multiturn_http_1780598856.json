@@ -1,0 +1,35 @@
+{
+  "args": {
+    "url": "http://127.0.0.1:8000",
+    "model": "google/gemma-4-12B",
+    "turns": 3,
+    "max_tokens": 48,
+    "out": "/home/aditya/tt-xla/presentation/screenshots/stress_multiturn_http_1780598856.json"
+  },
+  "rows": [
+    {
+      "turn": 0,
+      "prompt_tokens": 36,
+      "completion_tokens": 48,
+      "wall_s": 4.849,
+      "user": "Hello! My name is Aditya. Could you suggest a 4-character abbreviation I can use as a nickname?",
+      "assistant": "Hi Aditya! Since your name has 6 letters, there are several ways to approach a 4-character abbreviation depending on the \"vibe\" you want.\n\nHere are a few suggestions categorized by style:\n\n### 1."
+    },
+    {
+      "turn": 1,
+      "prompt_tokens": 105,
+      "completion_tokens": 48,
+      "wall_s": 8.764,
+      "user": "Tell me a one-sentence interesting fact about chess.",
+      "assistant": "The game of chess is so complex that there are more possible unique games of chess than there are atoms in the observable universe.thought\nThe game of chess is so complex that there are more possible unique games of chess than there"
+    },
+    {
+      "turn": 2,
+      "prompt_tokens": 180,
+      "completion_tokens": 48,
+      "wall_s": 13.165,
+      "user": "Now combine both \u2014 write a one-sentence chess strategy named after the nickname you suggested for me.",
+      "assistant": "Since you didn't pick a specific nickname from the list yet, I will use **ADTY** (a common 4-character abbreviation for Aditya) as the name for the strategy:\n\n**The ADTY Strategy involves controlling the"
+    }
+  ]
+}
