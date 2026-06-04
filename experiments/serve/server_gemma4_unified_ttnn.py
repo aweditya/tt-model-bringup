@@ -1025,6 +1025,38 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx):
     return h_out
 
 
+def _set_pos(state, pos):
+    """Update cur_pos_buf + rot_idxs_buf for the new decode position.
+
+    Recreates the buffers from a fresh host tensor. ttnn doesn't expose a
+    convenient in-place write for these particular dtypes/layouts on this
+    build; recreate is simple and fine for eager (will refactor for trace
+    at v0.4).
+    """
+    if state.cur_pos_buf is not None:
+        ttnn.deallocate(state.cur_pos_buf)
+    state.cur_pos_buf = ttnn.from_torch(
+        torch.tensor([int(pos)], dtype=torch.int32),
+        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    if state.rot_idxs_buf is not None:
+        ttnn.deallocate(state.rot_idxs_buf)
+    state.rot_idxs_buf = ttnn.from_torch(
+        torch.tensor([int(pos)], dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+
+
+def step_forward_v031(state, tok_id, pos, capture=None):
+    """v0.3.1 multi-step forward — wraps `step_forward_v03` with a position
+    update. KV cache accumulates across calls; RoPE rotates by pos.
+    """
+    _set_pos(state, pos)
+    return step_forward_v03(state, tok_id, capture=capture)
+
+
 def step_forward_v03(state, tok_id, capture=None):
     """v0.3.0 forward — paged SDPA on sliding layers; global layers still
     use v0.2's V-routing shortcut. Goal: argmax should still match HF.
