@@ -7,10 +7,21 @@ robust enough to live-demo at a tech conference.
 
 ```
 ssh -L 8000:localhost:8000 qb1
-python3 scripts/chat.py                # default: greedy, max 1024
+python3 scripts/chat.py                # default: greedy, max 1024, <think> hidden
 python3 scripts/chat.py --tools        # enable shell / read_file / write_file / calc
+python3 scripts/chat.py --show-think   # show the model's <think>…</think> reasoning
 python3 scripts/chat.py --temp 0.7 --seed 42
 ```
+
+The welcome panel is Claude-Code-styled: a closed box showing the URL, model,
+working directory, and current settings. Each assistant turn opens with
+`● assistant (<model_short>)` and a thin grey rule.
+
+Qwen3.6 + Gemma 4 IT both emit `<think>…</think>` blocks. By default these
+are suppressed from the rendered stream (replaced with a single dim
+`(thinking…)` hint); the raw text is still appended to history so the
+model has full context on the next turn. Use `/think` mid-session or
+`--show-think` at launch to surface them.
 
 `--url http://...` points at a different server (default
 `http://localhost:8000`).
@@ -19,7 +30,7 @@ python3 scripts/chat.py --temp 0.7 --seed 42
 
 | Command                | What it does                                              |
 |------------------------|-----------------------------------------------------------|
-| `/new`                 | Clear history (keep the system prompt)                    |
+| `/new` / `/clear`      | Clear history (keep the system prompt)                    |
 | `/sys <text>`          | Set or replace the system prompt                          |
 | `/temp <float>`        | Set temperature (0 = greedy)                              |
 | `/top-p <float>`       | Set top_p                                                 |
@@ -27,8 +38,9 @@ python3 scripts/chat.py --temp 0.7 --seed 42
 | `/seed <int>`          | Fix the seed                                              |
 | `/max <int>`           | Set `max_tokens` per turn                                 |
 | `/tools`               | Toggle built-in tool calling                              |
+| `/think`               | Toggle visibility of `<think>…</think>` blocks (default hidden) |
 | `/continue`            | Resume after `finish=length`                              |
-| `/show`                | Print current params + history length                     |
+| `/status` / `/show`    | Panel of current url / model / params / history counts    |
 | `/history`             | Dump transcript (truncated per message)                   |
 | `/save <file>`         | Save transcript to JSON                                   |
 | `/load <file>`         | Load transcript from JSON                                 |

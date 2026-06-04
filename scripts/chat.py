@@ -99,22 +99,31 @@ GREY = lambda s: _c("38;5;243", s)     # noqa: E731
 
 # Box-drawing for panels.
 H = "─"; V = "│"; TL = "╭"; TR = "╮"; BL = "╰"; BR = "╯"; MID = "├"
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def _visible_len(s: str) -> int:
+    """Length of s minus ANSI SGR escapes — for padding inside a panel."""
+    return len(_ANSI_RE.sub("", s))
+
 
 def panel(title: str, body: str, color=CYAN, width: int | None = None) -> str:
-    """Render a single-line-title panel around body. Body may contain ANSI."""
+    """Render a closed-on-all-sides panel around body. Body may contain ANSI."""
     if width is None:
         try:
             width = max(40, min(120, os.get_terminal_size().columns - 2))
         except Exception:
             width = 80
-    # Pad with H to width
     plain_title = f"{TL}{H} {title} "
-    pad = max(0, width - len(plain_title) - 1)
-    top_line = color(f"{TL}{H} {title} " + H*pad + TR)
+    pad_top = max(0, width - len(plain_title) - 1)
+    top_line = color(f"{TL}{H} {title} " + H*pad_top + TR)
     bot_line = color(f"{BL}" + H*(width-2) + BR)
     out = [top_line]
     for line in body.splitlines():
-        out.append(color(V) + " " + line)
+        # We render: │<space><body><pad-to-width-2><space>│
+        inner = " " + line
+        vlen = _visible_len(inner)
+        pad = max(0, width - 2 - vlen)
+        out.append(color(V) + inner + " " * pad + color(V))
     out.append(bot_line)
     return "\n".join(out)
 
@@ -286,12 +295,21 @@ class StreamRenderer:
     Prose lines word-wrap to $COLUMNS to avoid hard mid-word splits in
     narrow terminals. Code-fence lines are emitted verbatim (mangling
     code with soft wraps is worse than letting the terminal handle it).
+
+    When `hide_think=True` (the default), Qwen3.6 / Gemma-4-IT model
+    `<think>…</think>` blocks are suppressed from the rendered stream
+    and replaced with a single dim "(thinking…)" hint. The raw content
+    is still appended to the assistant message so the model has full
+    context for follow-ups.
     """
-    def __init__(self):
+    def __init__(self, hide_think: bool = True):
         self.buf = ""
         self.in_code = False
         # Per-line word-wrap state: characters emitted since last "\n".
         self._col = 0
+        self.hide_think = hide_think
+        self.in_think = False
+        self._thinking_label_shown = False
 
     def feed(self, chunk: str) -> None:
         self.buf += chunk
@@ -326,6 +344,22 @@ class StreamRenderer:
         return out
 
     def _emit_line(self, line: str) -> None:
+        # Hide <think>…</think> blocks (Qwen3.6 + Gemma 4 IT chatter).
+        stripped = line.strip()
+        if self.hide_think:
+            if stripped == "<think>":
+                self.in_think = True
+                if not self._thinking_label_shown:
+                    sys.stdout.write(DIM(ITAL("  (thinking…)\n")))
+                    sys.stdout.flush()
+                    self._thinking_label_shown = True
+                return
+            if stripped == "</think>":
+                self.in_think = False
+                self._thinking_label_shown = False
+                return
+            if self.in_think:
+                return
         m = _FENCE_RE.match(line.rstrip("\n"))
         if m:
             self.in_code = not self.in_code
@@ -793,14 +827,16 @@ def _parse_tool_calls(text: str) -> list[dict]:
 # ── Help text ─────────────────────────────────────────────────────
 HELP = """\
 COMMANDS
-  /new                  reset conversation history (keep system prompt)
+  /new  /clear          reset conversation history (keep system prompt)
   /sys <text>           set the system prompt
   /temp <float>         temperature (0 = greedy)
   /top-p /top-k /seed   sampling params
   /max <int>            max_tokens per turn
   /tools                toggle built-in tool calling
+  /think                toggle <think>…</think> visibility (default hidden)
   /continue             resume after a finish=length cut
-  /show /history        show params / transcript
+  /status  /show        show current url / model / params / counts
+  /history              dump transcript (truncated per message)
   /save /load <file>    persist transcript to JSON
   /metrics              fetch server /metrics (live dashboard)
   /paste [header]       multi-line paste mode (end with ':end:' or 3 blanks)
@@ -835,11 +871,15 @@ def main():
     ap.add_argument("--max", type=int, default=1024, help="max_tokens per turn")
     ap.add_argument("--tools", action="store_true",
                     help="enable built-in tool calling (shell, read_file, calc)")
+    ap.add_argument("--show-think", action="store_true",
+                    help="show raw <think>…</think> reasoning blocks "
+                         "(hidden by default for cleaner output)")
     args = ap.parse_args()
 
     params = {"temperature": args.temp, "top_p": args.top_p, "top_k": args.top_k,
               "seed": args.seed, "max_tokens": args.max}
     tools_on = bool(args.tools)
+    hide_think = not args.show_think
     messages: list[dict] = []
     if args.sys:
         messages.append({"role": "system", "content": args.sys})
@@ -850,12 +890,38 @@ def main():
         print(DIM("[chat] is the daemon up and your ssh tunnel open?"))
         sys.exit(1)
 
-    # Banner
+    # Claude-Code-style welcome panel.
+    model_id = body.get("model", "?") if isinstance(body, dict) else "?"
+    # Strip HF org for the per-turn badge: "Qwen/Qwen3.6-27B" → "Qwen3.6-27B".
+    model_short = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+    cwd_disp = PROJECT_ROOT
+    home = os.path.expanduser("~")
+    if cwd_disp == home or cwd_disp.startswith(home + os.sep):
+        cwd_disp = "~" + cwd_disp[len(home):]
+    if len(cwd_disp) > 64:
+        # Path-aware trim: keep first segment + ellipsis + last 3 segments.
+        parts = cwd_disp.split(os.sep)
+        if len(parts) >= 5:
+            cwd_disp = os.sep.join([parts[0], "…"] + parts[-3:])
+    banner_body = "\n".join([
+        BOLD(CYAN("✻ Welcome to tt-chat")) + "  " + DIM(f"({args.url})"),
+        "",
+        "  " + DIM("/help") + " for commands  ·  "
+              + DIM("/paste") + " multi-line  ·  "
+              + DIM("/yank") + " copy reply",
+        "  " + DIM("/metrics") + " live perf  ·  "
+              + DIM("/screenshot") + " save png  ·  "
+              + DIM("/exit") + " leave",
+        "",
+        DIM(f"  model:  {model_id}"),
+        DIM(f"  cwd:    {cwd_disp}"),
+        DIM(f"  tools:  {'ON' if tools_on else 'OFF'}"
+            f"   ·  think={'HIDDEN' if hide_think else 'shown'}"
+            f"   ·  temp={params['temperature']}  max={params['max_tokens']}"),
+    ])
     print()
-    print(CYAN(BOLD(f"  tt-chat → {args.url}")))
-    print(DIM(f"  server: {body}"))
-    print(DIM("  /help for commands · multi-line: end with \\"))
-    print(DIM(f"  tools: {'ON' if tools_on else 'OFF'}"))
+    print(panel("tt-chat", banner_body, color=CYAN,
+                width=min(82, _cols(82))))
     print()
 
     CONTINUE_PROMPT = ("Continue your previous response from exactly where you "
@@ -877,7 +943,7 @@ def main():
                 print(DIM(HELP)); continue
             elif cmd == "continue":
                 user = CONTINUE_PROMPT  # fall through
-            elif cmd == "new":
+            elif cmd in ("new", "clear"):
                 sys_msg = next((m for m in messages if m["role"] == "system"), None)
                 messages = [sys_msg] if sys_msg else []
                 print(DIM("history cleared")); continue
@@ -901,8 +967,27 @@ def main():
                 params["max_tokens"] = int(arg); print(DIM(f"max_tokens={params['max_tokens']}")); continue
             elif cmd == "tools":
                 tools_on = not tools_on; print(DIM(f"tools={'ON' if tools_on else 'OFF'}")); continue
-            elif cmd == "show":
-                print(DIM(f"params={params}  history={len(messages)} msgs  tools={'ON' if tools_on else 'OFF'}"))
+            elif cmd == "think":
+                hide_think = not hide_think
+                print(DIM(f"think_hidden={'ON' if hide_think else 'OFF'}"))
+                continue
+            elif cmd in ("show", "status"):
+                n_user = sum(1 for m in messages if m["role"] == "user")
+                n_assist = sum(1 for m in messages if m["role"] == "assistant")
+                status_body = "\n".join([
+                    DIM(f"  url:     {args.url}"),
+                    DIM(f"  model:   {model_id}"),
+                    DIM(f"  cwd:     {PROJECT_ROOT}"),
+                    DIM(f"  tools:   {'ON' if tools_on else 'OFF'}"),
+                    DIM(f"  sampling: temp={params['temperature']}  "
+                        f"top_p={params['top_p']}  top_k={params['top_k']}  "
+                        f"seed={params['seed']}"),
+                    DIM(f"  max_tok: {params['max_tokens']}"),
+                    DIM(f"  history: {len(messages)} msgs  "
+                        f"(user={n_user}  assistant={n_assist})"),
+                ])
+                print(panel("status", status_body, color=CYAN,
+                            width=min(82, _cols(82))))
                 continue
             elif cmd == "history":
                 print(DIM("─" * 40))
@@ -996,8 +1081,9 @@ def main():
         messages.append({"role": "user", "content": user})
         for _round in range(4):   # tool-call loops capped at 4 per user turn
             print()
-            print(GREEN(BOLD("assistant ")) + GREY("─" * 40))
-            renderer = StreamRenderer()
+            print(CYAN("● ") + BOLD("assistant") + DIM(f"  ({model_short})"))
+            print(GREY("─" * min(60, _cols(60))))
+            renderer = StreamRenderer(hide_think=hide_think)
             reply = []
             t0 = time.time(); ttft = None; n_chunks = 0; finish = None
             try:

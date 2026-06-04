@@ -27,7 +27,13 @@ For Gemma 4: `TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it ...`. Do NOT pass `TT_C
 - Multi-turn HTTP with PC on 27B: turn 2 = 5.99s for 172-tok prompt (PC hit, 6.3× speedup)
 - 35B at TT_CB_SLOTS=1: 3.13 tok/s (B>1 blocked by task #162 — won't fix this session)
 
-**TUI is ready** (`scripts/chat.py`, README at `scripts/CHAT_TUI.md`). Key new features:
+**TUI is ready** (`scripts/chat.py`, README at `scripts/CHAT_TUI.md`). Key features:
+- Claude-Code-style welcome panel (closed box, url + model + cwd + settings)
+- `● assistant (<model_short>)` per-turn header with thin grey rule
+- `<think>…</think>` block hiding (replaced with a single dim "(thinking…)"
+  hint); `/think` toggles, `--show-think` opts out at launch
+- `/status` (and `/show`) panel; `/clear` (and `/new`) reset; cwd shown as
+  `~/…` with path-aware ellipsis for long paths
 - `/paste` multi-line mode (with bracketed paste + burst heuristic fallback)
 - `/yank` copies last assistant reply / code block to system clipboard
 - `/metrics [N]` live Prometheus dashboard for N refresh cycles
@@ -35,6 +41,10 @@ For Gemma 4: `TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it ...`. Do NOT pass `TT_C
 - Expanded shell allow-list (`git`, `grep`, `find`, `python -V/-c`, etc.) with strict deny-list
 - `write_file(path, content, mode)` and line-ranged `read_file(path, start=N, n=M)` tools
 - Graceful HTTP-error recovery + terminal-state reset on exit
+
+**TUI verified live on 27B 2026-06-04**: banner renders all-four-sides closed,
+`<think>` hides cleanly, multi-turn HTTP wall/prompt_t drops from 0.349 → 0.024
+across 3 turns (prefix cache hitting; same nickname/fact carry across turns).
 
 **To run TUI** (once server is back):
 ```
