@@ -338,41 +338,18 @@ def bootstrap(state, log=None):
         dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    # Page tables: identity mapping. paged_update_cache asserts
-    # `page_table.dim(0) == input.dim(1)`. 35B has NKV_PER_CHIP=1 so a
-    # `[1, num_blocks]` page table works; Gemma 4 sliding has
-    # NKV_PER_CHIP_SLIDING=2 → page table must be `[2, num_blocks]`
-    # (same physical mapping per row). Global stays at `[1, num_blocks]`.
-    # See `[[paged-update-cache-nkv-per-chip]]`.
+    # Page table + cur_pos: v0.3.0.1 uses NKV=1-per-cache layout (35B's
+    # clean contract), so all caches use a single `[1, num_blocks]` page
+    # table and `[1]` cur_pos buffer. Kernel asserts update_idxs INT32 at
+    # `paged_update_cache_device_operation.cpp:112`.
     num_blocks = MAX_KV // state.sdpa_block_size
-    pt_sliding = np.broadcast_to(
-        np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks),
-        (NKV_PER_CHIP_SLIDING, num_blocks),
-    ).copy()
-    state.page_table_sliding_tt = ttnn.from_torch(
-        torch.from_numpy(pt_sliding),
+    pt_identity = np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks)
+    state.page_table_tt = ttnn.from_torch(
+        torch.from_numpy(pt_identity),
         dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    pt_global = np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks)
-    state.page_table_global_tt = ttnn.from_torch(
-        torch.from_numpy(pt_global),
-        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
-    # cur_pos_buf: kernel may also tie size to input dim 1. Provide a
-    # sliding-sized one (2 entries, both 0) and a global-sized one (1).
-    # Kernel asserts update_idxs is INT32 (not uint32) at
-    # `paged_update_cache_device_operation.cpp:112`. 35B uses uint32
-    # in its bootstrap; either the API changed or 35B's bootstrap path
-    # is different (its cur_pos_buf is referenced by sdpa_decode too,
-    # which may accept both).
-    state.cur_pos_buf_sliding = ttnn.from_torch(
-        torch.zeros((NKV_PER_CHIP_SLIDING,), dtype=torch.int32),
-        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
-    state.cur_pos_buf_global = ttnn.from_torch(
+    state.cur_pos_buf = ttnn.from_torch(
         torch.zeros((1,), dtype=torch.int32),
         dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
@@ -381,27 +358,33 @@ def bootstrap(state, log=None):
     log(f"  paged SDPA: MAX_KV={MAX_KV}, block_size={state.sdpa_block_size}, "
         f"num_blocks={num_blocks}")
 
-    # KV caches per layer. Forked from `server_35b_ttnn.py:1455-1483` —
-    # sliding layers have NKV=8 (2/chip) sharded along the chip axis; global
-    # layers have NKV=1 replicated (plan §6.8 — wastes 4× memory but is the
-    # simplest setup; revisit if memory pressures appear).
+    # KV caches per layer. v0.3.0.1: two caches per sliding layer, each
+    # with NKV_PER_CHIP=1 effective (mirrors 35B's clean contract). The 8
+    # KV heads are split: cache_0 holds even-indexed (KV head 2c on chip c),
+    # cache_1 holds odd (KV head 2c+1 on chip c). Then HF GQA mapping
+    # (Q head q → KV head q//2) translates to:
+    #   - Q heads (4c, 4c+1) attend to cache_0 (KV head 2c)
+    #   - Q heads (4c+2, 4c+3) attend to cache_1 (KV head 2c+1)
+    # Each SDPA call has NQ_per_call=2, NKV_per_call=1, GQA group=2.
+    # Memory: same total as previous single-cache approach (~320 MB/chip).
     state.kv_caches_tt = []
     for L in range(NUM_LAYERS):
         if state.layer_types[L] == "sliding_attention":
-            # Logical [num_blocks, NCHIPS * NKV_PER_CHIP=8, block_size, head_dim]
-            # sharded along dim=1 → per-chip [num_blocks, NKV_PER_CHIP=2, block, head_dim].
-            cs = (state.num_blocks, NCHIPS * NKV_PER_CHIP_SLIDING,
-                  state.sdpa_block_size, HEAD_DIM_SLIDING)
-            init = np.zeros(cs, dtype=np.float32)
-            kc = ttnn.from_torch(
-                torch.from_numpy(init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
-            )
-            vc = ttnn.from_torch(
-                torch.from_numpy(init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
-            )
-        else:  # full_attention (global)
+            layer_caches = []
+            for _ in range(NKV_PER_CHIP_SLIDING):  # 2 caches per sliding layer
+                cs = (state.num_blocks, NCHIPS, state.sdpa_block_size, HEAD_DIM_SLIDING)
+                init = np.zeros(cs, dtype=np.float32)
+                kc = ttnn.from_torch(
+                    torch.from_numpy(init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+                )
+                vc = ttnn.from_torch(
+                    torch.from_numpy(init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    device=state.mesh, mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+                )
+                layer_caches.append((kc, vc))
+            state.kv_caches_tt.append(layer_caches)
+        else:  # full_attention (global) — single cache, NKV=1, replicated
             cs = (state.num_blocks, NUM_KV_HEADS_GLOBAL,
                   state.sdpa_block_size, HEAD_DIM_GLOBAL)
             init = np.zeros(cs, dtype=np.float32)
@@ -413,26 +396,25 @@ def bootstrap(state, log=None):
                 torch.from_numpy(init), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                 device=state.mesh, mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
             )
-        state.kv_caches_tt.append((kc, vc))
-    log(f"  KV caches: {NUM_LAYERS} layers allocated")
+            state.kv_caches_tt.append([(kc, vc)])  # list-wrap for uniform indexing
+    log(f"  KV caches: {NUM_LAYERS} layers allocated "
+        f"(sliding: {NKV_PER_CHIP_SLIDING} caches/layer × {sum(1 for t in state.layer_types if t == 'sliding_attention')} layers)")
 
     # SDPA program/memory/compute configs (35B-style B3 recipe — HiFi2
     # +fp32_dest_acc_en=False per `[[fp32-sdpa-cliff-probe]]`; HiFi4+fp32
     # has a Blackhole bug at large positions).
     compute_grid = state.mesh.compute_with_storage_grid_size()
-    shard_grid_sliding = ttnn.num_cores_to_corerangeset(
-        NKV_PER_CHIP_SLIDING, compute_grid, row_wise=True)
+    # v0.3.0.1: each cache write is NKV=1 effective (one KV head at a time).
+    # 1 core for the [BLOCK_SIZE, head_dim] shard.
     state.paged_write_mem_cfg_sliding = ttnn.MemoryConfig(
         ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
-        ttnn.ShardSpec(shard_grid_sliding,
+        ttnn.ShardSpec(ttnn.num_cores_to_corerangeset(1, compute_grid, row_wise=True),
                        [state.sdpa_block_size, HEAD_DIM_SLIDING],
                        ttnn.ShardOrientation.ROW_MAJOR),
     )
-    shard_grid_global = ttnn.num_cores_to_corerangeset(
-        NUM_KV_HEADS_GLOBAL, compute_grid, row_wise=True)
     state.paged_write_mem_cfg_global = ttnn.MemoryConfig(
         ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
-        ttnn.ShardSpec(shard_grid_global,
+        ttnn.ShardSpec(ttnn.num_cores_to_corerangeset(NUM_KV_HEADS_GLOBAL, compute_grid, row_wise=True),
                        [state.sdpa_block_size, HEAD_DIM_GLOBAL],
                        ttnn.ShardOrientation.ROW_MAJOR),
     )
@@ -852,126 +834,92 @@ def _shard_for_paged_write(t_2d, state, n_kv_heads, head_dim, mem_cfg, dbg=False
 
 
 def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
-    """Sliding-attention forward at pos 0 via paged_update_cache + paged SDPA.
+    """v0.3.0.1 sliding-attention via TWO paged SDPA calls (one per KV head).
 
-    Matches v0.2's `_layer_pos0_sliding` result (which proved correct: cos=0.99999
-    vs HF at v0.1.2) but routes through the real cache pipeline so v0.3.1 can
-    extend to pos > 0 by simply advancing cur_pos.
+    Each call uses NKV_PER_CHIP=1 effective — matches 35B's clean contract.
+    HF GQA mapping: Q heads (4c, 4c+1) → KV head 2c (cache_0); Q heads
+    (4c+2, 4c+3) → KV head 2c+1 (cache_1). Output [1, 1, 4, head_dim]
+    assembled via concat along the Q-head axis.
     """
-    kc, vc = state.kv_caches_tt[layer_idx]
-    _DBG = layer_idx == 0  # only print on L0 to keep noise low
+    layer_caches = state.kv_caches_tt[layer_idx]  # list of 2 (kc, vc) tuples
 
-    # Q/K/V projections (Q sharded over heads, K/V sharded over KV heads).
+    # Q/K/V projections.
     q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
     k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
     v = ttnn.matmul(h_norm, w["v_proj"], compute_kernel_config=HIFI4)
-    if _DBG:
-        print(f"[L0 dbg] q shape={list(q.shape)}", flush=True)
-        print(f"[L0 dbg] k shape={list(k.shape)}", flush=True)
-        print(f"[L0 dbg] v shape={list(v.shape)}", flush=True)
 
-    q_h = ttnn.reshape(q, [NQ_PER_CHIP, HEAD_DIM_SLIDING])
+    q_h = ttnn.reshape(q, [NQ_PER_CHIP, HEAD_DIM_SLIDING])  # [4, 256] per chip
     ttnn.deallocate(q)
-    if _DBG: print(f"[L0 dbg] q_h reshape OK shape={list(q_h.shape)}", flush=True)
-    k_h = ttnn.reshape(k, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
+    k_h = ttnn.reshape(k, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])  # [2, 256]
     ttnn.deallocate(k)
-    if _DBG: print(f"[L0 dbg] k_h reshape OK shape={list(k_h.shape)}", flush=True)
-    v_h = ttnn.reshape(v, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
+    v_h = ttnn.reshape(v, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])  # [2, 256]
     ttnn.deallocate(v)
-    if _DBG: print(f"[L0 dbg] v_h reshape OK shape={list(v_h.shape)}", flush=True)
 
-    # More debug to find where the second reshape fails.
-    if _DBG:
-        try:
-            tmp = ttnn.rms_norm(v_h, weight=state.ones_head_dim_sliding, epsilon=EPS)
-            print(f"[L0 dbg] v_n rms_norm OK shape={list(tmp.shape)}", flush=True)
-            tmp_rm = ttnn.to_layout(tmp, ttnn.ROW_MAJOR_LAYOUT)
-            print(f"[L0 dbg] v_n to_layout(ROW_MAJOR) OK shape={list(tmp_rm.shape)}", flush=True)
-            tmp_4d = ttnn.reshape(tmp_rm, [1, NKV_PER_CHIP_SLIDING, 1, HEAD_DIM_SLIDING])
-            print(f"[L0 dbg] v_n 4D reshape OK shape={list(tmp_4d.shape)}", flush=True)
-            ttnn.deallocate(tmp); ttnn.deallocate(tmp_rm); ttnn.deallocate(tmp_4d)
-        except Exception as e:
-            print(f"[L0 dbg] FAILED in early-debug block: {type(e).__name__}: {e}", flush=True)
-            raise
-
-    # q_norm, k_norm (with_scale=True; learnable weights per head).
+    # q_norm, k_norm (learned weight) + v_norm (all-ones).
     q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
     k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h)
-
-    # v_norm (with_scale=False; identity-weight rms norm).
     v_n = ttnn.rms_norm(v_h, weight=state.ones_head_dim_sliding, epsilon=EPS)
     ttnn.deallocate(v_h)
 
-    # RoPE at pos 0 is identity (cos=1, sin=0). v0.3.1 applies it for pos > 0.
+    # RoPE at pos 0 is identity. Skip; v0.3.1 will add it for pos > 0.
 
-    # Write K, V to paged cache at cur_pos=0.
-    k_sharded = _shard_for_paged_write(k_n, state, NKV_PER_CHIP_SLIDING,
-                                        HEAD_DIM_SLIDING, state.paged_write_mem_cfg_sliding,
-                                        dbg=_DBG)
-    if _DBG: print(f"[L0 dbg] k_sharded done", flush=True)
-    v_sharded = _shard_for_paged_write(v_n, state, NKV_PER_CHIP_SLIDING,
-                                        HEAD_DIM_SLIDING, state.paged_write_mem_cfg_sliding,
-                                        dbg=_DBG)
-    if _DBG: print(f"[L0 dbg] v_sharded done", flush=True)
-    ttnn.deallocate(k_n); ttnn.deallocate(v_n)
-    if _DBG: print(f"[L0 dbg] kc shape={list(kc.shape)} dtype={kc.dtype}", flush=True)
-    if _DBG: print(f"[L0 dbg] page_table shape={list(state.page_table_sliding_tt.shape)}", flush=True)
-    if _DBG: print(f"[L0 dbg] cur_pos shape={list(state.cur_pos_buf_sliding.shape)}", flush=True)
-    ttnn.experimental.paged_update_cache(
-        kc, k_sharded,
-        update_idxs_tensor=state.cur_pos_buf_sliding,
-        page_table=state.page_table_sliding_tt,
-    )
-    if _DBG: print(f"[L0 dbg] paged_update_cache K OK", flush=True)
-    ttnn.experimental.paged_update_cache(
-        vc, v_sharded,
-        update_idxs_tensor=state.cur_pos_buf_sliding,
-        page_table=state.page_table_sliding_tt,
-    )
-    if _DBG: print(f"[L0 dbg] paged_update_cache V OK", flush=True)
-    ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
+    # Two SDPA passes — one per (cache, KV-head, Q-half) trio.
+    attn_outs = []
+    Q_HALF = NQ_PER_CHIP // NKV_PER_CHIP_SLIDING  # 2 Q heads per KV head
+    for kv_idx in range(NKV_PER_CHIP_SLIDING):
+        kc, vc = layer_caches[kv_idx]
 
-    # Paged SDPA decode. Q shape [1, 1, NQ_PER_CHIP, head_dim] per chip.
-    # sliding_window_size=1024 on sliding layers (Step 0.1 verified).
-    q_for_sdpa = ttnn.reshape(q_n, [1, 1, NQ_PER_CHIP, HEAD_DIM_SLIDING])
-    ttnn.deallocate(q_n)
-    if _DBG: print(f"[L0 dbg] q_for_sdpa shape={list(q_for_sdpa.shape)}", flush=True)
-    try:
-        attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+        # Slice K, V to this KV head: row kv_idx → [1, head_dim].
+        k_i = ttnn.slice(k_n, [kv_idx, 0], [kv_idx + 1, HEAD_DIM_SLIDING])
+        v_i = ttnn.slice(v_n, [kv_idx, 0], [kv_idx + 1, HEAD_DIM_SLIDING])
+
+        # Write K_i, V_i to cache_i (NKV=1 input — matches 35B contract).
+        k_sharded = _shard_for_paged_write(k_i, state, 1, HEAD_DIM_SLIDING,
+                                            state.paged_write_mem_cfg_sliding)
+        v_sharded = _shard_for_paged_write(v_i, state, 1, HEAD_DIM_SLIDING,
+                                            state.paged_write_mem_cfg_sliding)
+        ttnn.deallocate(k_i); ttnn.deallocate(v_i)
+        ttnn.experimental.paged_update_cache(
+            kc, k_sharded,
+            update_idxs_tensor=state.cur_pos_buf,
+            page_table=state.page_table_tt,
+        )
+        ttnn.experimental.paged_update_cache(
+            vc, v_sharded,
+            update_idxs_tensor=state.cur_pos_buf,
+            page_table=state.page_table_tt,
+        )
+        ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
+
+        # Slice Q to the Q-half for this KV head.
+        q_half = ttnn.slice(q_n,
+                            [kv_idx * Q_HALF, 0],
+                            [(kv_idx + 1) * Q_HALF, HEAD_DIM_SLIDING])
+        q_for_sdpa = ttnn.reshape(q_half, [1, 1, Q_HALF, HEAD_DIM_SLIDING])
+        ttnn.deallocate(q_half)
+
+        # Paged SDPA decode with sliding_window kwarg.
+        attn_i = ttnn.transformer.paged_scaled_dot_product_attention_decode(
             q_for_sdpa, kc, vc,
-            cur_pos_tensor=state.cur_pos_buf_sliding,
-            page_table_tensor=state.page_table_sliding_tt,
+            cur_pos_tensor=state.cur_pos_buf,
+            page_table_tensor=state.page_table_tt,
             scale=1.0 / (HEAD_DIM_SLIDING ** 0.5),
             program_config=state.paged_sdpa_progcfg,
             compute_kernel_config=state.sdpa_compute_kernel_config,
             sliding_window_size=SLIDING_WINDOW,
         )
-        if _DBG: print(f"[L0 dbg] paged SDPA OK shape={list(attn_out.shape)}", flush=True)
-        # HACK: SDPA returns [1, 2, NQ=4, head_dim] because the kernel treats
-        # my NKV=2 hack as batch=2. Both batches read identical K, V (same
-        # page_table rows + cur_pos=[0,0]), so batch 0 ≈ batch 1. Slice
-        # batch 0 to get [1, 1, 4, 256] for downstream. This is a wrong-GQA
-        # workaround for v0.3.0 — argmax won't match HF in general, but if
-        # batch 0 captures the right Q-head/KV-head combinations by luck,
-        # we'll see something close.
-        if attn_out.shape[1] == 2:
-            attn_sliced = ttnn.slice(attn_out, [0, 0, 0, 0], [1, 1, NQ_PER_CHIP, HEAD_DIM_SLIDING])
-            ttnn.deallocate(attn_out)
-            attn_out = attn_sliced
-            if _DBG: print(f"[L0 dbg] sliced batch 0 → shape={list(attn_out.shape)}", flush=True)
-    except Exception as e:
-        if _DBG:
-            print(f"[L0 dbg] paged SDPA FAILED: {type(e).__name__}: {e}", flush=True)
-            print(f"[L0 dbg]   Q: shape={list(q_for_sdpa.shape)} dtype={q_for_sdpa.dtype}", flush=True)
-            print(f"[L0 dbg]   K cache: shape={list(kc.shape)} dtype={kc.dtype}", flush=True)
-            print(f"[L0 dbg]   V cache: shape={list(vc.shape)} dtype={vc.dtype}", flush=True)
-            print(f"[L0 dbg]   page_table: shape={list(state.page_table_sliding_tt.shape)} dtype={state.page_table_sliding_tt.dtype}", flush=True)
-            print(f"[L0 dbg]   cur_pos: shape={list(state.cur_pos_buf_sliding.shape)} dtype={state.cur_pos_buf_sliding.dtype}", flush=True)
-        raise
-    ttnn.deallocate(q_for_sdpa)
-    attn_flat = ttnn.reshape(attn_out, [1, NQ_PER_CHIP * HEAD_DIM_SLIDING])
-    ttnn.deallocate(attn_out)
+        ttnn.deallocate(q_for_sdpa)
+        attn_outs.append(attn_i)
+    ttnn.deallocate(q_n); ttnn.deallocate(k_n); ttnn.deallocate(v_n)
+
+    # Concat the two halves along Q-head axis (dim 2). attn_i shape
+    # [1, 1, Q_HALF, head_dim] → concat → [1, 1, NQ_PER_CHIP, head_dim].
+    attn_concat = ttnn.concat(attn_outs, dim=2)
+    for a in attn_outs:
+        ttnn.deallocate(a)
+    attn_flat = ttnn.reshape(attn_concat, [1, NQ_PER_CHIP * HEAD_DIM_SLIDING])
+    ttnn.deallocate(attn_concat)
 
     # o_proj column-sharded + all_reduce.
     partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)

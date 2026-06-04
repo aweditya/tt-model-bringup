@@ -255,11 +255,12 @@ projection sub-steps.
 
 ### v0.3 sub-staging (extends §4)
 
-| Sub-stage | Adds | Gate |
-|---|---|---|
-| v0.3.0 | KV cache allocator (sliding + global), SDPA program configs + memory configs, ones-table per head_dim, full Q/K/V projection + q_norm + k_norm + v_norm in the forward, RoPE table precompute, RoPE application (identity at pos 0). `paged_update_cache` + `paged_scaled_dot_product_attention_decode` with `sliding_window_size=1024` on sliding, no kwarg on global. | cos ≥ 0.999 on mixer_out + final_norm + argmax matches HF at pos 0 (= v0.2 result, but via the paged path) |
-| v0.3.1 | Multi-step decode loop: pre-allocated `tok_buf` written out-of-trace; update_input_buffers advances tok+cur_pos+rot_idxs per step. Maintain KV cache across steps. RoPE at pos > 0 (non-trivial). | TT tokens 0..7 match HF teacher-forced argmax_per_position[0..7] |
-| v0.3.2 | (optional) Free-run greedy from pos 5 — use TT's own previous token as input. | TT generates same trajectory as HF greedy for ≥ 16 tokens |
+| Sub-stage | Adds | Gate | Status |
+|---|---|---|---|
+| v0.3.0 | KV cache allocator (sliding + global), SDPA program configs + memory configs, ones-table per head_dim, full Q/K/V projection + q_norm + k_norm + v_norm in the forward, RoPE table precompute, RoPE application (identity at pos 0). `paged_update_cache` + `paged_scaled_dot_product_attention_decode` with `sliding_window_size=1024` on sliding, no kwarg on global. | cos ≥ 0.999 on mixer_out + final_norm + argmax matches HF at pos 0 (= v0.2 result, but via the paged path) | **ARGMAX PASS 2026-06-03 commit `01c88d6`** — but cos 0.9965 (just below 0.999) due to wrong-GQA batch-0-slice workaround. Real cos PASS requires v0.3.0.1 (split SDPA into 2 calls per sliding layer, each with NKV_PER_CHIP=1). Three new memory entries: [[paged-update-cache-nkv-per-chip]], [[read-kernel-source-first]], [[use-existing-isolation-probes]]. |
+| v0.3.0.1 | Split sliding SDPA into 2 calls per layer (Q halves × per-KV-head caches, NKV_PER_CHIP=1 each — matches 35B contract cleanly). 2 caches per sliding layer. | cos ≥ 0.999 on mixer_out + final_norm + argmax matches HF | NEXT |
+| v0.3.1 | Multi-step decode loop: pre-allocated `tok_buf` written out-of-trace; update_input_buffers advances tok+cur_pos+rot_idxs per step. Maintain KV cache across steps. RoPE at pos > 0 (non-trivial). | TT tokens 0..7 match HF teacher-forced argmax_per_position[0..7] | |
+| v0.3.2 | (optional) Free-run greedy from pos 5 — use TT's own previous token as input. | TT generates same trajectory as HF greedy for ≥ 16 tokens | |
 
 ### v0.3 design notes (file:line references)
 

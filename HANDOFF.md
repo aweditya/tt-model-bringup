@@ -75,10 +75,17 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
   0.25). v0.2 probe re-runs with these in place: STILL PASSES.
   Only FORWARD changes remain. Plan §"v0.3 sub-staging" has detailed
   design notes with 35B `file:line` references.
-  - v0.3.0: full Q/K/V + q_norm/k_norm/v_norm + RoPE + paged SDPA at
-    pos 0. Gate: matches v0.2 result via paged path.
-  - v0.3.1: multi-step decode + KV cache across steps + non-trivial
-    RoPE. Gate: 8-tok teacher-forced matches HF.
+  - v0.3.0 **ARGMAX PASS 2026-06-03 commit `01c88d6`** — paged
+    SDPA pipeline runs end-to-end; TT argmax=258882 = HF 258882.
+    cos 0.9965 (just below 0.999) due to wrong-GQA workaround
+    (batch-0 slice of [1, 2, NQ, head_dim] kernel output).
+    Memorialized: [[paged-update-cache-nkv-per-chip]],
+    [[read-kernel-source-first]], [[use-existing-isolation-probes]].
+  - v0.3.0.1 NEXT: split sliding SDPA into 2 calls per layer with
+    Q halves + 1-KV-head caches each (matches 35B's clean
+    NKV_PER_CHIP=1 contract). Gate: cos ≥ 0.999.
+  - v0.3.1: multi-step decode + non-trivial RoPE. Gate: 8-tok
+    teacher-forced matches HF.
   - v0.3.2 (optional): free-run greedy ≥ 16 tokens.
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
