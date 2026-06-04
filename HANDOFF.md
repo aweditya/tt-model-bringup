@@ -109,10 +109,19 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
     coherent: "The capital of France is a city of art, culture, and
     history." End-to-end forward composition validated. Probe:
     `gm4_v032_freerun.py`.
+  - **v0.3.3 long-context validation IN FLIGHT** — mirrors 27B/35B's
+    needle-haystack + bf16 prefill drift gates. Three sub-probes:
+    (a) per-pos cosine ladder at L=128 vs an extended HF oracle, (b)
+    sliding-window correctness at pos > 1024 (invariance to pre-window
+    tokens), (c) needle-haystack retrieval at L=100, 500, 1024. Plan
+    table has the fork map + concrete gates. Reuse: extend
+    `hf_reference_gemma4_12b.py`, fork `needle_haystack_35b_ttnn.py`
+    and `gm4_v031_multistep_cos.py`.
 
-  **~4-5 days of focused work remaining** to ship `TT_BACKEND=gemma4_12b
+  **~5-6 days of focused work remaining** to ship `TT_BACKEND=gemma4_12b
   serve_cb.sh start` chat working end-to-end:
-  v0.4 trace (~1 day) + v1 CB (~2-3 days) + v2 HTTP (~1 day).
+  v0.3.3 long-context (~1 day) + v0.4 trace (~1 day) + v1 CB (~2-3 days)
+  + v2 HTTP (~1 day).
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
