@@ -325,32 +325,28 @@ def bootstrap(state, log=None):
     # for each per layer.
     state.MAX_KV = MAX_KV
     state.sdpa_block_size = 32  # tile-height; matches 35B
-    # cur_pos_buf: int32 [1] device-resident, written before each step
-    # via update_input_buffers (v0.3.1+). For v0.3.0 we hard-set pos=0.
+    # cur_pos_buf: int32 [1] device-resident — kernel asserts INT32 at
+    # `paged_update_cache_device_operation.cpp:112`. rot_idxs_buf: uint32 [1]
+    # for ttnn.embedding into the cos/sin tables. Both pre-allocated ONCE
+    # here and updated in place via copy_host_to_device_tensor in `_set_pos`
+    # (27B prod pattern at server_tp.py:1607-1619; recreating per step is
+    # the [[ttnn-list-rebinding-leaks]] anti-pattern).
     state.cur_pos_buf = ttnn.from_torch(
         torch.zeros((1,), dtype=torch.int32),
-        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    # rot_idxs_buf: int32 [1] for RoPE cos/sin table indexing per step.
     state.rot_idxs_buf = ttnn.from_torch(
         torch.zeros((1,), dtype=torch.int32),
         dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    # Page table + cur_pos: v0.3.0.1 uses NKV=1-per-cache layout (35B's
-    # clean contract), so all caches use a single `[1, num_blocks]` page
-    # table and `[1]` cur_pos buffer. Kernel asserts update_idxs INT32 at
-    # `paged_update_cache_device_operation.cpp:112`.
+    # Page table: v0.3.0.1 uses NKV=1-per-cache layout (35B's clean
+    # contract), so all caches use a single `[1, num_blocks]` page table.
     num_blocks = MAX_KV // state.sdpa_block_size
     pt_identity = np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks)
     state.page_table_tt = ttnn.from_torch(
         torch.from_numpy(pt_identity),
-        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
-    state.cur_pos_buf = ttnn.from_torch(
-        torch.zeros((1,), dtype=torch.int32),
         dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
@@ -423,13 +419,15 @@ def bootstrap(state, log=None):
         compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
         q_chunk_size=0, k_chunk_size=0, exp_approx_mode=False,
     )
-    # Global (head_dim=512): doubles per-head data. Grid count alone DOES NOT
-    # shrink the per-core CB (validated: 16 cores → 1.525 MB/core;
-    # 32 cores → also 1.525 MB/core). The CB size is determined by chunk
-    # sizes, not core count. Try smaller k_chunk_size to fit.
+    # Global (head_dim=512): canonical config from tt-metal's in-tree Gemma 4
+    # demo at `models/demos/gemma4/tt/attention/decode.py:126-160`. The CB
+    # math is `k_tiles = k_chunk_size * DHt * 2` (double-buffered). At
+    # head_dim=512, DHt=16 (vs 8 at 256); halving k_chunk_size from the
+    # auto-default (128) to 64 restores the per-core CB footprint to within
+    # the 1.5 MB L1 budget. CoreCoord(8,4) = 32 cores.
     state.paged_sdpa_progcfg_global = ttnn.SDPAProgramConfig(
-        compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
-        q_chunk_size=1, k_chunk_size=16, exp_approx_mode=False,
+        compute_with_storage_grid_size=ttnn.CoreCoord(8, 4),
+        q_chunk_size=32, k_chunk_size=64, exp_approx_mode=False,
     )
     state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
         math_fidelity=ttnn.MathFidelity.HiFi2, math_approx_mode=False,
@@ -836,14 +834,22 @@ def _apply_full_rope(x, cos_tt, sin_tt, n_heads, head_dim):
     At pos 0 cos = 1, sin = 0 → x_rope = x (identity). v0.3.1.0 uses
     this to validate the RoPE plumbing without changing the answer.
     """
+    # x1, x2 are SLICE VIEWS of x — they share storage. Calling
+    # ttnn.deallocate on a view handle frees the underlying buffer and
+    # corrupts x for subsequent ops ([[ttnn-slice-view-decay]]). This was
+    # masked at pos 0 because sin=0 zeroes out the rotated branch and the
+    # final result reduces to x_cos = mul(x, 1) = x, which happens to be
+    # correct even if x is read after dealloc. At pos > 0 cos ≠ 1, sin ≠ 0,
+    # and x_cos reads garbage. Fix: let views die at scope exit; only
+    # dealloc tensors with their own storage (neg_x2, rotated, x_cos,
+    # rotated_sin).
     half = head_dim // 2
     x1 = ttnn.slice(x, [0, 0], [n_heads, half])
     x2 = ttnn.slice(x, [0, half], [n_heads, head_dim])
     neg_x2 = ttnn.neg(x2)
-    ttnn.deallocate(x2)
     rotated = ttnn.concat([neg_x2, x1], dim=-1)
-    ttnn.deallocate(neg_x2); ttnn.deallocate(x1)
-    x_cos = ttnn.mul(x, cos_tt)            # cos [1, head_dim] broadcasts over n_heads
+    ttnn.deallocate(neg_x2)
+    x_cos = ttnn.mul(x, cos_tt)
     rotated_sin = ttnn.mul(rotated, sin_tt)
     ttnn.deallocate(rotated)
     x_rope = ttnn.add(x_cos, rotated_sin)
@@ -936,16 +942,17 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
     for kv_idx in range(NKV_PER_CHIP_SLIDING):
         kc, vc = layer_caches[kv_idx]
 
-        # Slice K, V to this KV head: row kv_idx → [1, head_dim].
+        # Slice K, V to this KV head: row kv_idx → [1, head_dim]. These
+        # are VIEWS of k_n / v_n: _shard_for_paged_write materialises
+        # independent storage via reshape→pad→to_layout, so k_sharded is
+        # safe — but the k_i / v_i view handles must NOT be deallocated
+        # ([[ttnn-slice-view-decay]]). k_n / v_n stay alive for the loop.
         k_i = ttnn.slice(k_n, [kv_idx, 0], [kv_idx + 1, HEAD_DIM_SLIDING])
         v_i = ttnn.slice(v_n, [kv_idx, 0], [kv_idx + 1, HEAD_DIM_SLIDING])
-
-        # Write K_i, V_i to cache_i (NKV=1 input — matches 35B contract).
         k_sharded = _shard_for_paged_write(k_i, state, 1, HEAD_DIM_SLIDING,
                                             state.paged_write_mem_cfg_sliding)
         v_sharded = _shard_for_paged_write(v_i, state, 1, HEAD_DIM_SLIDING,
                                             state.paged_write_mem_cfg_sliding)
-        ttnn.deallocate(k_i); ttnn.deallocate(v_i)
         ttnn.experimental.paged_update_cache(
             kc, k_sharded,
             update_idxs_tensor=state.cur_pos_buf,
@@ -958,14 +965,15 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
         )
         ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
 
-        # Slice Q to the Q-half for this KV head.
+        # Slice Q to the Q-half for this KV head. slice+reshape return
+        # VIEWS into q_n (see [[ttnn-slice-view-decay]]): do NOT deallocate
+        # either handle — q_n stays alive across the whole loop, the SDPA
+        # reads through these views, and the views auto-die at scope exit.
         q_half = ttnn.slice(q_n,
                             [kv_idx * Q_HALF, 0],
                             [(kv_idx + 1) * Q_HALF, HEAD_DIM_SLIDING])
         q_for_sdpa = ttnn.reshape(q_half, [1, 1, Q_HALF, HEAD_DIM_SLIDING])
-        ttnn.deallocate(q_half)
 
-        # Paged SDPA decode with sliding_window kwarg.
         attn_i = ttnn.transformer.paged_scaled_dot_product_attention_decode(
             q_for_sdpa, kc, vc,
             cur_pos_tensor=state.cur_pos_buf,
@@ -975,7 +983,6 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
             compute_kernel_config=state.sdpa_compute_kernel_config,
             sliding_window_size=SLIDING_WINDOW,
         )
-        ttnn.deallocate(q_for_sdpa)
         attn_outs.append(attn_i)
     ttnn.deallocate(q_n); ttnn.deallocate(k_n); ttnn.deallocate(v_n)
 
@@ -988,92 +995,6 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
     ttnn.deallocate(attn_concat)
 
     # o_proj column-sharded + all_reduce.
-    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
-    ttnn.deallocate(attn_flat)
-    out = all_reduce_tt(partial, state.mesh)
-    ttnn.deallocate(partial)
-    return out
-
-
-def _layer_global_manual(state, h_norm, w, layer_idx):
-    """v0.3.1 global attention via MANUAL computation (no paged SDPA).
-
-    paged_scaled_dot_product_attention_decode at head_dim=512 needs ~1.5 MB
-    L1 CB per core, but P150 has only 1.5 MB available. Validated 3
-    hypotheses: more cores doesn't help (CB size is data-determined),
-    k_chunk_size must be multiple of 32 (so we can't shrink below default).
-
-    Workaround: 8 global layers per token — manual attention is bounded.
-    Maintain K/V history in Python list of ttnn tensors per layer. Eager
-    only (will refactor for trace at v0.4 if perf demands).
-
-    Math per chip:
-      Q [NQ_PER_CHIP=4, head_dim=512]  (sharded over Q heads)
-      K, V history: ttnn tensors [N+1, head_dim=512] (replicated across chips)
-      scores = Q @ K^T / sqrt(d)  [NQ_PER_CHIP, N+1]
-      softmax(scores) → attn weights
-      attn = scores @ V  [NQ_PER_CHIP, head_dim=512]
-      o_proj column-sharded + all_reduce
-    """
-    # Initialize per-layer KV history list if first call.
-    if not hasattr(state, 'global_kv_history'):
-        state.global_kv_history = {}
-    hist_key = layer_idx
-    if hist_key not in state.global_kv_history:
-        state.global_kv_history[hist_key] = {'K': [], 'V': []}
-    kv_hist = state.global_kv_history[hist_key]
-
-    # Q/K projections. V aliases K_raw (HF attention_k_eq_v=True for global).
-    q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
-    k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
-
-    q_h = ttnn.reshape(q, [NQ_PER_CHIP, HEAD_DIM_GLOBAL])
-    ttnn.deallocate(q)
-    k_h = ttnn.reshape(k, [NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL])  # [1, 512]
-    ttnn.deallocate(k)
-    v_raw = ttnn.clone(k_h)
-
-    # q_norm, k_norm, v_norm (with_scale=False for v_norm).
-    q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
-    k_n_pre = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
-    v_n = ttnn.rms_norm(v_raw, weight=state.ones_head_dim_global, epsilon=EPS)
-    ttnn.deallocate(q_h); ttnn.deallocate(k_h); ttnn.deallocate(v_raw)
-
-    # p-RoPE (Q, K only; V is unrotated).
-    cos_tt, sin_tt = _lookup_rope(state, state.cos_global_tt,
-                                  state.sin_global_tt, HEAD_DIM_GLOBAL)
-    q_n = _apply_full_rope(q_n_pre, cos_tt, sin_tt, NQ_PER_CHIP, HEAD_DIM_GLOBAL)
-    ttnn.deallocate(q_n_pre)
-    k_n = _apply_full_rope(k_n_pre, cos_tt, sin_tt, NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL)
-    ttnn.deallocate(k_n_pre)
-    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
-
-    # Append current K, V to history (clone since we'll deallocate locals).
-    kv_hist['K'].append(ttnn.clone(k_n))
-    kv_hist['V'].append(ttnn.clone(v_n))
-    ttnn.deallocate(k_n); ttnn.deallocate(v_n)
-
-    # Concat K history: [N+1, head_dim]. Same for V.
-    k_all = ttnn.concat(kv_hist['K'], dim=0) if len(kv_hist['K']) > 1 else ttnn.clone(kv_hist['K'][0])
-    v_all = ttnn.concat(kv_hist['V'], dim=0) if len(kv_hist['V']) > 1 else ttnn.clone(kv_hist['V'][0])
-
-    # attn = softmax(Q @ K^T / sqrt(d)) @ V.
-    # Q [NQ_PER_CHIP, head_dim], K [N+1, head_dim], V [N+1, head_dim]
-    # transpose K → [head_dim, N+1], matmul Q @ K^T → [NQ_PER_CHIP, N+1]
-    k_t = ttnn.transpose(k_all, -2, -1)
-    ttnn.deallocate(k_all)
-    scores = ttnn.matmul(q_n, k_t, compute_kernel_config=HIFI4)
-    ttnn.deallocate(q_n); ttnn.deallocate(k_t)
-    scores_scaled = ttnn.multiply(scores, 1.0 / (HEAD_DIM_GLOBAL ** 0.5))
-    ttnn.deallocate(scores)
-    attn_weights = ttnn.softmax(scores_scaled, dim=-1)
-    ttnn.deallocate(scores_scaled)
-    attn = ttnn.matmul(attn_weights, v_all, compute_kernel_config=HIFI4)
-    ttnn.deallocate(attn_weights); ttnn.deallocate(v_all)
-
-    # Flatten + o_proj column-sharded + all_reduce.
-    attn_flat = ttnn.reshape(attn, [1, NQ_PER_CHIP * HEAD_DIM_GLOBAL])
-    ttnn.deallocate(attn)
     partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
     ttnn.deallocate(attn_flat)
     out = all_reduce_tt(partial, state.mesh)
@@ -1138,21 +1059,20 @@ def _layer_pos0_global_paged(state, h_norm, w, layer_idx):
     )
     ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
 
-    # Single SDPA call — NKV=1 = clean kernel contract.
+    # Single SDPA call — NKV=1 = clean kernel contract. reshape returns
+    # a VIEW of q_n ([[ttnn-slice-view-decay]]); keep q_n alive until SDPA
+    # reads it, and don't dealloc the view handle.
     q_for_sdpa = ttnn.reshape(q_n, [1, 1, NQ_PER_CHIP, HEAD_DIM_GLOBAL])
-    ttnn.deallocate(q_n)
     attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
         q_for_sdpa, kc, vc,
         cur_pos_tensor=state.cur_pos_buf,
         page_table_tensor=state.page_table_tt,
         scale=1.0 / (HEAD_DIM_GLOBAL ** 0.5),
-        program_config=state.paged_sdpa_progcfg_global,  # CoreCoord(8,4) for head_dim=512 L1 budget
+        program_config=state.paged_sdpa_progcfg_global,
         compute_kernel_config=state.sdpa_compute_kernel_config,
-        # No sliding_window_size — global layers attend over full context.
     )
-    ttnn.deallocate(q_for_sdpa)
+    ttnn.deallocate(q_n)
     attn_flat = ttnn.reshape(attn_out, [1, NQ_PER_CHIP * HEAD_DIM_GLOBAL])
-    ttnn.deallocate(attn_out)
 
     # o_proj column-sharded + all_reduce.
     partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
@@ -1173,9 +1093,7 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx):
     if lt == "sliding_attention":
         mixer = _layer_pos0_sliding_paged(state, h_norm, w, layer_idx)
     else:
-        # _layer_pos0_global_paged hit L1 budget at head_dim=512.
-        # Use manual attention with in-memory K/V history instead.
-        mixer = _layer_global_manual(state, h_norm, w, layer_idx)
+        mixer = _layer_pos0_global_paged(state, h_norm, w, layer_idx)
     ttnn.deallocate(h_norm)
     post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
     ttnn.deallocate(mixer)
@@ -1203,27 +1121,28 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx):
 
 
 def _set_pos(state, pos):
-    """Update cur_pos_buf + rot_idxs_buf for the new decode position.
-
-    Recreates the buffers from a fresh host tensor. ttnn doesn't expose a
-    convenient in-place write for these particular dtypes/layouts on this
-    build; recreate is simple and fine for eager (will refactor for trace
-    at v0.4).
+    """Update cur_pos_buf + rot_idxs_buf for the new decode position via
+    in-place copy_host_to_device_tensor (the 27B prod pattern at
+    server_tp.py:1607-1619). Recreating the buffers every step (deallocate +
+    from_torch) is the [[ttnn-list-rebinding-leaks]] anti-pattern and
+    produces garbage attention output past pos 0.
     """
-    if state.cur_pos_buf is not None:
-        ttnn.deallocate(state.cur_pos_buf)
-    state.cur_pos_buf = ttnn.from_torch(
+    cur_host = ttnn.from_torch(
         torch.tensor([int(pos)], dtype=torch.int32),
-        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    if state.rot_idxs_buf is not None:
-        ttnn.deallocate(state.rot_idxs_buf)
-    state.rot_idxs_buf = ttnn.from_torch(
-        torch.tensor([int(pos)], dtype=torch.int32),
-        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+    ttnn.copy_host_to_device_tensor(cur_host, state.cur_pos_buf)
+    # DEBUG: GM4_ROPE_ZERO forces rot_idxs=0 → RoPE identity at all
+    # positions. Use to isolate whether RoPE math or cache-read is the bug.
+    import os as _os
+    rot_pos = 0 if _os.environ.get("GM4_ROPE_ZERO") else int(pos)
+    rot_host = ttnn.from_torch(
+        torch.tensor([rot_pos], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
+    ttnn.copy_host_to_device_tensor(rot_host, state.rot_idxs_buf)
 
 
 def step_forward_v031(state, tok_id, pos, capture=None):
@@ -1231,6 +1150,15 @@ def step_forward_v031(state, tok_id, pos, capture=None):
     update. KV cache accumulates across calls; RoPE rotates by pos.
     """
     _set_pos(state, pos)
+    # DEBUG: confirm on-device buffer values after _set_pos (per-chip read).
+    import os as _os
+    if _os.environ.get("GM4_DEBUG_POS"):
+        cur_val = ttnn.to_torch(state.cur_pos_buf,
+                                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+        rot_val = ttnn.to_torch(state.rot_idxs_buf,
+                                mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+        print(f"  [dbg pos={pos}] cur_pos_buf={cur_val.flatten().tolist()} "
+              f"rot_idxs_buf={rot_val.flatten().tolist()}", flush=True)
     return step_forward_v03(state, tok_id, capture=capture)
 
 
