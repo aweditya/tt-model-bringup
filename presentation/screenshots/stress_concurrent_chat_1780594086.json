@@ -1,0 +1,670 @@
+{
+  "args": {
+    "url": "http://127.0.0.1:8000",
+    "model": "Qwen/Qwen3.6-27B",
+    "clients": "1,8,16,32",
+    "max_tokens": 48,
+    "out": "/home/aditya/tt-xla/presentation/screenshots/stress_concurrent_chat_1780594086.json"
+  },
+  "rounds": [
+    {
+      "n_clients": 1,
+      "wall_s": 8.959,
+      "total_completion_tokens": 48,
+      "aggregate_tok_s": 5.358,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 8.957,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\n\n</think>\n\nParis, the capital of France, is renowned worldwide as a global center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the ",
+          "prompt_tokens": 19,
+          "completion_tokens": 48,
+          "total_tokens": 67,
+          "tok_s_completion": 5.358746852351688
+        }
+      ]
+    },
+    {
+      "n_clients": 8,
+      "wall_s": 9.396,
+      "total_completion_tokens": 384,
+      "aggregate_tok_s": 40.87,
+      "per_client": [
+        {
+          "idx": 5,
+          "ok": true,
+          "elapsed_s": 8.979,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "<think>\n\n</think>\n\nFor a truly fun and iconic day trip from San Francisco, I highly recommend **Sausalito and the Golden Gate Bridge**.\n\nIt\u2019s easily accessible, visually stunning, and offers a perfect",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.3456961120654025
+        },
+        {
+          "idx": 4,
+          "ok": true,
+          "elapsed_s": 8.98,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "<think>\n\n</think>\n\nTCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are the two primary transport layer protocols used in the Internet Protocol Suite (TCP/IP). They both handle the",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.34545638472644
+        },
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 9.122,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\n\n</think>\n\nParis, the capital of France, is renowned worldwide as a global center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the ",
+          "prompt_tokens": 19,
+          "completion_tokens": 48,
+          "total_tokens": 67,
+          "tok_s_completion": 5.262022250317483
+        },
+        {
+          "idx": 6,
+          "ok": true,
+          "elapsed_s": 9.12,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "<think>\n\n</think>\n\nPhotosynthesis and cellular respiration are complementary biological processes that form a continuous cycle of energy and matter exchange. They are essentially the reverse of one an",
+          "prompt_tokens": 18,
+          "completion_tokens": 48,
+          "total_tokens": 66,
+          "tok_s_completion": 5.263285098415921
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 9.258,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "<think>\n\n</think>\n\nFor a quick, delicious, and reliable weeknight pasta, I highly recommend **Creamy Garlic Butter Pasta with Spinach and Parmesan**. It comes together in about **15\u201320 minutes**, uses",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.184675536261049
+        },
+        {
+          "idx": 7,
+          "ok": true,
+          "elapsed_s": 9.392,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "<think>\n\n</think>\n\nAfter the ghost of his father reveals that he was murdered by Hamlet's uncle Claudius, Prince Hamlet feigns madness to seek revenge while grappling with moral uncertainty and existe",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.110567928677368
+        },
+        {
+          "idx": 3,
+          "ok": true,
+          "elapsed_s": 9.394,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "<think>\nThinking Process:\n\n1.  **Deconstruct the prompt:**\n    *   Topic: Mystery story.\n    *   Setting: Library.\n    *   Format: One paragraph.\n\n2.  **Brainstorm",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.109830655218638
+        },
+        {
+          "idx": 2,
+          "ok": true,
+          "elapsed_s": 9.394,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "<think>\nHere's a thinking process:\n\n1.  **Understand the User Request:**\n   - **Topic:** How a transistor works\n   - **Target Audience:** High-school student\n   - **Goal:** Explain clearly,",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.1096094109162475
+        }
+      ]
+    },
+    {
+      "n_clients": 16,
+      "wall_s": 9.649,
+      "total_completion_tokens": 768,
+      "aggregate_tok_s": 79.594,
+      "per_client": [
+        {
+          "idx": 5,
+          "ok": true,
+          "elapsed_s": 9.083,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "<think>\n\n</think>\n\nFor a truly fun and iconic day trip from San Francisco, I highly recommend **Sausalito and the Golden Gate Bridge**.\n\nIt\u2019s easily accessible, visually stunning, and offers a perfect",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.28431203381555
+        },
+        {
+          "idx": 4,
+          "ok": true,
+          "elapsed_s": 9.084,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "<think>\n\n</think>\n\nTCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are the two primary transport layer protocols used in the Internet Protocol Suite (TCP/IP). They both handle the",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.28402466350353
+        },
+        {
+          "idx": 13,
+          "ok": true,
+          "elapsed_s": 9.35,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "<think>\n\n</think>\n\nFor a truly fun and iconic day trip from San Francisco, I highly recommend **Sausalito and the Golden Gate Bridge**.\n\nIt\u2019s easily accessible, visually stunning, and offers a perfect",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.133921081578629
+        },
+        {
+          "idx": 6,
+          "ok": true,
+          "elapsed_s": 9.353,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "<think>\n\n</think>\n\nPhotosynthesis and cellular respiration are complementary biological processes that form a continuous cycle of energy and matter exchange. They are essentially the reverse of one an",
+          "prompt_tokens": 18,
+          "completion_tokens": 48,
+          "total_tokens": 66,
+          "tok_s_completion": 5.131949568954058
+        },
+        {
+          "idx": 12,
+          "ok": true,
+          "elapsed_s": 9.351,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "<think>\n\n</think>\n\nTCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are the two primary transport layer protocols used in the Internet Protocol Suite (TCP/IP). They both handle the",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.133103109349594
+        },
+        {
+          "idx": 2,
+          "ok": true,
+          "elapsed_s": 9.498,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "<think>\nHere's a thinking process:\n\n1.  **Understand the User Request:**\n   - **Topic:** How a transistor works\n   - **Target Audience:** High-school student\n   - **Goal:** Explain clearly,",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.053638098665313
+        },
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 9.499,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\n\n</think>\n\nParis, the capital of France, is renowned worldwide as a global center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the ",
+          "prompt_tokens": 19,
+          "completion_tokens": 48,
+          "total_tokens": 67,
+          "tok_s_completion": 5.053261748304551
+        },
+        {
+          "idx": 14,
+          "ok": true,
+          "elapsed_s": 9.494,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "<think>\n\n</think>\n\nPhotosynthesis and cellular respiration are complementary biological processes that form a continuous cycle of energy and matter exchange. They are essentially the reverse of one an",
+          "prompt_tokens": 18,
+          "completion_tokens": 48,
+          "total_tokens": 66,
+          "tok_s_completion": 5.055757463376591
+        },
+        {
+          "idx": 8,
+          "ok": true,
+          "elapsed_s": 9.497,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\n\n</think>\n\nParis, the capital of France, is renowned worldwide as a global center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the ",
+          "prompt_tokens": 19,
+          "completion_tokens": 48,
+          "total_tokens": 67,
+          "tok_s_completion": 5.054266742720865
+        },
+        {
+          "idx": 3,
+          "ok": true,
+          "elapsed_s": 9.508,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "<think>\nThinking Process:\n\n1.  **Deconstruct the prompt:**\n    *   Topic: Mystery story.\n    *   Setting: Library.\n    *   Format: One paragraph.\n\n2.  **Brainstorm",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.048258714938262
+        },
+        {
+          "idx": 10,
+          "ok": true,
+          "elapsed_s": 9.506,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "<think>\nHere's a thinking process:\n\n1.  **Understand the User Request:**\n   - **Topic:** How a transistor works\n   - **Target Audience:** High-school student\n   - **Goal:** Explain clearly,",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.049339981931619
+        },
+        {
+          "idx": 7,
+          "ok": true,
+          "elapsed_s": 9.507,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "<think>\n\n</think>\n\nAfter the ghost of his father reveals that he was murdered by Hamlet's uncle Claudius, Prince Hamlet feigns madness to seek revenge while grappling with moral uncertainty and existe",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.048824739695112
+        },
+        {
+          "idx": 9,
+          "ok": true,
+          "elapsed_s": 9.507,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "<think>\n\n</think>\n\nFor a quick, delicious, and reliable weeknight pasta, I highly recommend **Creamy Garlic Butter Pasta with Spinach and Parmesan**. It comes together in about **15\u201320 minutes**, uses",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.049099632211769
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 9.509,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "<think>\n\n</think>\n\nFor a quick, delicious, and reliable weeknight pasta, I highly recommend **Creamy Garlic Butter Pasta with Spinach and Parmesan**. It comes together in about **15\u201320 minutes**, uses",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.047764069435724
+        },
+        {
+          "idx": 11,
+          "ok": true,
+          "elapsed_s": 9.506,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "<think>\nThinking Process:\n\n1.  **Deconstruct the prompt:**\n    *   Topic: Mystery story.\n    *   Setting: Library.\n    *   Format: One paragraph.\n\n2.  **Brainstorm",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.049321492679238
+        },
+        {
+          "idx": 15,
+          "ok": true,
+          "elapsed_s": 9.642,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "<think>\n\n</think>\n\nAfter the ghost of his father reveals that he was murdered by Hamlet's uncle Claudius, Prince Hamlet feigns madness to seek revenge while grappling with moral uncertainty and existe",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.978098074717095
+        }
+      ]
+    },
+    {
+      "n_clients": 32,
+      "wall_s": 9.809,
+      "total_completion_tokens": 1536,
+      "aggregate_tok_s": 156.595,
+      "per_client": [
+        {
+          "idx": 13,
+          "ok": true,
+          "elapsed_s": 9.212,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "<think>\n\n</think>\n\nFor a truly fun and iconic day trip from San Francisco, I highly recommend **Sausalito and the Golden Gate Bridge**.\n\nIt\u2019s easily accessible, visually stunning, and offers a perfect",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.21072656041812
+        },
+        {
+          "idx": 5,
+          "ok": true,
+          "elapsed_s": 9.216,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "<think>\n\n</think>\n\nFor a truly fun and iconic day trip from San Francisco, I highly recommend **Sausalito and the Golden Gate Bridge**.\n\nIt\u2019s easily accessible, visually stunning, and offers a perfect",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.208468031500007
+        },
+        {
+          "idx": 4,
+          "ok": true,
+          "elapsed_s": 9.216,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "<think>\n\n</think>\n\nTCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are the two primary transport layer protocols used in the Internet Protocol Suite (TCP/IP). They both handle the",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.2082598558213995
+        },
+        {
+          "idx": 20,
+          "ok": true,
+          "elapsed_s": 9.221,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "<think>\n\n</think>\n\nTCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are the two primary transport layer protocols used in the Internet Protocol Suite (TCP/IP). They both handle the",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.20574137341847
+        },
+        {
+          "idx": 12,
+          "ok": true,
+          "elapsed_s": 9.224,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "<think>\n\n</think>\n\nTCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are the two primary transport layer protocols used in the Internet Protocol Suite (TCP/IP). They both handle the",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.203918506078669
+        },
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 9.229,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\n\n</think>\n\nParis, the capital of France, is renowned worldwide as a global center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the ",
+          "prompt_tokens": 19,
+          "completion_tokens": 48,
+          "total_tokens": 67,
+          "tok_s_completion": 5.20121595755831
+        },
+        {
+          "idx": 21,
+          "ok": true,
+          "elapsed_s": 9.22,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "<think>\n\n</think>\n\nFor a truly fun and iconic day trip from San Francisco, I highly recommend **Sausalito and the Golden Gate Bridge**.\n\nIt\u2019s easily accessible, visually stunning, and offers a perfect",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.205818099901374
+        },
+        {
+          "idx": 6,
+          "ok": true,
+          "elapsed_s": 9.227,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "<think>\n\n</think>\n\nPhotosynthesis and cellular respiration are complementary biological processes that form a continuous cycle of energy and matter exchange. They are essentially the reverse of one an",
+          "prompt_tokens": 18,
+          "completion_tokens": 48,
+          "total_tokens": 66,
+          "tok_s_completion": 5.202214936121208
+        },
+        {
+          "idx": 8,
+          "ok": true,
+          "elapsed_s": 9.379,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\n\n</think>\n\nParis, the capital of France, is renowned worldwide as a global center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the ",
+          "prompt_tokens": 19,
+          "completion_tokens": 48,
+          "total_tokens": 67,
+          "tok_s_completion": 5.117921026800509
+        },
+        {
+          "idx": 28,
+          "ok": true,
+          "elapsed_s": 9.372,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "<think>\n\n</think>\n\nTCP (Transmission Control Protocol) and UDP (User Datagram Protocol) are the two primary transport layer protocols used in the Internet Protocol Suite (TCP/IP). They both handle the",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.121893799182798
+        },
+        {
+          "idx": 22,
+          "ok": true,
+          "elapsed_s": 9.374,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "<think>\n\n</think>\n\nPhotosynthesis and cellular respiration are complementary biological processes that form a continuous cycle of energy and matter exchange. They are essentially the reverse of one an",
+          "prompt_tokens": 18,
+          "completion_tokens": 48,
+          "total_tokens": 66,
+          "tok_s_completion": 5.120798822529536
+        },
+        {
+          "idx": 14,
+          "ok": true,
+          "elapsed_s": 9.377,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "<think>\n\n</think>\n\nPhotosynthesis and cellular respiration are complementary biological processes that form a continuous cycle of energy and matter exchange. They are essentially the reverse of one an",
+          "prompt_tokens": 18,
+          "completion_tokens": 48,
+          "total_tokens": 66,
+          "tok_s_completion": 5.119174612247679
+        },
+        {
+          "idx": 2,
+          "ok": true,
+          "elapsed_s": 9.382,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "<think>\nHere's a thinking process:\n\n1.  **Understand the User Request:**\n   - **Topic:** How a transistor works\n   - **Target Audience:** High-school student\n   - **Goal:** Explain clearly,",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 5.116382895708267
+        },
+        {
+          "idx": 29,
+          "ok": true,
+          "elapsed_s": 9.371,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "<think>\n\n</think>\n\nFor a truly fun and iconic day trip from San Francisco, I highly recommend **Sausalito and the Golden Gate Bridge**.\n\nIt\u2019s easily accessible, visually stunning, and offers a perfect",
+          "prompt_tokens": 17,
+          "completion_tokens": 48,
+          "total_tokens": 65,
+          "tok_s_completion": 5.12192090269857
+        },
+        {
+          "idx": 10,
+          "ok": true,
+          "elapsed_s": 9.658,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "<think>\nHere's a thinking process:\n\n1.  **Understand the User Request:**\n   - **Topic:** How a transistor works\n   - **Target Audience:** High-school student\n   - **Goal:** Explain clearly,",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.969976641232782
+        },
+        {
+          "idx": 11,
+          "ok": true,
+          "elapsed_s": 9.658,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "<think>\nThinking Process:\n\n1.  **Deconstruct the prompt:**\n    *   Topic: Mystery story.\n    *   Setting: Library.\n    *   Format: One paragraph.\n\n2.  **Brainstorm",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.970151970776503
+        },
+        {
+          "idx": 3,
+          "ok": true,
+          "elapsed_s": 9.661,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "<think>\nThinking Process:\n\n1.  **Deconstruct the prompt:**\n    *   Topic: Mystery story.\n    *   Setting: Library.\n    *   Format: One paragraph.\n\n2.  **Brainstorm",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.968279565699915
+        },
+        {
+          "idx": 9,
+          "ok": true,
+          "elapsed_s": 9.659,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "<think>\n\n</think>\n\nFor a quick, delicious, and reliable weeknight pasta, I highly recommend **Creamy Garlic Butter Pasta with Spinach and Parmesan**. It comes together in about **15\u201320 minutes**, uses",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.9696526392701275
+        },
+        {
+          "idx": 30,
+          "ok": true,
+          "elapsed_s": 9.651,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "<think>\n\n</think>\n\nPhotosynthesis and cellular respiration are complementary biological processes that form a continuous cycle of energy and matter exchange. They are essentially the reverse of one an",
+          "prompt_tokens": 18,
+          "completion_tokens": 48,
+          "total_tokens": 66,
+          "tok_s_completion": 4.973501802020151
+        },
+        {
+          "idx": 16,
+          "ok": true,
+          "elapsed_s": 9.656,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\n\n</think>\n\nParis, the capital of France, is renowned worldwide as a global center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the ",
+          "prompt_tokens": 19,
+          "completion_tokens": 48,
+          "total_tokens": 67,
+          "tok_s_completion": 4.971086493258006
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 9.662,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "<think>\n\n</think>\n\nFor a quick, delicious, and reliable weeknight pasta, I highly recommend **Creamy Garlic Butter Pasta with Spinach and Parmesan**. It comes together in about **15\u201320 minutes**, uses",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.9678958392791746
+        },
+        {
+          "idx": 7,
+          "ok": true,
+          "elapsed_s": 9.66,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "<think>\n\n</think>\n\nAfter the ghost of his father reveals that he was murdered by Hamlet's uncle Claudius, Prince Hamlet feigns madness to seek revenge while grappling with moral uncertainty and existe",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.968972752819742
+        },
+        {
+          "idx": 24,
+          "ok": true,
+          "elapsed_s": 9.662,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\n\n</think>\n\nParis, the capital of France, is renowned worldwide as a global center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the ",
+          "prompt_tokens": 19,
+          "completion_tokens": 48,
+          "total_tokens": 67,
+          "tok_s_completion": 4.967995749556363
+        },
+        {
+          "idx": 17,
+          "ok": true,
+          "elapsed_s": 9.664,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "<think>\n\n</think>\n\nFor a quick, delicious, and reliable weeknight pasta, I highly recommend **Creamy Garlic Butter Pasta with Spinach and Parmesan**. It comes together in about **15\u201320 minutes**, uses",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.966730189490144
+        },
+        {
+          "idx": 15,
+          "ok": true,
+          "elapsed_s": 9.665,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "<think>\n\n</think>\n\nAfter the ghost of his father reveals that he was murdered by Hamlet's uncle Claudius, Prince Hamlet feigns madness to seek revenge while grappling with moral uncertainty and existe",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.96626413172493
+        },
+        {
+          "idx": 18,
+          "ok": true,
+          "elapsed_s": 9.664,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "<think>\nHere's a thinking process:\n\n1.  **Understand the User Request:**\n   - **Topic:** How a transistor works\n   - **Target Audience:** High-school student\n   - **Goal:** Explain clearly,",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.96685321196635
+        },
+        {
+          "idx": 19,
+          "ok": true,
+          "elapsed_s": 9.664,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "<think>\nThinking Process:\n\n1.  **Deconstruct the prompt:**\n    *   Topic: Mystery story.\n    *   Setting: Library.\n    *   Format: One paragraph.\n\n2.  **Brainstorm",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.966939968532066
+        },
+        {
+          "idx": 23,
+          "ok": true,
+          "elapsed_s": 9.663,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "<think>\n\n</think>\n\nAfter the ghost of his father reveals that he was murdered by Hamlet's uncle Claudius, Prince Hamlet feigns madness to seek revenge while grappling with moral uncertainty and existe",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.967608512364454
+        },
+        {
+          "idx": 27,
+          "ok": true,
+          "elapsed_s": 9.797,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "<think>\nThinking Process:\n\n1.  **Deconstruct the prompt:**\n    *   Topic: Mystery story.\n    *   Setting: Library.\n    *   Format: One paragraph.\n\n2.  **Brainstorm",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.899345307117714
+        },
+        {
+          "idx": 25,
+          "ok": true,
+          "elapsed_s": 9.798,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "<think>\n\n</think>\n\nFor a quick, delicious, and reliable weeknight pasta, I highly recommend **Creamy Garlic Butter Pasta with Spinach and Parmesan**. It comes together in about **15\u201320 minutes**, uses",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.898944975251551
+        },
+        {
+          "idx": 31,
+          "ok": true,
+          "elapsed_s": 9.796,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "<think>\n\n</think>\n\nAfter the ghost of his father reveals that he was murdered by Hamlet's uncle Claudius, Prince Hamlet feigns madness to seek revenge while grappling with moral uncertainty and existe",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.899862807360067
+        },
+        {
+          "idx": 26,
+          "ok": true,
+          "elapsed_s": 9.798,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "<think>\nHere's a thinking process:\n\n1.  **Understand the User Request:**\n   - **Topic:** How a transistor works\n   - **Target Audience:** High-school student\n   - **Goal:** Explain clearly,",
+          "prompt_tokens": 20,
+          "completion_tokens": 48,
+          "total_tokens": 68,
+          "tok_s_completion": 4.899005652676593
+        }
+      ]
+    }
+  ]
+}
