@@ -7,9 +7,9 @@ robust enough to live-demo at a tech conference.
 
 ```
 ssh -L 8000:localhost:8000 qb1
-python3 scripts/chat.py                # default: greedy, max 1024, <think> hidden
+python3 scripts/chat.py                # default: greedy, max 1024, <think> shown
 python3 scripts/chat.py --tools        # enable shell / read_file / write_file / calc
-python3 scripts/chat.py --show-think   # show the model's <think>…</think> reasoning
+python3 scripts/chat.py --hide-think   # hide the model's <think>…</think> reasoning
 python3 scripts/chat.py --temp 0.7 --seed 42
 ```
 
@@ -18,10 +18,11 @@ working directory, and current settings. Each assistant turn opens with
 `● assistant (<model_short>)` and a thin grey rule.
 
 Qwen3.6 + Gemma 4 IT both emit `<think>…</think>` blocks. By default these
-are suppressed from the rendered stream (replaced with a single dim
-`(thinking…)` hint); the raw text is still appended to history so the
-model has full context on the next turn. Use `/think` mid-session or
-`--show-think` at launch to surface them.
+stream through unchanged — leaving them visible makes it obvious the
+model is alive on long thinks (Qwen3.6 thinks for 15-25 s before
+answering). Use `/think` mid-session or `--hide-think` at launch to
+suppress them (the renderer replaces the block with a single dim
+`(thinking…)` hint, and the raw text still goes into history).
 
 `--url http://...` points at a different server (default
 `http://localhost:8000`).
@@ -38,7 +39,7 @@ model has full context on the next turn. Use `/think` mid-session or
 | `/seed <int>`          | Fix the seed                                              |
 | `/max <int>`           | Set `max_tokens` per turn                                 |
 | `/tools`               | Toggle built-in tool calling                              |
-| `/think`               | Toggle visibility of `<think>…</think>` blocks (default hidden) |
+| `/think`               | Toggle visibility of `<think>…</think>` blocks (default shown)  |
 | `/continue`            | Resume after `finish=length`                              |
 | `/status` / `/show`    | Panel of current url / model / params / history counts    |
 | `/history`             | Dump transcript (truncated per message)                   |

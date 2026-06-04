@@ -296,13 +296,14 @@ class StreamRenderer:
     narrow terminals. Code-fence lines are emitted verbatim (mangling
     code with soft wraps is worse than letting the terminal handle it).
 
-    When `hide_think=True` (the default), Qwen3.6 / Gemma-4-IT model
-    `<think>…</think>` blocks are suppressed from the rendered stream
-    and replaced with a single dim "(thinking…)" hint. The raw content
-    is still appended to the assistant message so the model has full
-    context for follow-ups.
+    When `hide_think=True`, Qwen3.6 / Gemma-4-IT model `<think>…</think>`
+    blocks are suppressed from the rendered stream and replaced with a
+    single dim "(thinking…)" hint. Default is `False` (show them) so a
+    user watching a long Qwen3.6 think can see token flow and know the
+    model is alive. The raw content is always appended to the assistant
+    message so the model has full context for follow-ups.
     """
-    def __init__(self, hide_think: bool = True):
+    def __init__(self, hide_think: bool = False):
         self.buf = ""
         self.in_code = False
         # Per-line word-wrap state: characters emitted since last "\n".
@@ -833,7 +834,7 @@ COMMANDS
   /top-p /top-k /seed   sampling params
   /max <int>            max_tokens per turn
   /tools                toggle built-in tool calling
-  /think                toggle <think>…</think> visibility (default hidden)
+  /think                toggle <think>…</think> visibility (default shown)
   /continue             resume after a finish=length cut
   /status  /show        show current url / model / params / counts
   /history              dump transcript (truncated per message)
@@ -871,15 +872,16 @@ def main():
     ap.add_argument("--max", type=int, default=1024, help="max_tokens per turn")
     ap.add_argument("--tools", action="store_true",
                     help="enable built-in tool calling (shell, read_file, calc)")
-    ap.add_argument("--show-think", action="store_true",
-                    help="show raw <think>…</think> reasoning blocks "
-                         "(hidden by default for cleaner output)")
+    ap.add_argument("--hide-think", action="store_true",
+                    help="hide <think>…</think> reasoning blocks "
+                         "(shown by default so it's obvious the model is "
+                         "alive on long thinks; toggle in-session with /think)")
     args = ap.parse_args()
 
     params = {"temperature": args.temp, "top_p": args.top_p, "top_k": args.top_k,
               "seed": args.seed, "max_tokens": args.max}
     tools_on = bool(args.tools)
-    hide_think = not args.show_think
+    hide_think = bool(args.hide_think)
     messages: list[dict] = []
     if args.sys:
         messages.append({"role": "system", "content": args.sys})

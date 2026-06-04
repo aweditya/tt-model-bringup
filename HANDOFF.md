@@ -30,8 +30,9 @@ For Gemma 4: `TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it ...`. Do NOT pass `TT_C
 **TUI is ready** (`scripts/chat.py`, README at `scripts/CHAT_TUI.md`). Key features:
 - Claude-Code-style welcome panel (closed box, url + model + cwd + settings)
 - `● assistant (<model_short>)` per-turn header with thin grey rule
-- `<think>…</think>` block hiding (replaced with a single dim "(thinking…)"
-  hint); `/think` toggles, `--show-think` opts out at launch
+- `<think>…</think>` blocks shown by default (so it's obvious the model is
+  alive on a long 20s Qwen3.6 think); `/think` toggles, `--hide-think`
+  opts into the dim "(thinking…)" placeholder at launch
 - `/status` (and `/show`) panel; `/clear` (and `/new`) reset; cwd shown as
   `~/…` with path-aware ellipsis for long paths
 - `/paste` multi-line mode (with bracketed paste + burst heuristic fallback)
