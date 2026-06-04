@@ -55,7 +55,10 @@ suppress them (the renderer replaces the block with a single dim
 ## Input editing
 
 The prompt uses Python's `readline` library, so all the standard
-Emacs-style line-editing keys work:
+Emacs-style line-editing keys work. macOS Pythons typically link
+`readline` against `libedit` (not GNU readline) — the TUI detects
+this at startup and applies the right `parse_and_bind` syntax for
+both backends, so Option-←/→ word-nav works the same way on both.
 
 | Key                  | What it does                          |
 |----------------------|---------------------------------------|

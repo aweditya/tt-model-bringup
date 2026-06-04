@@ -407,25 +407,59 @@ def _read_input(prompt: str) -> str | None:
 def _setup_readline(history_path: str | None) -> None:
     """Configure readline once at startup. No-op if readline missing.
 
-    - Emacs editing mode (default): Ctrl-W word-delete, Ctrl-A/E line
-      start/end, Alt-B/F word nav (== Option-←/→ on macOS Terminal /
-      iTerm with 'Use Option as Meta' on).
-    - Bracketed paste so multi-line pastes don't submit per-line.
-    - Optional persistent history at `history_path`.
+    macOS Pythons usually link the `readline` module against
+    Apple's libedit, not GNU readline. The two use *different*
+    `parse_and_bind` syntaxes — GNU's `set editing-mode emacs`
+    is silently ignored by libedit, leaving Alt-B/F (== Option-
+    arrows when the terminal sends ESC b / ESC f, as WezTerm
+    does) without an emacs-style binding.
+
+    We detect libedit and apply both syntaxes accordingly:
+
+    - Emacs editing mode: Ctrl-W word-delete, Ctrl-A/E line nav,
+      Alt-B/F word nav.
+    - Bracketed paste: only GNU readline; libedit doesn't expose
+      a switch but generally passes pastes through fine.
+    - Persistent history at `history_path`.
     """
     try:
         import readline  # noqa: F401  (side-effect: makes input() use libreadline)
     except ImportError:
         return
+
+    is_libedit = "libedit" in (readline.__doc__ or "")
     try:
-        readline.parse_and_bind("set editing-mode emacs")
-        readline.parse_and_bind("set enable-bracketed-paste on")
-        readline.parse_and_bind("set horizontal-scroll-mode off")
-        readline.parse_and_bind("set bell-style none")
+        if is_libedit:
+            # libedit syntax (also documented in `editrc(5)`).
+            readline.parse_and_bind("bind -e")           # emacs mode
+            # Re-bind a few escapes that some macOS terminals send for
+            # Option-arrows in case the user's term doesn't already map
+            # them to ESC b / ESC f. ed-prev-word / ed-next-word are
+            # libedit's emacs-mode word-motion verbs.
+            readline.parse_and_bind(r"bind '\e\e[D' ed-prev-word")
+            readline.parse_and_bind(r"bind '\e\e[C' ed-next-word")
+            readline.parse_and_bind(r"bind '\e[1;3D' ed-prev-word")
+            readline.parse_and_bind(r"bind '\e[1;3C' ed-next-word")
+            # ESC b / ESC f are emacs defaults; rebind defensively in
+            # case the user's editrc disturbed them.
+            readline.parse_and_bind(r"bind '\eb' ed-prev-word")
+            readline.parse_and_bind(r"bind '\ef' ed-next-word")
+        else:
+            # GNU readline syntax.
+            readline.parse_and_bind("set editing-mode emacs")
+            readline.parse_and_bind("set enable-bracketed-paste on")
+            readline.parse_and_bind("set horizontal-scroll-mode off")
+            readline.parse_and_bind("set bell-style none")
+            readline.parse_and_bind(r"\eb: backward-word")
+            readline.parse_and_bind(r"\ef: forward-word")
+            readline.parse_and_bind(r"\e[1;3D: backward-word")
+            readline.parse_and_bind(r"\e[1;3C: forward-word")
     except Exception:
         pass
+
     if history_path:
         try:
+            os.makedirs(os.path.dirname(history_path), exist_ok=True)
             readline.set_history_length(2000)
             if os.path.exists(history_path):
                 readline.read_history_file(history_path)
