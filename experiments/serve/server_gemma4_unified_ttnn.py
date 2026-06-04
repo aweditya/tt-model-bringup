@@ -801,11 +801,18 @@ def _lm_head_argmax(state, final, capture_logits=False):
     gathered = ttnn.all_gather(sharded_softcapped, dim=-1)
     ttnn.deallocate(sharded_softcapped)
     # Slice to true vocab (in case of any tile padding); for Gemma 4 12B
-    # this is a no-op (262144 is tile-aligned).
+    # this is a no-op (262144 is tile-aligned). The slice's begins/ends
+    # must match the input rank — ttnn matmul output here may be rank-2
+    # `[B, VOCAB]` or rank-3 `[1, B, VOCAB]` depending on path. Build
+    # the indices from gathered.shape so we work for either.
     vocab_size = getattr(state, "vocab_size", None)
     if vocab_size is None:
         vocab_size = int(gathered.shape[-1])
-    sliced = ttnn.slice(gathered, [0, 0], [gathered.shape[0], vocab_size])
+    gshape = list(gathered.shape)
+    begins = [0] * len(gshape)
+    ends = list(gshape)
+    ends[-1] = vocab_size
+    sliced = ttnn.slice(gathered, begins, ends)
     # Keep `gathered` alive: `sliced` is a VIEW. The full-logits readback
     # (capture path) uses it; the argmax path consumes it.
     full_logits = gathered if capture_logits else None
