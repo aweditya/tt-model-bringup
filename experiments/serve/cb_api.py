@@ -286,13 +286,6 @@ def _build_app_with_default_lifespan():
         await loop.run_in_executor(None, base.bootstrap, st, _flush_log)
         bootstrap_status["stage"] = "bootstrap_done; building engine"
         bootstrap_status["elapsed_s"] = round(_time.time() - bootstrap_status["started_at"], 1)
-        # 27B-only deltanet feature flags (the 35B path keys these via
-        # getattr-default in its forward; setting them here is a no-op for 35B
-        # but is incorrect-by-convention. Gate by backend.)
-        if TT_BACKEND == "27b":
-            st.deltanet_recurrence_mode = "manual"
-            st.deltanet_decay_gate_mode = "manual"
-            st.deltanet_decay_mode = "native_softplus"
         # Tokenizer reports a single eos_token_id; the model's
         # generation_config may list multiple (Gemma IT: [1, 106, 50] — the
         # dialog stop is 106, the corpus stop is 1, and 50 is rare-but-
