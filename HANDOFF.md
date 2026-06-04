@@ -173,6 +173,27 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
   experimentation (`TT_BACKEND=gemma4_12b bash experiments/serve/scripts/serve_cb.sh
   start`). Per-token decode at **19.5 tok/s single-seq traced**;
   19.5 → projected ~55-65 tok/s aggregate at B=4 traced.
+
+  - **Gemma 4 12B IT (instruct) DONE 2026-06-04 commit `bdd207c`** —
+    bootstrap variant-switch via `TT_GEMMA4_VARIANT=it`. Forks the
+    base machinery (same arch); the only deltas are weights, the
+    shipped chat template, and proper `<end_of_turn>` EOS. v1.6 B=4
+    acceptance PASSED at distinct-from-base argmax outputs. End-to-end
+    HTTP chat smoke:
+        `curl /v1/chat/completions ... "Write a one-sentence summary
+         of the city of Paris."`
+        → "Paris is a world-renowned cultural and historical capital
+           celebrated for its iconic landmarks, rich artistic heritage,
+           and sophisticated culinary scene."
+    Known followup: IT has three EOS candidates `[1, 106, 50]` in
+    `generation_config.json`; cb_engine only gates on one. Extend
+    cb_engine to accept a list when that wart matters.
+
+  **Two-variant bringup recipe validated** — the model_bringup_recipe.md
+  staging ladder (v0.0 oracle → v1 CB → v2 HTTP) carried us from the
+  base model bringup to an instruction-tuned variant in **~2 hours**
+  (download + oracle + smoke + EOS fix). The "fork, don't write" rule
+  paid out.
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
