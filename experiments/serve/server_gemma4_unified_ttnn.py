@@ -784,6 +784,194 @@ def _layer_forward_pos0(state, h_in, layer_idx):
     return h_out
 
 
+# ── v0.3.0: paged-SDPA forward at pos 0 (matches v0.2 result via the cache) ──
+#
+# Forks 35B's `attn_forward_ttnn_sdpa` paged path (server_35b_ttnn.py:842-917)
+# and adapts for Gemma 4's:
+# - v_norm (with_scale=False) on V after view-to-heads
+# - NKV_PER_CHIP_SLIDING=2 (vs 35B's 1) — same shape contract; just a thicker
+#   dim 1 in the cache
+# - sliding_window_size=1024 kwarg on the SDPA decode call (verified Step 0.1)
+# - global path: NKV=1 replicated, head_dim=512, attention_k_eq_v aliases V=K
+#
+# RoPE at pos 0 is identity (cos[0]=1, sin[0]=0). v0.3.0 SKIPS RoPE for that
+# reason; v0.3.1 applies it at pos > 0.
+
+
+def _shard_for_paged_write(t_2d, state, n_kv_heads, head_dim, mem_cfg):
+    """Reshape + pad a [n_kv_heads, head_dim] per-chip tensor for paged_update_cache.
+
+    Output: HEIGHT_SHARDED L1 [1, n_kv_heads, BLOCK_SIZE, head_dim] per chip.
+    Matches 35B's `_shard_for_paged_write` helper at server_35b_ttnn.py:845-849
+    extended for n_kv_heads > 1.
+    """
+    t4d = ttnn.reshape(t_2d, [1, n_kv_heads, 1, head_dim])
+    t_pad = ttnn.pad(t4d, [[0, 0], [0, 0], [0, state.sdpa_block_size - 1], [0, 0]],
+                     value=0.0)
+    return ttnn.to_memory_config(t_pad, mem_cfg)
+
+
+def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx):
+    """Sliding-attention forward at pos 0 via paged_update_cache + paged SDPA.
+
+    Matches v0.2's `_layer_pos0_sliding` result (which proved correct: cos=0.99999
+    vs HF at v0.1.2) but routes through the real cache pipeline so v0.3.1 can
+    extend to pos > 0 by simply advancing cur_pos.
+    """
+    kc, vc = state.kv_caches_tt[layer_idx]
+
+    # Q/K/V projections (Q sharded over heads, K/V sharded over KV heads).
+    q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
+    k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
+    v = ttnn.matmul(h_norm, w["v_proj"], compute_kernel_config=HIFI4)
+
+    q_h = ttnn.reshape(q, [NQ_PER_CHIP, HEAD_DIM_SLIDING])
+    ttnn.deallocate(q)
+    k_h = ttnn.reshape(k, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
+    ttnn.deallocate(k)
+    v_h = ttnn.reshape(v, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
+    ttnn.deallocate(v)
+
+    # q_norm, k_norm (with_scale=True; learnable weights per head).
+    q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    k_n = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h)
+
+    # v_norm (with_scale=False; identity-weight rms norm).
+    v_n = ttnn.rms_norm(v_h, weight=state.ones_head_dim_sliding, epsilon=EPS)
+    ttnn.deallocate(v_h)
+
+    # RoPE at pos 0 is identity (cos=1, sin=0). v0.3.1 applies it for pos > 0.
+
+    # Write K, V to paged cache at cur_pos=0.
+    k_sharded = _shard_for_paged_write(k_n, state, NKV_PER_CHIP_SLIDING,
+                                        HEAD_DIM_SLIDING, state.paged_write_mem_cfg_sliding)
+    v_sharded = _shard_for_paged_write(v_n, state, NKV_PER_CHIP_SLIDING,
+                                        HEAD_DIM_SLIDING, state.paged_write_mem_cfg_sliding)
+    ttnn.deallocate(k_n); ttnn.deallocate(v_n)
+    ttnn.experimental.paged_update_cache(
+        kc, k_sharded,
+        update_idxs_tensor=state.cur_pos_buf,
+        page_table=state.page_table_tt,
+    )
+    ttnn.experimental.paged_update_cache(
+        vc, v_sharded,
+        update_idxs_tensor=state.cur_pos_buf,
+        page_table=state.page_table_tt,
+    )
+    ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
+
+    # Paged SDPA decode. Q shape [1, 1, NQ_PER_CHIP, head_dim] per chip.
+    # sliding_window_size=1024 on sliding layers (Step 0.1 verified).
+    q_for_sdpa = ttnn.reshape(q_n, [1, 1, NQ_PER_CHIP, HEAD_DIM_SLIDING])
+    ttnn.deallocate(q_n)
+    attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+        q_for_sdpa, kc, vc,
+        cur_pos_tensor=state.cur_pos_buf,
+        page_table_tensor=state.page_table_tt,
+        scale=1.0 / (HEAD_DIM_SLIDING ** 0.5),
+        program_config=state.paged_sdpa_progcfg,
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+        sliding_window_size=SLIDING_WINDOW,
+    )
+    ttnn.deallocate(q_for_sdpa)
+    attn_flat = ttnn.reshape(attn_out, [1, NQ_PER_CHIP * HEAD_DIM_SLIDING])
+    ttnn.deallocate(attn_out)
+
+    # o_proj column-sharded + all_reduce.
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+    return out
+
+
+def _layer_forward_pos0_paged(state, h_in, layer_idx):
+    """v0.3.0 layer forward — uses paged SDPA on sliding layers; falls back to
+    the v0.2 global helper for global layers (v0.3.0 scope is sliding only;
+    v0.3.1 ports global as well)."""
+    w = state.per_layer_tt[layer_idx]
+    lt = state.layer_types[layer_idx]
+    residual_1 = ttnn.clone(h_in)
+    h_norm = ttnn.rms_norm(h_in, weight=w["input_layernorm"], epsilon=EPS)
+    if lt == "sliding_attention":
+        mixer = _layer_pos0_sliding_paged(state, h_norm, w, layer_idx)
+    else:
+        # v0.3.0 still uses v0.2 global helper; v0.3.1 will port to paged.
+        mixer = _layer_pos0_global(state, h_norm, w)
+    ttnn.deallocate(h_norm)
+    post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
+    ttnn.deallocate(mixer)
+    h_after_attn = ttnn.add(residual_1, post_attn)
+    ttnn.deallocate(residual_1); ttnn.deallocate(post_attn)
+    pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"], epsilon=EPS)
+    gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4)
+    up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(pre_ff)
+    gelu_gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
+    ttnn.deallocate(gate)
+    mid = ttnn.mul(gelu_gate, up)
+    ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
+    mlp_partial = ttnn.matmul(mid, w["down_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(mid)
+    mlp_out = all_reduce_tt(mlp_partial, state.mesh)
+    ttnn.deallocate(mlp_partial)
+    post_ff = ttnn.rms_norm(mlp_out, weight=w["post_feedforward_layernorm"], epsilon=EPS)
+    ttnn.deallocate(mlp_out)
+    h_residual_2 = ttnn.add(h_after_attn, post_ff)
+    ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff)
+    h_out = ttnn.multiply(h_residual_2, w["layer_scalar"])
+    ttnn.deallocate(h_residual_2)
+    return h_out
+
+
+def step_forward_v03(state, tok_id, capture=None):
+    """v0.3.0 forward — paged SDPA on sliding layers; global layers still
+    use v0.2's V-routing shortcut. Goal: argmax should still match HF.
+    """
+    tok_tt = ttnn.from_torch(
+        torch.tensor([[int(tok_id)]], dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    embed = ttnn.embedding(tok_tt, state.embed_tt)
+    ttnn.deallocate(tok_tt)
+    h = ttnn.multiply(ttnn.to_layout(embed, ttnn.TILE_LAYOUT), EMBED_SCALE)
+    ttnn.deallocate(embed)
+
+    for L in range(NUM_LAYERS):
+        h_new = _layer_forward_pos0_paged(state, h, L)
+        ttnn.deallocate(h)
+        h = h_new
+
+    final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
+    ttnn.deallocate(h)
+    if capture is not None:
+        capture["final_norm"] = _readback_replicated(final, state.mesh)
+
+    logits_raw = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
+    ttnn.deallocate(final)
+    inv = ttnn.multiply(logits_raw, 1.0 / FINAL_LOGIT_SOFTCAP)
+    ttnn.deallocate(logits_raw)
+    th = ttnn.tanh(inv)
+    ttnn.deallocate(inv)
+    logits = ttnn.multiply(th, FINAL_LOGIT_SOFTCAP)
+    ttnn.deallocate(th)
+    if capture is not None:
+        capture["logits"] = _readback_replicated(logits, state.mesh)
+
+    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+    ttnn.deallocate(logits)
+    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
+    ttnn.deallocate(logits_rm)
+    arr = ttnn.to_torch(argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+    ttnn.deallocate(argmax_tt)
+    argmax = int(arr.reshape(-1)[0].item())
+    if capture is not None:
+        capture["argmax"] = argmax
+    return argmax
+
+
 def step_forward_v02(state, tok_id, capture=None):
     """Full 48-layer forward at pos 0 → final_norm → lm_head → softcap → argmax.
 
