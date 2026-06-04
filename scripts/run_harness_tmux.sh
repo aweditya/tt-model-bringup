@@ -29,6 +29,9 @@ tmux kill-session -t $MODEL 2>/dev/null || true
 sleep 1
 mkdir -p ~/tt-xla/.cache/$RUNTIME_DIR/trig
 rm -f ~/tt-xla/.cache/$RUNTIME_DIR/harness.log
+# Clear stale triggers (especially _exit from a previous shutdown) so the
+# fresh harness doesn't immediately exit or run an old test.
+rm -f ~/tt-xla/.cache/$RUNTIME_DIR/trig/*
 cd ~/tt-xla
 tmux new-session -d -s $MODEL \\
   "cd ~/tt-xla && \\
