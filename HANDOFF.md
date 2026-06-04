@@ -66,10 +66,15 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
   multiplied at end of each decoder layer, AND the cosine-is-not-enough
   diagnostic discipline ([[cos-not-enough-also-check-mad]]) — direction
   passed at L0 but magnitude was 18× off, propagating to L1 collapse.
-- **v0.3 IN FLIGHT** — bootstrap scaffolding committed (cur_pos_buf,
-  rot_idxs_buf, page_table_tt). Plan §"v0.3 sub-staging" has detailed
-  design notes with 35B `file:line` references and TWO head_dim
-  variants (sliding=256 / global=512) breakdown.
+- **v0.3 IN FLIGHT — setup DONE 2026-06-03 commit `cb4e299`**:
+  KV caches per layer (sliding [num_blocks, 8, 32, 256] sharded over
+  mesh dim=1; global [num_blocks, 1, 32, 512] replicated), SDPA
+  program + memory + compute configs (35B B3 recipe — HiFi2 +
+  fp32_dest_acc=False per [[fp32-sdpa-cliff-probe]]), RoPE tables
+  (sliding theta=10000 full-rotate, global p-RoPE theta=1e6 partial
+  0.25). v0.2 probe re-runs with these in place: STILL PASSES.
+  Only FORWARD changes remain. Plan §"v0.3 sub-staging" has detailed
+  design notes with 35B `file:line` references.
   - v0.3.0: full Q/K/V + q_norm/k_norm/v_norm + RoPE + paged SDPA at
     pos 0. Gate: matches v0.2 result via paged path.
   - v0.3.1: multi-step decode + KV cache across steps + non-trivial
