@@ -1,5 +1,14 @@
 # Live measurements (2026-06-04 session) — POST-FIX + ARGMAX-TRACE
 
+## Single-client streaming (TTFT + decode separately, HTTP CB engine, B=32, traced)
+
+| Model | TTFT (s) | Prompt tokens | ms / prompt-token | Decode (tok/s) | Total wall (s, 64 toks) |
+|---|---|---|---|---|---|
+| Gemma 4 12B IT | **1.40** | 18 | 78 | **17.42** | 5.02 |
+| Qwen3.6-27B | TBD (re-measurement pending) | | | | |
+
+Gm4 single-client decode at 17.4 tok/s is now 83% of the dev-harness B=1 ceiling (21 tok/s). CB structural cost is the remaining 17% gap.
+
 ## Final headline (after `4506385` argmax-tail trace fix)
 
 | Model | TT_CB_SLOTS | 1 client | 8 clients | 16 clients | 32 clients | Scaling 1→32 |
@@ -117,7 +126,7 @@ For Gemma 4, dev-harness B=1 = 21.05 tok/s; CB-engine B=32 with 32 clients = 162
 
 ## Bugs surfaced + still open
 
-1. **Gemma 4 IT prefix-cache misses on chat template** (0/60 hits). Needs the equivalent of Qwen3.6's `_messages_to_prompt` patches for Gemma 4. `[[prefix-cache-multiturn-miss-2026-06-04]]`.
+1. **Gemma 4 IT prefix-cache STILL misses after the tokenize=True fix (`46083bd`)** (0/3 hits in latest probe; 3 live slots so cache infra works). Root cause: the Gemma Jinja template applies `| trim` to past assistant content BEFORE tokenization — `r['gen']` keeps trailing whitespace tokens; the chat-template re-render drops them. Next fix: scheduler `_finish` should `decode → rstrip → re-tokenise` the assistant content before storing `tokens_so_far`. Wall times are still much better (turn 2 was 49.12s before; now 13.17s with the argmax-tail trace fix).
 2. **35B B>1 empty-slot poisoning** (task #162) — we were forced to TT_CB_SLOTS=1 for 35B. The 3.13 tok/s 35B number is therefore the WORST CB configuration possible for that model — it can't share the B=32 multiplier yet.
 3. **Argmax-tail trace not available in HTTP path** — `cb_api.py` forces `sampling=True` even at temperature=0. The historical 376 / 593 tok/s benches used `sampling=False` with the argmax-tail trace. Catching this would close the gap from 156 → ~376 tok/s on 27B B=32.
 4. **35B free-run determinism** — same prompt produces different outputs across runs (bf16 chain noise + non-deterministic reductions). Research at `research/35b_determinism_2026-06-04.md`; fix sketches at the bottom of that file (deterministic argmax tie-break, multicore=False on final argmax, fp32_dest_acc on lm_head).
