@@ -35,23 +35,33 @@ sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 import server_gemma4_unified_ttnn as srv  # noqa: E402
 
 N_STEPS = 100
-START_TOK = 2  # BOS
+# Use the v0.3.1 prompt for the first 6 steps (teacher-forced from
+# "The capital of France is"), then free-run via argmax. BOS-only
+# free-run degenerates to a constant <image|> loop in ~1 step (v0.3.2),
+# which makes the eager-vs-traced match trivial — a 6-token prompt
+# warms up real residual-stream dynamics so the gate has teeth.
+PROMPT_IDS = [2, 818, 5279, 529, 7001, 563]  # BOS + "The capital of France is"
 
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def _run_n_steps(state, fn, start_tok, n):
-    """Run `fn(state, tok_id, pos)` n times, feeding previous argmax as
-    next input. Returns the list of n argmax tokens.
+def _run_n_steps(state, fn, prompt_ids, n):
+    """Run `fn(state, tok_id, pos)` n times. For pos < len(prompt_ids):
+    teacher-force the prompt token. For pos >= len(prompt_ids): feed the
+    previous step's argmax (free-run). Returns the list of n argmax tokens.
     """
     out = []
-    tok = start_tok
+    prev_argmax = None
     for pos in range(n):
-        argmax = fn(state, tok, pos)
+        if pos < len(prompt_ids):
+            tok = prompt_ids[pos]
+        else:
+            tok = prev_argmax
+        argmax = fn(state, int(tok), pos)
         out.append(int(argmax))
-        tok = int(argmax)
+        prev_argmax = int(argmax)
     return out
 
 
@@ -66,9 +76,10 @@ def main(state=None):
     else:
         log("using pre-bootstrapped state from harness")
 
-    log(f"running {N_STEPS} EAGER steps from tok={START_TOK} (BOS)…")
+    log(f"running {N_STEPS} EAGER steps "
+        f"(teacher-forced pos 0..{len(PROMPT_IDS)-1}, free-run after)…")
     t0 = time.time()
-    eager_argmax = _run_n_steps(state, srv.step_forward_v031, START_TOK, N_STEPS)
+    eager_argmax = _run_n_steps(state, srv.step_forward_v031, PROMPT_IDS, N_STEPS)
     log(f"  eager done in {time.time()-t0:.1f}s "
         f"({(time.time()-t0)*1000/N_STEPS:.1f} ms/tok)")
     log(f"  eager first 10: {eager_argmax[:10]}")
@@ -79,9 +90,9 @@ def main(state=None):
     srv.ensure_decode_trace(state, log=log)
     log(f"  trace capture took {time.time()-t0:.1f}s")
 
-    log(f"running {N_STEPS} TRACED steps from tok={START_TOK}…")
+    log(f"running {N_STEPS} TRACED steps (same prompt)…")
     t0 = time.time()
-    traced_argmax = _run_n_steps(state, srv.step_forward_traced, START_TOK, N_STEPS)
+    traced_argmax = _run_n_steps(state, srv.step_forward_traced, PROMPT_IDS, N_STEPS)
     log(f"  traced done in {time.time()-t0:.1f}s "
         f"({(time.time()-t0)*1000/N_STEPS:.1f} ms/tok)")
     log(f"  traced first 10: {traced_argmax[:10]}")

@@ -97,12 +97,32 @@ def _add_test_paths():
             sys.path.insert(0, p)
 
 
+class _TeeStdout:
+    """Mirror stdout/stderr to last.log AND the tmux session, so tests'
+    print()s land in the per-trigger log."""
+    def __init__(self, orig, log_fh):
+        self.orig = orig; self.log_fh = log_fh
+    def write(self, s):
+        self.orig.write(s); self.orig.flush()
+        try: self.log_fh.write(s); self.log_fh.flush()
+        except Exception: pass
+    def flush(self):
+        try: self.orig.flush()
+        except Exception: pass
+        try: self.log_fh.flush()
+        except Exception: pass
+
+
 def run_test(state, trigger_name: str) -> int:
     if LOG_PATH.exists():
         LOG_PATH.unlink()
     log(f"[harness] running {trigger_name}")
+    # Tee test stdout/stderr into the trigger's last.log too.
+    log_fh = open(LOG_PATH, "a", buffering=1)
+    orig_out, orig_err = sys.stdout, sys.stderr
+    sys.stdout = _TeeStdout(orig_out, log_fh)
+    sys.stderr = _TeeStdout(orig_err, log_fh)
     try:
-        # Reload the server module so probes see any in-flight edits.
         importlib.reload(base)
         mod = _discover_test_module(trigger_name)
         if mod is None:
@@ -123,6 +143,10 @@ def run_test(state, trigger_name: str) -> int:
     except Exception:
         log(traceback.format_exc())
         return 1
+    finally:
+        sys.stdout, sys.stderr = orig_out, orig_err
+        try: log_fh.close()
+        except Exception: pass
 
 
 def main():
