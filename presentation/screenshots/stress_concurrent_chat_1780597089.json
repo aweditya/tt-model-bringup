@@ -1,0 +1,670 @@
+{
+  "args": {
+    "url": "http://127.0.0.1:8000",
+    "model": "google/gemma-4-12B",
+    "clients": "1,8,16,32",
+    "max_tokens": 48,
+    "out": "/home/aditya/tt-xla/presentation/screenshots/stress_concurrent_chat_1780597089.json"
+  },
+  "rounds": [
+    {
+      "n_clients": 1,
+      "wall_s": 4.21,
+      "total_completion_tokens": 48,
+      "aggregate_tok_s": 11.402,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 4.208,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 48,
+          "total_tokens": 72,
+          "tok_s_completion": 11.406483635954267
+        }
+      ]
+    },
+    {
+      "n_clients": 8,
+      "wall_s": 4.302,
+      "total_completion_tokens": 384,
+      "aggregate_tok_s": 89.254,
+      "per_client": [
+        {
+          "idx": 4,
+          "ok": true,
+          "elapsed_s": 4.119,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "The simplest way to understand the difference between **TCP** (Transmission Control Protocol) and **UDP** (User Datagram Protocol) is to think of them as two different types of mail delivery:\n\n*   **T",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 11.65206292116311
+        },
+        {
+          "idx": 5,
+          "ok": true,
+          "elapsed_s": 4.119,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "Depending on what kind of \"fun\" you are looking for, here are four different types of day trips from San Francisco, ranging from coastal relaxation to mountain adventure.\n\n### 1. The Classic Coastal E",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 11.65290123546112
+        },
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 4.124,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 48,
+          "total_tokens": 72,
+          "tok_s_completion": 11.638257211283468
+        },
+        {
+          "idx": 6,
+          "ok": true,
+          "elapsed_s": 4.121,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "Photosynthesis and cellular respiration are often described as two sides of the same biological coin. They are **complementary processes** that form a continuous cycle of energy transformation, where ",
+          "prompt_tokens": 21,
+          "completion_tokens": 48,
+          "total_tokens": 69,
+          "tok_s_completion": 11.646494532655455
+        },
+        {
+          "idx": 7,
+          "ok": true,
+          "elapsed_s": 4.237,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "After the ghost of his father reveals he was murdered by his uncle, Prince Hamlet becomes consumed by a quest for revenge against the new king. His internal struggle and erratic behavior lead to a tra",
+          "prompt_tokens": 23,
+          "completion_tokens": 48,
+          "total_tokens": 71,
+          "tok_s_completion": 11.32833373218281
+        },
+        {
+          "idx": 2,
+          "ok": true,
+          "elapsed_s": 4.299,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "To understand a transistor, you first need to forget about complex physics for a second and think about a simple **water faucet.**\n\nA transistor is essentially an **electronic faucet.** It is a tiny s",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 11.166473456172723
+        },
+        {
+          "idx": 3,
+          "ok": true,
+          "elapsed_s": 4.3,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "The heavy scent of vanilla and decaying paper hung in the air of the West Wing, where the only sound was the rhythmic ticking of a grandfather clock that seemed to count down to something unseen. Elia",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 11.162769777740518
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 4.301,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "For a quick weeknight pasta, the goal is **high flavor with minimal cleanup.** \n\nHere are three different \"styles\" of quick pasta depending on what you have in your pantry. All of these take about **1",
+          "prompt_tokens": 26,
+          "completion_tokens": 48,
+          "total_tokens": 74,
+          "tok_s_completion": 11.160479581126523
+        }
+      ]
+    },
+    {
+      "n_clients": 16,
+      "wall_s": 4.452,
+      "total_completion_tokens": 768,
+      "aggregate_tok_s": 172.519,
+      "per_client": [
+        {
+          "idx": 6,
+          "ok": true,
+          "elapsed_s": 4.143,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "Photosynthesis and cellular respiration are often described as two sides of the same biological coin. They are **complementary processes** that form a continuous cycle of energy transformation, where ",
+          "prompt_tokens": 21,
+          "completion_tokens": 48,
+          "total_tokens": 69,
+          "tok_s_completion": 11.584492387180049
+        },
+        {
+          "idx": 5,
+          "ok": true,
+          "elapsed_s": 4.206,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "Depending on what kind of \"fun\" you are looking for, here are four different types of day trips from San Francisco, ranging from coastal relaxation to mountain adventure.\n\n### 1. The Classic Coastal E",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 11.413514673698232
+        },
+        {
+          "idx": 4,
+          "ok": true,
+          "elapsed_s": 4.206,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "The simplest way to understand the difference between **TCP** (Transmission Control Protocol) and **UDP** (User Datagram Protocol) is to think of them as two different types of mail delivery:\n\n*   **T",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 11.411820948882362
+        },
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 4.208,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 48,
+          "total_tokens": 72,
+          "tok_s_completion": 11.40719391198073
+        },
+        {
+          "idx": 12,
+          "ok": true,
+          "elapsed_s": 4.322,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "The simplest way to understand the difference between **TCP** (Transmission Control Protocol) and **UDP** (User Datagram Protocol) is to think of them as two different types of mail delivery:\n\n*   **T",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 11.106302681081365
+        },
+        {
+          "idx": 7,
+          "ok": true,
+          "elapsed_s": 4.325,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "After the ghost of his father reveals he was murdered by his uncle, Prince Hamlet becomes consumed by a quest for revenge against the new king. His internal struggle and erratic behavior lead to a tra",
+          "prompt_tokens": 23,
+          "completion_tokens": 48,
+          "total_tokens": 71,
+          "tok_s_completion": 11.099133984962522
+        },
+        {
+          "idx": 2,
+          "ok": true,
+          "elapsed_s": 4.327,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "To understand a transistor, you first need to forget about complex physics for a second and think about a simple **water faucet.**\n\nA transistor is essentially an **electronic faucet.** It is a tiny s",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 11.092545950711413
+        },
+        {
+          "idx": 3,
+          "ok": true,
+          "elapsed_s": 4.327,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "The heavy scent of vanilla and decaying paper hung in the air of the West Wing, where the only sound was the rhythmic ticking of a grandfather clock that seemed to count down to something unseen. Elia",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 11.093167544433756
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 4.389,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "For a quick weeknight pasta, the goal is **high flavor with minimal cleanup.** \n\nHere are three different \"styles\" of quick pasta depending on what you have in your pantry. All of these take about **1",
+          "prompt_tokens": 26,
+          "completion_tokens": 48,
+          "total_tokens": 74,
+          "tok_s_completion": 10.936995364804107
+        },
+        {
+          "idx": 8,
+          "ok": true,
+          "elapsed_s": 4.386,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 48,
+          "total_tokens": 72,
+          "tok_s_completion": 10.945012734332595
+        },
+        {
+          "idx": 14,
+          "ok": true,
+          "elapsed_s": 4.383,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "Photosynthesis and cellular respiration are often described as two sides of the same biological coin. They are **complementary processes** that form a continuous cycle of energy transformation, where ",
+          "prompt_tokens": 21,
+          "completion_tokens": 48,
+          "total_tokens": 69,
+          "tok_s_completion": 10.952014047625122
+        },
+        {
+          "idx": 13,
+          "ok": true,
+          "elapsed_s": 4.383,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "Depending on what kind of \"fun\" you are looking for, here are four different types of day trips from San Francisco, ranging from coastal relaxation to mountain adventure.\n\n### 1. The Classic Coastal E",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 10.95085954524743
+        },
+        {
+          "idx": 15,
+          "ok": true,
+          "elapsed_s": 4.443,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "After the ghost of his father reveals he was murdered by his uncle, Prince Hamlet becomes consumed by a quest for revenge against the new king. His internal struggle and erratic behavior lead to a tra",
+          "prompt_tokens": 23,
+          "completion_tokens": 48,
+          "total_tokens": 71,
+          "tok_s_completion": 10.804022300463373
+        },
+        {
+          "idx": 9,
+          "ok": true,
+          "elapsed_s": 4.446,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "For a quick weeknight pasta, the goal is **high flavor with minimal cleanup.** \n\nHere are three different \"styles\" of quick pasta depending on what you have in your pantry. All of these take about **1",
+          "prompt_tokens": 26,
+          "completion_tokens": 48,
+          "total_tokens": 74,
+          "tok_s_completion": 10.796351926382144
+        },
+        {
+          "idx": 10,
+          "ok": true,
+          "elapsed_s": 4.445,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "To understand a transistor, you first need to forget about complex physics for a second and think about a simple **water faucet.**\n\nA transistor is essentially an **electronic faucet.** It is a tiny s",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 10.797495504989763
+        },
+        {
+          "idx": 11,
+          "ok": true,
+          "elapsed_s": 4.445,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "The heavy scent of vanilla and decaying paper hung in the air of the West Wing, where the only sound was the rhythmic ticking of a grandfather clock that seemed to count down to something unseen. Elia",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 10.79841749256319
+        }
+      ]
+    },
+    {
+      "n_clients": 32,
+      "wall_s": 4.859,
+      "total_completion_tokens": 1536,
+      "aggregate_tok_s": 316.124,
+      "per_client": [
+        {
+          "idx": 6,
+          "ok": true,
+          "elapsed_s": 4.129,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "Photosynthesis and cellular respiration are often described as two sides of the same biological coin. They are **complementary processes** that form a continuous cycle of energy transformation, where ",
+          "prompt_tokens": 21,
+          "completion_tokens": 48,
+          "total_tokens": 69,
+          "tok_s_completion": 11.623746585217656
+        },
+        {
+          "idx": 4,
+          "ok": true,
+          "elapsed_s": 4.13,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "The simplest way to understand the difference between **TCP** (Transmission Control Protocol) and **UDP** (User Datagram Protocol) is to think of them as two different types of mail delivery:\n\n*   **T",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 11.621386784574586
+        },
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 4.249,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 48,
+          "total_tokens": 72,
+          "tok_s_completion": 11.29588245126089
+        },
+        {
+          "idx": 5,
+          "ok": true,
+          "elapsed_s": 4.248,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "Depending on what kind of \"fun\" you are looking for, here are four different types of day trips from San Francisco, ranging from coastal relaxation to mountain adventure.\n\n### 1. The Classic Coastal E",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 11.299805015709874
+        },
+        {
+          "idx": 7,
+          "ok": true,
+          "elapsed_s": 4.249,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "After the ghost of his father reveals he was murdered by his uncle, Prince Hamlet becomes consumed by a quest for revenge against the new king. His internal struggle and erratic behavior lead to a tra",
+          "prompt_tokens": 23,
+          "completion_tokens": 48,
+          "total_tokens": 71,
+          "tok_s_completion": 11.29555162728997
+        },
+        {
+          "idx": 12,
+          "ok": true,
+          "elapsed_s": 4.37,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "The simplest way to understand the difference between **TCP** (Transmission Control Protocol) and **UDP** (User Datagram Protocol) is to think of them as two different types of mail delivery:\n\n*   **T",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 10.98503019447592
+        },
+        {
+          "idx": 14,
+          "ok": true,
+          "elapsed_s": 4.369,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "Photosynthesis and cellular respiration are often described as two sides of the same biological coin. They are **complementary processes** that form a continuous cycle of energy transformation, where ",
+          "prompt_tokens": 21,
+          "completion_tokens": 48,
+          "total_tokens": 69,
+          "tok_s_completion": 10.986533042667958
+        },
+        {
+          "idx": 3,
+          "ok": true,
+          "elapsed_s": 4.373,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "The heavy scent of vanilla and decaying paper hung in the air of the West Wing, where the only sound was the rhythmic ticking of a grandfather clock that seemed to count down to something unseen. Elia",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 10.975273189875168
+        },
+        {
+          "idx": 2,
+          "ok": true,
+          "elapsed_s": 4.374,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "To understand a transistor, you first need to forget about complex physics for a second and think about a simple **water faucet.**\n\nA transistor is essentially an **electronic faucet.** It is a tiny s",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 10.974443390390176
+        },
+        {
+          "idx": 13,
+          "ok": true,
+          "elapsed_s": 4.369,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "Depending on what kind of \"fun\" you are looking for, here are four different types of day trips from San Francisco, ranging from coastal relaxation to mountain adventure.\n\n### 1. The Classic Coastal E",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 10.985247773284831
+        },
+        {
+          "idx": 8,
+          "ok": true,
+          "elapsed_s": 4.431,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 48,
+          "total_tokens": 72,
+          "tok_s_completion": 10.832481206405761
+        },
+        {
+          "idx": 1,
+          "ok": true,
+          "elapsed_s": 4.434,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "For a quick weeknight pasta, the goal is **high flavor with minimal cleanup.** \n\nHere are three different \"styles\" of quick pasta depending on what you have in your pantry. All of these take about **1",
+          "prompt_tokens": 26,
+          "completion_tokens": 48,
+          "total_tokens": 74,
+          "tok_s_completion": 10.825475253828703
+        },
+        {
+          "idx": 10,
+          "ok": true,
+          "elapsed_s": 4.489,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "To understand a transistor, you first need to forget about complex physics for a second and think about a simple **water faucet.**\n\nA transistor is essentially an **electronic faucet.** It is a tiny s",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 10.692054845067734
+        },
+        {
+          "idx": 15,
+          "ok": true,
+          "elapsed_s": 4.488,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "After the ghost of his father reveals he was murdered by his uncle, Prince Hamlet becomes consumed by a quest for revenge against the new king. His internal struggle and erratic behavior lead to a tra",
+          "prompt_tokens": 23,
+          "completion_tokens": 48,
+          "total_tokens": 71,
+          "tok_s_completion": 10.696182886200209
+        },
+        {
+          "idx": 16,
+          "ok": true,
+          "elapsed_s": 4.549,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 48,
+          "total_tokens": 72,
+          "tok_s_completion": 10.551861919162134
+        },
+        {
+          "idx": 20,
+          "ok": true,
+          "elapsed_s": 4.547,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "The simplest way to understand the difference between **TCP** (Transmission Control Protocol) and **UDP** (User Datagram Protocol) is to think of them as two different types of mail delivery:\n\n*   **T",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 10.555523212163054
+        },
+        {
+          "idx": 9,
+          "ok": true,
+          "elapsed_s": 4.552,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "For a quick weeknight pasta, the goal is **high flavor with minimal cleanup.** \n\nHere are three different \"styles\" of quick pasta depending on what you have in your pantry. All of these take about **1",
+          "prompt_tokens": 26,
+          "completion_tokens": 48,
+          "total_tokens": 74,
+          "tok_s_completion": 10.545529534870528
+        },
+        {
+          "idx": 22,
+          "ok": true,
+          "elapsed_s": 4.547,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "Photosynthesis and cellular respiration are often described as two sides of the same biological coin. They are **complementary processes** that form a continuous cycle of energy transformation, where ",
+          "prompt_tokens": 21,
+          "completion_tokens": 48,
+          "total_tokens": 69,
+          "tok_s_completion": 10.556529433830525
+        },
+        {
+          "idx": 11,
+          "ok": true,
+          "elapsed_s": 4.552,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "The heavy scent of vanilla and decaying paper hung in the air of the West Wing, where the only sound was the rhythmic ticking of a grandfather clock that seemed to count down to something unseen. Elia",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 10.545330130518543
+        },
+        {
+          "idx": 21,
+          "ok": true,
+          "elapsed_s": 4.548,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "Depending on what kind of \"fun\" you are looking for, here are four different types of day trips from San Francisco, ranging from coastal relaxation to mountain adventure.\n\n### 1. The Classic Coastal E",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 10.55381174769793
+        },
+        {
+          "idx": 19,
+          "ok": true,
+          "elapsed_s": 4.67,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "The heavy scent of vanilla and decaying paper hung in the air of the West Wing, where the only sound was the rhythmic ticking of a grandfather clock that seemed to count down to something unseen. Elia",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 10.279211557393031
+        },
+        {
+          "idx": 18,
+          "ok": true,
+          "elapsed_s": 4.67,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "To understand a transistor, you first need to forget about complex physics for a second and think about a simple **water faucet.**\n\nA transistor is essentially an **electronic faucet.** It is a tiny s",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 10.27810638471992
+        },
+        {
+          "idx": 23,
+          "ok": true,
+          "elapsed_s": 4.669,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "After the ghost of his father reveals he was murdered by his uncle, Prince Hamlet becomes consumed by a quest for revenge against the new king. His internal struggle and erratic behavior lead to a tra",
+          "prompt_tokens": 23,
+          "completion_tokens": 48,
+          "total_tokens": 71,
+          "tok_s_completion": 10.281492973836725
+        },
+        {
+          "idx": 17,
+          "ok": true,
+          "elapsed_s": 4.788,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "For a quick weeknight pasta, the goal is **high flavor with minimal cleanup.** \n\nHere are three different \"styles\" of quick pasta depending on what you have in your pantry. All of these take about **1",
+          "prompt_tokens": 26,
+          "completion_tokens": 48,
+          "total_tokens": 74,
+          "tok_s_completion": 10.024648115600145
+        },
+        {
+          "idx": 30,
+          "ok": true,
+          "elapsed_s": 4.784,
+          "prompt": "How do photosynthesis and cellular respiration interact?",
+          "completion": "Photosynthesis and cellular respiration are often described as two sides of the same biological coin. They are **complementary processes** that form a continuous cycle of energy transformation, where ",
+          "prompt_tokens": 21,
+          "completion_tokens": 48,
+          "total_tokens": 69,
+          "tok_s_completion": 10.033113472881006
+        },
+        {
+          "idx": 28,
+          "ok": true,
+          "elapsed_s": 4.785,
+          "prompt": "What is the difference between TCP and UDP?",
+          "completion": "The simplest way to understand the difference between **TCP** (Transmission Control Protocol) and **UDP** (User Datagram Protocol) is to think of them as two different types of mail delivery:\n\n*   **T",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 10.031408261559857
+        },
+        {
+          "idx": 29,
+          "ok": true,
+          "elapsed_s": 4.787,
+          "prompt": "Recommend a fun day trip from San Francisco.",
+          "completion": "Depending on what kind of \"fun\" you are looking for, here are four different types of day trips from San Francisco, ranging from coastal relaxation to mountain adventure.\n\n### 1. The Classic Coastal E",
+          "prompt_tokens": 22,
+          "completion_tokens": 48,
+          "total_tokens": 70,
+          "tok_s_completion": 10.027503607407299
+        },
+        {
+          "idx": 24,
+          "ok": true,
+          "elapsed_s": 4.789,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "Paris is the capital of France and is globally renowned as a center for art, fashion, gastronomy, and culture. The city is home to iconic landmarks such as the Eiffel Tower, the Louvre Museum, and the",
+          "prompt_tokens": 24,
+          "completion_tokens": 48,
+          "total_tokens": 72,
+          "tok_s_completion": 10.023986776259065
+        },
+        {
+          "idx": 31,
+          "ok": true,
+          "elapsed_s": 4.787,
+          "prompt": "Summarize the plot of Hamlet in two sentences.",
+          "completion": "After the ghost of his father reveals he was murdered by his uncle, Prince Hamlet becomes consumed by a quest for revenge against the new king. His internal struggle and erratic behavior lead to a tra",
+          "prompt_tokens": 23,
+          "completion_tokens": 48,
+          "total_tokens": 71,
+          "tok_s_completion": 10.026371002325881
+        },
+        {
+          "idx": 26,
+          "ok": true,
+          "elapsed_s": 4.789,
+          "prompt": "Explain how a transistor works to a high-school student.",
+          "completion": "To understand a transistor, you first need to forget about complex physics for a second and think about a simple **water faucet.**\n\nA transistor is essentially an **electronic faucet.** It is a tiny s",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 10.022903865566851
+        },
+        {
+          "idx": 27,
+          "ok": true,
+          "elapsed_s": 4.848,
+          "prompt": "Write a one-paragraph mystery story set in a library.",
+          "completion": "The heavy scent of vanilla and decaying paper hung in the air of the West Wing, where the only sound was the rhythmic ticking of a grandfather clock that seemed to count down to something unseen. Elia",
+          "prompt_tokens": 25,
+          "completion_tokens": 48,
+          "total_tokens": 73,
+          "tok_s_completion": 9.901707767343257
+        },
+        {
+          "idx": 25,
+          "ok": true,
+          "elapsed_s": 4.848,
+          "prompt": "What's a good recipe for a quick weeknight pasta?",
+          "completion": "For a quick weeknight pasta, the goal is **high flavor with minimal cleanup.** \n\nHere are three different \"styles\" of quick pasta depending on what you have in your pantry. All of these take about **1",
+          "prompt_tokens": 26,
+          "completion_tokens": 48,
+          "total_tokens": 74,
+          "tok_s_completion": 9.900218292370546
+        }
+      ]
+    }
+  ]
+}
