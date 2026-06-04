@@ -75,8 +75,6 @@ def _reset_terminal() -> None:
         return
     try:
         sys.stdout.write("\x1b[?25h\x1b[0m\x1b[2K\r")
-        # Disable bracketed paste mode on exit (was enabled in raw paste path).
-        sys.stdout.write("\x1b[?2004l")
         sys.stdout.flush()
     except Exception:
         pass
@@ -289,229 +287,104 @@ def _render_metrics_dashboard(url: str, refresh_s: float = 1.0,
 # Track whether we're inside a fenced code block; flush a styled line.
 _FENCE_RE = re.compile(r"^```(\w*)\s*$")
 
+_THINK_OPEN  = "<think>"
+_THINK_CLOSE = "</think>"
+
+
 class StreamRenderer:
-    """Light streaming markdown renderer — code fences get DIM colour.
+    """Character-level streaming renderer.
 
-    Prose lines word-wrap to $COLUMNS to avoid hard mid-word splits in
-    narrow terminals. Code-fence lines are emitted verbatim (mangling
-    code with soft wraps is worse than letting the terminal handle it).
+    Emits bytes to stdout AS THEY ARRIVE — no line buffering — so a
+    long Qwen3.6 think visibly flows instead of appearing line-by-line.
+    The only buffering kept is the minimum lookahead needed to detect
+    `<think>` / `</think>` marker boundaries when `hide_think=True`.
 
-    When `hide_think=True`, Qwen3.6 / Gemma-4-IT model `<think>…</think>`
-    blocks are suppressed from the rendered stream and replaced with a
-    single dim "(thinking…)" hint. Default is `False` (show them) so a
-    user watching a long Qwen3.6 think can see token flow and know the
-    model is alive. The raw content is always appended to the assistant
-    message so the model has full context for follow-ups.
+    When `hide_think=False` (the default — user prefers seeing reasoning
+    flow), feed() is effectively a flush-on-every-chunk pass-through.
+    The raw content is always returned to the caller via `.text`, so
+    the assistant message in history is complete regardless of render.
     """
+    _MAX_LOOKAHEAD = max(len(_THINK_OPEN), len(_THINK_CLOSE)) - 1  # 7
+
     def __init__(self, hide_think: bool = False):
-        self.buf = ""
-        self.in_code = False
-        # Per-line word-wrap state: characters emitted since last "\n".
-        self._col = 0
         self.hide_think = hide_think
         self.in_think = False
         self._thinking_label_shown = False
+        self._pending = ""  # safe-to-not-emit-yet tail (for hide_think only)
 
     def feed(self, chunk: str) -> None:
-        self.buf += chunk
-        while "\n" in self.buf:
-            line, _, rest = self.buf.partition("\n")
-            self._emit_line(line + "\n")
-            self.buf = rest
+        if not chunk:
+            return
+        if not self.hide_think:
+            # True streaming: emit raw bytes immediately.
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            return
+        # hide_think path — drive a small state machine over pending+chunk.
+        self._pending += chunk
+        self._drain()
 
-    def flush(self) -> None:
-        if self.buf:
-            self._emit_line(self.buf)
-            self.buf = ""
-
-    def _wrap_prose(self, line: str) -> str:
-        """Word-wrap a single line (with trailing \\n) to $COLUMNS."""
-        width = max(20, _cols(80) - 2)
-        had_nl = line.endswith("\n")
-        text = line[:-1] if had_nl else line
-        if not text.strip():
-            return line
-        # textwrap with break_long_words=False avoids mid-word splits.
-        wrapped = textwrap.wrap(
-            text, width=width,
-            break_long_words=False, break_on_hyphens=False,
-            drop_whitespace=False, replace_whitespace=False,
-        )
-        if not wrapped:
-            return line
-        out = "\n".join(wrapped)
-        if had_nl:
-            out += "\n"
-        return out
-
-    def _emit_line(self, line: str) -> None:
-        # Hide <think>…</think> blocks (Qwen3.6 + Gemma 4 IT chatter).
-        stripped = line.strip()
-        if self.hide_think:
-            if stripped == "<think>":
-                self.in_think = True
-                if not self._thinking_label_shown:
-                    sys.stdout.write(DIM(ITAL("  (thinking…)\n")))
-                    sys.stdout.flush()
-                    self._thinking_label_shown = True
-                return
-            if stripped == "</think>":
+    def _drain(self) -> None:
+        """State machine: emit safe bytes, suppress text between markers."""
+        while self._pending:
+            if self.in_think:
+                idx = self._pending.find(_THINK_CLOSE)
+                if idx == -1:
+                    # Keep only the last (len-1) chars in case the marker
+                    # straddles the next chunk.
+                    if len(self._pending) > self._MAX_LOOKAHEAD:
+                        self._pending = self._pending[-self._MAX_LOOKAHEAD:]
+                    return
+                # Consume up to and past </think>; flip state, loop.
+                self._pending = self._pending[idx + len(_THINK_CLOSE):]
                 self.in_think = False
                 self._thinking_label_shown = False
-                return
-            if self.in_think:
-                return
-        m = _FENCE_RE.match(line.rstrip("\n"))
-        if m:
-            self.in_code = not self.in_code
-            sys.stdout.write(GREY(line))
-        elif self.in_code:
-            sys.stdout.write(GREY(line))
-        else:
-            sys.stdout.write(self._wrap_prose(line))
-        sys.stdout.flush()
-
-
-# ── Multi-line input + bracketed paste ────────────────────────────
-# We use bracketed paste mode (\x1b[?2004h) so a pasted block arrives
-# wrapped as \x1b[200~ ... \x1b[201~ and contained newlines do NOT
-# submit. For terminals that don't honour bracketed paste, a 50 ms
-# inter-byte timeout collapses bursts into a single paste-equivalent.
-BRACKETED_PASTE_ON  = "\x1b[?2004h"
-BRACKETED_PASTE_OFF = "\x1b[?2004l"
-PASTE_START = "\x1b[200~"
-PASTE_END   = "\x1b[201~"
-PASTE_BURST_MS = 50
-
-try:
-    import termios  # type: ignore
-    import tty      # type: ignore
-    import select   # type: ignore
-    _HAVE_TERMIOS = True
-except Exception:
-    _HAVE_TERMIOS = False
-
-
-def _read_input_raw(prompt: str) -> str | None:
-    """Raw-mode prompt with bracketed-paste + burst-detection support.
-
-    Returns the assembled line on Enter (outside a paste), None on Ctrl-D
-    / Ctrl-C. Inside a bracketed paste (or a fast burst), newlines are
-    kept as literal '\\n' in the buffer instead of submitting.
-
-    Falls back to plain input() if stdin is not a TTY or termios isn't
-    available (e.g. piped stdin, Windows).
-    """
-    if not (_HAVE_TERMIOS and sys.stdin.isatty() and TTY):
-        try:
-            return input(prompt)
-        except (EOFError, KeyboardInterrupt):
-            return None
-
-    sys.stdout.write(prompt); sys.stdout.flush()
-    sys.stdout.write(BRACKETED_PASTE_ON); sys.stdout.flush()
-
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    buf: list[str] = []
-    in_paste = False
-    last_byte_t = 0.0
-    burst_mode = False  # heuristic for terminals w/o bracketed paste
-    pending = ""        # rolling tail to spot \x1b[200~ / \x1b[201~
-
-    def _redraw_tail(n_keep: int = 80) -> None:
-        # Cheap redraw: erase line, reprint prompt + last n_keep chars of buf.
-        s = "".join(buf)
-        tail = s[-n_keep:] if len(s) > n_keep else s
-        # Replace literal newlines with a visible glyph so the prompt
-        # row doesn't actually wrap.
-        tail_disp = tail.replace("\n", DIM("↵"))
-        sys.stdout.write("\r\x1b[2K" + prompt + tail_disp)
-        sys.stdout.flush()
-
-    try:
-        tty.setcbreak(fd)
-        while True:
-            r, _, _ = select.select([fd], [], [], 0.1)
-            if not r:
-                # Idle: if we were in a burst, end it.
-                if burst_mode and (time.time() - last_byte_t) * 1000 > PASTE_BURST_MS:
-                    burst_mode = False
                 continue
-            ch = os.read(fd, 1).decode("utf-8", errors="replace")
-            if not ch:
-                return None  # EOF
-            now = time.time()
-            # Detect rapid arrival → likely paste.
-            if last_byte_t and (now - last_byte_t) * 1000 < PASTE_BURST_MS:
-                burst_mode = True
-            last_byte_t = now
-
-            # ESC sequence buffering for bracketed paste markers.
-            if ch == "\x1b" or pending:
-                pending += ch
-                if pending.endswith(PASTE_START):
-                    in_paste = True
-                    pending = ""
-                    continue
-                if pending.endswith(PASTE_END):
-                    in_paste = False
-                    pending = ""
-                    continue
-                # Bail out of escape buffering once it's clearly not a
-                # paste marker (any other escape we silently drop — keeps
-                # arrow keys etc. from polluting the buffer).
-                if len(pending) > 8 or (len(pending) >= 2 and pending[1] not in "[" ):
-                    pending = ""
-                continue
-
-            # Ctrl-C cancels the line; Ctrl-D on empty buf → EOF.
-            if ch == "\x03":  # Ctrl-C
-                sys.stdout.write("\n"); sys.stdout.flush()
-                return ""
-            if ch == "\x04":  # Ctrl-D
-                if not buf:
-                    return None
-                continue
-            # Enter: submit only when NOT in a paste / burst.
-            if ch in ("\r", "\n"):
-                if in_paste or burst_mode:
-                    buf.append("\n")
-                    sys.stdout.write(DIM("↵"))
+            # Not in think — look for <think> to enter.
+            idx = self._pending.find(_THINK_OPEN)
+            if idx == -1:
+                # Emit everything except a potential partial open marker.
+                safe = max(0, len(self._pending) - self._MAX_LOOKAHEAD)
+                if safe:
+                    sys.stdout.write(self._pending[:safe])
                     sys.stdout.flush()
-                    continue
-                sys.stdout.write("\n"); sys.stdout.flush()
-                return "".join(buf)
-            # Backspace / DEL.
-            if ch in ("\x7f", "\x08"):
-                if buf:
-                    buf.pop()
-                    sys.stdout.write("\b \b"); sys.stdout.flush()
-                continue
-            buf.append(ch)
-            sys.stdout.write(ch); sys.stdout.flush()
-    finally:
-        try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        except Exception:
-            pass
-        try:
-            sys.stdout.write(BRACKETED_PASTE_OFF); sys.stdout.flush()
-        except Exception:
-            pass
+                    self._pending = self._pending[safe:]
+                return
+            # Flush text before <think>, then enter think mode.
+            if idx:
+                sys.stdout.write(self._pending[:idx])
+                sys.stdout.flush()
+            self._pending = self._pending[idx + len(_THINK_OPEN):]
+            self.in_think = True
+            if not self._thinking_label_shown:
+                sys.stdout.write(DIM(ITAL("  (thinking…)\n")))
+                sys.stdout.flush()
+                self._thinking_label_shown = True
+
+    def flush(self) -> None:
+        """End-of-stream: flush any pending non-think tail."""
+        if not self.hide_think:
+            return
+        if not self.in_think and self._pending:
+            sys.stdout.write(self._pending)
+            sys.stdout.flush()
+        self._pending = ""
 
 
+# ── Multi-line input ──────────────────────────────────────────────
 def _read_input(prompt: str) -> str | None:
-    """Read possibly-multi-line input.
+    """Read a possibly-multi-line line using readline (cooked) mode.
 
-    Path A (TTY + termios): raw-mode reader with bracketed-paste +
-    burst detection — newlines inside a paste/burst become literal '\\n'.
-    Path B (fallback): legacy line-mode where trailing '\\' continues
-    onto the next line.
+    Cooked mode gives Emacs-style editing for free via libreadline:
+    Ctrl-W (delete word), Alt-B / Alt-F (Option-←/→ on macOS, word
+    nav), Ctrl-A / Ctrl-E (start/end), arrow-key history, etc. We
+    also enable bracketed-paste-on so multi-line pastes don't submit
+    line by line. For long blocks the `/paste` slash command still
+    works as the explicit fallback.
+
+    Trailing '\\' continues onto the next line; an empty continuation
+    submits — useful for manual multi-line input without /paste.
     """
-    if _HAVE_TERMIOS and sys.stdin.isatty() and TTY:
-        s = _read_input_raw(prompt)
-        return None if s is None else s.strip()
     try:
         first = input(prompt)
     except (EOFError, KeyboardInterrupt):
@@ -529,6 +402,45 @@ def _read_input(prompt: str) -> str | None:
             break
         buf.append(nxt.rstrip("\\"))
     return "\n".join(buf).strip()
+
+
+def _setup_readline(history_path: str | None) -> None:
+    """Configure readline once at startup. No-op if readline missing.
+
+    - Emacs editing mode (default): Ctrl-W word-delete, Ctrl-A/E line
+      start/end, Alt-B/F word nav (== Option-←/→ on macOS Terminal /
+      iTerm with 'Use Option as Meta' on).
+    - Bracketed paste so multi-line pastes don't submit per-line.
+    - Optional persistent history at `history_path`.
+    """
+    try:
+        import readline  # noqa: F401  (side-effect: makes input() use libreadline)
+    except ImportError:
+        return
+    try:
+        readline.parse_and_bind("set editing-mode emacs")
+        readline.parse_and_bind("set enable-bracketed-paste on")
+        readline.parse_and_bind("set horizontal-scroll-mode off")
+        readline.parse_and_bind("set bell-style none")
+    except Exception:
+        pass
+    if history_path:
+        try:
+            readline.set_history_length(2000)
+            if os.path.exists(history_path):
+                readline.read_history_file(history_path)
+            import atexit
+            atexit.register(_safe_write_history, history_path)
+        except Exception:
+            pass
+
+
+def _safe_write_history(path: str) -> None:
+    try:
+        import readline
+        readline.write_history_file(path)
+    except Exception:
+        pass
 
 
 def _read_paste_block(sentinels=(":end:",)) -> str:
@@ -869,7 +781,9 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--top-k", type=int, default=0)
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--max", type=int, default=1024, help="max_tokens per turn")
+    ap.add_argument("--max", type=int, default=4096,
+                    help="max_tokens per turn (default 4096 — generous so "
+                         "Qwen3.6's long thinks rarely need /continue)")
     ap.add_argument("--tools", action="store_true",
                     help="enable built-in tool calling (shell, read_file, calc)")
     ap.add_argument("--hide-think", action="store_true",
@@ -882,6 +796,10 @@ def main():
               "seed": args.seed, "max_tokens": args.max}
     tools_on = bool(args.tools)
     hide_think = bool(args.hide_think)
+
+    # Persistent history of user prompts across sessions; readline
+    # editing keys (Ctrl-W, Alt-←/→, Ctrl-A/E, ↑/↓ history).
+    _setup_readline(os.path.join(PROJECT_ROOT, ".cache", "chat_history"))
     messages: list[dict] = []
     if args.sys:
         messages.append({"role": "system", "content": args.sys})

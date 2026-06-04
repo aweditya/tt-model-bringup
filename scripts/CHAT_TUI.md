@@ -52,25 +52,34 @@ suppress them (the renderer replaces the block with a single dim
 | `/help`                | Show in-app help                                          |
 | `/exit` / `/quit`      | Leave                                                     |
 
-## Input modes
+## Input editing
 
-- **Plain prompt**: Type and press Enter. On a TTY the input is read in
-  raw mode so paste is detected automatically.
-- **Bracketed paste**: The TUI sets `\x1b[?2004h` on startup; modern
-  terminals wrap pastes in `\x1b[200~ ... \x1b[201~`. Newlines inside
-  the wrap are kept as literal `\n` — the message is only submitted
-  when Enter is pressed *outside* a paste.
-- **Burst heuristic**: Terminals that don't honour bracketed paste fall
-  back to a 50 ms inter-byte timer. Bytes arriving faster than 50 ms
-  apart are treated as paste content.
-- **`/paste`**: Explicit multi-line mode for terminals that don't pass
-  paste reliably. Each line is read normally; the block ends with a
-  line whose only content is `:end:` (or 3 consecutive blank lines).
-- **Fallback (no TTY / no termios)**: Trailing `\` continues onto the
-  next line; an empty continuation submits.
+The prompt uses Python's `readline` library, so all the standard
+Emacs-style line-editing keys work:
 
-`Ctrl-C` cancels the current input line. `Ctrl-D` on an empty line
-exits.
+| Key                  | What it does                          |
+|----------------------|---------------------------------------|
+| `Ctrl-W`             | Delete previous word                  |
+| `Ctrl-A` / `Ctrl-E`  | Beginning / end of line               |
+| `Ctrl-U` / `Ctrl-K`  | Cut to start / end of line            |
+| `Alt-B` / `Alt-F`    | Move backward / forward by word       |
+| `Option-←` / `Option-→` | Word nav (macOS Terminal / iTerm — enable "Use Option as Meta") |
+| `↑` / `↓`            | Previous / next prompt from history   |
+| `Ctrl-R`             | Reverse-search history                |
+| `Ctrl-C`             | Cancel current input line             |
+| `Ctrl-D`             | EOF on an empty line — exits          |
+
+History persists at `.cache/chat_history` across sessions (max 2000
+lines).
+
+**Multi-line input**:
+- **Bracketed paste**: readline honours `set enable-bracketed-paste on`
+  (we set this at startup), so multi-line pastes don't submit line by
+  line.
+- **`/paste [header]`**: Explicit multi-line block; terminate with `:end:`
+  on its own line or three blank lines in a row.
+- **Trailing `\` continuation**: End a line with `\` to continue manually.
+  Empty continuation submits.
 
 ## Clipboard (`/yank`)
 
@@ -165,10 +174,12 @@ Deltas between refreshes are highlighted green (increase) or red
 - All HTTP failures (connection refused, 5xx, dropped stream) surface
   as a red error panel; the prompt loop keeps running.
 - `main()` is wrapped in `try / finally` that resets cursor (`\x1b[?25h`),
-  colour (`\x1b[0m`), clears the current line (`\x1b[2K\r`), and
-  disables bracketed paste (`\x1b[?2004l`) on every exit path.
-- The streaming markdown renderer word-wraps prose lines to
-  `$COLUMNS` (falling back to `shutil.get_terminal_size`) with
-  `textwrap.wrap(..., break_long_words=False)` to avoid mid-word
-  splits. Code-fence content is emitted verbatim so syntax isn't
-  mangled.
+  colour (`\x1b[0m`), and clears the current line (`\x1b[2K\r`) on
+  every exit path.
+- The streaming renderer emits chunks character-by-character as they
+  arrive (no per-line buffering) so long Qwen3.6 thinks visibly flow.
+  When `--hide-think` is set, a tiny lookahead buffer detects
+  `<think>` / `</think>` marker boundaries that straddle chunks.
+- Word wrap is delegated to the terminal — this lets the live stream
+  feel continuous (the prior `textwrap.wrap` path produced a line-by-
+  line cadence).

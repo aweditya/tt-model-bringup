@@ -30,12 +30,18 @@ For Gemma 4: `TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it ...`. Do NOT pass `TT_C
 **TUI is ready** (`scripts/chat.py`, README at `scripts/CHAT_TUI.md`). Key features:
 - Claude-Code-style welcome panel (closed box, url + model + cwd + settings)
 - `● assistant (<model_short>)` per-turn header with thin grey rule
-- `<think>…</think>` blocks shown by default (so it's obvious the model is
-  alive on a long 20s Qwen3.6 think); `/think` toggles, `--hide-think`
-  opts into the dim "(thinking…)" placeholder at launch
+- **Character-level streaming** — chunks emit to stdout as they arrive
+  (no line buffering), so long Qwen3.6 thinks visibly flow
+- **Readline editing** in the input prompt — Ctrl-W word-delete, Ctrl-A/E
+  line nav, Alt-B/F (= Option-←/→) word nav, ↑/↓ history (persisted
+  at `.cache/chat_history`), Ctrl-R reverse search
+- `--max 4096` default (up from 1024) so `/continue` is rare
+- `<think>…</think>` blocks shown by default (the live token flow is
+  the "model is alive" signal); `/think` toggles, `--hide-think` opts
+  into the dim "(thinking…)" placeholder at launch
 - `/status` (and `/show`) panel; `/clear` (and `/new`) reset; cwd shown as
   `~/…` with path-aware ellipsis for long paths
-- `/paste` multi-line mode (with bracketed paste + burst heuristic fallback)
+- `/paste` multi-line mode (terminal-level bracketed-paste also enabled)
 - `/yank` copies last assistant reply / code block to system clipboard
 - `/metrics [N]` live Prometheus dashboard for N refresh cycles
 - `/screenshot` saves to `presentation/screenshots/tui_<ts>.png`
