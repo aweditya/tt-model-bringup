@@ -117,10 +117,12 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
       median 0.9932 (≥0.99), 5th-pct 0.9779 (≥0.95). No cliff.
       Probe: `gm4_v033a_long_cos.py`; oracle:
       `.cache/hf_oracle_gemma4_12b_L215/` (HF needs `.venv-gemma4`).
-    - **v0.3.3.c needle-haystack** retrieval probe shipped 2026-06-03
-      (`gm4_v033c_needle_haystack.py`). Forks `needle_haystack_35b_ttnn.py`.
-      Default L=100/256/512 frac=0.5. Gates: L=100 ALL Y, L=256 ≥75%,
-      L=512 ≥50% Y+P.
+    - **v0.3.3.c needle-haystack PASS 2026-06-03** — 3/3 Y verdicts
+      at L=100/256/512 frac=0.5 (random 8-char passwords retrieved
+      verbatim). Eg L=512 needle `FWD7SWFY` → TT generated
+      `**FWD7SWFY**`. Probe: `gm4_v033c_needle_haystack.py`. Saved
+      under `.cache/needle_haystack_gm4_ttnn/`. Long-context
+      retrieval works end-to-end. Decode at ~160 ms/tok eager.
     - **Dev harness for Gemma 4 LIVE 2026-06-03 commit `<gm4-harness>`**
       — `experiments/cb/dev/gm4_dev_harness.py` (forked
       `cb35_dev_harness.py`). Bootstraps Gemma 4 ONCE (~80s), runs
