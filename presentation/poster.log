@@ -1,4 +1,4 @@
-This is LuaHBTeX, Version 1.21.0 (TeX Live 2025)  (format=lualatex 2025.3.8)  4 JUN 2026 11:38
+This is LuaHBTeX, Version 1.21.0 (TeX Live 2025)  (format=lualatex 2025.3.8)  4 JUN 2026 11:57
  restricted system commands enabled.
 **poster.tex
 (./poster.tex
@@ -1405,11 +1405,17 @@ File: omslmsy.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
 LaTeX Font Info:    External font `cmex7' loaded for size
 (Font)              <6> on input line 33.
-Package pgfplots info on input line 265: Using 'lua backend=false' for axis: xm
+Package pgfplots info on input line 280: Using 'lua backend=false' for axis: xm
 ode=log unsupported (yet).
+LaTeX Font Info:    Calculating math sizes for size <29.86> on input line 280.
 
-Overfull \vbox (21.8551pt too high) detected at line 265
- []
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <29.86> not available
+(Font)              size <24.88> substituted on input line 280.
+
+
+LaTeX Font Warning: Font shape `OMX/cmex/m/n' in size <14.93> not available
+(Font)              size <14.4> substituted on input line 280.
 
 
 
@@ -1431,21 +1437,26 @@ Overfull \vbox (21.8551pt too high) detected at line 265
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
  ***********
+
+
+LaTeX Font Warning: Size substitutions with differences
+(Font)              up to 4.98pt have occurred.
+
 Package rerunfilecheck Info: File `poster.out' has not changed.
 (rerunfilecheck)             Checksum: D41D8CD98F00B204E9800998ECF8427E;0.
 )
 
 Here is how much of LuaTeX's memory you used:
- 39867 strings out of 475506
- 305233,1648299 words of node,token memory allocated
- 75231 words of node memory still in use:
-   752 hlist, 61 vlist, 90 rule, 270 disc, 88 local_par, 124 math, 2409 glue, 75
-8 kern, 158 penalty, 3804 glyph, 2572 attribute, 82 glue_spec, 2572 attribute_li
-st, 4 write, 909 pdf_literal, 370 pdf_colorstack nodes
-   avail lists: 2:416,3:3231,4:1281,5:2337,6:273,7:19330,8:22,9:2868,10:19,11:81
-9
- 61711 multiletter control sequences out of 65536+600000
- 102 fonts using 17393423 bytes
+ 39891 strings out of 475506
+ 305222,1648299 words of node,token memory allocated
+ 74989 words of node memory still in use:
+   786 hlist, 65 vlist, 100 rule, 242 disc, 93 local_par, 123 math, 2496 glue, 7
+27 kern, 166 penalty, 3600 glyph, 2678 attribute, 82 glue_spec, 2678 attribute_l
+ist, 4 write, 920 pdf_literal, 396 pdf_colorstack nodes
+   avail lists: 2:416,3:3288,4:1359,5:2244,6:288,7:18976,8:21,9:3012,10:17,11:73
+5
+ 61735 multiletter control sequences out of 65536+600000
+ 123 fonts using 18781287 bytes
  128i,23n,116p,721b,3023s stack positions out of 10000i,1000n,20000p,200000b,200000s
 {/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/lm/lm-rm.enc}</usr/local/tex
 live/2025/texmf-dist/fonts/truetype/typoland/lato/Lato-LightItalic.ttf>{/usr/loc
@@ -1460,7 +1471,7 @@ texlive/2025/texmf-dist/fonts/type1/public/lm/lmmi12.pfb></usr/local/texlive/202
 5/texmf-dist/fonts/type1/public/lm/lmr12.pfb></usr/local/texlive/2025/texmf-dist
 /fonts/type1/public/lm/lmr17.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1
 /public/lm/lmsy10.pfb>
-Output written on poster.pdf (1 page, 121846 bytes).
+Output written on poster.pdf (1 page, 121539 bytes).
 
 PDF statistics: 84 PDF objects out of 1000 (max. 8388607)
  52 compressed objects within 1 object stream

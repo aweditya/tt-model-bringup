@@ -37,7 +37,7 @@
 \separatorcolumn
 
 % =====================================================================
-% COLUMN 1 --- Project + Architecture
+% COLUMN 1 --- Project + Architecture + What Mattered
 % =====================================================================
 \begin{column}{\colwidth}
 
@@ -46,19 +46,20 @@
     End-to-end bringup of three modern LLM families on a single
     \textbf{$1\times4$ Blackhole P150} mesh: dense GQA, MoE with Gated
     DeltaNet recurrence, and a hybrid sliding/global-attention model.
-    Every model walks from HF reference to a continuous-batching HTTP
-    chat server, gated end-to-end against a CPU fp32 oracle.
+    Each model walks from HF reference to a continuous-batching HTTP
+    chat server, gated against a CPU fp32 oracle.
   \end{block}
 
   % ------------------- Hardware -------------------
   \begin{block}{Hardware}
-    \begin{center}\small
+    \begin{center}\footnotesize
+    \setlength{\tabcolsep}{4pt}
     \begin{tabular}{l l}
       \toprule
-      Mesh           & $1\times4$ Blackhole P150 (4 chips) \\
-      DRAM           & 32 GB GDDR6/chip, \textbf{404 GB/s} measured stream \\
-      On-chip        & 110 Tensix cores, 1.39 MiB L1/core \\
-      Host link      & 1.4 GB/s tilize-bound \\
+      Mesh      & $1\times4$ Blackhole P150 (4 chips) \\
+      DRAM      & 32 GB GDDR6/chip, \textbf{404 GB/s} stream \\
+      On-chip   & 110 Tensix cores, 1.39 MiB L1/core \\
+      Host link & 1.4 GB/s tilize-bound \\
       \bottomrule
     \end{tabular}
     \end{center}
@@ -66,32 +67,45 @@
 
   % ------------------- Models Brought Up -------------------
   \begin{block}{Models Brought Up}
-    \begin{center}\small
+    \begin{center}\footnotesize
+    \setlength{\tabcolsep}{3pt}
     \begin{tabular}{l c l c}
       \toprule
       \textbf{Model} & \textbf{Params} & \textbf{Architecture} & \textbf{Status} \\
       \midrule
-      Qwen3.6-27B          & 27B  & Dense GQA, TP4                  & shipped \\
-      Qwen3.6-35B-A3B      & 35B  & MoE + Gated DeltaNet ($\sim$3B active) & shipped, $B{=}1$ \\
-      Gemma 4 12B IT       & 12B  & Hybrid sliding/global attention & shipped \\
+      Qwen3.6-27B      & 27B & Dense GQA, TP4        & shipped \\
+      Qwen3.6-35B-A3B  & 35B & MoE + Gated DeltaNet  & $B{=}1$ \\
+      Gemma 4 12B IT   & 12B & Hybrid sliding/global & shipped \\
       \bottomrule
     \end{tabular}
     \end{center}
-
-    All three reach byte-stable HTTP chat with continuous batching;
-    each new model reused $\sim$80--90\% of the previous bringup's
-    scaffolding (CB engine, dev harness, HF oracle, paged SDPA).
   \end{block}
 
-  % ------------------- Methodology (collapsed) -------------------
+  % ------------------- Methodology -------------------
   \begin{block}{Methodology}
-    A staged ladder gates each rung on cosine vs.\ an HF fp32 oracle:
+    A staged ladder gates each rung on cosine vs.\ a CPU fp32 oracle:
     single-layer $\to$ full forward $\to$ multi-step decode $\to$ long
-    context $\to$ trace capture $\to$ continuous batching $\to$ HTTP.
-    Validation is teacher-forced multi-step cosine \emph{and} MAD per
-    layer; six of seven silent-failure classes are invisible at decode
-    pos 0 alone. Throughout, comparison is to ground truth, never a
-    sibling TT path.
+    context $\to$ trace $\to$ continuous batching $\to$ HTTP. Each new
+    model reused $\sim$80--90\% of the prior bringup (CB engine, dev
+    harness, HF oracle, paged SDPA). Validation is teacher-forced
+    multi-step cosine \emph{and} MAD per layer; six of seven
+    silent-failure classes are invisible at decode pos 0 alone.
+  \end{block}
+
+  % ------------------- What Mattered (moved from col 2) -------------------
+  \begin{block}{What Mattered}
+    Three changes account for most of the throughput delta over a
+    naive port.
+    \begin{itemize}\setlength\itemsep{0.3ex}\setlength\parskip{0pt}
+      \item \textbf{Paged SDPA, HiFi2 fp16 accumulation} --- kernel-time
+            win; $+62\%$ on 27B TP single-stream.
+      \item \textbf{Vocab-sharded lm\_head, on-device argmax} --- a 600
+            KB host readback collapses to 8 bytes; $+8\%$ Gemma 4,
+            $+5\%$ 27B.
+      \item \textbf{Two-phase trace warmup} --- compile every path
+            first, capture all traces back-to-back; otherwise decode
+            JIT corrupts prefill trace memory.
+    \end{itemize}
   \end{block}
 
 \end{column}
@@ -118,7 +132,7 @@
     \begin{tikzpicture}
       \begin{axis}[
         width=0.95\colwidth,
-        height=0.5\colwidth,
+        height=0.48\colwidth,
         xlabel={Concurrent clients ($B$)},
         ylabel={Aggregate tok/s},
         xmode=log, log basis x=2,
@@ -148,8 +162,25 @@
     \end{center}
 
     Diminishing returns past $B{=}32$ on Gemma 4 (316 $\to$ 340 at
-    $B{=}64$); scheduler + paged SDPA overhead saturate the
+    $B{=}64$): scheduler + paged SDPA overhead saturate the
     weight-bandwidth amortization win.
+  \end{block}
+
+  % ------------------- Single-client streaming (NEW) -------------------
+  \begin{block}{Single-Client Streaming (HTTP, $B{=}32$ traced)}
+    \begin{center}\footnotesize
+    \setlength{\tabcolsep}{5pt}
+    \begin{tabular}{l r r}
+      \toprule
+      \textbf{Model} & \textbf{Prefill} & \textbf{Decode} \\
+      \midrule
+      Gemma 4 12B   & \textbf{78 ms/tok} (TTFT 1.40 s) & \textbf{17.4 tok/s} \\
+      Qwen3.6-27B   & \textbf{94 ms/tok} (TTFT 1.70 s) & \textbf{11.5 tok/s} \\
+      \bottomrule
+    \end{tabular}
+    \end{center}
+    Decode at 17.4 tok/s is 83\% of the $B{=}1$ dev-harness ceiling;
+    the small gap is HTTP + scheduler overhead on otherwise idle slots.
   \end{block}
 
   % ------------------- Roofline -------------------
@@ -157,37 +188,21 @@
     Decode at $B{=}1$ is weight-bandwidth-bound:
     $t_{\min} \approx \tfrac{\text{active GB/chip}}{\text{404 GB/s}}$.
 
-    \begin{center}\small
+    \begin{center}\footnotesize
+    \setlength{\tabcolsep}{4pt}
     \begin{tabular}{l r r r}
       \toprule
-      \textbf{Model} & \textbf{Traced ms/tok} & \textbf{tok/s} & \textbf{\% ceiling ($B{=}1$)} \\
+      \textbf{Model} & \textbf{ms/tok} & \textbf{tok/s} & \textbf{\% ceiling} \\
       \midrule
-      Gemma 4 12B          & \textbf{47.5}  & \textbf{21.0} & 31\% of 67 tok/s \\
-      Qwen3.6-27B (TP4)    & \textbf{77.0}  & \textbf{12.9} & 22\% of 60 tok/s \\
-      Qwen3.6-35B-A3B      & \textbf{81.2}  & \textbf{12.3} & 4.6\% of 270 tok/s \\
+      Gemma 4 12B        & \textbf{47.5} & \textbf{21.0} & 31\% of 67 \\
+      Qwen3.6-27B (TP4)  & \textbf{77.0} & \textbf{12.9} & 22\% of 60 \\
+      Qwen3.6-35B-A3B    & \textbf{81.2} & \textbf{12.3} & 4.6\% of 270 \\
       \bottomrule
     \end{tabular}
     \end{center}
 
-    Continuous batching closes the gap on real workloads:
-    $B{=}32$ amortizes weight reads $\sim$28$\times$.
-  \end{block}
-
-  % ------------------- What Mattered -------------------
-  \begin{block}{What Mattered}
-    Three changes account for the majority of the throughput delta over
-    a naive port.
-    \begin{itemize}\setlength\itemsep{0.4ex}
-      \item \textbf{Paged SDPA with HiFi2 fp16 accumulation} ---
-            kernel-time win, $+62\%$ on 27B TP single-stream.
-      \item \textbf{Vocab-sharded lm\_head with on-device argmax} ---
-            collapses a 600 KB host readback to 8 bytes; $+8\%$ on
-            Gemma 4, $+5\%$ on 27B.
-      \item \textbf{Two-phase trace warmup} --- compile all paths
-            first, then capture all traces back-to-back. Without it,
-            decode JIT corrupts prefill trace memory at multi-trace
-            coexistence ($\to$ 99\% CPU hang).
-    \end{itemize}
+    Continuous batching closes the gap on real workloads: $B{=}32$
+    amortizes weight reads $\sim$28$\times$.
   \end{block}
 
 \end{column}
@@ -203,22 +218,23 @@
   \begin{block}{Correctness}
     Three orthogonal gates, run per model on every change.
 
-    \begin{center}\small
+    \begin{center}\footnotesize
+    \setlength{\tabcolsep}{4pt}
     \begin{tabular}{l c c c}
       \toprule
       \textbf{Gate} & \textbf{27B} & \textbf{35B-A3B} & \textbf{Gemma 4} \\
       \midrule
-      HF cosine ladder       & PASS  & cos$_{L32}{\ge}0.987$ & PASS \\
-      Multi-turn KV retention & PASS  & 3/3 PASS              & PASS \\
-      Traced $=$ Eager        & PASS  & PASS                  & \textbf{100/100} \\
-      Needle haystack         & $L{=}500$ & coherent          & 3/3 ($L{\le}512$) \\
+      HF cosine ladder        & PASS      & cos$_{L32}{\ge}0.987$ & PASS \\
+      Multi-turn KV retention & PASS      & 3/3 PASS              & PASS \\
+      Traced $=$ Eager        & PASS      & PASS                  & \textbf{100/100} \\
+      Needle haystack         & $L{=}500$ & coherent              & 3/3 ($L{\le}512$) \\
       \bottomrule
     \end{tabular}
     \end{center}
 
-    Validation gates against a CPU fp32 oracle with per-sub-op hooks.
-    Cosine alone is insufficient ($\cos(a, ka){=}1$); MAD is reported
-    at every probed position.
+    Validation is against a CPU fp32 oracle with per-sub-op hooks.
+    Cosine alone is insufficient ($\cos(a,ka){=}1$); MAD is reported at
+    every probed position.
   \end{block}
 
   % ------------------- Continuous Batching -------------------
@@ -232,30 +248,29 @@
   % ------------------- Prefix Cache -------------------
   \begin{block}{Prefix Cache in Practice}
     Two-turn 27B chat over HTTP:
-    \begin{center}\small
+    \begin{center}\footnotesize
+    \setlength{\tabcolsep}{6pt}
     \begin{tabular}{l r r}
       \toprule
       \textbf{Turn} & \textbf{Prompt} & \textbf{Prefill} \\
       \midrule
-      1 (cold)         & 105 tok & 19.26 s \\
-      2 (PC hit)       & 172 tok & \textbf{3.06 s} \\
+      1 (cold)   & 105 tok & 19.26 s \\
+      2 (PC hit) & 172 tok & \textbf{3.06 s} \\
       \bottomrule
     \end{tabular}
     \end{center}
-    A prefix-cache hit on turn 2 yields a \textbf{6.3$\times$} prefill
-    speedup despite the longer prompt; the new prompt re-uses the
-    cached KV for the shared prefix and only computes the suffix.
+    Turn 2 is a \textbf{6.3$\times$} prefill speedup despite a longer
+    prompt: the cached KV is reused for the shared prefix and only the
+    suffix is computed.
   \end{block}
 
   % ------------------- Conclusion -------------------
   \begin{block}{Conclusion}
-    A single $1\times4$ Blackhole P150 mesh, paired with a disciplined
-    bringup recipe, takes a modern LLM from HF spec to byte-stable
-    HTTP chat at \textbf{316 tok/s aggregate} on 12B and
-    \textbf{232 tok/s} on 27B. The hardware is competitive on
-    real-workload throughput; the open software stack lets a small
-    team bring up new architectures (MoE recurrence, hybrid attention,
-    dual-head-dim) end-to-end without waiting on a vendor roadmap.
+    A single $1\times4$ Blackhole P150 mesh, with a disciplined bringup
+    recipe, takes a modern LLM from spec to byte-stable HTTP chat at
+    \textbf{316 tok/s} on 12B and \textbf{232 tok/s} on 27B. The open
+    stack lets a small team bring up new architectures (MoE recurrence,
+    hybrid attention, dual-head-dim) without a vendor roadmap.
   \end{block}
 
 \end{column}
