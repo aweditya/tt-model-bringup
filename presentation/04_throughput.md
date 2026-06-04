@@ -99,3 +99,69 @@ SDPA on global layers, `research/gemma4_perf_briefing_2026-06-04.md`).
 Tiny models (Llama 8B, Qwen2.5, SmolLM under `models/`) were brought up earlier
 on single-chip Wormhole; not in scope for the (1,4)-mesh decode comparison
 above and not re-measured under the current workflow.
+
+## POST-FIX UPDATE 2026-06-04 — HTTP CB stress (after commit `38b15b0`)
+
+The numbers above are pure single-stream / traced. After this session's
+`cb_dn_recurrence_mode = "owned_gdn"` fix in `setup_cb_state`
+(`38b15b0`), the user-facing HTTP path scales near-linearly to ~160
+tok/s aggregate at 32 concurrent clients. Source of truth:
+`presentation/06_live_measurements.md` (drives the poster).
+
+### Headline HTTP aggregate (TT_CB_SLOTS=32, traced, paged SDPA)
+
+| Model | 1 client | 8 clients | 16 clients | 32 clients | Scaling 1→32 |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.6-27B (TP) | 5.36 | 40.87 | 79.59 | **156.59** | **29.23×** |
+| Gemma 4 12B IT (unified) | 5.29 | 41.80 | 83.91 | **162.85** | **30.79×** |
+| Qwen3.6-35B-A3B (MoE, B=1 only — see #162) | 3.13 | — | — | — | — |
+
+### Pre-fix vs post-fix (the session catch)
+
+| Config | Aggregate tok/s at 4 clients |
+|---|---:|
+| 27B B=4, TT_CB_TOPK_K=128, `cb_dn_recurrence_mode` unset → manual DN | 13.30 |
+| 27B B=32 (post-fix), no TT_CB_TOPK_K, owned_gdn fast path | 156.59 at 32 clients |
+
+The 13.30 number was supposed to be ~44 tok/s; the audit subagent
+traced the gap to **the CB forward reading a different attribute
+family than the single-stream forward**. A prior "fix" (commit
+`017665e`) removed `deltanet_*` overrides but those only gate the
+single-stream `forward_token_tp_inner` (`server_tp.py:724`); the CB
+forward `forward_batch_tp_inner` (`server_tp_cb.py:454`) reads
+`cb_dn_recurrence_mode` / `cb_conv_mode` which were never set →
+defaulted to `manual` via `getattr`. The correct fix sets those two
+attrs inside `setup_cb_state` itself. Details:
+`research/cb_perf_regression_audit_2026-06-04.md`.
+
+### Multi-turn HTTP with prefix cache (27B, post-fix)
+
+| Turn | prompt_t | gen_t | wall (s) | Notes |
+|---:|---:|---:|---:|---|
+| 0 | 32 | 48 | 10.73 | Cold prefill + decode |
+| 1 | 105 | 38 | 19.26 | Cold prefill |
+| 2 | 172 | 41 | **9.03** | **PC HIT** — 6.3× speedup vs turn 1 despite 64% more prompt tokens |
+
+`cb_prefix_cache_hits_total = 1`, `cb_prefix_cache_live_slots = 32`.
+Gemma 4 PC currently misses on chat-template re-renders (0/60 hits);
+needs the equivalent of Qwen3.6's `_messages_to_prompt` patches for
+Gemma 4 — open bug.
+
+### Why HTTP 156 tok/s vs historical 376/593 tok/s
+
+The historical `27b_cb_scope.md:687-688` benches used the argmax-tail
+trace (single 8-byte readback per step). The HTTP path forces
+`sampling=True` in `cb_api.py`, routing through the slower logits-tail
+trace. Closing the gap requires capturing both traces and routing
+greedy requests through the argmax tail (audit Fix 3).
+
+### Dev-harness vs HTTP — both correct, different things
+
+| Path | Measures | Gemma 4 number |
+|---|---|---:|
+| Dev harness `step_forward_traced` (B=1, non-paged SDPA, no CB) | Pure model trace speed | **21.05 tok/s** |
+| HTTP CB `forward_batch_*_inner` (B=32, paged SDPA, per-slot KV) | What users see | **162.85 tok/s** agg (~5.09 tok/s/slot) |
+
+The per-slot CB rate is ~25% of the dev-harness B=1 because the CB
+forward does 32× the work per step. The dev-harness number is the
+ceiling we measure against; the HTTP number is the product.

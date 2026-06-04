@@ -226,28 +226,48 @@
     \end{center}
 
     \textbf{Continuous batching --- the largest single lever.}
-    Matmul weight reads amortize across $B$. Measured
-    $\text{step\_ms} \approx 73 + 4.3{\cdot}B$ on 27B.
+    Matmul weight reads amortize across $B$. HTTP stress (post-fix
+    \verb|38b15b0|, traced, $B{=}32$ slots, paged SDPA, per-slot KV):
 
     \begin{center}\small
-    \begin{tabular}{r r r r}
+    \begin{tabular}{r r r r r}
       \toprule
-      $B$ & \textbf{27B agg tok/s} & \textbf{vs $B{=}1$} & \textbf{Gemma 4 IT HTTP agg} \\
+      \textbf{Clients} & \textbf{27B tok/s} & \textbf{vs 1c} & \textbf{Gemma 4 IT tok/s} & \textbf{vs 1c} \\
       \midrule
-      1   & 12.96             & $1.00\times$       & \textbf{3.39} \\
-      2   & ---               & ---                & \textbf{6.64} ($1.96\times$) \\
-      4   & ---               & ---                & \textbf{13.14} ($3.88\times$) \\
-      8   & 75                & $5.8\times$        & --- \\
-      32  & \textbf{150.5}    & $11.6\times$       & --- \\
-      64  & 183.5             & $14.2\times$       & --- \\
-      64* & \textbf{593.1}    & $\mathbf{45.8\times}$ & * shift-acc conv1d \\
+      1   & 5.36              & $1.00\times$       & 5.29              & $1.00\times$ \\
+      8   & 40.87             & $7.63\times$       & 41.80             & $7.90\times$ \\
+      16  & 79.59             & $14.85\times$      & 83.91             & $15.86\times$ \\
+      32  & \textbf{156.59}   & $156.59/5.36 = $ \textbf{29.2$\times$} & \textbf{162.85} & $162.85/5.29 = $ \textbf{30.8$\times$} \\
       \bottomrule
     \end{tabular}
     \end{center}
 
-    Per-client tok/s stays flat under load; CB carries the scaling.
-    Naive 27B asymptote $\sim 232$ tok/s; with shift-acc conv1d the
-    per-slot vector slope drops $3.6 \to 0.71$ ms/seq.
+    Both models hit $\sim$160 tok/s aggregate at 32 concurrent clients
+    with near-perfectly-linear $29$--$31{\times}$ scaling from one
+    client, validating the CB design.
+
+    \textbf{Multi-turn prefix cache (27B).} Turn 2 wall $= 9.03$~s for
+    a 172-token prompt vs. turn 1's $19.26$~s for a 105-token prompt:
+    $19.26/9.03 = $ \textbf{6.3$\times$ speedup} on the PC-hit turn
+    (\verb|cb_prefix_cache_hits_total = 1|,
+    \verb|live_slots = 32|). Gemma 4 PC still misses on chat-template
+    re-renders --- open bug.
+
+    \textbf{Two ``throughput'' numbers, both correct.} Dev-harness
+    \verb|step_forward_traced| is pure model speed (B=1 single-stream,
+    no paged SDPA, no CB) $\to$ $21$ tok/s for Gemma 4. HTTP CB pays
+    paged SDPA + per-slot bookkeeping $\to$ $\sim$5 tok/s/slot at
+    $B{=}32$, $162$ tok/s aggregate.
+
+    \textbf{35B HTTP} is $B{=}1$ only (the $B{>}1$ empty-slot poison
+    bug is not fixed this session) $\to$ $3.13$ tok/s. Once \#162
+    lands, 35B inherits the same $B{=}32$ aggregate multiplier.
+
+    \textbf{Historical $B{=}64 = 593$ tok/s} (\verb|research/27b_cb_scope.md|)
+    used the argmax-tail trace with $8$-byte readback; HTTP currently
+    forces \verb|sampling=True| and routes through the slower
+    logits-trace tail. Capturing both traces and routing greedy
+    requests to argmax closes the gap (see Future Work).
   \end{block}
 
 \end{column}
@@ -284,13 +304,25 @@
             40-layer chain compounds $\sim$1 ULP into argmax flips.
             \emph{Resolution:} gate on per-slot independence and
             determinism, not exact tokens.
-      \item \textbf{Silent perf regression --- caught by audit.} The
-            code-cleanup pass found \verb|cb_api.py| was overriding
-            \verb|st.deltanet_recurrence_mode = "manual"| \emph{after}
-            bootstrap, silently disabling the owned\_gdn fast path
-            for every 27B HTTP request (commit \verb|017665e|).
-            \emph{Resolution:} subagent audit \emph{before} every
-            perf measurement.
+      \item \textbf{Silent perf regression --- caught by audit
+            subagent.} The CB engine had been silently running
+            \verb|manual| DN recurrence (slow CPU-style path) on every
+            27B HTTP request. A first ``fix'' (commit \verb|017665e|)
+            removed \verb|deltanet_*| overrides --- but those flags
+            only gate the single-stream \verb|forward_token_tp_inner|;
+            the CB forward \verb|forward_batch_tp_inner| reads
+            \emph{different} attribute names
+            (\verb|cb_dn_recurrence_mode| at
+            \verb|server_tp_cb.py:454|) that were never set $\to$
+            defaulted to \verb|manual| via \verb|getattr|. The correct
+            fix (\verb|38b15b0|) sets
+            \verb|cb_dn_recurrence_mode = "owned_gdn"| and
+            \verb|cb_conv_mode = "shiftacc"| inside
+            \verb|setup_cb_state| itself. Pre-fix $B{=}4$ HTTP $=$
+            $13.30$ tok/s; post-fix $B{=}32 = $ $156.59$ tok/s.
+            \emph{Resolution:} dispatched a focused audit subagent
+            that cited file:line and reconciled three sources
+            (\verb|research/cb_perf_regression_audit_2026-06-04.md|).
       \item \textbf{Dev-harness PASS $\ne$ HTTP PASS.} cb35\_prod\_topk
             shipped 4/4 PASS; first \verb|/v1/chat/completions| crashed
             with \verb|TypeError: only length-1 arrays...| because
@@ -341,17 +373,26 @@
     (\verb|research/code_cleanup_plan_2026-06-04.md|, 18 items, 6 High).
 
     \begin{itemize}
+      \item \textbf{Argmax-tail trace in HTTP} --- \verb|cb_api.py|
+            currently forces \verb|sampling=True|, routing through the
+            logits-trace tail; capture both traces and route greedy
+            requests to the $8$-byte-readback argmax tail. Closes the
+            $156 \to 376$ tok/s gap on 27B $B{=}32$
+            (historical $593$ tok/s at $B{=}64$).
+      \item \textbf{Gemma 4 chat-template patches for prefix cache} ---
+            re-renders of the prior assistant turn after
+            \verb|<end_of_turn>\n<start_of_turn>user| don't byte-equal
+            the generated tokens; 0/60 PC hits today. Port Qwen3.6's
+            \verb|_messages_to_prompt| patches to Gemma 4 for the same
+            $\sim$6$\times$ multi-turn speedup we get on 27B.
       \item \textbf{Gemma 4 P2 distributed RMSNorm} --- projected
             $+12$--$15$ ms/tok ($21$ tok/s $\to \sim$28 tok/s).
       \item \textbf{Gemma 4 P3 paged SDPA on global layers} ---
             $+20$--$40\%$ on attention; closes the $31\% \to 60\%$ gap
             to roofline.
-      \item \textbf{Prefix-cache matcher} --- chat-template multi-turn
-            currently misses (byte-exact prefix required); fix lifts
-            turn-2+ TTFT from $\sim$5.3~s to $\sim$2.7~s
-            ($1.97\times$ already validated on raw prompts).
       \item \textbf{35B $B{>}1$ empty-slot poisoning} (\#162) ---
-            unlocks 35B CB beyond \verb|TT_CB_SLOTS=1|.
+            unlocks 35B CB beyond \verb|TT_CB_SLOTS=1|; today 35B is
+            the ``one chat at a time'' model.
       \item \textbf{35B determinism} --- tie-breaking argmax + fp32
             \verb|lm_head|, brings free-run needle from
             $\sim$50\% per-trial to deterministic retrieval.
@@ -373,13 +414,20 @@
     gates must account for it. Per-token throughput tracks the
     $1{\times}4$ P150 BW ceiling ($21$ tok/s = $31\%$ of $67$ tok/s
     BW floor on Gemma 4); continuous batching delivers the headline
-    aggregate numbers ($150$~tok/s at $B{=}32$, $593$~tok/s at
-    $B{=}64$ with shift-acc conv1d). Most kernels we used came from
-    tt-metal; the kernels we wrote --- owned\_gdn, owned decay/gate,
-    the CB scheduler --- were correctness-gating. An audit subagent
-    catches silent perf regressions a human reviewer misses (the
-    \verb|cb_api.py| owned\_gdn override was live in prod for days
-    before the audit surfaced it).
+    HTTP aggregate numbers (\textbf{$156.59$~tok/s on 27B at
+    $32$ concurrent clients}, \textbf{$162.85$~tok/s on Gemma 4},
+    $29$--$31{\times}$ linear scaling from one client). Most kernels
+    we used came from tt-metal; the kernels we wrote --- owned\_gdn,
+    owned decay/gate, the CB scheduler --- were correctness-gating.
+    An audit subagent catches silent perf regressions a human reviewer
+    misses: the CB engine had been silently routing 27B through
+    \verb|manual| DN recurrence (a first ``fix'' targeted the
+    \emph{wrong} attribute family --- \verb|deltanet_*| gates only the
+    single-stream path, not the CB forward), and the audit traced it
+    to \verb|cb_dn_recurrence_mode| defaulting to \verb|manual| via
+    \verb|getattr| at \verb|server_tp_cb.py:454|; the right fix
+    (\verb|38b15b0|, two lines in \verb|setup_cb_state|) unlocked the
+    $156$~tok/s number.
   \end{block}
 
 \end{column}
