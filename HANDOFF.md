@@ -132,18 +132,19 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
       probe whose filename ends in `_<short_name>.py`).
     - v0.3.3.b sliding-window invariance at pos > 1024 — pending; not
       blocking (v0.4 trace shipping first).
-  - **v0.4 traced decode IN FLIGHT 2026-06-03** — `update_input_buffers`,
-    `forward_token_gm4_inner` (reads ONLY tok_buf/cur_pos_buf/rot_idxs_buf),
-    `ensure_decode_trace` (two-phase warmup per [[ttnn-multi-trace-two-phase-warmup]]),
-    `step_forward_traced` shipped. Bootstrap bumped to
-    `trace_region_size=400_000_000` (default 50 MB too small for 48-layer
-    decode trace). Validator: `gm4_v04_trace_validate.py` — 100 traced
-    steps must equal 100 eager steps token-for-token. Running via the
-    dev harness.
+  - **v0.4 traced decode DONE 2026-06-03 commit `626c67a`** — 100/100
+    traced == eager on a non-trivial teacher-forced + free-run sequence
+    (`[258882, 236743, 529, 506, 236764, 496, 3207, 529, 1610, 236764]`
+    first 10 tokens before the model degenerates to `<image|>`). Eager
+    **182.7 ms/tok** → traced **51.3 ms/tok = 3.56× speedup** out of
+    the box; trace capture cost 693 ms one-time. Two-phase warmup per
+    [[ttnn-multi-trace-two-phase-warmup]]. `trace_region_size=400_000_000`
+    on the mesh (default 50 MB OOMs the 48-layer decode trace).
+    Validator: `gm4_v04_trace_validate.py`.
 
   **~3-4 days of focused work remaining** to ship `TT_BACKEND=gemma4_12b
   serve_cb.sh start` chat working end-to-end:
-  v0.4 trace gate (in flight) + v1 CB (~2-3 days) + v2 HTTP (~1 day).
+  v1 CB (~2-3 days) + v2 HTTP (~1 day).
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
