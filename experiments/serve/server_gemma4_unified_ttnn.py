@@ -328,12 +328,16 @@ def bootstrap(state, log=None):
                     "{% endfor %}"
                     "{% if add_generation_prompt %}<start_of_turn>model\n{% endif %}"
                 )
-            # For chat with the BASE model, the response should stop on
-            # <end_of_turn>, not <eos>. The IT variant uses <end_of_turn>
-            # as a proper special-token EOS already.
-            eot_id = state.tokenizer.convert_tokens_to_ids("<end_of_turn>")
-            if eot_id is not None and eot_id != state.tokenizer.unk_token_id:
-                state.tokenizer.eos_token = "<end_of_turn>"
+        # For chat, the response should stop on <end_of_turn> (dialog
+        # boundary), not the corpus-level <eos>. The IT generation_config
+        # lists three EOS candidates [1=<eos>, 106=<end_of_turn>, 50];
+        # cb_engine only matches a single eos_token_id, so we point it at
+        # <end_of_turn> for BOTH variants. (For BASE: <end_of_turn> is
+        # multi-token text, so this still won't stop reliably, but it's a
+        # no-op when unmatched. For IT: 106 fires after the model's reply.)
+        eot_id = state.tokenizer.convert_tokens_to_ids("<end_of_turn>")
+        if eot_id is not None and eot_id != state.tokenizer.unk_token_id:
+            state.tokenizer.eos_token = "<end_of_turn>"
         log(f"  tokenizer: {state.tokenizer.__class__.__name__}, "
             f"eos_token={state.tokenizer.eos_token!r} "
             f"id={state.tokenizer.eos_token_id}, "
