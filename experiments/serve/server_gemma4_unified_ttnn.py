@@ -311,6 +311,14 @@ def bootstrap(state, log=None):
     state.final_norm_tt = np_to_replicated(final_norm_w, state.mesh)
     log(f"  final_norm: {final_norm_w.shape}")
 
+    # Tied lm_head (plan §1.8): lm_head ≡ embed_table.T. Upload separately
+    # in [HIDDEN, VOCAB] layout for the final matmul. Memory: ~2 GB/chip
+    # bf16 — fits easily in P150's 31.8 GB. For v0.2 we keep it replicated;
+    # vocab-sharded variant can come later (see 27B's
+    # `server_tp.py:1680-1687` pattern).
+    state.lm_head_tt = np_to_replicated(embed_w_np.T, state.mesh)
+    log(f"  lm_head (tied, replicated): {embed_w_np.T.shape}")
+
     log(f"[bootstrap] uploading {NUM_LAYERS} layer weights to mesh…")
     t0 = time.time()
     state.per_layer_tt = []
@@ -330,6 +338,12 @@ def bootstrap(state, log=None):
         else:
             layer_tt.update(upload_attn_layer_global(layer_sd, state.mesh))
         layer_tt.update(upload_mlp_layer(layer_sd, state.mesh))
+        # Gemma 4 NEW: per-layer learned scalar applied at the END of the
+        # decoder layer (after both residual adds): `h *= layer_scalar`.
+        # See `Gemma4UnifiedTextDecoderLayer.forward:540` in HF. 27B/35B
+        # don't have this. Without it the residual stream propagates with
+        # wrong magnitudes; L0 cos~1 but mad ~18× too high, then L1+ collapse.
+        layer_tt["layer_scalar"] = float(np.asarray(layer_sd["layer_scalar"]).reshape(-1)[0])
         state.per_layer_tt.append(layer_tt)
         if (L + 1) % 10 == 0:
             log(f"  layer {L+1}/{NUM_LAYERS} uploaded ({time.time()-t0:.1f}s)")
@@ -511,9 +525,14 @@ def step_forward_v01(state, tok_id, capture):
     ttnn.deallocate(mlp_out)
     capture["post_ff_norm"] = _readback_replicated(post_ff_norm, state.mesh)
 
-    # Second residual add → L0 output.
-    h_l0 = ttnn.add(h_after_attn, post_ff_norm)
+    # Second residual add → L0 output. THEN multiply by layer_scalar
+    # per Gemma4UnifiedTextDecoderLayer.forward:540 (a learned per-layer
+    # scalar buffer). Missing this was the v0.2 L1+ collapse bug — cos
+    # invariant under scalar mult masked an 18× magnitude error at L0.
+    h_pre = ttnn.add(h_after_attn, post_ff_norm)
     ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff_norm)
+    h_l0 = ttnn.multiply(h_pre, w0["layer_scalar"])
+    ttnn.deallocate(h_pre)
     capture["l0_out"] = _readback_replicated(h_l0, state.mesh)
     ttnn.deallocate(h_l0)
 
@@ -542,6 +561,160 @@ def _readback_sharded_head(t_tt, mesh, per_chip_heads, head_dim):
     arr = ttnn.to_torch(t_tt, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
     arr = arr.float().reshape(NCHIPS, per_chip_heads, head_dim)
     return arr.reshape(NCHIPS * per_chip_heads, head_dim).numpy()
+
+
+# ── v0.2: full forward through all 48 layers + final_norm + lm_head ──
+#
+# step_forward_v02 reuses two per-layer helpers (sliding vs global). At pos 0
+# with seq_len=1, softmax(QK^T) = 1 trivially, so attn_out per Q head is just
+# V (after v_norm + GQA mapping). The Q/K projections are skipped — they
+# would be needed for pos > 0 (v0.3). RoPE at pos 0 is identity (cos=1,
+# sin=0); also skipped.
+
+def _layer_pos0_sliding(state, h_norm, w):
+    """Sliding attention at pos 0 (validated bit-id to HF at v0.1.2)."""
+    v = ttnn.matmul(h_norm, w["v_proj"], compute_kernel_config=HIFI4)
+    v_h = ttnn.reshape(v, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
+    ttnn.deallocate(v)
+    v_n = ttnn.rms_norm(v_h, weight=state.ones_head_dim_sliding, epsilon=EPS)
+    ttnn.deallocate(v_h)
+    attn = ttnn.repeat_interleave(v_n, GQA_GROUP_SLIDING, dim=0)
+    ttnn.deallocate(v_n)
+    attn_flat = ttnn.reshape(attn, [1, NQ_PER_CHIP * HEAD_DIM_SLIDING])
+    ttnn.deallocate(attn)
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+    return out
+
+
+def _layer_pos0_global(state, h_norm, w):
+    """Full (global) attention at pos 0. NKV=1 (K replicated across chips),
+    head_dim=512, p-RoPE, attention_k_eq_v=True (V aliases K_raw pre-norm
+    per HF code lines 391-401). At pos 0 with seq=1, attn_out per Q head
+    is v_norm(K_raw), same for all heads since there's one KV head.
+    """
+    k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
+    # V is aliased from K_raw (pre-k_norm, pre-RoPE) per HF.
+    v_h = ttnn.reshape(k, [NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL])
+    ttnn.deallocate(k)
+    v_n = ttnn.rms_norm(v_h, weight=state.ones_head_dim_global, epsilon=EPS)
+    ttnn.deallocate(v_h)
+    # Repeat to all Q heads on this chip (each chip handles NQ_PER_CHIP heads).
+    attn = ttnn.repeat_interleave(v_n, NQ_PER_CHIP, dim=0)  # [NQ_PER_CHIP, 512]
+    ttnn.deallocate(v_n)
+    attn_flat = ttnn.reshape(attn, [1, NQ_PER_CHIP * HEAD_DIM_GLOBAL])
+    ttnn.deallocate(attn)
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+    return out
+
+
+def _layer_forward_pos0(state, h_in, layer_idx):
+    """One full Gemma 4 decoder layer at pos 0. Returns h_out [1, HIDDEN].
+
+    Defensive `ttnn.clone(h_in)` for the residual_1 add: per-layer-cos
+    debug showed L0 PASS, L1 hard-FAIL. Hypothesis: rms_norm + downstream
+    ops may be aliasing `h_in` between the input_layernorm read and the
+    residual add. Clone before rms_norm to break any aliasing.
+    """
+    w = state.per_layer_tt[layer_idx]
+    lt = state.layer_types[layer_idx]
+    residual_1 = ttnn.clone(h_in)
+    h_norm = ttnn.rms_norm(h_in, weight=w["input_layernorm"], epsilon=EPS)
+    if lt == "sliding_attention":
+        mixer = _layer_pos0_sliding(state, h_norm, w)
+    else:
+        mixer = _layer_pos0_global(state, h_norm, w)
+    ttnn.deallocate(h_norm)
+    post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
+    ttnn.deallocate(mixer)
+    h_after_attn = ttnn.add(residual_1, post_attn)
+    ttnn.deallocate(residual_1); ttnn.deallocate(post_attn)
+    pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"], epsilon=EPS)
+    gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4)
+    up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(pre_ff)
+    gelu_gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
+    ttnn.deallocate(gate)
+    mid = ttnn.mul(gelu_gate, up)
+    ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
+    mlp_partial = ttnn.matmul(mid, w["down_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(mid)
+    mlp_out = all_reduce_tt(mlp_partial, state.mesh)
+    ttnn.deallocate(mlp_partial)
+    post_ff = ttnn.rms_norm(mlp_out, weight=w["post_feedforward_layernorm"], epsilon=EPS)
+    ttnn.deallocate(mlp_out)
+    h_residual_2 = ttnn.add(h_after_attn, post_ff)
+    ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff)
+    # Gemma 4 final per-layer scalar multiplication (HF decoder layer
+    # forward:540). Without this, L0 has cos~1 but mad ~18× too big at
+    # `layer_scalar=0.054`, and L1+ collapses to near-zero cos.
+    h_out = ttnn.multiply(h_residual_2, w["layer_scalar"])
+    ttnn.deallocate(h_residual_2)
+    return h_out
+
+
+def step_forward_v02(state, tok_id, capture=None):
+    """Full 48-layer forward at pos 0 → final_norm → lm_head → softcap → argmax.
+
+    capture (optional dict) fills:
+      embed_scaled, final_norm, logits, argmax
+    Returns: argmax token id (int).
+    """
+    tok_tt = ttnn.from_torch(
+        torch.tensor([[int(tok_id)]], dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    embed = ttnn.embedding(tok_tt, state.embed_tt)
+    ttnn.deallocate(tok_tt)
+    h = ttnn.multiply(ttnn.to_layout(embed, ttnn.TILE_LAYOUT), EMBED_SCALE)
+    ttnn.deallocate(embed)
+    if capture is not None:
+        capture["embed_scaled"] = _readback_replicated(h, state.mesh)
+
+    for L in range(NUM_LAYERS):
+        h_new = _layer_forward_pos0(state, h, L)
+        ttnn.deallocate(h)
+        h = h_new
+        if capture is not None and capture.get("per_layer", False):
+            # Save THIS layer's output for cosine localization.
+            capture[f"layer_{L}"] = _readback_replicated(h, state.mesh)
+
+    final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
+    ttnn.deallocate(h)
+    if capture is not None:
+        capture["final_norm"] = _readback_replicated(final, state.mesh)
+
+    # lm_head: replicated [HIDDEN, VOCAB]; per-chip matmul gives full logits.
+    logits_raw = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
+    ttnn.deallocate(final)
+
+    # Logit softcap: logits = SOFTCAP · tanh(logits / SOFTCAP). Monotonic so
+    # argmax is invariant — but sampling distributions depend on it.
+    inv = ttnn.multiply(logits_raw, 1.0 / FINAL_LOGIT_SOFTCAP)
+    ttnn.deallocate(logits_raw)
+    th = ttnn.tanh(inv)
+    ttnn.deallocate(inv)
+    logits = ttnn.multiply(th, FINAL_LOGIT_SOFTCAP)
+    ttnn.deallocate(th)
+    if capture is not None:
+        capture["logits"] = _readback_replicated(logits, state.mesh)
+
+    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+    ttnn.deallocate(logits)
+    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
+    ttnn.deallocate(logits_rm)
+    arr = ttnn.to_torch(argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+    ttnn.deallocate(argmax_tt)
+    argmax = int(arr.reshape(-1)[0].item())
+    if capture is not None:
+        capture["argmax"] = argmax
+    return argmax
 
 
 if __name__ == "__main__":

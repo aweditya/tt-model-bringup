@@ -54,9 +54,21 @@ bug lives in our codebase, v0.3 surfaces it without MoE/DN confounders.
   ttnn `all_reduce_async` signature change vs the simple
   `ttnn.all_reduce(cluster_axis=1)` used by 35B (one-line fix in
   `all_reduce_tt`).
-- **v0.1.3 IN FLIGHT** — post_attention_layernorm + residual + MLP +
-  post_feedforward_layernorm + residual. Gate: cos ≥ 0.999 on all 4
-  remaining sub-steps + L0 output.
+- **v0.1.3 DONE 2026-06-03 commit `7f9f396`** — 13/13 sub-steps PASS;
+  full L0 forward bit-id to HF at cos ≥ 0.999958. L0 output (vs HF
+  hidden_states[1, 0, :]) cos=0.999975. Two-op GELU works per Step 0.2;
+  both Gemma 4 post-norms (post_attention + post_feedforward) correct.
+- **v0.2 DONE 2026-06-03** — all 48 layers (sliding + global dispatch)
+  + final_norm + tied lm_head + 30·tanh logit softcap. Greedy top-1
+  matches HF at pos 0: TT argmax=258882 == HF argmax=258882 (`<image|>`).
+  final_norm cos=0.999563, logits cos=0.999137. Surfaced two more
+  Gemma 4 novelties: per-layer `layer_scalar` ([[gemma4-layer-scalar]])
+  multiplied at end of each decoder layer, AND the cosine-is-not-enough
+  diagnostic discipline ([[cos-not-enough-also-check-mad]]) — direction
+  passed at L0 but magnitude was 18× off, propagating to L1 collapse.
+- **v0.3 NEXT** — KV cache + paged SDPA with `sliding_window_size=1024`
+  kwarg (verified available in Step 0.1). Gate: 8-tok generation matches
+  HF token-for-token.
 - **All computation on (1,4) P150 mesh on qb1**; readback only for
   cosine compare against the HF oracle (matches 27B/35B pattern).
 - **Reuse mandate (user-set 2026-06-03)**: every new file must cite the
