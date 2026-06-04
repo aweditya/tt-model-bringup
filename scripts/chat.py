@@ -46,11 +46,40 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
 import time
 from urllib.parse import urlparse
+
+
+# ── Terminal width helper ─────────────────────────────────────────
+def _cols(default: int = 80) -> int:
+    """Best-effort terminal width. Honours $COLUMNS, falls back to shutil."""
+    try:
+        c = int(os.environ.get("COLUMNS", "0"))
+        if c > 0:
+            return c
+    except ValueError:
+        pass
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
+
+
+def _reset_terminal() -> None:
+    """Restore cursor + colour + clear current line. Safe to call repeatedly."""
+    if not TTY:
+        return
+    try:
+        sys.stdout.write("\x1b[?25h\x1b[0m\x1b[2K\r")
+        # Disable bracketed paste mode on exit (was enabled in raw paste path).
+        sys.stdout.write("\x1b[?2004l")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 # ── ANSI helpers ───────────────────────────────────────────────────
@@ -97,7 +126,11 @@ def _conn(url):
 
 
 def _stream_chat(url, messages, params, tools=None):
-    """POST /v1/chat/completions stream=true; yield (kind, payload)."""
+    """POST /v1/chat/completions stream=true; yield (kind, payload).
+
+    Network/server failures yield ("error", msg) instead of raising so the
+    caller's prompt loop survives a flaky server.
+    """
     body = {"messages": messages, "max_tokens": params["max_tokens"], "stream": True}
     if params["temperature"] > 0:
         body["temperature"] = params["temperature"]
@@ -107,16 +140,33 @@ def _stream_chat(url, messages, params, tools=None):
             body["seed"] = params["seed"]
     if tools:
         body["tools"] = tools
-    conn = _conn(url)
     try:
-        conn.request("POST", "/v1/chat/completions",
-                     json.dumps(body), {"Content-Type": "application/json"})
-        resp = conn.getresponse()
+        conn = _conn(url)
+    except OSError as e:
+        yield ("error", f"connect failed: {e}")
+        return
+    try:
+        try:
+            conn.request("POST", "/v1/chat/completions",
+                         json.dumps(body), {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+        except (OSError, http.client.HTTPException) as e:
+            yield ("error", f"request failed: {e}")
+            return
+        if resp.status >= 500:
+            yield ("error", f"server HTTP {resp.status}: "
+                            f"{resp.read()[:200].decode('utf-8','replace')}")
+            return
         if resp.status != 200:
-            yield ("error", f"HTTP {resp.status} {resp.read()[:200].decode('utf-8','replace')}")
+            yield ("error", f"HTTP {resp.status} "
+                            f"{resp.read()[:200].decode('utf-8','replace')}")
             return
         while True:
-            line = resp.readline()
+            try:
+                line = resp.readline()
+            except (OSError, http.client.HTTPException) as e:
+                yield ("error", f"stream dropped: {e}")
+                return
             if not line:
                 return
             line = line.rstrip(b"\r\n")
@@ -138,7 +188,10 @@ def _stream_chat(url, messages, params, tools=None):
             if d:
                 yield ("delta", d)
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _health(url):
@@ -151,8 +204,11 @@ def _health(url):
 
 
 def _metrics(url):
-    conn = _conn(url); conn.request("GET", "/metrics")
-    r = conn.getresponse(); raw = r.read().decode("utf-8"); conn.close()
+    try:
+        conn = _conn(url); conn.request("GET", "/metrics")
+        r = conn.getresponse(); raw = r.read().decode("utf-8"); conn.close()
+    except Exception as e:
+        return f"<error fetching /metrics: {e}>"
     return raw if r.status == 200 else f"<HTTP {r.status}>"
 
 
@@ -161,10 +217,17 @@ def _metrics(url):
 _FENCE_RE = re.compile(r"^```(\w*)\s*$")
 
 class StreamRenderer:
-    """Light streaming markdown renderer — code fences get DIM colour."""
+    """Light streaming markdown renderer — code fences get DIM colour.
+
+    Prose lines word-wrap to $COLUMNS to avoid hard mid-word splits in
+    narrow terminals. Code-fence lines are emitted verbatim (mangling
+    code with soft wraps is worse than letting the terminal handle it).
+    """
     def __init__(self):
         self.buf = ""
         self.in_code = False
+        # Per-line word-wrap state: characters emitted since last "\n".
+        self._col = 0
 
     def feed(self, chunk: str) -> None:
         self.buf += chunk
@@ -178,6 +241,26 @@ class StreamRenderer:
             self._emit_line(self.buf)
             self.buf = ""
 
+    def _wrap_prose(self, line: str) -> str:
+        """Word-wrap a single line (with trailing \\n) to $COLUMNS."""
+        width = max(20, _cols(80) - 2)
+        had_nl = line.endswith("\n")
+        text = line[:-1] if had_nl else line
+        if not text.strip():
+            return line
+        # textwrap with break_long_words=False avoids mid-word splits.
+        wrapped = textwrap.wrap(
+            text, width=width,
+            break_long_words=False, break_on_hyphens=False,
+            drop_whitespace=False, replace_whitespace=False,
+        )
+        if not wrapped:
+            return line
+        out = "\n".join(wrapped)
+        if had_nl:
+            out += "\n"
+        return out
+
     def _emit_line(self, line: str) -> None:
         m = _FENCE_RE.match(line.rstrip("\n"))
         if m:
@@ -186,7 +269,7 @@ class StreamRenderer:
         elif self.in_code:
             sys.stdout.write(GREY(line))
         else:
-            sys.stdout.write(line)
+            sys.stdout.write(self._wrap_prose(line))
         sys.stdout.flush()
 
 
@@ -465,9 +548,15 @@ def main():
                     elif kind == "finish":
                         finish = payload
                     elif kind == "error":
-                        print(); print(RED(f"error: {payload}")); reply = None; break
+                        print()
+                        print(panel("error", RED(str(payload)), color=RED))
+                        reply = None; break
             except KeyboardInterrupt:
                 print(); print(DIM("interrupted")); reply = None
+            except Exception as e:
+                print()
+                print(panel("error", RED(f"{type(e).__name__}: {e}"), color=RED))
+                reply = None
             renderer.flush()
             elapsed = time.time() - t0
             print()
@@ -503,4 +592,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        _reset_terminal()
