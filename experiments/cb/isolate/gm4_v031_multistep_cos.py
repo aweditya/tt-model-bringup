@@ -34,7 +34,7 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def main():
+def main(state=None):
     if not ORACLE_DIR.exists():
         log(f"FATAL: oracle missing at {ORACLE_DIR}")
         return 1
@@ -47,11 +47,15 @@ def main():
     log(f"oracle: HF argmax_per_position={hf_argmax.tolist()} "
         f"text={meta['argmax_text_per_position']}")
 
-    log("bootstrapping Gemma 4 12B server (~80 sec)…")
-    t0 = time.time()
-    state = srv.State()
-    srv.bootstrap(state, log=log)
-    log(f"bootstrap took {time.time()-t0:.1f}s")
+    owned_state = state is None
+    if owned_state:
+        log("bootstrapping Gemma 4 12B server (~80 sec)…")
+        t0 = time.time()
+        state = srv.State()
+        srv.bootstrap(state, log=log)
+        log(f"bootstrap took {time.time()-t0:.1f}s")
+    else:
+        log("using pre-bootstrapped state from harness")
 
     # HF hidden_states shape [n_layers+1, seq, HIDDEN]. Last index is the
     # post-final-norm hidden state at each sequence position.
@@ -85,8 +89,9 @@ def main():
     all_pass = (n_pass == seq_len)
     log(f"VERDICT: {'PASS' if all_pass else 'FAIL'}")
 
-    import ttnn
-    ttnn.close_device(state.mesh)
+    if owned_state:
+        import ttnn
+        ttnn.close_device(state.mesh)
     return 0 if all_pass else 1
 
 

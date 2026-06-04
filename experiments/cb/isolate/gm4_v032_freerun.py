@@ -39,7 +39,7 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def main():
+def main(state=None):
     prompt_ids = np.load(ORACLE_DIR / "prompt_ids.npy")
     meta = json.loads((ORACLE_DIR / "meta.json").read_text())
     seq_len = int(meta["seq_len"])
@@ -48,11 +48,15 @@ def main():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(meta["model_id"])
 
-    log("bootstrapping Gemma 4 12B server (~80 sec)…")
-    t0 = time.time()
-    state = srv.State()
-    srv.bootstrap(state, log=log)
-    log(f"bootstrap took {time.time()-t0:.1f}s")
+    owned_state = state is None
+    if owned_state:
+        log("bootstrapping Gemma 4 12B server (~80 sec)…")
+        t0 = time.time()
+        state = srv.State()
+        srv.bootstrap(state, log=log)
+        log(f"bootstrap took {time.time()-t0:.1f}s")
+    else:
+        log("using pre-bootstrapped state from harness")
 
     log(f"teacher-forced prefill (pos 0..{seq_len-1}) + free-run "
         f"(pos {seq_len}..{seq_len+FREE_RUN_TOKENS-1})…")
@@ -79,8 +83,9 @@ def main():
     log(f"  {text!r}")
     log("=" * 78)
 
-    import ttnn
-    ttnn.close_device(state.mesh)
+    if owned_state:
+        import ttnn
+        ttnn.close_device(state.mesh)
 
 
 if __name__ == "__main__":

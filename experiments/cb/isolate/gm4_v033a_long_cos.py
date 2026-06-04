@@ -59,7 +59,7 @@ def cos(a, b):
     return float(a @ b / (na * nb)) if (na and nb) else 0.0
 
 
-def main():
+def main(state=None):
     if not ORACLE_DIR.exists():
         log(f"FATAL: oracle missing at {ORACLE_DIR}")
         log("Generate first:")
@@ -80,11 +80,15 @@ def main():
         log(f"FATAL: seq_len={seq_len} > MAX_KV={srv.MAX_KV}. Bump MAX_KV.")
         return 1
 
-    log("bootstrapping Gemma 4 12B server (~80 sec)…")
-    t0 = time.time()
-    state = srv.State()
-    srv.bootstrap(state, log=log)
-    log(f"bootstrap took {time.time()-t0:.1f}s")
+    owned_state = state is None
+    if owned_state:
+        log("bootstrapping Gemma 4 12B server (~80 sec)…")
+        t0 = time.time()
+        state = srv.State()
+        srv.bootstrap(state, log=log)
+        log(f"bootstrap took {time.time()-t0:.1f}s")
+    else:
+        log("using pre-bootstrapped state from harness")
 
     log(f"running teacher-forced multi-step decode pos 0..{seq_len-1}…")
     n_argmax_pass = 0
@@ -131,8 +135,9 @@ def main():
                   and p95 >= COS_P5_GATE)
     log(f"VERDICT: {'PASS' if gates_pass else 'FAIL'}")
 
-    import ttnn
-    ttnn.close_device(state.mesh)
+    if owned_state:
+        import ttnn
+        ttnn.close_device(state.mesh)
     return 0 if gates_pass else 1
 
 
