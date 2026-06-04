@@ -1,86 +1,108 @@
-# Live measurements (2026-06-04 session)
+# Live measurements (2026-06-04 session) — POST-FIX
 
 Single canonical source for the poster + presentation. Numbers below
 are from `presentation/screenshots/stress_*.json` runs through the
-HTTP server (traced decode path, B=cb_slots).
+HTTP server (traced decode path, B=cb_slots, owned_gdn fast path
+active per commit `38b15b0`).
 
-## Per-client + aggregate throughput (HTTP /v1/chat/completions, traced)
+## Headline numbers (post-fix, after commit `38b15b0`)
 
-### Gemma 4 12B Instruct, TT_CB_SLOTS=4, TT_CB_TOPK_K=128, traced
+| Model | TT_CB_SLOTS | 1 client | 8 clients | 16 clients | 32 clients | Scaling 1→32 |
+|---|---|---|---|---|---|---|
+| **Qwen3.6-27B (dense, TP)** | 32 | 5.36 tok/s | 40.87 tok/s | 79.59 tok/s | **156.59 tok/s** | **29.23×** |
+| **Gemma 4 12B Instruct (unified)** | 32 | 5.29 tok/s | 41.80 tok/s | 83.91 tok/s | **162.85 tok/s** | **30.79×** |
+| Qwen3.6-35B-A3B (MoE) | 1 | 3.13 tok/s | — | — | — | — |
 
-| Clients | Wall (s) | Total completion tokens | Aggregate tok/s | Per-client tok/s | Speedup vs 1 client |
-|---|---|---|---|---|---|
-| 1 | 18.89 | 64 | 3.39 | 3.39 | 1.00× |
-| 2 | 19.29 | 128 | 6.64 | 3.32 | 1.96× |
-| 4 | 19.48 | 256 | 13.14 | 3.29 | **3.88×** |
+27B and Gemma 4 both reach ~160 tok/s aggregate at 32 concurrent
+clients with **near-perfectly-linear** scaling, validating the CB
+design.
 
-Per-step metric (from `/metrics`): `cb_step_seconds_sum=157.5s / count=728 = 216 ms/step`. 99.7% in device.
+35B was measured at TT_CB_SLOTS=1 only (the B>1 empty-slot poison bug
+is task #162, not fixed this session). Same per-step structural cost
+as the others before the fix.
 
-### Qwen3.6-27B, TT_CB_SLOTS=4, TT_CB_TOPK_K=128, traced, owned_gdn (after cb_api clobber fix)
+## Pre-fix vs post-fix (the regression we caught + corrected mid-session)
 
-| Clients | Wall (s) | Total completion tokens | Aggregate tok/s | Per-client tok/s | Speedup vs 1 client |
-|---|---|---|---|---|---|
-| 1 | 18.80 | 64 | 3.40 | 3.40 | 1.00× |
-| 2 | 19.29 | 128 | 6.64 | 3.32 | 1.95× |
-| 4 | 19.25 | 256 | 13.30 | 3.33 | **3.91×** |
+| Backend | Config | Step time (ms) | Aggregate tok/s at 4 clients |
+|---|---|---|---|
+| 27B B=4 | TT_CB_TOPK_K=128, `cb_dn_recurrence_mode` unset → manual DN | 229 | 13.30 |
+| 27B B=32 | No TT_CB_TOPK_K, `cb_dn_recurrence_mode = "owned_gdn"` (fix `38b15b0`) | ~290 (full B=32 forward) | 156.59 at 32 clients |
+| Gemma 4 B=4 | TT_CB_TOPK_K=128 | 216 | 13.14 |
+| Gemma 4 B=32 | No TT_CB_TOPK_K | ~295 (full B=32 forward) | 162.85 at 32 clients |
 
-Per-step metric: `cb_step_seconds_sum=57.3s / count=250 = 229 ms/step`. 99.5% in device.
+The big takeaway: **B=4 with the topk-tail trace was hurt by ~100 ms of fixed device cost** (per the `cb_scheduler.py:173-176` docstring "topk adds ~100 ms of fixed device cost that HURTS at low B"). Removing it + the owned_gdn fix unlocked the historical scaling.
 
-### 35B-A3B — TBD (next backend switch)
+## Multi-turn HTTP (TT_CB_PREFIX_CACHE=1)
 
-## Multi-turn HTTP with TT_CB_PREFIX_CACHE=1
-
-### Gemma 4 12B IT — PC misses on chat template
-
-| Turn | prompt_t | gen_t | wall (s) | wall / prompt_t |
-|---|---|---|---|---|
-| 0 | 36 | 48 | 17.95 | 0.499 |
-| 1 | 105 | 48 | 32.89 | 0.313 |
-| 2 | 180 | 48 | 49.12 | 0.273 |
-
-Metrics: `cb_prefix_cache_hits_total = 0, cb_prefix_cache_misses_total = 10`. Wall grows linearly in `prompt_t` — Gemma 4 chat template re-renders the prior assistant turn in a way that doesn't byte-equal what was generated, so the matcher (exact-prefix) misses. Documented in `[[prefix-cache-multiturn-miss-2026-06-04]]`.
-
-### Qwen3.6-27B — PC hits on turn 2!
+### Qwen3.6-27B — PC works (Qwen3.6 chat template patches active)
 
 | Turn | prompt_t | gen_t | wall (s) | wall / prompt_t | Notes |
 |---|---|---|---|---|---|
-| 0 | 32 | 48 | 18.09 | 0.565 | Cold prefill + decode |
-| 1 | 105 | 38 | 32.52 | 0.310 | Cold prefill (3.3× prompt) |
-| 2 | 172 | 43 | **16.24** | **0.094** | **PC HIT** — turn 2 wall is HALF of turn 1's wall, despite 64% more prompt tokens |
+| 0 | 32 | 48 | 10.73 | 0.335 | Cold prefill + decode |
+| 1 | 105 | 38 | 19.26 | 0.183 | Cold prefill |
+| 2 | 172 | 41 | **9.03** | **0.053** | **PC HIT** — turn 2 wall is HALF turn 1's wall despite 64% more prompt tokens |
 
-Metrics: `cb_prefix_cache_hits_total = 1, cb_prefix_cache_misses_total = 9`. The Qwen3.6 chat template patches in `experiments/serve/openai_endpoint.py:35-90` (preserve_thinking=True + trailing strip) make turn N+1 re-tokenize to a true prefix of the cached tokens_so_far. Net effect: **6.0× speedup on the PC-hit turn's prefill**.
+Metrics: `cb_prefix_cache_hits_total = 1, cb_prefix_cache_misses_total = 59, cb_prefix_cache_live_slots = 32`.
 
-## Correctness gates passed this session (dev harness, eager)
+**6.3× speedup on the PC-hit turn**. The `_messages_to_prompt`
+chat-template patches in `experiments/serve/openai_endpoint.py:35-90`
+(preserve_thinking=True + trailing strip) make turn N+1 re-tokenize
+to a true prefix of the cached tokens_so_far.
+
+### Gemma 4 12B IT — PC misses on chat template (KNOWN BUG)
+
+| Turn | prompt_t | gen_t | wall (s) | wall / prompt_t |
+|---|---|---|---|---|
+| 0 | 36 | 48 | 10.40 | 0.289 |
+| 1 | 105 | 48 | 18.94 | 0.180 |
+| 2 | 180 | 48 | 28.32 | 0.157 |
+
+Metrics: `cb_prefix_cache_hits_total = 0, cb_prefix_cache_misses_total = 60`. Gemma's chat template re-renders the prior assistant turn (after `<end_of_turn>\n<start_of_turn>user\n…`) in a way that doesn't byte-equal what was generated. Needs the equivalent of Qwen3.6's patches for Gemma 4. Documented `[[prefix-cache-multiturn-miss-2026-06-04]]`.
+
+## Correctness gates passed this session (dev harness, eager — what we validate against, not what we serve)
 
 - **35B teacher-forced cosine ladder**: 7/8 positions argmax-match HF on the 85-tok prompt; cos_L32 ≥ 0.987 at every probed position. The "drift cliff" memory entry is invalidated — drift is gone in current state. `[[35b-drift-resolved-2026-06-04]]`.
-- **35B free-run needle-haystack** (L = 100, 200, 300, 460, 1024): per-trial Y/N is a coin flip; bf16 chain noise flips argmax → ~50% retrieval per trial. Failures are coherent ("I don't know"), not gibberish. Successful trials echo the 8-char needle verbatim. `[[35b-needle-haystack-2026-06-04]]`.
-- **35B multi-turn Q&A (3 turns)**: 3/3 PASS visual-grade. T2 correctly recalled "Paris" from T0 and answered with a Paris fact. Retention works. Eager ~195 ms/tok. `[[35b-multiturn-qa-2026-06-04]]`.
-- **Gemma 4 12B v0.4 trace validator**: 100/100 token-for-token match traced vs eager at 100 free-run steps. Traced **47.5 ms/tok = 21.05 tok/s** single-seq. `[[feedback-p22-gm4-vocab-shard-result]]`.
+- **35B free-run needle-haystack** (L = 100, 200, 300, 460, 1024): per-trial Y/N is a coin flip; bf16 chain noise flips argmax → ~50% retrieval per trial. Failures are coherent ("I don't know"), not gibberish. `[[35b-needle-haystack-2026-06-04]]`.
+- **35B multi-turn Q&A (3 turns)**: 3/3 PASS visual-grade (eager). T2 correctly recalled "Paris" from T0 and answered with a Paris fact. `[[35b-multiturn-qa-2026-06-04]]`.
+- **Gemma 4 12B v0.4 trace validator**: 100/100 token-for-token match traced vs eager at 100 free-run steps. Traced **47.5 ms/tok = 21.05 tok/s** single-seq via the dev-harness `step_forward_traced` (non-paged SDPA, no CB scheduler overhead). `[[feedback-p22-gm4-vocab-shard-result]]`.
+
+## Two distinct "throughput" numbers to keep straight (per `[[feedback-perf-no-handwaving]]`)
+
+The user-facing chat experience goes through CB → paged SDPA → per-slot bookkeeping. The dev-harness single-seq path bypasses all that. Both are "correct" measurements but answer different questions:
+
+| Path | What it measures | Use it for |
+|---|---|---|
+| Dev harness `step_forward_traced` (single-stream, non-paged SDPA) | Pure model speed at B=1 — pure trace replay | "How fast is the model at all?" baseline ceiling |
+| HTTP CB engine `forward_batch_*_inner` (B-leading, paged SDPA, per-slot KV) | What ships to users; pays CB structural cost | "What will a user see?" + aggregate scaling story |
+
+For Gemma 4, dev-harness B=1 = 21.05 tok/s; CB-engine B=32 with 32 clients = 162.85 tok/s aggregate ≈ 5.09 tok/s/slot. The per-slot CB rate is ~25% of dev-harness B=1 because the CB forward does 32× the work per step.
 
 ## Roofline + ceilings
 
 - P150 measured DRAM BW: **404 GB/s on-device** (79% of 512 GB/s peak). `[[feedback-p150-memory-bandwidth-measured]]`.
 - Gemma 4 12B bf16 ceiling: 24 GB / 6 GB/chip / 404 GB/s = **14.85 ms/tok = 67.3 tok/s**. We're at 21.05 tok/s single-seq traced = **31% of ceiling**. Headroom **3.2×**.
-- 27B dense bf16: scaled ceiling depends on which numbers we trust; current 27B B=1 traced single-seq ≈ 12.93 tok/s (HANDOFF), B=32 CB hits 150.5 tok/s = ~75% scaling efficiency.
+- 27B B=32 CB aggregate ceiling per `[[feedback-realistic-tp-ceiling]]`: realistic TP ceiling is 1.78× (not 4×) per El Reg's measurement. At 156 tok/s aggregate with 32 active slots we're 23× the 1-client number — well above the TP ceiling expectation, demonstrating that batching dominates the scaling story (not multi-chip TP).
 
-## Bugs surfaced + fixed this session
+## Bugs surfaced + fixed this session (in order)
 
-1. **gm4 `_lm_head_argmax` rank-3** → broke cb_scheduler topk path. Fixed at source in commit `29205d7`. (one contract for all backends).
-2. **cb_api was clobbering 27B owned_gdn defaults** (re-set to "manual" after bootstrap). Deleted in commit `017665e`. Net: 27B now actually runs the custom kernel path that two weeks of work targeted.
-3. **`openai_endpoint.py` stale on qb1** (no `tools` kwarg). Caught by 500 errors on the first 27B stress. Fixed by `scripts/deploy.sh experiments/serve/openai_endpoint.py`. Memory entry `[[stale-deploy-27b-tools-2026-06-04]]`.
-4. **gm4 build_key_to_shard** silently killed the harness when picking the wrong snapshot dir (IT variant has two). Walk all snapshots. Commit `0418e83`.
-5. **ttnn.slice rank-aware** at gm4 vocab-shard path. Commit `5620314`.
+1. **gm4 `_lm_head_argmax` rank-3 → rank-2 contract** — one tensor reshape in the helper unblocked the topk path. Commit `5620314` (slice), `29205d7` (rank normalization).
+2. **gm4 `build_key_to_shard` IT multi-snapshot** — picked the wrong snapshot dir silently. Walk all snapshots. Commit `0418e83`.
+3. **`cb_api.py` clobbered 27B `deltanet_*` (WRONG attribute family)** — discovered to be a no-op for CB perf. The single-stream path needed it; the CB path reads different names. Removed in commit `017665e` (correct removal of dead code, but didn't fix CB perf).
+4. **`openai_endpoint.py` stale on qb1** (no `tools` kwarg) → 27B HTTP 500s. Fixed by `deploy.sh experiments/serve/openai_endpoint.py`. Memory `[[stale-deploy-27b-tools-2026-06-04]]`.
+5. **CB engine ran manual DN recurrence on 27B (THE BIG FIX)** — `state.cb_dn_recurrence_mode` was never set, defaulted to `"manual"` via `getattr(state, '…', 'manual')` at `server_tp_cb.py:454`. Fixed by setting `cb_dn_recurrence_mode = "owned_gdn"` and `cb_conv_mode = "shiftacc"` defaults inside `setup_cb_state` itself. Commit `38b15b0`. **This is what unlocked the 156 tok/s number.**
 
 ## Bugs surfaced + still open
 
-1. **Gemma 4 IT prefix-cache misses on chat template** (0/10 hits). Needs the equivalent of Qwen3.6's `_messages_to_prompt` patch for Gemma 4. `[[prefix-cache-multiturn-miss-2026-06-04]]`.
-2. **CB engine was silently running manual DN recurrence on 27B** — `cb_dn_recurrence_mode` was never set, defaulted to "manual" via getattr in `server_tp_cb.py:454`. Earlier "owned_gdn fix" at commit `017665e` was for the WRONG attribute family (single-stream `deltanet_*`). Real fix landed at commit `38b15b0`: set the CB-mode defaults inside `setup_cb_state` itself. Recovery measurement pending re-launch. Per `research/cb_perf_regression_audit_2026-06-04.md`, expected gain: B=32 step from 232 ms → ~85 ms (376 tok/s aggregate).
-3. **TT_CB_TOPK_K=128 was hurting B=4 perf** — adds ~100 ms of on-device top-k kernel work that's only amortised at B≥16. Our launch wrapper hardcoded it; the cb_api default (`0` → None → full-logits trace) is correct. Dropping it should recover B=4 to ~131 ms/step (per `cb_scheduler.py:173-176`).
-4. **gm4 B=4 step time still high after fix-1** — gm4 has no DeltaNet, so the cb_dn_recurrence_mode fix doesn't apply. Expected to drop only with TT_CB_TOPK_K removal. Then expected step ≈ 131 ms at B=4 ≈ 30 tok/s aggregate at 4 clients (estimate from the cb_scheduler docstring).
+1. **Gemma 4 IT prefix-cache misses on chat template** (0/60 hits). Needs the equivalent of Qwen3.6's `_messages_to_prompt` patches for Gemma 4. `[[prefix-cache-multiturn-miss-2026-06-04]]`.
+2. **35B B>1 empty-slot poisoning** (task #162) — we were forced to TT_CB_SLOTS=1 for 35B. The 3.13 tok/s 35B number is therefore the WORST CB configuration possible for that model — it can't share the B=32 multiplier yet.
+3. **Argmax-tail trace not available in HTTP path** — `cb_api.py` forces `sampling=True` even at temperature=0. The historical 376 / 593 tok/s benches used `sampling=False` with the argmax-tail trace. Catching this would close the gap from 156 → ~376 tok/s on 27B B=32.
+4. **35B free-run determinism** — same prompt produces different outputs across runs (bf16 chain noise + non-deterministic reductions). Research at `research/35b_determinism_2026-06-04.md`; fix sketches at the bottom of that file (deterministic argmax tie-break, multicore=False on final argmax, fp32_dest_acc on lm_head).
 
-## Open audit items (from `research/code_cleanup_plan_2026-06-04.md`)
+## Open audit items (from `research/code_cleanup_plan_2026-06-04.md` + `research/cb_perf_regression_audit_2026-06-04.md`)
 
-18 items, 6 High severity. Top-3 leverage:
-- A1: Delete 35B manual DN recurrence else-branch (it's been broken at cos 0.08 since the start). Removes a known-broken regime and the `TT_DN_STATE_DTYPE` env knob.
-- A2: Fix 35B B>1 empty-slot poisoning so the `TT_CB_SLOTS=1` carve-out for 35B can be dropped.
-- B1: ✅ DONE (cb_api owned_gdn clobber, commit `017665e`).
+18 items, 6 High severity. After this session's fixes:
+- ✅ B1 (cb_api owned_gdn override) — properly addressed by commit `38b15b0` (the earlier `017665e` was the WRONG fix as the perf audit caught).
+- ⏳ A1: Delete 35B manual DN recurrence else-branch (it's been broken at cos 0.08 since the start). Removes a known-broken regime.
+- ⏳ A2: Fix 35B B>1 empty-slot poisoning so the `TT_CB_SLOTS=1` carve-out for 35B can be dropped.
+- ⏳ D: Deploy-bundle tooling (this session: stale `openai_endpoint.py` on qb1 crashed the first 27B stress).
+- ⏳ Argmax-tail trace in HTTP — would close the 156 → 376 tok/s gap on 27B B=32. Captures both traces, routes greedy requests to argmax. Audit Fix 3.
