@@ -10,32 +10,34 @@ Read top to bottom; everything else is linked.
 **The user wants you to keep going through the queue below without
 asking; they're not stopping for status updates.**
 
-### Live RIGHT NOW on qb1
-- **cb35 dev harness** RESIDENT (~22 min in). Per-layer drift probe ran,
-  found NO cliff. drift_ladder reran 7/8 pass. Needle-haystack sanity
-  sweep IN FLIGHT (L=100/200/300/460 × 2 trials), confirmed
-  **bf16 free-run non-determinism** — same seed flips Y↔N.
-- **5 presentation subagents** dispatched in background — workstream
-  `presentation/` (writes to feed slides on branch `presentation/cs440lx-prep`).
-  Agent #1 (workflow) completed → `presentation/01_workflow.md`.
-  Agents 2-5 (perf catalog / TT-reuse / throughput / challenges) still running.
+### Live RIGHT NOW
+- **Server**: STOPPED (qb1 in use by a colleague, paused at user request).
+  Will resume when free. All experiments paused.
+- **Code state**: all session fixes committed + pushed (see `git log --oneline -20`).
+- **Last verified perf** (HTTP CB, traced, owned_gdn, argmax-tail fast path):
+  - Gemma 4 12B IT B=32: **8.35 / 89.25 / 172.52 / 316.12** tok/s at 1/8/16/32 clients (27.7×)
+  - Qwen3.6-27B B=32: **8.32 / 61.27 / 117.62 / 232.12** tok/s at 1/8/16/32 clients (27.9×)
+  - Single-client streaming: gm4 TTFT 1.40s, decode 17.4 tok/s; 27B TTFT 1.70s, decode 11.5 tok/s
+  - 35B at TT_CB_SLOTS=1: 3.13 tok/s (blocked by task #162 for B>1)
 
-### What's queued (do these in order — recipe at `research/model_bringup_recipe.md`)
+### What's queued
 
-| # | Task | State | Briefing / file |
-|---|---|---|---|
-| 1 | **Gemma 4 perf opt P1** (vocab-shard) | ✅ DONE — 47.5 ms/tok traced (+8%) | `[[feedback-p22-gm4-vocab-shard-result]]` |
-| 2 | **35B-A3B drift bisection** | ✅ DONE — drift GONE | `[[35b-drift-resolved-2026-06-04]]` |
-| 3 | **35B needle-haystack** | ✅ DONE — bf16 non-deterministic, ~50/50 per trial, coherent failures | `[[35b-needle-haystack-2026-06-04]]` |
-| 4 | **35B multi-turn Q&A** | ✅ DONE — 3/3 retention works | `[[35b-multiturn-qa-2026-06-04]]` |
-| 5 | **Server stress (Gemma 4 IT, traced, B=4)** | ✅ DONE — 1.96×/3.88× scaling at 2/4 clients | `presentation/screenshots/stress_concurrent_chat_*.json` |
-| 6 | **Multi-turn HTTP (PC demo)** | ⚠️ BUG FOUND — 0 PC hits in chat-template multi-turn; matcher requires byte-exact prefix | `[[prefix-cache-multiturn-miss-2026-06-04]]` |
-| 7 | **27B HTTP perf baseline** | 🔄 BOOTSTRAPPING — first run after cb_api.py override deletion (was silently routing through manual DN path) | `[[cb-api-clobbered-27b-owned-gdn]]` |
-| 8 | **35B HTTP stress** | ⏳ after 27B | same script, restart with TT_BACKEND=35b |
-| 9 | **Code cleanup execution** (18 items) | ⏳ from `research/code_cleanup_plan_2026-06-04.md` — 6 High severity | top-3 leverage: A1 delete 35B manual DN, A2 fix B>1 empty-slot poison, B1 already done (cb_api override) |
-| 10 | **Gemma 4 perf P2/P3** (tasks #178/179) | ⏳ design ready | `research/gemma4_perf_briefing_2026-06-04.md` |
-| 11 | **Presentation deck assembly** (task #172) | 5/5 subagent reports IN — assemble next | `presentation/01..05_*.md` |
-| 12 | **Stretch: chat TUI tools + Gemma vision** (#174-176) | ⏳ | scripts/chat.py + Gemma vision wiring |
+| # | Task | State |
+|---|---|---|
+| 1 | Gemma 4 perf | ✅ +8% vocab-shard, +94% argmax-tail, gm4 = 316 tok/s at B=32 |
+| 2 | 27B perf | ✅ +75% cb_dn_recurrence fix, +48% argmax-tail, 27B = 232 tok/s at B=32 |
+| 3 | 35B drift / multi-turn Q&A / needle | ✅ resolved + 3/3 PASS + 50/50 (bf16 floor) |
+| 4 | Multi-turn HTTP with PC (27B) | ✅ 6.3× speedup on turn 2 (PC hits) |
+| 5 | Gemma 4 multi-turn PC | ⏳ scheduler-side canonicalisation shipped (commit `8aeeb53`); validator finds a SECOND chat-template asymmetry (`<|channel>thought\n<channel|>` suffix). Fix designed, parked pending test. See `research/gemma4_pc_chat_template_asymmetry_2026-06-04.md`. |
+| 6 | bf16 determinism | ⏳ `use_multicore=False` on lm_head argmax (commit `918c025`); needs server test to confirm perf cost + determinism win |
+| 7 | 35B B>1 empty-slot poisoning (#162) | ⏳ unblocks 35B aggregate AND spec-dec |
+| 8 | Gemma 4 perf P2 (distributed RMSNorm) | ⏳ design in `research/gemma4_perf_briefing_2026-06-04.md` |
+| 9 | Gemma 4 perf P3 (paged SDPA on globals) | ⏳ design in same briefing |
+| 10 | TUI hardening | ✅ commits `c523d28`, `c88f6d5`, `f20bb81`, `0e5a8f5`; README `scripts/CHAT_TUI.md` |
+| 11 | TUI screenshots for poster | ⏳ needs server back up |
+| 12 | Spec-dec (Qwen 3B + 35B) | ⏳ feasibility in `research/speculative_decoding_plan_2026-06-04.md`; blocked on #162 |
+| 13 | Cleanup audit (18 items) | ⏳ 3 done (B1 cb_api, A1 docs, determinism); 15 pending |
+| 14 | Poster v3 | ✅ Tenstorrent sky-blue, columns rebalanced, streaming numbers in |
 
 ### In-flight as of right now (compaction-resilient: re-check these after compaction)
 - **35B per-layer drift probe** — `cb35` tmux harness bootstrapping
