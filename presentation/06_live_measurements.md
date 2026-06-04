@@ -74,7 +74,9 @@ Metrics: `cb_prefix_cache_hits_total = 1, cb_prefix_cache_misses_total = 9`. The
 ## Bugs surfaced + still open
 
 1. **Gemma 4 IT prefix-cache misses on chat template** (0/10 hits). Needs the equivalent of Qwen3.6's `_messages_to_prompt` patch for Gemma 4. `[[prefix-cache-multiturn-miss-2026-06-04]]`.
-2. **B=4 step time scaling 4-5× over B=1 single-seq** is more than BW-bound math predicts. Both 27B and Gemma 4 hit ~220 ms/step at B=4 vs B=1 traced ~50-80 ms. UNDER INVESTIGATION. Most likely: the trace replays the full B=4 forward (matmuls scale with B in activation dim) plus per-slot SDPA work. To confirm: run TT_CB_SLOTS=1 single-client and expect ~20 tok/s.
+2. **CB engine was silently running manual DN recurrence on 27B** — `cb_dn_recurrence_mode` was never set, defaulted to "manual" via getattr in `server_tp_cb.py:454`. Earlier "owned_gdn fix" at commit `017665e` was for the WRONG attribute family (single-stream `deltanet_*`). Real fix landed at commit `38b15b0`: set the CB-mode defaults inside `setup_cb_state` itself. Recovery measurement pending re-launch. Per `research/cb_perf_regression_audit_2026-06-04.md`, expected gain: B=32 step from 232 ms → ~85 ms (376 tok/s aggregate).
+3. **TT_CB_TOPK_K=128 was hurting B=4 perf** — adds ~100 ms of on-device top-k kernel work that's only amortised at B≥16. Our launch wrapper hardcoded it; the cb_api default (`0` → None → full-logits trace) is correct. Dropping it should recover B=4 to ~131 ms/step (per `cb_scheduler.py:173-176`).
+4. **gm4 B=4 step time still high after fix-1** — gm4 has no DeltaNet, so the cb_dn_recurrence_mode fix doesn't apply. Expected to drop only with TT_CB_TOPK_K removal. Then expected step ≈ 131 ms at B=4 ≈ 30 tok/s aggregate at 4 clients (estimate from the cb_scheduler docstring).
 
 ## Open audit items (from `research/code_cleanup_plan_2026-06-04.md`)
 

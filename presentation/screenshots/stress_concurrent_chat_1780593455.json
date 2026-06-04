@@ -1,0 +1,30 @@
+{
+  "args": {
+    "url": "http://127.0.0.1:8000",
+    "model": "Qwen/Qwen3.6-35B-A3B",
+    "clients": "1",
+    "max_tokens": 64,
+    "out": "/home/aditya/tt-xla/presentation/screenshots/stress_concurrent_chat_1780593455.json"
+  },
+  "rounds": [
+    {
+      "n_clients": 1,
+      "wall_s": 20.464,
+      "total_completion_tokens": 64,
+      "aggregate_tok_s": 3.128,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 20.462,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - The user just said \"Paris\"\n   - This is a very short, direct, and factual response\n   - I need to respond appropriately\n\n2.  **Iden",
+          "prompt_tokens": 19,
+          "completion_tokens": 64,
+          "total_tokens": 83,
+          "tok_s_completion": 3.1277148669816066
+        }
+      ]
+    }
+  ]
+}

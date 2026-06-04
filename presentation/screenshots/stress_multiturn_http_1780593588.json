@@ -1,0 +1,35 @@
+{
+  "args": {
+    "url": "http://127.0.0.1:8000",
+    "model": "Qwen/Qwen3.6-35B-A3B",
+    "turns": 3,
+    "max_tokens": 48,
+    "out": "/home/aditya/tt-xla/presentation/screenshots/stress_multiturn_http_1780593588.json"
+  },
+  "rows": [
+    {
+      "turn": 0,
+      "prompt_tokens": 32,
+      "completion_tokens": 48,
+      "wall_s": 19.74,
+      "user": "Hello! My name is Aditya. Could you suggest a 4-character abbreviation I can use as a nickname?",
+      "assistant": "<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - The user just said \"I'm'm'm'm'm'm'm'm'm'm'm'm'm'm'm'm'm'm'm'm'm"
+    },
+    {
+      "turn": 1,
+      "prompt_tokens": 105,
+      "completion_tokens": 43,
+      "wall_s": 36.256,
+      "user": "Tell me a one-sentence interesting fact about chess.",
+      "assistant": "<think>\n\n</think>\n\nSure! Here's a fun fact: Chess is one of the oldest known board games, with origins tracing back to 6th-century India, and it has been played worldwide for centuries."
+    },
+    {
+      "turn": 2,
+      "prompt_tokens": 177,
+      "completion_tokens": 48,
+      "wall_s": 54.87,
+      "user": "Now combine both \u2014 write a one-sentence chess strategy named after the nickname you suggested for me.",
+      "assistant": "<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:** The user just said \"I\" (or maybe they meant to type something else). I need to respond appropriately.\n2.  3."
+    }
+  ]
+}

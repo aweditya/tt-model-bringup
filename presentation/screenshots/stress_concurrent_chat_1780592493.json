@@ -1,0 +1,30 @@
+{
+  "args": {
+    "url": "http://127.0.0.1:8000",
+    "model": "Qwen/Qwen3.6-27B",
+    "clients": "1",
+    "max_tokens": 64,
+    "out": "/home/aditya/tt-xla/presentation/screenshots/stress_concurrent_chat_1780592493.json"
+  },
+  "rounds": [
+    {
+      "n_clients": 1,
+      "wall_s": 18.633,
+      "total_completion_tokens": 64,
+      "aggregate_tok_s": 3.435,
+      "per_client": [
+        {
+          "idx": 0,
+          "ok": true,
+          "elapsed_s": 18.632,
+          "prompt": "Tell me about the city of Paris in three sentences.",
+          "completion": "<think>\n\n</think>\n\nParis, the capital of France, is renowned worldwide for its rich history, iconic landmarks like the Eiffel Tower, and profound influence on art, fashion, and gastronomy. The city's ",
+          "prompt_tokens": 19,
+          "completion_tokens": 64,
+          "total_tokens": 83,
+          "tok_s_completion": 3.4349674627807283
+        }
+      ]
+    }
+  ]
+}
