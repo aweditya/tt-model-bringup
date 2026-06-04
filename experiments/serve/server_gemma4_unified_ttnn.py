@@ -380,13 +380,26 @@ def bootstrap(state, log=None):
     state.final_norm_tt = np_to_replicated(final_norm_w, state.mesh)
     log(f"  final_norm: {final_norm_w.shape}")
 
-    # Tied lm_head (plan §1.8): lm_head ≡ embed_table.T. Upload separately
-    # in [HIDDEN, VOCAB] layout for the final matmul. Memory: ~2 GB/chip
-    # bf16 — fits easily in P150's 31.8 GB. For v0.2 we keep it replicated;
-    # vocab-sharded variant can come later (see 27B's
-    # `server_tp.py:1680-1687` pattern).
-    state.lm_head_tt = np_to_replicated(embed_w_np.T, state.mesh)
-    log(f"  lm_head (tied, replicated): {embed_w_np.T.shape}")
+    # Tied lm_head (plan §1.8): lm_head ≡ embed_table.T. Vocab-sharded on
+    # dim=-1 across the (1, NCHIPS) mesh — each chip holds [HIDDEN,
+    # VOCAB/NCHIPS]. Forward computes per-chip [B, VOCAB/NCHIPS] logits
+    # via TP matmul, all_gathers on dim=-1 to replicate full logits,
+    # slices to vocab_size, untilizes and on-device argmaxes — small
+    # readback. Forks 27B P22 (`server_tp.py:1680-1687`, commit `ef3f336`).
+    # Gemma 4 12B's VOCAB=262144 is cleanly divisible by 4 (=65536) and
+    # tile-aligned (65536 % 32 = 0). Pre-fix this was REPLICATED, costing
+    # ~2 GB/chip and forcing a [1, 262144] readback per token.
+    NCHIPS = 4
+    VOCAB = int(embed_w_np.shape[0])
+    assert VOCAB % NCHIPS == 0, f"VOCAB {VOCAB} not divisible by NCHIPS {NCHIPS}"
+    state.vocab_size = VOCAB  # cb_api / scheduler expect this attr
+    state.lm_head_tt = ttnn.from_torch(
+        torch.from_numpy(embed_w_np.T.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    log(f"  lm_head (tied, vocab-sharded dim=1, "
+        f"per-chip {VOCAB // NCHIPS}): {embed_w_np.T.shape}")
 
     # v0.3: KV cache + paged SDPA infrastructure (forked from 35B
     # `server_35b_ttnn.py:1700-1820` setup). Two head_dim variants —
@@ -756,6 +769,53 @@ def step_forward_v01(state, tok_id, capture):
     ttnn.deallocate(h_pre)
     capture["l0_out"] = _readback_replicated(h_l0, state.mesh)
     ttnn.deallocate(h_l0)
+
+
+def _lm_head_argmax(state, final, capture_logits=False):
+    """Sharded lm_head + softcap + all_gather + on-device argmax. Forks
+    27B P22 (`server_tp.py:1680-1687`, commit `ef3f336`).
+
+    Pipeline (per chip):
+      x [B, HIDDEN] @ lm_head[HIDDEN, VOCAB/4] → sharded_logits [B, VOCAB/4]
+      softcap: SOFTCAP·tanh(sharded_logits / SOFTCAP) (elementwise, sharded)
+      all_gather dim=-1                       → [B, VOCAB] replicated
+      slice [B, vocab_size]                   → ROW-MAJOR-friendly
+      untilize → argmax(keepdim=True, multicore) → [B, 1] UINT32
+
+    Returns (argmax_tt, full_logits_or_None). `capture_logits=True` keeps
+    the full [B, vocab_size] tensor for cosine validators (incurs a
+    bf16 readback, ~2 MB at vocab=262144 — fine for debug, off by
+    default).
+    """
+    # Per-chip matmul: weights are sharded on dim 1 (VOCAB axis); result
+    # is sharded the same way.
+    sharded = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
+    ttnn.deallocate(final)
+    # Softcap on the sharded tensor (cheaper than on the gathered).
+    inv = ttnn.multiply(sharded, 1.0 / FINAL_LOGIT_SOFTCAP)
+    ttnn.deallocate(sharded)
+    th = ttnn.tanh(inv)
+    ttnn.deallocate(inv)
+    sharded_softcapped = ttnn.multiply(th, FINAL_LOGIT_SOFTCAP)
+    ttnn.deallocate(th)
+    # All_gather to replicate the full logits on every chip.
+    gathered = ttnn.all_gather(sharded_softcapped, dim=-1)
+    ttnn.deallocate(sharded_softcapped)
+    # Slice to true vocab (in case of any tile padding); for Gemma 4 12B
+    # this is a no-op (262144 is tile-aligned).
+    vocab_size = getattr(state, "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = int(gathered.shape[-1])
+    sliced = ttnn.slice(gathered, [0, 0], [gathered.shape[0], vocab_size])
+    # Keep `gathered` alive: `sliced` is a VIEW. The full-logits readback
+    # (capture path) uses it; the argmax path consumes it.
+    full_logits = gathered if capture_logits else None
+    rm = ttnn.untilize(sliced, use_multicore=True)
+    if not capture_logits:
+        ttnn.deallocate(gathered)
+    argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
+    ttnn.deallocate(rm)
+    return argmax_tt, full_logits
 
 
 def _readback_replicated(t_tt, mesh):
@@ -1291,21 +1351,11 @@ def step_forward_v03(state, tok_id, capture=None):
     if capture is not None:
         capture["final_norm"] = _readback_replicated(final, state.mesh)
 
-    logits_raw = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
-    ttnn.deallocate(final)
-    inv = ttnn.multiply(logits_raw, 1.0 / FINAL_LOGIT_SOFTCAP)
-    ttnn.deallocate(logits_raw)
-    th = ttnn.tanh(inv)
-    ttnn.deallocate(inv)
-    logits = ttnn.multiply(th, FINAL_LOGIT_SOFTCAP)
-    ttnn.deallocate(th)
-    if capture is not None:
-        capture["logits"] = _readback_replicated(logits, state.mesh)
-
-    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-    ttnn.deallocate(logits)
-    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
-    ttnn.deallocate(logits_rm)
+    argmax_tt, full_logits = _lm_head_argmax(state, final,
+                                              capture_logits=(capture is not None))
+    if capture is not None and full_logits is not None:
+        capture["logits"] = _readback_replicated(full_logits, state.mesh)
+        ttnn.deallocate(full_logits)
     arr = ttnn.to_torch(argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
     ttnn.deallocate(argmax_tt)
     argmax = int(arr.reshape(-1)[0].item())
@@ -1346,25 +1396,11 @@ def step_forward_v02(state, tok_id, capture=None):
     if capture is not None:
         capture["final_norm"] = _readback_replicated(final, state.mesh)
 
-    # lm_head: replicated [HIDDEN, VOCAB]; per-chip matmul gives full logits.
-    logits_raw = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
-    ttnn.deallocate(final)
-
-    # Logit softcap: logits = SOFTCAP · tanh(logits / SOFTCAP). Monotonic so
-    # argmax is invariant — but sampling distributions depend on it.
-    inv = ttnn.multiply(logits_raw, 1.0 / FINAL_LOGIT_SOFTCAP)
-    ttnn.deallocate(logits_raw)
-    th = ttnn.tanh(inv)
-    ttnn.deallocate(inv)
-    logits = ttnn.multiply(th, FINAL_LOGIT_SOFTCAP)
-    ttnn.deallocate(th)
-    if capture is not None:
-        capture["logits"] = _readback_replicated(logits, state.mesh)
-
-    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-    ttnn.deallocate(logits)
-    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
-    ttnn.deallocate(logits_rm)
+    argmax_tt, full_logits = _lm_head_argmax(state, final,
+                                              capture_logits=(capture is not None))
+    if capture is not None and full_logits is not None:
+        capture["logits"] = _readback_replicated(full_logits, state.mesh)
+        ttnn.deallocate(full_logits)
     arr = ttnn.to_torch(argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
     ttnn.deallocate(argmax_tt)
     argmax = int(arr.reshape(-1)[0].item())
@@ -1427,18 +1463,7 @@ def forward_token_gm4_inner(state):
         h = h_new
     final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
     ttnn.deallocate(h)
-    logits_raw = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
-    ttnn.deallocate(final)
-    inv = ttnn.multiply(logits_raw, 1.0 / FINAL_LOGIT_SOFTCAP)
-    ttnn.deallocate(logits_raw)
-    th = ttnn.tanh(inv)
-    ttnn.deallocate(inv)
-    logits = ttnn.multiply(th, FINAL_LOGIT_SOFTCAP)
-    ttnn.deallocate(th)
-    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-    ttnn.deallocate(logits)
-    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
-    ttnn.deallocate(logits_rm)
+    argmax_tt, _ = _lm_head_argmax(state, final, capture_logits=False)
     return argmax_tt
 
 

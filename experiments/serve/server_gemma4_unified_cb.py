@@ -473,27 +473,22 @@ def forward_batch_gm4_inner(state, return_logits=False, return_topk=None):
 
     final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
     ttnn.deallocate(h)
-    logits_raw = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
-    ttnn.deallocate(final)
-    inv = ttnn.multiply(logits_raw, 1.0 / FINAL_LOGIT_SOFTCAP)
-    ttnn.deallocate(logits_raw)
-    th = ttnn.tanh(inv)
-    ttnn.deallocate(inv)
-    logits = ttnn.multiply(th, FINAL_LOGIT_SOFTCAP)
-    ttnn.deallocate(th)
+    # Vocab-sharded lm_head + softcap + on-device argmax. Forks 27B P22
+    # via the base server's _lm_head_argmax helper (lm_head is sharded
+    # on dim=1, per-chip matmul, all_gather, slice, untilize, argmax).
+    argmax_tt, full_logits = base._lm_head_argmax(
+        state, final, capture_logits=(return_logits or return_topk is not None))
     if return_logits:
-        return logits
+        # Full logits already gathered, sliced to [B, vocab].
+        ttnn.deallocate(argmax_tt)
+        return full_logits
     if return_topk is not None:
-        # On-device top-k: smaller readback than full logits (sampling path).
-        # sorted=True so index 0 is the argmax (free greedy fallback).
-        top_vals, top_idxs = ttnn.topk(logits, k=int(return_topk), dim=-1,
+        # Top-k over the already-gathered logits — small readback per slot.
+        top_vals, top_idxs = ttnn.topk(full_logits, k=int(return_topk), dim=-1,
                                        largest=True, sorted=True)
-        ttnn.deallocate(logits)
+        ttnn.deallocate(argmax_tt)
+        ttnn.deallocate(full_logits)
         return (top_vals, top_idxs)
-    logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-    ttnn.deallocate(logits)
-    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
-    ttnn.deallocate(logits_rm)
     return argmax_tt
 
 
