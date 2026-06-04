@@ -1710,7 +1710,10 @@ def step_forward_inner(state, capture=None):
     # On-device argmax requires ROW_MAJOR input (multicore argmax constraint).
     logits_rm = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
     ttnn.deallocate(logits)
-    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=True)
+    # use_multicore=False for determinism. Per research/35b_determinism_2026-06-04.md,
+    # the multicore variant lets different cores "win" identical-bit ties → free-run
+    # output flips between runs for the same prompt. Single-core argmax is bit-stable.
+    argmax_tt = ttnn.argmax(logits_rm, dim=-1, keepdim=True, use_multicore=False)
     ttnn.deallocate(logits_rm)
     # Return the device argmax tensor — the host readback happens in the
     # outer step_forward_ttnn (outside any captured trace region). B17-D.

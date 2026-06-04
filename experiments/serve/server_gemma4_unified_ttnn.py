@@ -835,7 +835,9 @@ def _lm_head_argmax(state, final, capture_logits=False):
     rm = ttnn.untilize(sliced, use_multicore=True)
     if not capture_logits:
         ttnn.deallocate(gathered)
-    argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=True)
+    # use_multicore=False for determinism (cross-core tie-break race; see
+    # research/35b_determinism_2026-06-04.md). Negligible perf cost at vocab=262144/4.
+    argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=False)
     ttnn.deallocate(rm)
     # Normalize rank to match the 27B contract that cb_scheduler expects:
     # argmax → [B, 1]; full_logits → [B, vocab_size]. Gemma 4's activations

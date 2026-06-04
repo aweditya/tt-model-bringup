@@ -1683,7 +1683,9 @@ def forward_token_tp_inner(state, return_logits: bool = False):
     rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
     if return_logits:
         return rm_logits_tt
-    argmax_tt = ttnn.argmax(rm_logits_tt, dim=-1, keepdim=True, use_multicore=True)
+    # use_multicore=False for determinism (cross-core tie-break race; see
+    # research/35b_determinism_2026-06-04.md). Same fix applied to gm4 + 35B.
+    argmax_tt = ttnn.argmax(rm_logits_tt, dim=-1, keepdim=True, use_multicore=False)
     return argmax_tt
 
 
