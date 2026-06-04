@@ -49,10 +49,28 @@ def setup_cb_state(state, B, blocks_per_seq=None):
     B: number of concurrent slots (fixed batch width, e.g. 32).
     blocks_per_seq: KV blocks reserved per slot (default = current NUM_BLOCKS,
       i.e. each slot gets MAX_POS/BLOCK_SIZE blocks).
+
+    Default fast-path flags (the CB forward consults these via getattr):
+      - cb_dn_recurrence_mode = "owned_gdn" → routes the DN step through the
+        custom kernel (qwen36_gdn_decode_owned). 376 / 593 tok/s at B=32/64
+        in `research/27b_cb_scope.md:687-688` requires this. The base
+        single-stream defaults (server_tp.MeshServerState.__init__) are
+        already "owned_gdn"; the CB analogue must match.
+      - cb_conv_mode = "shiftacc" → 3-column shift-accumulate conv1d
+        (DNK-G4 default; produces the 593 number).
+
+    Both are explicitly set here so the CB engine never silently falls
+    through to the slow `manual` defaults. Caller can override AFTER
+    setup_cb_state if needed for an A/B test, but should not leave them
+    unset.
     """
     cfg = state.cfg
     mesh = state.mesh
     state.cb_B = B
+    if not hasattr(state, 'cb_dn_recurrence_mode'):
+        state.cb_dn_recurrence_mode = "owned_gdn"
+    if not hasattr(state, 'cb_conv_mode'):
+        state.cb_conv_mode = "shiftacc"
     BLOCK_SIZE = base.BLOCK_SIZE
     if blocks_per_seq is None:
         blocks_per_seq = base.NUM_BLOCKS  # per slot, same context budget as B=1
