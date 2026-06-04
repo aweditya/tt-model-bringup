@@ -11,29 +11,31 @@ Read top to bottom; everything else is linked.
 asking; they're not stopping for status updates.**
 
 ### Live RIGHT NOW on qb1
-- **Server**: `serve_cb.sh start` is running with **Gemma 4 12B
-  Instruct** (`TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it TT_MODEL_ID=google/gemma-4-12B-it`)
-  on port 8000. PID ~517177 (check `bash experiments/serve/scripts/serve_cb.sh status`).
-- **Stack on disk**: HEAD is `a24f2ea` "perf(gm4): P1 — vocab-sharded
-  lm_head". The vocab-sharded change is deployed but **PERF NUMBER
-  NOT YET MEASURED** — see "in-flight" below.
+- **cb35 dev harness** is bootstrapping (~14 min). After ready, will run
+  `experiments/cb/isolate/cb35_per_layer_drift_pos1.py` — the per-layer
+  cosine ladder bisecting the pos1→pos5 drift cliff.
+- **Stack on disk**: HEAD is `0418e83` "fix(gm4): build_key_to_shard
+  tolerates IT-variant multi-snapshot layout". P1 vocab-shard ALREADY
+  MEASURED — `47.5 ms/tok traced (+8.0%)`, see
+  `[[feedback-p22-gm4-vocab-shard-result]]`.
 
 ### What's queued (do these in order — recipe at `research/model_bringup_recipe.md`)
 
 | # | Task | State | Briefing / file |
 |---|---|---|---|
-| 1 | **Gemma 4 perf opt P1** (vocab-shard) | code SHIPPED, **measurement IN FLIGHT** | `research/gemma4_perf_briefing_2026-06-04.md` |
-| 2 | **Gemma 4 perf opt P2** (distributed RMSNorm) | not started; design in briefing | same |
-| 3 | **Gemma 4 perf opt P3** (paged SDPA on global layers) | not started; design in briefing | same |
-| 4 | **35B-A3B drift overnight** | server hook ALREADY exists (no diff); design ready | `research/35b_drift_briefing_2026-06-04.md` |
+| 1 | **Gemma 4 perf opt P1** (vocab-shard) | ✅ DONE — 47.5 ms/tok traced (+8%) | `[[feedback-p22-gm4-vocab-shard-result]]` |
+| 2 | **35B-A3B drift bisection** | probe deployed, harness bootstrapping | `research/35b_drift_briefing_2026-06-04.md` |
+| 3 | **Gemma 4 perf opt P2** (distributed RMSNorm) | not started; design in briefing | `research/gemma4_perf_briefing_2026-06-04.md` |
+| 4 | **Gemma 4 perf opt P3** (paged SDPA on global layers) | not started; design in briefing | same |
 
 ### In-flight as of right now (compaction-resilient: re-check these after compaction)
-- **Server bootstrap measurement** — `serve_cb.sh` is bootstrapping IT
-  with the vocab-sharded lm_head. Once `/health` returns 200,
-  curl `/v1/chat/completions` and read TTFT/tok_per_sec. **Baseline
-  before vocab-shard: 51.3 ms/tok traced single-seq (19.5 tok/s).**
-  Expected post-shard: ~48 ms/tok (+5-8%). Capture in
-  `feedback_p22_gm4_vocab_shard_result.md` memory after measuring.
+- **35B per-layer drift probe** — `cb35` tmux harness bootstrapping.
+  Once `[harness] ready. Drop trigger files` appears in
+  `~/tt-xla/.cache/cb35_runtime/harness.log`, run:
+  `ssh qb1 'touch ~/tt-xla/.cache/cb35_runtime/trig/per_layer_drift_pos1'`
+  Watches `~/tt-xla/.cache/cb35_runtime/trig/last.log` for verdict.
+  Output JSON: `~/tt-xla/.cache/cb35_runtime/per_layer_drift_pos1.json`.
+  Pins owned_gdn=ON + dn_state_dtype=bf16 (manual path broken).
 - **No subagents running** — both finished. Briefings saved:
   - `research/gemma4_perf_briefing_2026-06-04.md` — TOP-3 perf opts
     + Tracy capture commands + roofline. Read this first when starting perf.
