@@ -5,21 +5,27 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## POST-WIN QUICK-START (2026-06-05 09:09 PT) — **G1 KERNEL COMPLETE** ✓
+## POST-WIN QUICK-START (2026-06-05 09:46 PT) — **G1 + G2 DONE** ✓
 
-**Where we are**: G1 **single-core kernel DONE**. Modes 1-5 all PASS.
-The Nemotron-3 Mamba2 SSD decode kernel is end-to-end correct on
-single-core, B=1, single-head. Commit `b2c4ccc`.
+**Where we are**: G1 single-core kernel + G2 multi-core sharding (64
+heads, full Nemotron shapes) are both complete. G3 partial (B>1 single
+or small-multi heads PASS; B>1 + 64 heads parked). Drop-ready for
+Phase 1 server integration at B=1.
 
-Production math:
+Production math (mode=5):
 - `state_out[d, s] = decay * state_in[d, s] + dt_eff * x[d] * B[s]`
-- `y[d] = C · state_out^T[d] + D · x[d]`  ← mode=5 = production
+- `y[d] = C · state_out^T[d] + D · x[d]`
 
-Latest regression sweep:
+Regression sweep (single-head precision after multi-step fix):
 - mode=2: state cos=1.000000
-- mode=3: state cos=0.999707, y sentinel
-- mode=4: state cos=0.999707, y cos=**0.999998** (y_naive vs state_in)
-- mode=5: state cos=0.999707, y cos=**0.999852** (PRODUCTION)
+- mode=3: state cos=1.000000 (was 0.999707 pre-fix)
+- mode=4: state cos=1.000000, y cos=0.999996
+- mode=5: state cos=1.000000, y cos=0.999996
+- 8-step multi-step replay: per-step cos ≥ 0.9999 ✓
+- G2 multi-head smoke (B=1, NUM_HEADS=64): state cos=0.999999, y cos=0.999995 ✓
+
+Run the full regression at any time:
+  `ssh $TT_HOST 'cd ~/tt-xla && bash experiments/cb/isolate/mamba2_regression_sweep.sh'`
 
 **🔑 THE 4-INGREDIENT RECIPE** (memory: [[feedback-mm-init-prime-required]]):
 The Blackhole TRISC pipeline hangs at ~4 transpose+matmul+binary iters
@@ -54,33 +60,39 @@ no effect without the short init.
 
 `cb_outer` is bf16 (matches GDN's tensor_format).
 
-**Exact next task**: G1 **day-5** — multi-step replay via G0a harness.
+**Exact next task**: G4 — Python wrapper + Phase 1 server scaffold.
 
-The kernel is correct for ONE decode step. Production decode runs
-hundreds of sequential steps with state feedback. The G0a harness at
-`experiments/utils/test_mamba2_decode_isolated.py` exercises this:
-1. Initial `state_in[0]`, run kernel → produces `state_out[0], y[0]`
-2. Feed `state_in[1] = state_out[0]`, run kernel → produces step 1
-3. Repeat 8 times; compare each step's outputs to the numpy oracle.
+The kernel is drop-ready. Phase 1 server integration is the next
+substantial unit of work. Steps:
 
-Gate: per-step cos ≥ 0.999, **no drift past pos 8**. If drift appears
-at later positions, that's a precision / fp32-acc / pack-format issue
-to investigate (not a fundamental correctness bug — single-step is
-proven).
+1. **Python wrapper** at `experiments/serve/nemotron3_mamba2_step.py` (or
+   similar) — wraps the per-step kernel call, takes a per-(batch, head)
+   fixture from the CB engine's slot store, handles tile-row padding +
+   per-group B/C replication, returns y + updated state. Pattern fork
+   from `experiments/serve/server_35b_ttnn.py`'s `dn_forward_ttnn`.
+2. **Architecture scaffold** at `experiments/serve/server_nemotron3_ttnn.py`
+   — bootstrap, weight upload, 52-layer hybrid dispatch
+   (`hybrid_override_pattern` = 23 Mamba2 + 23 MoE + 6 GQA Attention).
+   Heavy fork from `server_35b_ttnn.py` (also a hybrid model).
+3. **HF oracle** at `experiments/utils/hf_reference_nemotron3_nano.py` —
+   `trust_remote_code=True`, per-layer hooks for `state_out`, `y`,
+   attention K/V cache to feed v0.1.x per-layer cosine ladders.
 
-Recipe:
-1. Drive the harness with `--kernel-callable ttnn.experimental.nemotron3_mamba2_decode_owned`
-2. Wrap our op signature into the harness's expected callable interface
-3. Run 8 steps, check per-step cos + accumulated drift
+**G3 batched (B>1) parked** — see plan §3a. Hangs/NaN when
+`blocks_per_core > 1` at full 64-head shapes. Not a Phase 1 blocker
+(CB engine handles concurrency at server layer; same pattern as 27B/35B).
+Resume after Phase 1 server validates end-to-end correctness.
 
-**Then G2-G4** (each blocks the next):
-- **G2**: multi-core sharding — fan 64 heads across the Tensix grid
-  (currently 1 core / 1 head). Program-factory work + per-block
-  per-core runtime arg assignment.
-- **G3**: batched (B > 1). Likely needs a different SPMD partition
-  (per-(batch, head) blocks) and minor reader/writer changes.
-- **G4**: Python wrapper + Phase 1 server integration. Replaces the
-  per-step manual ttnn composite in `experiments/serve/server_*_ttnn.py`.
+**Phase 1 sub-stages** (after G4 lands):
+- v0.0: HF oracle + tokenizer + RAM check on the QuietBox host
+- v0.1: bootstrap mesh + embed lookup + final_norm
+- v0.1.1: L0 (Mamba2) eager composite using the owned kernel — cos ≥ 0.999 vs HF
+- v0.1.2: L1 (MoE) — fork from 35B's Pattern A batched
+- v0.1.3: L5 (Attention) — simplest attention we've shipped (no RoPE, no Q-gate)
+- v0.2: all 52 layers + final_norm + lm_head + argmax — argmax match HF at pos 0
+- v0.3+: multi-step decode + chat smoke + CB integration
+
+Plan: `research/nemotron3_nano_30b_a3b_bringup_plan.md` §3b.
 
 **Memory entries**:
 - [[feedback-mm-init-prime-required]] — the 4-ingredient recipe

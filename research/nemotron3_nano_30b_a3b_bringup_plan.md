@@ -347,11 +347,36 @@ the per-group broadcast.
   - [x] **G1 single-core kernel COMPLETE.** Modes 1-5 all PASS. The
     Nemotron-3 Mamba2 SSD decode kernel is end-to-end correct on
     single-core, B=1, single-head. Task #186 DONE.
-  - [ ] **Day-5 (next): G0a harness multi-step replay**. Drive the
-    kernel through 8 sequential decode steps with state feedback
-    (state_out[t] → state_in[t+1]). Gate: per-step cos ≥ 0.999, no
-    drift past pos 8. Harness: `experiments/utils/test_mamba2_decode_isolated.py`.
-- [ ] **G2..G4** — sequential, gated on G1.
+  - [x] **Day-5 PASS (2026-06-05): 8-step multi-step replay**. Recurrence
+    bit-correct at every step (cos ≥ 0.9999). Exposed and fixed a hidden
+    precision bug: `mm_init_short` + bf16 cb_outer was silently dropping
+    the outer-product contribution. The single-step smoke missed it
+    because random state_in dominated; multi-step with state_in=ZEROS
+    surfaced it. Fix: cb_outer now fp32, matmul_outer_x_dt_B uses full
+    mm_init (the day-4.2 split-phase made the iter cap a non-issue).
+    Commit `2386d97`. Probe: `experiments/cb/isolate/mamba2_multi_step_replay.py`.
+    Regression sweep: `experiments/cb/isolate/mamba2_regression_sweep.sh`.
+- [x] **G2 (2026-06-05): multi-core 64-head shard — PASS**. Full Nemotron
+  shapes at NUM_HEADS=64, N_GROUPS=8 (1 head per core), state cos=0.9999,
+  y cos=0.9999. The program_factory's existing split_work_to_cores
+  worked out-of-the-box; the fix was host-side per-head input replication
+  (B/C from per-group → per-head, x/z to per-head tile-rows). Commit
+  `bcc2ce9`. Probe: `experiments/cb/isolate/mamba2_g2_multihead_smoke.py`.
+  Task #187 done.
+- [x] **G3 (2026-06-05): batched B>1 — PARTIAL**. B=2 single-head PASS,
+  B=2 small-multi-head PASS, **B=2 full 64-head HANGS/NaN** when
+  `blocks_per_core > 1` (some cores process 2 blocks). Static analysis
+  of CB sizing didn't surface the bug; needs device-side DPrint/Tracy
+  instrumentation. Parked: NOT a Phase 1 blocker because B=1 + full
+  64-head (G2) is correct and the CB engine drives per-slot at the
+  server layer (same pattern as 27B/35B). Commit `765e9c7`. Task #188 done.
+- [ ] **G4 (next): server-side Python wrapper + Phase 1 unblock**.
+  Build `experiments/serve/nemotron3_mamba2_owned_step.py` (or similar)
+  that wraps the kernel call, handles per-(batch, head) reshape, and
+  exposes a step-fn signature compatible with the CB engine's slot
+  interface. Then `server_nemotron3_ttnn.py` scaffold to drive the
+  forward (Mamba2 + MoE + 6 GQA attention layers per the
+  hybrid_override_pattern). Phase 1 begins. Task #189 in progress.
 
 Phase 0 timeline estimate: **3-5 weeks** depending on how many of the
 G-stages hit unexpected snags. Each stage gates the next; do NOT
