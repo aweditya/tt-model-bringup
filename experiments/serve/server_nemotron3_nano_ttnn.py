@@ -160,6 +160,73 @@ def upload_attn_layer(state, key_to_shard, L: int, log) -> dict:
     return out
 
 
+def upload_mamba2_layer(state, key_to_shard, L: int, log) -> dict:
+    """Upload Mamba2-layer weights (pre-norm + in_proj/conv1d/dt_bias/A_log/D
+    /norm/out_proj). Replicated across the mesh for v0.1.2 (no head
+    sharding yet — v0.5 perf concern).
+
+    Per-tensor shapes (from architecture brief + v0.0.2 introspect):
+      norm           [HIDDEN]
+      in_proj        [d_inner + conv_dim + num_heads, HIDDEN]
+                     where conv_dim = d_inner + 2*n_groups*ssm_state
+      conv1d.weight  [conv_dim, 1, conv_kernel]
+      conv1d.bias    [conv_dim]
+      dt_bias        [num_heads]
+      A_log          [num_heads]
+      D              [num_heads]
+      norm.weight    [d_inner]  (MambaRMSNormGated; group_size=d_inner/n_groups)
+      out_proj       [HIDDEN, d_inner]
+
+    Helper constants (locally):
+      d_inner   = MAMBA_HEADS * MAMBA_HEAD_DIM = 4096
+      conv_dim  = d_inner + 2 * N_GROUPS * SSM_STATE = 6144
+    """
+    prefix = f"backbone.layers.{L}"
+    mp = f"{prefix}.mixer"
+    in_dim = D_INNER + CONV_DIM_M + MAMBA_HEADS  # 4096 + 6144 + 64 = 10304
+
+    norm_w = load_t(key_to_shard, f"{prefix}.norm.weight")
+    in_proj_w = load_t(key_to_shard, f"{mp}.in_proj.weight")
+    conv1d_w = load_t(key_to_shard, f"{mp}.conv1d.weight")  # [conv_dim, 1, kernel]
+    conv1d_b = load_t(key_to_shard, f"{mp}.conv1d.bias")
+    dt_bias = load_t(key_to_shard, f"{mp}.dt_bias")
+    A_log = load_t(key_to_shard, f"{mp}.A_log")
+    D_w = load_t(key_to_shard, f"{mp}.D")
+    mixer_norm_w = load_t(key_to_shard, f"{mp}.norm.weight")
+    out_proj_w = load_t(key_to_shard, f"{mp}.out_proj.weight")
+
+    assert norm_w.shape == (HIDDEN,)
+    assert in_proj_w.shape == (in_dim, HIDDEN), in_proj_w.shape
+    assert conv1d_w.shape == (CONV_DIM_M, 1, CONV_KERNEL), conv1d_w.shape
+    assert conv1d_b.shape == (CONV_DIM_M,)
+    assert dt_bias.shape == (MAMBA_HEADS,)
+    assert A_log.shape == (MAMBA_HEADS,)
+    assert D_w.shape == (MAMBA_HEADS,)
+    assert mixer_norm_w.shape == (D_INNER,)
+    assert out_proj_w.shape == (HIDDEN, D_INNER), out_proj_w.shape
+
+    out = {
+        "kind": "mamba2",
+        "norm": np_to_replicated(norm_w, state.mesh),
+        # in_proj uploaded pre-transposed for matmul [HIDDEN, in_dim].
+        "in_proj": np_to_replicated(in_proj_w.T, state.mesh),
+        # conv1d weights/biases kept as numpy for now; we'll plumb them
+        # into qwen36_conv1d_decode_owned at v0.1.2.b. Host-side copies
+        # mean we don't yet pay the upload cost.
+        "conv1d_w_np": conv1d_w.copy(),
+        "conv1d_b_np": conv1d_b.copy(),
+        "dt_bias_np": dt_bias.copy(),
+        "A_log_np": A_log.copy(),
+        "D_np": D_w.copy(),
+        "mixer_norm_w_np": mixer_norm_w.copy(),
+        # out_proj uploaded pre-transposed for matmul [d_inner, HIDDEN].
+        "out_proj": np_to_replicated(out_proj_w.T, state.mesh),
+    }
+    log(f"  L{L} (mamba2): norm + in_proj + out_proj uploaded replicated bf16; "
+        f"conv1d / dt_bias / A_log / D / mixer_norm held host-side for v0.1.2.b+")
+    return out
+
+
 # ── State ──────────────────────────────────────────────────────────────
 class State:
     """All bootstrap state lives here so cb_api can stash it on a single object.
@@ -271,9 +338,11 @@ def bootstrap(state: State, log=None):
             kind = state.layer_types[L]
             if kind == "attention":
                 state.per_layer_tt[L] = upload_attn_layer(state, key_to_shard, L, log)
+            elif kind == "mamba2":
+                state.per_layer_tt[L] = upload_mamba2_layer(state, key_to_shard, L, log)
             else:
                 raise NotImplementedError(
-                    f"v0.1.1 only supports attention layers; L{L} is {kind!r}")
+                    f"v0.1.2 supports {{attention, mamba2}}; L{L} is {kind!r}")
         log(f"[bootstrap] v0.1.1 ready (sparse layer upload: {targets}).")
     else:
         log("[bootstrap] v0.1.0 ready (top-level only — no layers uploaded).")
@@ -490,6 +559,47 @@ def attn_block_eager(state: State, h_input_np, layer_idx: int):
         "v":          v_np,
         "o_proj_out": o_np,
         "block_out":  block_np,
+    }
+    if squeeze_batch:
+        for k in out:
+            out[k] = out[k][0]
+    return out
+
+
+# ── Mamba2 forward (v0.1.2) ───────────────────────────────────────────
+def mamba2_in_proj_only(state: State, h_input_np, layer_idx: int):
+    """v0.1.2.a — pre-norm + in_proj only. Sanity-check weight upload
+    and the [HIDDEN → d_inner + conv_dim + num_heads = 10304] matmul
+    before composing the rest of the Mamba2 block.
+
+    Input:  h_input_np  numpy fp32 [B, S, HIDDEN] (or [S, HIDDEN])
+    Output: dict with h_norm, in_proj_out as numpy fp32.
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "mamba2", \
+        f"L{layer_idx} weights not loaded as mamba2"
+
+    squeeze_batch = h_input_np.ndim == 2
+    if squeeze_batch:
+        h_input_np = h_input_np[None]
+
+    h_tt = ttnn.from_torch(
+        torch.from_numpy(h_input_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    h_norm_tt = ttnn.rms_norm(h_tt, weight=w["norm"], epsilon=EPS)
+    in_proj_tt = ttnn.matmul(h_norm_tt, w["in_proj"], compute_kernel_config=HIFI4)
+
+    def _readback(t):
+        arr = ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return arr[:1].float().numpy()
+
+    out = {
+        "h_norm":      _readback(h_norm_tt),
+        "in_proj_out": _readback(in_proj_tt),
     }
     if squeeze_batch:
         for k in out:
