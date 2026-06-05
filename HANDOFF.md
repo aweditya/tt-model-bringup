@@ -26,42 +26,49 @@ transition. Source checkpoint at commit `b5c93fa`.
   tt-metal #15930 = no `transpose_wh_uninit`).
 - `cb_outer` is bf16 (matches GDN's tensor_format).
 
-**Exact next task**: G1 **day-4.1 (REVISED 2026-06-05 post-research)** —
-**structural restructure**, not bisect.
+**Where we landed (2026-06-05 morning)**: Option A (matmul_reduce_C_state
+prime) IMPLEMENTED — math correct, structurally matches GDN, drops the
+bare-mm_init workaround. But mode=3 still HANGS at the 8-iter
+transpose+matmul+bcast+add loop.
 
-The 3 research subagents converged on a principled answer:
-- GDN doesn't need a prime because its **delta-rule math forces**
-  `pred = k · s_prev` (matmul_reduce) BEFORE the state update. Mamba2
-  SSD is linear — no `pred` term — so our `mm_init` prime is a
-  workaround for an init-ordering hole that doesn't exist in GDN.
-- **The fix is to pull mode=5's `y_partial = C · state_in^T` reduce
-  EARLIER in the pipeline**, giving us a real isolated `matmul_reduce`
-  before the transpose+matmul loop. Structurally identical to GDN. This
-  collapses day-4.1 + day-4.5 (mode 3+5) into one cleaner change.
+**Critical bisect (commit `44342ff`)**:
+- **A** matmul_reduce_C_state alone (2 iters d=0..1) → PASS. Helper is sound.
+- **B** matmul_reduce + 8-iter state-update loop → HANG.
+- **C** matmul_reduce with `transpose=0` (matching downstream's mm_init
+  params) → HANG. Not the transpose-flag transition.
+- **D** 8 iters all with d=0 (no d-transition) → HANG.
+- **Conclusion**: the hang is **iter-count itself**, not d-transition,
+  not init-config mismatch. The `transpose_wh_tile + matmul_tiles`
+  inner-loop class of hang has a hardcoded cap (~4 iters) on Blackhole
+  regardless of mm_init priming. Option A is necessary (correct math,
+  produces the y_partial we'll need at mode=5) but not sufficient.
 
-**Plan (Option A from research)**:
-1. Add a `matmul_reduce_C_state(cb_state_in, cb_C, head_dim_tiles, cb_y_partial)`
-   helper. Fork from GDN's `matmul_reduce` (line 215 in GDN compute
-   kernel). Reads cb_state_in (all 8 tiles) reduces against cb_C
-   (4 tiles ssm_state vector) → writes `head_dim_tiles=2` tiles to
-   cb_y_partial.
-2. In mode=3 wire-up: call `matmul_reduce_C_state` BEFORE the state-update
-   loop. Drop the bare `mm_init(cb_x, cb_dt_B, cb_outer)` workaround at
-   line 651 — no longer needed.
-3. Mode=5 will then add the fixup: `y_partial += C · outer` (one extra
-   reduce after each outer-product step), plus the D·x skip.
+**Exact next task**: G1 **day-4.2** — try the SDPA escape hatch.
 
-**Alternative escape hatch**: SDPA folds Kᵀ into matmul's `transpose=1`
-B-operand flag, never uses `transpose_wh_tile`. Could be a one-line
-replacement for our entire `transpose_x_to_col + matmul_outer_x_dt_B`
-pair — see [[feedback-sdpa-transpose-b-flag-escape-hatch]]. Worth a
-small isolation probe.
+SDPA never calls `transpose_wh_tile` — it folds Kᵀ into matmul's
+`transpose=1` B-operand flag, sidestepping the sticky-bit class of hang
+entirely. Apply the same pattern to our outer-product:
 
-**Memory entries written this round**:
-- [[feedback-mm-init-prime-required]] — the workaround
-- [[feedback-gdn-vs-mamba2-kernel-delta]] — the structural reason +
-  principled fix
-- [[feedback-sdpa-transpose-b-flag-escape-hatch]] — the alternative
+1. Drop the `transpose_x_to_col` helper from the inner loop. The x[d]
+   tile stays in its native row-vector layout.
+2. Rewrite `matmul_outer_x_dt_B` to call `mm_init(cb_x, cb_dt_B,
+   cb_outer, transpose=1)` and `matmul_tiles(cb_x, cb_dt_B, d, s, 0)`.
+   The `transpose=1` flag flips B (cb_dt_B's row-vector) into col-vector
+   orientation on the fly. Result: outer-product `x[d, i] * dt_B[s, j]`
+   in the output tile.
+3. Inner loop becomes: matmul_outer (no transpose_wh) + mul_decay + add
+   + pop cb_outer. No cb_x_col, no transpose_wh_tile.
+4. Run smoke. If the 8-iter loop now passes, the SDPA hypothesis is
+   confirmed.
+
+**Validation sanity**: bisect-A (matmul_reduce_C_state alone) still
+PASSES, so mode=2 + matmul_reduce regression is sound. We have a working
+foundation; the SDPA swap is a focused 1-helper change.
+
+**Memory entries**:
+- [[feedback-mm-init-prime-required]] — original workaround
+- [[feedback-gdn-vs-mamba2-kernel-delta]] — structural math reason
+- [[feedback-sdpa-transpose-b-flag-escape-hatch]] — the next move
 - [[tt-llk-frozen-in-tt-metal]] — repo state + missing L3 docs
 
 **Current source state**: the kernel at

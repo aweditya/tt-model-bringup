@@ -312,29 +312,28 @@ the per-group broadcast.
     - Single-phase loop works (transpose+matmul+mul_decay+add+pop per s)
       once mm_init prime is in place; two-phase split unnecessary.
     Bisect log + canonical patterns documented in commit `b5c93fa`.
-  - [ ] **Day-4.1 (REVISED post-research 2026-06-05)**: STRUCTURAL fix.
-    Research round (3 parallel subagents) surfaced the principled answer:
-    GDN doesn't need a prime because its **math forces** an early
-    `matmul_reduce(k, s_prev) = pred` (delta-rule prediction-error
-    requires reading old state through current key). Mamba2 SSD is
-    linear — no `pred` term, no natural early matmul. Our bare
-    `mm_init` prime workaround papers over a TRISC init-ordering hole.
-    The PRINCIPLED fix is to **restructure mode=3 to compute
-    `y_partial = C · state_in^T` FIRST** (the C·state reduce we need
-    anyway at mode=5), giving us an isolated `matmul_reduce` before
-    the transpose+matmul loop — structurally identical to GDN's
-    pipeline shape. Then state-update loop. Then fixup
-    `y_partial += C · outer`. Pull mode=5's reduce earlier in the
-    pipeline; this collapses day-4.1 + day-4.5 into one cleaner pass.
-    Memory: [[feedback-gdn-vs-mamba2-kernel-delta]].
-  - [ ] **Alternative escape hatch** (memory: [[feedback-sdpa-transpose-b-flag-escape-hatch]]):
-    SDPA folds Kᵀ into matmul's `transpose=1` B-operand flag, never
-    calls `transpose_wh_tile`. Could replace `transpose_x_to_col +
-    matmul_outer_x_dt_B` with a single `matmul_tiles(x, dt_B,
-    transpose=1)` call. Worth a small isolation probe; if it works,
-    drop transpose helper entirely.
-  - [ ] Day-4.5 (folded into day-4.1 above): C_state_reduce ahead of
-    state update. Full math at mode=5.
+  - [x] **Day-4.1 (2026-06-05): Option A IMPLEMENTED, did not unblock.**
+    Added `matmul_reduce_C_state` (forks GDN's `matmul_reduce` at
+    qwen36_gdn_decode_owned.cpp:215) with `transpose=1` for correct
+    A @ B^T math against C's row-vector layout. Helper alone PASSES
+    (both d iterations). Drops the bare-mm_init workaround. **But the
+    full 8-iter state-update loop still HANGS.** Commit `44342ff`.
+    Bisects A/B/C/D in commit message confirm: the hang is iter-count,
+    NOT d-transition or init-config mismatch. ~4 transpose+matmul
+    iterations is the hardcoded Blackhole TRISC cap regardless of
+    mm_init priming. Option A is *necessary* (correct math + structural
+    GDN match + produces y_partial for mode=5) but *not sufficient*.
+  - [ ] **Day-4.2 (next): SDPA escape hatch**. Drop `transpose_wh_tile`
+    from the inner loop. Replace `transpose_x_to_col +
+    matmul_outer_x_dt_B` with a single matmul call using
+    `mm_init(cb_x, cb_dt_B, cb_outer, transpose=1)` and
+    `matmul_tiles(cb_x, cb_dt_B, d, s, 0)`. SDPA does this for K^T and
+    never hits the >4-iter hang (memory:
+    [[feedback-sdpa-transpose-b-flag-escape-hatch]]). The
+    `transpose_x_to_col` helper and `cb_x_col` CB go away entirely.
+  - [ ] Day-4.3: mode=4 wires D·x (using `cb_y_partial` from
+    matmul_reduce_C_state + `D · x[d]` add). y_partial gets fixup
+    `+= C · outer` for production mode=5.
   - [ ] Day-5: G0a harness compare at cos ≥ 0.999 vs numpy oracle,
     single-step AND 8-step multi-step replay.
 - [ ] **G2..G4** — sequential, gated on G1.
