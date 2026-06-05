@@ -66,7 +66,10 @@ HEAD_DIM_ATTN = 128
 N_ROUTED_EXPERTS = 128
 N_SHARED_EXPERTS = 1
 TOP_K_ROUTED = 6
-N_GROUP_MOE = 8
+# n_group=1 + topk_group=1 means the group restriction is degenerate
+# (one big group containing all 128 experts). Verified at MoE config probe
+# 2026-06-05; brief had said n_group=8 but actual config says 1.
+N_GROUP_MOE = 1
 TOPK_GROUP = 1
 ROUTED_SCALING = 2.5
 ROUTED_INTERMEDIATE = 1856
@@ -157,6 +160,40 @@ def upload_attn_layer(state, key_to_shard, L: int, log) -> dict:
         "kind":   "attention",
     }
     log(f"  L{L} (attention): norm + q/k/v/o_proj uploaded replicated bf16")
+    return out
+
+
+def upload_moe_layer_router_only(state, key_to_shard, L: int, log) -> dict:
+    """v0.1.3.a — upload pre-norm + router weights only.
+
+    Adds:
+      norm                                   [HIDDEN]
+      mixer.gate.weight                      [N_ROUTED_EXPERTS, HIDDEN]
+      mixer.gate.e_score_correction_bias     [N_ROUTED_EXPERTS]
+
+    Expert weights (128 routed + 1 shared) land at v0.1.3.b — they're
+    the bulk of the layer (~256 + 2 weight tensors per layer × 23 layers).
+    """
+    prefix = f"backbone.layers.{L}"
+    mp = f"{prefix}.mixer"
+    norm_w = load_t(key_to_shard, f"{prefix}.norm.weight")
+    gate_w = load_t(key_to_shard, f"{mp}.gate.weight")
+    bias = load_t(key_to_shard, f"{mp}.gate.e_score_correction_bias")
+    assert norm_w.shape == (HIDDEN,)
+    assert gate_w.shape == (N_ROUTED_EXPERTS, HIDDEN), gate_w.shape
+    assert bias.shape == (N_ROUTED_EXPERTS,), bias.shape
+
+    out = {
+        "kind": "moe_router_only",
+        "norm": np_to_replicated(norm_w, state.mesh),
+        # gate uploaded pre-transposed for matmul [HIDDEN, N_EXPERTS]
+        "gate_w": np_to_replicated(gate_w.T, state.mesh),
+        # bias kept host-side; cheap [128] vector, only used post-matmul
+        # in the topk path which runs on host for v0.1.3.a.
+        "e_score_bias_np": bias.copy(),
+    }
+    log(f"  L{L} (moe_router_only): norm + gate.weight + e_score_bias "
+        f"uploaded replicated bf16 (experts come at v0.1.3.b)")
     return out
 
 
@@ -359,9 +396,13 @@ def bootstrap(state: State, log=None):
                 state.per_layer_tt[L] = upload_attn_layer(state, key_to_shard, L, log)
             elif kind == "mamba2":
                 state.per_layer_tt[L] = upload_mamba2_layer(state, key_to_shard, L, log)
+            elif kind == "moe":
+                # v0.1.3.a: router-only upload; experts at v0.1.3.b.
+                state.per_layer_tt[L] = upload_moe_layer_router_only(
+                    state, key_to_shard, L, log)
             else:
                 raise NotImplementedError(
-                    f"v0.1.2 supports {{attention, mamba2}}; L{L} is {kind!r}")
+                    f"v0.1.3 supports {{attention, mamba2, moe}}; L{L} is {kind!r}")
         log(f"[bootstrap] v0.1.1 ready (sparse layer upload: {targets}).")
     else:
         log("[bootstrap] v0.1.0 ready (top-level only — no layers uploaded).")
@@ -883,6 +924,87 @@ def mamba2_block_eager(state: State, h_input_np, layer_idx: int):
     if squeeze_batch:
         for k in out:
             out[k] = out[k][0]
+    return out
+
+
+# ── MoE forward (v0.1.3) ───────────────────────────────────────────────
+def moe_router_only(state: State, h_input_np, layer_idx: int):
+    """v0.1.3.a — pre-norm + router (sigmoid + e_score_correction_bias +
+    topk). Returns topk_indices and topk_weights matching HF
+    NemotronHTopkRouter contract.
+
+    The router math (modeling_nemotron_h.py:905-918, simplified for
+    Nemotron's degenerate n_group=topk_group=1 case):
+      1. router_logits = h_norm @ gate.weight.T          [B*S, n_experts]
+      2. scores = sigmoid(router_logits)
+      3. scores_for_choice = scores + e_score_correction_bias
+      4. topk_indices = topk(scores_for_choice, k=6)
+      5. topk_weights = scores.gather(1, topk_indices)    (UN-biased!)
+      6. norm_topk_prob=True → topk_weights /= sum(topk_weights, dim=-1)
+      7. topk_weights *= routed_scaling_factor (2.5)
+
+    HYBRID: matmul + sigmoid on device; bias + topk + normalize on host
+    (those last three need scatter/topk/gather primitives that ttnn
+    exposes individually; for v0.1.3.a the host loop is correct + cheap
+    at B*S=5. Full on-device topk lands at v0.5 perf — 27B already has
+    `experiments/utils/ttnn_introspect.py` validated on-device topk).
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "moe_router_only"
+    squeeze_batch = h_input_np.ndim == 2
+    if squeeze_batch:
+        h_input_np = h_input_np[None]
+    B, S, _ = h_input_np.shape
+
+    h_tt = ttnn.from_torch(
+        torch.from_numpy(h_input_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # Pre-norm + router matmul + sigmoid all on device
+    h_norm_tt = ttnn.rms_norm(h_tt, weight=w["norm"], epsilon=EPS)
+    # HF uses fp32 for the router matmul (line 910). Use HiFi4 +
+    # fp32_dest_acc to closely match.
+    logits_tt = ttnn.matmul(h_norm_tt, w["gate_w"], compute_kernel_config=HIFI4)
+    scores_tt = ttnn.sigmoid(logits_tt)
+
+    def _readback(t):
+        arr = ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return arr[:1].float().numpy()
+
+    scores_np = _readback(scores_tt)  # [B, S, N_EXPERTS]
+    if scores_np.ndim == 3:
+        scores_np = scores_np[0]  # [S, N_EXPERTS]
+
+    # Host topk
+    bias = w["e_score_bias_np"].astype(np.float32)
+    scores_for_choice = scores_np + bias[None, :]
+    # n_group == topk_group == 1 → group restriction is a NOP for
+    # Nemotron. Direct topk over all N_EXPERTS.
+    # np.argpartition gives unsorted top-k; sort by value to match HF
+    # sorted=False (HF doesn't sort; order doesn't matter for downstream).
+    topk_indices = np.argpartition(
+        -scores_for_choice, TOP_K_ROUTED, axis=-1
+    )[:, :TOP_K_ROUTED]  # [S, top_k]
+    # gather the ORIGINAL (un-biased) scores at these indices
+    rows = np.arange(scores_np.shape[0])[:, None]
+    topk_weights = scores_np[rows, topk_indices]  # [S, top_k]
+    # norm_topk_prob=True for Nemotron
+    denom = topk_weights.sum(axis=-1, keepdims=True) + 1e-20
+    topk_weights = topk_weights / denom
+    topk_weights = topk_weights * np.float32(ROUTED_SCALING)
+
+    out = {
+        "h_norm":       _readback(h_norm_tt),
+        "scores":       scores_np,
+        "topk_indices": topk_indices.astype(np.int32),
+        "topk_weights": topk_weights,
+    }
+    if not squeeze_batch:
+        out["topk_indices"] = out["topk_indices"][None]
+        out["topk_weights"] = out["topk_weights"][None]
     return out
 
 
