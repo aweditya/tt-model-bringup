@@ -226,7 +226,9 @@ the per-group broadcast.
   `98fc43d`) + self-test ✓ on qb1; tt-metal SSM survey ✓ (no matches,
   build from scratch confirmed). HF byte-match gate still open
   (pending Nemotron weight download).
-- **Task #184** — G0a isolation harness (blocked by #183)
+- **Task #184** — G0a isolation harness — **DONE** (commit `4352baf`):
+  multi-step replay + per-head cos/MAD gate. Self-test PASSES; kernel-
+  compare path stubbed via `--kernel-callable` for G1 to wire in.
 - **Task #185** — G0b qb1 RAM + tt-metal SSM survey — **DONE**:
   qb1 has 503/468 GB RAM (plenty); ZERO ttnn SSM ops at module level.
 - **Task #186** — G1 single-core (blocked by #184)
@@ -241,10 +243,14 @@ the per-group broadcast.
 - [-] **G0** — numpy oracle written + internal self-test PASS. HF
       byte-match gate still open (pending Nemotron weight download
       to qb1).
-- [ ] **G0a** — isolation harness (next foreground; blocked by HF
-      verification of G0 oracle, but can be developed in parallel
-      using random fixtures from `mamba2_numpy_oracle._make_fixture`).
-- [ ] **G1..G4** — sequential, gated on prior.
+- [x] **G0a** — isolation harness (multi-step replay + per-head
+      cos/MAD + kernel-compare hook via `--kernel-callable`). Commit
+      `4352baf`. PASSES self-consistency (bit-equal across 8 steps)
+      and step-evolution sanity.
+- [ ] **G1..G4** — sequential, gated on prior. **G1 is the next
+      hands-on task**: author the single-core tt-metal SSD kernel.
+      Wire it into the harness via `--kernel-callable` for the
+      pass gate.
 
 Phase 0 timeline estimate: **3-5 weeks** depending on how many of the
 G-stages hit unexpected snags. Each stage gates the next; do NOT

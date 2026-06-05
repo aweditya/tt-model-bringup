@@ -45,9 +45,17 @@ parallel), #186 (G1 single-core), #187 (G2 multi-core), #188 (G3 batched),
 - ⏸ G0 HF byte-match gate: blocked on Nemotron weight download (~63 GB);
   fires at v0.0 oracle invocation. Internal self-test sufficient to
   unblock G0a harness development.
-- ⏭ Next: G0a isolation harness (task #184) — fork from
-  `test_pattern_a_moe_np.py`, generates random fixtures, will later
-  compare ttnn kernel against the numpy oracle's outputs.
+- ✅ G0a isolation harness: `experiments/utils/test_mamba2_decode_isolated.py`
+  (commit `4352baf`). Multi-step replay (8 consecutive decode steps,
+  ssm_state threaded) with per-head cos/MAD compare + assert gates.
+  Self-test PASSES on qb1: self-consistency bit-equal, step evolution
+  finite. Kernel-compare path stubbed via `--kernel-callable
+  <module:fn>` flag — G1 author plugs their ttnn-backed Mamba2 SSD
+  callable there and the gate fires automatically.
+- ⏭ Next: **G1 (#186)** — author the single-core tt-metal SSD kernel.
+  The numpy oracle + harness mean the kernel author can iterate
+  against a fast deterministic ground-truth without spinning up the
+  full forward.
 
 ---
 
