@@ -62,7 +62,21 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next tasks**: v0.2.6 (host weight cache, ~30 LOC) then v0.3.
+**Phase 1 — exact next task**: v0.3 (multi-step decode with KV cache + ssm_state on device).
+
+**Background work in flight 2026-06-05**: Gemma 4 perf optimization
+agent running on qb2 (all 4 P150s free). Brief: read
+`research/gemma4_perf_briefing_2026-06-04.md`, use tt-perf-report to
+identify TOP-3 bottlenecks in traced decode, land ONE optimization
+(P2 distributed RMSNorm OR P3 paged SDPA on globals OR RMSNorm
+fusion — pick from profile, not queue order). Reports to
+`research/gemma4_perf_qb2_2026-06-05/log.md`. ZERO file overlap with
+the foreground Nemotron path. agent ID `aece88b1979f5345c`.
+
+**v0.2.6 DONE 2026-06-05** (commit `1685827`): host numpy weight cache
++ MoE pre-stack cache. Iter 1 cold=183.8s, iter 2 warm=61.8s, **2.97×**
+warm speedup (not the 4× I originally planned — the bottleneck is
+mesh upload not disk I/O). argmax_last=6993 on both iters ✓.
 
 v0.2.5 COMPLETE 2026-06-05 (commit `926b49c`) — `_tt` block variants
 take/return `ttnn.Tensor`, 0 inter-block readbacks. Regression PASS
