@@ -240,14 +240,44 @@ Each gets its own plan-of-action doc (TBD). Sketch only here:
 
 Three email replies are drafted verbatim in §6 of each audit doc.
 Send each independently:
-- gm4: cite specific commits we've shipped + ask about `paged_fused_
-  update_cache` signature + RMSNorm fusion target pattern.
+- gm4: see refined version below (post-adoption findings update);
+  cite specific commits we've shipped + reframe `paged_fused_update_
+  cache` question + RMSNorm fusion target pattern.
 - qwen: ask about the "256K vs 128K" discrepancy + offer our PC +
   active-prompt suffix detector.
 - gdn: send our complete-kernel pointer + ask about TT-LANG ablation.
 
 User to send when convenient (no automation, no PRs without explicit
 go-ahead).
+
+### Refined gm4 reply (post-#191/#192 findings)
+
+Since we tried `paged_fused_update_cache` and found a contract issue,
+the gm4 audit's §6 boilerplate reply ("would love to pick up #44946")
+is stale. Better:
+
+> Hi <name> — thanks for the pointer to #44962. End-to-end on (1,4)
+> P150 we're at 47.5 ms/tok traced single-client / 316 tok/s aggregate
+> at B=32. Of your sub-issues we've shipped #44947, #44952, #44953
+> (argmax), #44956, and most of #44955. We tried adopting
+> `paged_fused_update_cache` (#44946) but our K and V shards land on
+> the same `paged_write_mem_cfg` core grid, and the device-op asserts
+> non-overlapping `input_tensor1`/`input_tensor2` grids
+> (`paged_fused_update_cache_device_operation.cpp:226`) — server
+> crashes during bootstrap. Two asks: (1) what's your preferred
+> disjoint-shard pattern for the NKV_PER_CHIP=1 split case? We'd
+> rather fork your reference layout than invent one. (2) the input-
+> overlap contract isn't in the Python docstring — would you be open
+> to a one-line patch noting it? Either fix would let us re-attempt
+> in a week or so. Separately, would love to plan #44948 (RMSNorm
+> fusion) — projected +12-15 ms/tok per our briefing; happy to share
+> back three gm4_unified-specific corrections (SDPA scale=1.0,
+> per-layer layer_scalar, v_norm with_scale=False) and our
+> `use_multicore=False` argmax determinism fix at vocab=262144.
+
+The disjoint-cfg unblock (task #198 NEXT-F) is gated on Tenstorrent's
+answer, OR on us synthesising our own pattern from the Llama70B
+sharding precedent. Either path is a 2-4 hour patch.
 
 ------------------------------------------------------------------------
 
