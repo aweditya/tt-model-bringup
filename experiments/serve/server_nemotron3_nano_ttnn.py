@@ -163,6 +163,65 @@ def upload_attn_layer(state, key_to_shard, L: int, log) -> dict:
     return out
 
 
+def upload_moe_layer_full(state, key_to_shard, L: int, log) -> dict:
+    """v0.1.3.b — upload pre-norm + router + 128 routed experts + 1 shared.
+
+    Memory budget (per chip, replicated): 128 routed experts × ~10 MB
+    each + 1 shared expert × ~20 MB ≈ 1.29 GB. Plus the small overhead
+    (norm, gate, bias). 23 MoE layers × 1.29 GB > our 8 GB/chip target
+    — so for full v0.2 (all 52 layers) we'll need Pattern A sharding
+    (35B precedent). For L1-only v0.1.3.b this fits.
+    """
+    prefix = f"backbone.layers.{L}"
+    mp = f"{prefix}.mixer"
+
+    norm_w = load_t(key_to_shard, f"{prefix}.norm.weight")
+    gate_w = load_t(key_to_shard, f"{mp}.gate.weight")
+    bias = load_t(key_to_shard, f"{mp}.gate.e_score_correction_bias")
+    assert norm_w.shape == (HIDDEN,)
+    assert gate_w.shape == (N_ROUTED_EXPERTS, HIDDEN)
+    assert bias.shape == (N_ROUTED_EXPERTS,)
+
+    # Routed experts — list of {up, down} tensors per expert.
+    routed = []
+    for e in range(N_ROUTED_EXPERTS):
+        up_w = load_t(key_to_shard, f"{mp}.experts.{e}.up_proj.weight")
+        dn_w = load_t(key_to_shard, f"{mp}.experts.{e}.down_proj.weight")
+        assert up_w.shape == (ROUTED_INTERMEDIATE, HIDDEN), \
+            f"L{L}.experts[{e}].up shape {up_w.shape}"
+        assert dn_w.shape == (HIDDEN, ROUTED_INTERMEDIATE), \
+            f"L{L}.experts[{e}].down shape {dn_w.shape}"
+        # Pre-transpose for matmul: up [HIDDEN, intermediate], down [intermediate, HIDDEN]
+        routed.append({
+            "up":   np_to_replicated(up_w.T, state.mesh),
+            "down": np_to_replicated(dn_w.T, state.mesh),
+        })
+        if (e + 1) % 32 == 0:
+            log(f"  L{L} routed experts uploaded: {e+1}/{N_ROUTED_EXPERTS}")
+
+    # Shared expert (2× wider intermediate)
+    sh_up_w = load_t(key_to_shard, f"{mp}.shared_experts.up_proj.weight")
+    sh_dn_w = load_t(key_to_shard, f"{mp}.shared_experts.down_proj.weight")
+    assert sh_up_w.shape == (SHARED_INTERMEDIATE, HIDDEN)
+    assert sh_dn_w.shape == (HIDDEN, SHARED_INTERMEDIATE)
+    shared = {
+        "up":   np_to_replicated(sh_up_w.T, state.mesh),
+        "down": np_to_replicated(sh_dn_w.T, state.mesh),
+    }
+
+    out = {
+        "kind": "moe",
+        "norm": np_to_replicated(norm_w, state.mesh),
+        "gate_w": np_to_replicated(gate_w.T, state.mesh),
+        "e_score_bias_np": bias.copy(),
+        "routed": routed,
+        "shared": shared,
+    }
+    log(f"  L{L} (moe): norm + gate + bias + {N_ROUTED_EXPERTS} routed "
+        f"+ 1 shared (2x wider) uploaded replicated bf16")
+    return out
+
+
 def upload_moe_layer_router_only(state, key_to_shard, L: int, log) -> dict:
     """v0.1.3.a — upload pre-norm + router weights only.
 
@@ -397,9 +456,15 @@ def bootstrap(state: State, log=None):
             elif kind == "mamba2":
                 state.per_layer_tt[L] = upload_mamba2_layer(state, key_to_shard, L, log)
             elif kind == "moe":
-                # v0.1.3.a: router-only upload; experts at v0.1.3.b.
-                state.per_layer_tt[L] = upload_moe_layer_router_only(
-                    state, key_to_shard, L, log)
+                # Default to FULL upload (router + experts + shared).
+                # NEMOTRON3_MOE_ROUTER_ONLY=1 reverts to the router-only
+                # path for the v0.1.3.a smoke (smaller upload).
+                if _os.environ.get("NEMOTRON3_MOE_ROUTER_ONLY", "") == "1":
+                    state.per_layer_tt[L] = upload_moe_layer_router_only(
+                        state, key_to_shard, L, log)
+                else:
+                    state.per_layer_tt[L] = upload_moe_layer_full(
+                        state, key_to_shard, L, log)
             else:
                 raise NotImplementedError(
                     f"v0.1.3 supports {{attention, mamba2, moe}}; L{L} is {kind!r}")
@@ -1005,6 +1070,128 @@ def moe_router_only(state: State, h_input_np, layer_idx: int):
     if not squeeze_batch:
         out["topk_indices"] = out["topk_indices"][None]
         out["topk_weights"] = out["topk_weights"][None]
+    return out
+
+
+def moe_block_eager(state: State, h_input_np, layer_idx: int):
+    """v0.1.3.b — full L1 MoE block forward (mostly on-device).
+
+    Chain:
+      1. TT pre-norm + router (matmul + sigmoid)
+      2. host topk-6 (sigmoid + bias + topk + gather + normalize + scale)
+      3. per-token expert dispatch (5 tokens × 6 experts = 30 forwards):
+         - TT matmul(h_norm[t], expert.up.T) → relu² → matmul(.., expert.down.T)
+         - weighted add to accumulator
+      4. TT shared expert: matmul(h_input, sh.up.T) → relu² → matmul(.., sh.down.T)
+      5. mixer_out = routed_combined + shared_out (TT add)
+      6. block_out = h_input + mixer_out (TT residual)
+
+    Returns dict with intermediates needed by the smoke.
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "moe"
+    squeeze_batch = h_input_np.ndim == 2
+    if squeeze_batch:
+        h_input_np = h_input_np[None]
+    B, S, _ = h_input_np.shape
+    assert B == 1, "v0.1.3.b currently single-batch (CB lands later)"
+
+    # Upload h_input once
+    h_tt = ttnn.from_torch(
+        torch.from_numpy(h_input_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+
+    def _readback(t):
+        arr = ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return arr[:1].float().numpy()
+
+    # ── 1+2. Router (matmul + sigmoid + host topk) ──────────────
+    h_norm_tt = ttnn.rms_norm(h_tt, weight=w["norm"], epsilon=EPS)
+    logits_tt = ttnn.matmul(h_norm_tt, w["gate_w"], compute_kernel_config=HIFI4)
+    scores_tt = ttnn.sigmoid(logits_tt)
+    scores_np = _readback(scores_tt)[0]  # [S, n_experts]
+
+    bias = w["e_score_bias_np"].astype(np.float32)
+    scores_for_choice = scores_np + bias[None, :]
+    topk_indices = np.argpartition(
+        -scores_for_choice, TOP_K_ROUTED, axis=-1
+    )[:, :TOP_K_ROUTED]
+    rows = np.arange(scores_np.shape[0])[:, None]
+    topk_weights = scores_np[rows, topk_indices]
+    denom = topk_weights.sum(axis=-1, keepdims=True) + 1e-20
+    topk_weights = topk_weights / denom
+    topk_weights = topk_weights * np.float32(ROUTED_SCALING)
+
+    # ── 3. Per-token expert dispatch ─────────────────────────────
+    # Strategy: gather tokens per expert (most experts see ≤1 token at S=5).
+    # For each unique expert e, run on the gathered token slice once.
+    routed_accum_np = np.zeros((B, S, HIDDEN), dtype=np.float32)
+    # Map expert_idx → list of (token_idx, weight)
+    routings: dict[int, list[tuple[int, float]]] = {}
+    for t in range(S):
+        for k in range(TOP_K_ROUTED):
+            e = int(topk_indices[t, k])
+            routings.setdefault(e, []).append((t, float(topk_weights[t, k])))
+
+    # h_norm readback for host-side per-token slicing (small: [B,S,HIDDEN])
+    h_norm_np = _readback(h_norm_tt)  # [1, S, HIDDEN] or [4*1, S, HIDDEN] → first chip
+    if h_norm_np.ndim == 3:
+        pass  # already [1, S, HIDDEN]
+
+    for e, tw_list in routings.items():
+        tok_idxs = [t for t, _ in tw_list]
+        weights_for_tok = [_w for _, _w in tw_list]
+        # Build per-expert input [n_tok_for_e, HIDDEN]
+        x_e_np = h_norm_np[0, tok_idxs, :]  # [n_tok, HIDDEN]
+        x_e_np_3d = x_e_np[None]  # [1, n_tok, HIDDEN]
+
+        x_e_tt = ttnn.from_torch(
+            torch.from_numpy(x_e_np_3d.astype(np.float32)),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        up_tt = ttnn.matmul(x_e_tt, w["routed"][e]["up"],
+                              compute_kernel_config=HIFI4)
+        # relu² = relu(x) * relu(x)
+        relu = ttnn.relu(up_tt)
+        relu_sq = ttnn.mul(relu, relu)
+        down_tt = ttnn.matmul(relu_sq, w["routed"][e]["down"],
+                                compute_kernel_config=HIFI4)
+        # Read back the expert output and weighted-add into routed_accum
+        expert_out_np = _readback(down_tt)[0]  # [n_tok, HIDDEN]
+        for i, t in enumerate(tok_idxs):
+            routed_accum_np[0, t, :] += weights_for_tok[i] * expert_out_np[i]
+
+    # ── 4. Shared expert ─────────────────────────────────────────
+    sh_up_tt = ttnn.matmul(h_norm_tt, w["shared"]["up"],
+                              compute_kernel_config=HIFI4)
+    sh_relu = ttnn.relu(sh_up_tt)
+    sh_relu_sq = ttnn.mul(sh_relu, sh_relu)
+    sh_down_tt = ttnn.matmul(sh_relu_sq, w["shared"]["down"],
+                                compute_kernel_config=HIFI4)
+    shared_out_np = _readback(sh_down_tt)
+
+    # ── 5+6. Combine + residual ───────────────────────────────────
+    mixer_out_np = routed_accum_np + shared_out_np
+    block_out_np = h_input_np.astype(np.float32) + mixer_out_np
+
+    out = {
+        "h_norm":       h_norm_np,
+        "topk_indices": topk_indices.astype(np.int32),
+        "topk_weights": topk_weights,
+        "routed_accum": routed_accum_np,
+        "shared_out":   shared_out_np,
+        "mixer_out":    mixer_out_np,
+        "block_out":    block_out_np,
+    }
+    if squeeze_batch:
+        for k in out:
+            if isinstance(out[k], np.ndarray) and out[k].ndim >= 3:
+                out[k] = out[k][0]
     return out
 
 
