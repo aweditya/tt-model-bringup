@@ -110,12 +110,19 @@ def main() -> int:
                     help="pass add_special_tokens=False to the tokenizer (use when prompt is "
                          "already chat-template-rendered).")
     ap.add_argument("--hook-mamba2-layer", type=int, default=None,
-                    help="ALSO hook Mamba2 sub-modules (in_proj, conv1d, ssm_chunk, out_proj) "
-                         "on this layer index (must be a 'mamba2' kind per hybrid_override_pattern).")
+                    help="ALSO hook Mamba2 sub-modules (in_proj, conv1d, norm, out_proj, "
+                         "and the mixer output itself) on this layer index "
+                         "(must be a 'mamba2' kind per hybrid_override_pattern).")
     ap.add_argument("--hook-moe-layer", type=int, default=None,
-                    help="ALSO hook MoE router + expert outputs on this layer (must be 'moe').")
+                    help="ALSO hook MoE router (idx + weights), shared_experts output, "
+                         "and the mixer output on this layer (must be 'moe').")
     ap.add_argument("--hook-attn-layer", type=int, default=None,
-                    help="ALSO hook q/k/v/o projection outputs on this layer (must be 'attention').")
+                    help="ALSO hook q/k/v/o projection outputs AND the mixer output on this "
+                         "layer (must be 'attention').")
+    ap.add_argument("--gen", type=int, default=0,
+                    help="If >0, run greedy generation for this many tokens after the "
+                         "prompt and save per-position hidden_states / logits for ALL "
+                         "(prompt + gen) positions. Used for v0.3 multi-step validation.")
     args = ap.parse_args()
 
     if args.prompt is not None:
@@ -190,12 +197,32 @@ def main() -> int:
                 f"(type {type(model).__name__}, attrs: "
                 f"{[a for a in dir(model) if not a.startswith('_')][:20]})"
             )
+        # Block-level mixer output hook factory — captures what comes OUT
+        # of the entire layer.mixer call (= the residual input added to the
+        # layer's residual stream). Closes the per-layer cosine gate for
+        # v0.1.x. The mixer's output is either a Tensor or a tuple
+        # (e.g. attention returns (output, attn_weights[, …])); take [0].
+        def make_mixer_out_hook(layer_idx: int, label: str):
+            def hook(_m, _inp, output):
+                out_t = output[0] if isinstance(output, tuple) else output
+                sub_hooks[f"L{layer_idx}_{label}_mixer_out"] = \
+                    out_t.detach().float().cpu().numpy()
+            return hook
+
         if args.hook_mamba2_layer is not None:
             Nm = args.hook_mamba2_layer
             if layer_kinds[Nm] != "mamba2":
                 raise ValueError(
                     f"--hook-mamba2-layer {Nm} is {layer_kinds[Nm]!r}, not mamba2")
             layer = decoder_layers[Nm]
+            # Cross-check the modeling code's own classification — catches
+            # silent drift if hybrid_override_pattern ever stops matching
+            # the per-layer block_type.
+            bt = getattr(layer, "block_type", None)
+            if bt != "mamba":
+                raise RuntimeError(
+                    f"layer {Nm} block_type={bt!r}, expected 'mamba' — "
+                    f"hybrid_override_pattern may have drifted from model state")
             mixer = getattr(layer, "mixer", None) or getattr(layer, "mamba", None)
             if mixer is None:
                 raise RuntimeError(f"could not find Mamba2 mixer on layer {Nm}")
@@ -211,18 +238,29 @@ def main() -> int:
                         out_t.detach().float().cpu().numpy()
                 return hook
 
-            for name in ["in_proj", "conv1d", "out_proj"]:
+            # `norm` is MambaRMSNormGated — the gated norm AFTER the SSM
+            # step, BEFORE out_proj. This is the kernel post-condition we
+            # validate at v0.1.2: our owned kernel emits `y` (pre-norm),
+            # and ttnn rms_norm_gated emits this `norm` output.
+            for name in ["in_proj", "conv1d", "norm", "out_proj"]:
                 sub = getattr(mixer, name, None)
                 if sub is not None:
                     handles.append(sub.register_forward_hook(hook_named(name)))
                 else:
                     log(f"  warn: {name} not found on layer {Nm}'s mixer (sub-hook skipped)")
+            # Whole-mixer output for the per-layer cosine ladder gate.
+            handles.append(mixer.register_forward_hook(make_mixer_out_hook(Nm, "mamba2")))
 
         if args.hook_moe_layer is not None:
             Ne = args.hook_moe_layer
             if layer_kinds[Ne] != "moe":
                 raise ValueError(f"--hook-moe-layer {Ne} is {layer_kinds[Ne]!r}, not moe")
             layer = decoder_layers[Ne]
+            bt = getattr(layer, "block_type", None)
+            if bt != "moe":
+                raise RuntimeError(
+                    f"layer {Ne} block_type={bt!r}, expected 'moe' — "
+                    f"hybrid_override_pattern may have drifted from model state")
             # NemotronHBlock uses a uniform `mixer` attr for all layer types
             # (modeling_nemotron_h.py:752-758) — including MoE.
             mlp = getattr(layer, "mixer", None) or getattr(layer, "mlp", None)
@@ -243,12 +281,27 @@ def main() -> int:
                         sub_hooks[f"L{layer_idx}_moe_router"] = \
                             output.detach().float().cpu().numpy()
                 handles.append(mlp.gate.register_forward_hook(moe_router_hook))
+            # Shared expert (single NemotronHMLP, 2× wider than routed)
+            # — its output is added straight to the routed combine. We
+            # need it isolated for v0.1.3 sub-step validation.
+            if hasattr(mlp, "shared_experts"):
+                def shared_expert_hook(_m, _inp, output, layer_idx: int = Ne):
+                    out_t = output[0] if isinstance(output, tuple) else output
+                    sub_hooks[f"L{layer_idx}_moe_shared_out"] = \
+                        out_t.detach().float().cpu().numpy()
+                handles.append(mlp.shared_experts.register_forward_hook(shared_expert_hook))
+            handles.append(mlp.register_forward_hook(make_mixer_out_hook(Ne, "moe")))
 
         if args.hook_attn_layer is not None:
             Na = args.hook_attn_layer
             if layer_kinds[Na] != "attention":
                 raise ValueError(f"--hook-attn-layer {Na} is {layer_kinds[Na]!r}, not attention")
             layer = decoder_layers[Na]
+            bt = getattr(layer, "block_type", None)
+            if bt != "attention":
+                raise RuntimeError(
+                    f"layer {Na} block_type={bt!r}, expected 'attention' — "
+                    f"hybrid_override_pattern may have drifted from model state")
             attn = getattr(layer, "self_attn", None) or getattr(layer, "mixer", None)
             for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
                 sub = getattr(attn, name, None)
@@ -259,6 +312,7 @@ def main() -> int:
                                 output.detach().float().cpu().numpy()
                         return hook
                     handles.append(sub.register_forward_hook(make_hook(name)))
+            handles.append(attn.register_forward_hook(make_mixer_out_hook(Na, "attn")))
 
         return handles
 
@@ -266,11 +320,29 @@ def main() -> int:
     if sub_hooks or handles:
         log(f"  registered {len(handles)} sub-hook(s) on requested layer(s)")
 
+    # Optional multi-step greedy decode (v0.3 validation gate).
+    # If --gen > 0, we extend the prompt by N greedy-decoded tokens
+    # FIRST, then run the captured forward over the full extended
+    # sequence — so hidden_states / logits / argmax cover all
+    # (prompt_len + gen) positions. This mirrors how a teacher-forced
+    # TT trace would be cosine-compared at each position.
+    input_ids = inputs["input_ids"]
+    if args.gen > 0:
+        log(f"greedy generate {args.gen} tokens (extends sequence)…")
+        gen_t0 = time.time()
+        with torch.no_grad():
+            for _ in range(args.gen):
+                tmp = model(input_ids=input_ids, use_cache=False)
+                next_id = tmp.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                input_ids = torch.cat([input_ids, next_id], dim=1)
+        log(f"  generated {args.gen} tokens in {time.time() - gen_t0:.1f}s "
+            f"(seq now {input_ids.shape[1]})")
+
     log("HF forward pass with output_hidden_states=True …")
     t0 = time.time()
     with torch.no_grad():
         out = model(
-            input_ids=inputs["input_ids"],
+            input_ids=input_ids,
             output_hidden_states=True,
             use_cache=False,
         )
@@ -283,6 +355,22 @@ def main() -> int:
     log(f"  hidden_states: {len(hidden_states)} tensors, "
         f"first shape: {list(hidden_states[0].shape)}")
     log(f"  logits shape: {logits.shape}")
+
+    # Shape gates — catch silent modeling-code drift before the artifacts
+    # ship to a downstream cosine probe.
+    expected_n_hs = n_layers + 1
+    if len(hidden_states) != expected_n_hs:
+        raise RuntimeError(
+            f"hidden_states length {len(hidden_states)} != expected {expected_n_hs} "
+            f"(n_layers={n_layers} + embed)")
+    if hidden_states[0].shape[-1] != text_cfg.hidden_size:
+        raise RuntimeError(
+            f"hidden_states last dim {hidden_states[0].shape[-1]} != "
+            f"config.hidden_size {text_cfg.hidden_size}")
+    if logits.shape[-1] != text_cfg.vocab_size:
+        raise RuntimeError(
+            f"logits last dim {logits.shape[-1]} != "
+            f"config.vocab_size {text_cfg.vocab_size}")
 
     hs_stack = torch.stack([h[0] for h in hidden_states]).float().numpy()
     log(f"  hs_stack: {hs_stack.shape}  dtype={hs_stack.dtype}")
@@ -311,7 +399,11 @@ def main() -> int:
     log(f"  argmax[-1] = {pred_token}  -> {pred_text!r}")
 
     # ── Save artefacts ─────────────────────────────────────────────────
-    np.save(out_dir / "prompt_ids.npy", np.array(prompt_ids, dtype=np.int32))
+    # If --gen ran, input_ids now has prompt_len + gen tokens. Save the
+    # FULL extended sequence as the canonical prompt_ids (matches what
+    # the forward saw).
+    full_ids = input_ids[0].tolist()
+    np.save(out_dir / "prompt_ids.npy", np.array(full_ids, dtype=np.int32))
     np.save(out_dir / "hidden_states.npy", hs_stack)
     np.save(out_dir / "logits.npy", logits)
     np.save(out_dir / "final_norm.npy", fn_out)
@@ -323,6 +415,9 @@ def main() -> int:
         "model_id": MODEL_ID,
         "prompt": prompt_text,
         "prompt_ids": prompt_ids,
+        "prompt_len": len(prompt_ids),
+        "gen": args.gen,
+        "full_ids": full_ids,
         "predicted_token": pred_token,
         "predicted_text": pred_text,
         "n_layers": n_layers,
@@ -333,10 +428,10 @@ def main() -> int:
         "vocab_size": text_cfg.vocab_size,
         "hybrid_override_pattern": pattern,
         "layer_kinds": layer_kinds,
-        "sub_hooks": list(sub_hooks.keys()),
+        "sub_hooks": sorted(sub_hooks.keys()),
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-    log(f"saved meta.json + {3 + len(sub_hooks)} npys to {out_dir}")
+    log(f"saved meta.json + {5 + len(sub_hooks)} npys to {out_dir}")
 
     log("\nv0.0 oracle PASS ✓ — ready for v0.1.x per-layer cosine ladders")
     return 0
