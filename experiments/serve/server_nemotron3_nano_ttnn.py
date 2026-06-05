@@ -846,6 +846,45 @@ def attn_block_eager(state: State, h_input_np, layer_idx: int):
     return out
 
 
+def attn_block_eager_tt(state: State, h_input_tt, layer_idx: int):
+    """v0.2.5 on-device flow — same math as `attn_block_eager` but takes
+    and returns `ttnn.Tensor`. No host round-trips for h.
+
+    Input:  h_input_tt  ttnn.Tensor  [B, S, HIDDEN]  TILE  replicated
+    Output: block_tt    ttnn.Tensor  [B, S, HIDDEN]  TILE  replicated
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "attention"
+    B, S, _ = h_input_tt.shape
+    NQ = NUM_Q_HEADS
+    NKV = NUM_KV_HEADS
+    HD = HEAD_DIM_ATTN
+
+    h_norm_tt = ttnn.rms_norm(h_input_tt, weight=w["norm"], epsilon=EPS)
+    q_tt = ttnn.matmul(h_norm_tt, w["q_proj"], compute_kernel_config=HIFI4)
+    k_tt = ttnn.matmul(h_norm_tt, w["k_proj"], compute_kernel_config=HIFI4)
+    v_tt = ttnn.matmul(h_norm_tt, w["v_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(h_norm_tt)
+    q4 = ttnn.transpose(ttnn.reshape(q_tt, [B, S, NQ, HD]), 1, 2)
+    k4 = ttnn.transpose(ttnn.reshape(k_tt, [B, S, NKV, HD]), 1, 2)
+    v4 = ttnn.transpose(ttnn.reshape(v_tt, [B, S, NKV, HD]), 1, 2)
+    ttnn.deallocate(q_tt); ttnn.deallocate(k_tt); ttnn.deallocate(v_tt)
+    attn_tt = ttnn.transformer.scaled_dot_product_attention(
+        q4, k4, v4,
+        is_causal=True,
+        scale=1.0 / math.sqrt(HD),
+        compute_kernel_config=B3_HIFI2,
+    )
+    ttnn.deallocate(q4); ttnn.deallocate(k4); ttnn.deallocate(v4)
+    attn_tt = ttnn.transpose(attn_tt, 1, 2)
+    attn_tt = ttnn.reshape(attn_tt, [B, S, NQ * HD])
+    o_tt = ttnn.matmul(attn_tt, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_tt)
+    block_tt = ttnn.add(h_input_tt, o_tt)
+    ttnn.deallocate(o_tt)
+    return block_tt
+
+
 # ── Mamba2 forward (v0.1.2) ───────────────────────────────────────────
 def mamba2_in_proj_only(state: State, h_input_np, layer_idx: int):
     """v0.1.2.a — pre-norm + in_proj only. Sanity-check weight upload
@@ -1145,6 +1184,141 @@ def mamba2_block_eager(state: State, h_input_np, layer_idx: int):
         for k in out:
             out[k] = out[k][0]
     return out
+
+
+def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
+    """v0.2.5 on-device flow — same math as `mamba2_block_eager` but takes
+    and returns `ttnn.Tensor`. Internal SSD loop still bridges to numpy
+    via the G4 wrapper (deferred to v0.5 — needs ttnn-tensor kernel API).
+
+    Input:  h_input_tt  ttnn.Tensor [B, S, HIDDEN] TILE replicated
+    Output: block_tt    ttnn.Tensor [B, S, HIDDEN] TILE replicated
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "mamba2"
+    B, S, _ = h_input_tt.shape
+    NH = MAMBA_HEADS
+    HD = MAMBA_HEAD_DIM
+    NG = N_GROUPS
+    SS = SSM_STATE
+
+    h_norm_tt = ttnn.rms_norm(h_input_tt, weight=w["norm"], epsilon=EPS)
+    in_proj_tt = ttnn.matmul(h_norm_tt, w["in_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(h_norm_tt)
+
+    z_tt   = ttnn.slice(in_proj_tt, [0, 0, 0],                    [B, S, D_INNER])
+    xBC_tt = ttnn.slice(in_proj_tt, [0, 0, D_INNER],              [B, S, D_INNER + CONV_DIM_M])
+    dt_tt  = ttnn.slice(in_proj_tt, [0, 0, D_INNER + CONV_DIM_M], [B, S, D_INNER + CONV_DIM_M + MAMBA_HEADS])
+    ttnn.deallocate(in_proj_tt)
+
+    xBC_nhwc = ttnn.to_layout(ttnn.reshape(xBC_tt, [B, 1, S, CONV_DIM_M]),
+                              ttnn.ROW_MAJOR_LAYOUT)
+    conv_full_tt = ttnn.conv1d(
+        input_tensor=xBC_nhwc,
+        weight_tensor=w["conv1d_w"],
+        device=state.mesh,
+        in_channels=CONV_DIM_M, out_channels=CONV_DIM_M,
+        batch_size=B, input_length=S,
+        kernel_size=CONV_KERNEL, stride=1,
+        padding=CONV_KERNEL - 1, dilation=1,
+        groups=CONV_DIM_M,
+        bias_tensor=w["conv1d_b"],
+    )
+    conv_full_np = ttnn.to_torch(
+        conv_full_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    )[:1].float().numpy()
+    ttnn.deallocate(conv_full_tt)
+    if conv_full_np.ndim == 4:
+        conv_full_np = conv_full_np.squeeze(1)
+    if conv_full_np.shape[-1] != CONV_DIM_M:
+        conv_full_np = conv_full_np.transpose(0, 2, 1)
+    conv_causal_np = conv_full_np[:, :S, :]
+
+    conv_causal_tt = ttnn.from_torch(
+        torch.from_numpy(conv_causal_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    silu_out_tt = ttnn.silu(conv_causal_tt)
+    ttnn.deallocate(conv_causal_tt)
+
+    BC_SIZE = NG * SS
+    x_inner_tt = ttnn.slice(silu_out_tt, [0, 0, 0],                  [B, S, D_INNER])
+    B_inner_tt = ttnn.slice(silu_out_tt, [0, 0, D_INNER],            [B, S, D_INNER + BC_SIZE])
+    C_inner_tt = ttnn.slice(silu_out_tt, [0, 0, D_INNER + BC_SIZE],  [B, S, D_INNER + 2 * BC_SIZE])
+
+    def _rb(t):
+        arr = ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return arr[:1].float().numpy()
+
+    x_inner_np = _rb(x_inner_tt)
+    z_full_np  = _rb(z_tt)
+    B_inner_np = _rb(B_inner_tt)
+    C_inner_np = _rb(C_inner_tt)
+    dt_full_np = _rb(dt_tt)
+    ttnn.deallocate(x_inner_tt); ttnn.deallocate(B_inner_tt)
+    ttnn.deallocate(C_inner_tt); ttnn.deallocate(silu_out_tt)
+    ttnn.deallocate(dt_tt)
+
+    x_inner_np = x_inner_np.reshape(B, S, NH, HD)
+    z_inner_np = z_full_np.reshape(B, S, NH, HD)
+    B_inner_np = B_inner_np.reshape(B, S, NG, SS)
+    C_inner_np = C_inner_np.reshape(B, S, NG, SS)
+
+    import nemotron3_mamba2_step as _step_mod
+    dt_bias = w["dt_bias_np"]
+    A_log = w["A_log_np"]
+    D_w = w["D_np"]
+    ssm_state = np.zeros((B, NH, HD, SS), dtype=np.float32)
+    y_list = []
+    for p in range(S):
+        new_state, y_p = _step_mod.mamba2_decode_step_ttnn(
+            x=x_inner_np[:, p, :, :],
+            z=z_inner_np[:, p, :, :],
+            dt=dt_full_np[:, p, :],
+            dt_bias=dt_bias, A_log=A_log, D=D_w,
+            B_in=B_inner_np[:, p, :, :],
+            C_in=C_inner_np[:, p, :, :],
+            ssm_state=ssm_state,
+            device=state.mesh,
+            debug_mode=5,
+        )
+        ssm_state = new_state
+        y_list.append(y_p)
+    y_post_ssd = np.stack(y_list, axis=1)
+    y_flat = y_post_ssd.reshape(B, S, NH * HD)
+
+    y_tt = ttnn.from_torch(
+        torch.from_numpy(y_flat.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    group_size = D_INNER // NG
+    y_grouped = ttnn.reshape(y_tt, [B, S, NG, group_size])
+    sq = ttnn.mul(y_grouped, y_grouped)
+    var = ttnn.mean(sq, dim=-1, keepdim=True)
+    var_eps = ttnn.add(var, EPS)
+    rsqrt_var = ttnn.rsqrt(var_eps)
+    y_normed_g = ttnn.mul(y_grouped, rsqrt_var)
+    y_normed = ttnn.reshape(y_normed_g, [B, S, D_INNER])
+    mixer_norm_w_tt = ttnn.from_torch(
+        torch.from_numpy(w["mixer_norm_w_np"].astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    y_weighted = ttnn.mul(y_normed, mixer_norm_w_tt)
+    silu_z = ttnn.silu(z_tt)
+    norm_out_tt = ttnn.mul(y_weighted, silu_z)
+    ttnn.deallocate(z_tt); ttnn.deallocate(silu_z); ttnn.deallocate(mixer_norm_w_tt)
+    ttnn.deallocate(y_tt); ttnn.deallocate(y_weighted); ttnn.deallocate(y_normed)
+
+    o_tt = ttnn.matmul(norm_out_tt, w["out_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(norm_out_tt)
+    block_tt = ttnn.add(h_input_tt, o_tt)
+    ttnn.deallocate(o_tt)
+    return block_tt
 
 
 # ── MoE forward (v0.1.3) ───────────────────────────────────────────────
@@ -1586,6 +1760,167 @@ def moe_block_eager_ep(state: State, h_input_np, layer_idx: int):
             if isinstance(out[k], np.ndarray) and out[k].ndim >= 3:
                 out[k] = out[k][0]
     return out
+
+
+def moe_block_eager_ep_tt(state: State, h_input_tt, layer_idx: int):
+    """v0.2.5 on-device flow — same math as `moe_block_eager_ep` but
+    takes and returns `ttnn.Tensor`. Internal router topk + combine
+    weighted-sum still bridge to numpy (deferred to v0.5).
+
+    Input:  h_input_tt  ttnn.Tensor [B, S, HIDDEN] TILE replicated
+    Output: block_tt    ttnn.Tensor [B, S, HIDDEN] TILE replicated
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "moe_ep"
+    B, S_orig, _ = h_input_tt.shape
+    assert B == 1, "v0.1.4 single-batch (CB lands later)"
+
+    S_padded = ((S_orig + NCHIPS - 1) // NCHIPS) * NCHIPS
+    S_per_chip = S_padded // NCHIPS
+
+    # Pad h on device when needed (concat zeros tile-rows).
+    if S_padded != S_orig:
+        pad_tt = ttnn.from_torch(
+            torch.zeros((B, S_padded - S_orig, HIDDEN), dtype=torch.float32),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        h_padded_tt = ttnn.concat([h_input_tt, pad_tt], dim=1)
+        ttnn.deallocate(pad_tt)
+    else:
+        h_padded_tt = h_input_tt  # alias; do NOT deallocate
+
+    h_norm_tt = ttnn.rms_norm(h_padded_tt, weight=w["norm"], epsilon=EPS)
+    if S_padded != S_orig:
+        ttnn.deallocate(h_padded_tt)
+
+    # Router scores → host topk-6 (intra-block bridge, kept for now)
+    logits_tt = ttnn.matmul(h_norm_tt, w["gate_w"], compute_kernel_config=HIFI4)
+    scores_tt = ttnn.sigmoid(logits_tt)
+    ttnn.deallocate(logits_tt)
+    scores_np = ttnn.to_torch(
+        scores_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    )[:1].float().numpy()[0]
+    ttnn.deallocate(scores_tt)
+    bias = w["e_score_bias_np"].astype(np.float32)
+    scores_for_choice = scores_np + bias[None, :]
+    topk_indices = np.argpartition(
+        -scores_for_choice, TOP_K_ROUTED, axis=-1
+    )[:, :TOP_K_ROUTED]
+    rows = np.arange(scores_np.shape[0])[:, None]
+    topk_weights = scores_np[rows, topk_indices]
+    denom = topk_weights.sum(axis=-1, keepdims=True) + 1e-20
+    topk_weights = topk_weights / denom
+    topk_weights = topk_weights * np.float32(ROUTED_SCALING)
+
+    # Dispatch input: re-upload sharded on seq dim from h_padded numpy
+    # (need a separate sharded copy; h_norm_tt is replicated). We avoid
+    # the host round-trip by computing a SECOND rms_norm on the sharded
+    # input. h_padded_np is reconstructed from h_input_tt via readback;
+    # this readback is the one remaining inter-block bridge in v0.2.5
+    # — keeps moe_ep self-contained. v0.5 will use ttnn.reshard or
+    # similar to avoid it.
+    h_padded_np = ttnn.to_torch(
+        h_input_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    )[:1].float().numpy()
+    if S_padded != S_orig:
+        pad = np.zeros((B, S_padded - S_orig, HIDDEN), dtype=h_padded_np.dtype)
+        h_padded_np = np.concatenate([h_padded_np, pad], axis=1)
+    h_sharded_tt = ttnn.from_torch(
+        torch.from_numpy(h_padded_np.astype(np.float32)).reshape(B, 1, S_padded, HIDDEN),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=2),
+    )
+    h_norm_sharded_tile = ttnn.rms_norm(h_sharded_tt, weight=w["norm"], epsilon=EPS)
+    ttnn.deallocate(h_sharded_tt)
+    h_norm_sharded_tt = ttnn.to_layout(h_norm_sharded_tile, ttnn.ROW_MAJOR_LAYOUT)
+    ttnn.deallocate(h_norm_sharded_tile)
+
+    topk_indices_4d = topk_indices.astype(np.int32).reshape(B, 1, S_padded, TOP_K_ROUTED)
+    topk_indices_tt = ttnn.from_torch(
+        torch.from_numpy(topk_indices_4d),
+        device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=2),
+        dtype=ttnn.uint16,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+    )
+    dispatch_out_tt, dispatch_meta_tt = ttnn.all_to_all_dispatch(
+        h_norm_sharded_tt, topk_indices_tt, w["expert_mapping"],
+        cluster_axis=1, output_concat_dim=2,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    ttnn.deallocate(h_norm_sharded_tt); ttnn.deallocate(topk_indices_tt)
+
+    dispatch_chunk = ttnn.repeat(dispatch_out_tt, ttnn.Shape([1, E_LOCAL, 1, 1]))
+    dispatch_chunk = ttnn.reshape(dispatch_chunk, [E_LOCAL, S_padded, HIDDEN])
+    dispatch_chunk = ttnn.to_layout(dispatch_chunk, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(dispatch_out_tt)
+
+    up_out = ttnn.matmul(dispatch_chunk, w["experts_up_local"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(dispatch_chunk)
+    relu_out = ttnn.relu(up_out)
+    relu_sq = ttnn.mul(relu_out, relu_out)
+    ttnn.deallocate(up_out); ttnn.deallocate(relu_out)
+    expert_out = ttnn.matmul(relu_sq, w["experts_down_local"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(relu_sq)
+
+    expert_out_rm = ttnn.to_layout(expert_out, ttnn.ROW_MAJOR_LAYOUT)
+    ttnn.deallocate(expert_out)
+    expert_out_combine = ttnn.reshape(expert_out_rm, [E_LOCAL, B, S_padded, HIDDEN])
+    ttnn.deallocate(expert_out_rm)
+
+    combine_out_tt = ttnn.all_to_all_combine(
+        expert_out_combine, dispatch_meta_tt, w["expert_mapping"],
+        cluster_axis=1, output_shard_dim=2,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    ttnn.deallocate(expert_out_combine); ttnn.deallocate(dispatch_meta_tt)
+
+    # Readback combine → host weighted-sum across TOP_K (intra-block bridge)
+    combine_np = ttnn.to_torch(
+        combine_out_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=2),
+    ).float().numpy()
+    ttnn.deallocate(combine_out_tt)
+    if combine_np.ndim == 5:
+        combine_np = combine_np[0]
+    if combine_np.shape[0] != TOP_K_ROUTED and combine_np.ndim == 4:
+        combine_np = combine_np.squeeze(0)
+    w_bc = topk_weights.T[:, None, :, None]
+    routed_per_topk = combine_np.astype(np.float32) * w_bc.astype(np.float32)
+    routed_np = routed_per_topk.sum(axis=0)  # [B, S_padded, HIDDEN]
+    if routed_np.ndim == 2:
+        routed_np = routed_np[None]
+    routed_np = routed_np[:, :S_orig, :]  # slice padding
+
+    # Upload routed back to device (TILE replicated) → add to shared + residual
+    routed_tt = ttnn.from_torch(
+        torch.from_numpy(routed_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+
+    # Shared expert (replicated on padded h_norm)
+    sh_up_out = ttnn.matmul(h_norm_tt, w["shared_up"], compute_kernel_config=HIFI4)
+    sh_relu = ttnn.relu(sh_up_out)
+    sh_relu_sq = ttnn.mul(sh_relu, sh_relu)
+    ttnn.deallocate(sh_up_out); ttnn.deallocate(sh_relu)
+    sh_down_out = ttnn.matmul(sh_relu_sq, w["shared_down"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(sh_relu_sq); ttnn.deallocate(h_norm_tt)
+
+    # Slice shared_out back to S_orig (it ran on padded h_norm)
+    if S_padded != S_orig:
+        shared_slice_tt = ttnn.slice(sh_down_out, [0, 0, 0], [B, S_orig, HIDDEN])
+        ttnn.deallocate(sh_down_out)
+    else:
+        shared_slice_tt = sh_down_out
+
+    mixer_tt = ttnn.add(routed_tt, shared_slice_tt)
+    ttnn.deallocate(routed_tt); ttnn.deallocate(shared_slice_tt)
+    block_tt = ttnn.add(h_input_tt, mixer_tt)
+    ttnn.deallocate(mixer_tt)
+    return block_tt
 
 
 def main():
