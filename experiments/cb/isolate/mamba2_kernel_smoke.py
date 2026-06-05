@@ -12,8 +12,9 @@ pipeline, compute kernel dispatch). Math correctness is validated
 separately via `experiments/utils/test_mamba2_decode_isolated.py` once
 debug_mode=2..5 ship.
 
-Fork base: `experiments/cb/isolate/owned_gdn.py` (the analogous CB6/G0
-smoke for the 35B owned-GDN kernel).
+Fork base: `archive/cb_engine_scaffolding_2026-06-04/isolate__owned_gdn.py`
+(the analogous CB6/G0 smoke for the 35B owned-GDN kernel; archived
+2026-06-04 once promoted into `experiments/owned_ops/qwen36_gdn_decode_owned/`).
 
 Run on qb1:
     cd ~/tt-xla && \\

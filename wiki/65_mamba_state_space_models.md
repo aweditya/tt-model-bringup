@@ -529,6 +529,8 @@ just use the plain recurrence form.
   [Nemotron bringup plan](../research/nemotron3_nano_30b_a3b_bringup_plan.md)
   §3a — Phase 0 G0..G4 stage gates for the owned kernel.
 - The
-  [35B GDN kernel build](../experiments/cb/isolate/owned_gdn.py) +
-  memory entry `feedback_owned_decay_gate_shipped` — for the
-  architectural pattern we'll reuse (not the math).
+  [35B GDN kernel build](../archive/cb_engine_scaffolding_2026-06-04/isolate__owned_gdn.py)
+  (archived 2026-06-04 once promoted into
+  `experiments/owned_ops/qwen36_gdn_decode_owned/`) + memory entry
+  `feedback_owned_decay_gate_shipped` — for the architectural pattern
+  we'll reuse (not the math).
