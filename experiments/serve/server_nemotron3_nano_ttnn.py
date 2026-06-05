@@ -113,10 +113,32 @@ def np_to_replicated(arr, mesh, dtype=ttnn.bfloat16):
     )
 
 
+# v0.2.6 process-level numpy weight cache. When set (typically to
+# state.weight_np_cache by bootstrap), `load_t` reads each key once
+# from disk and serves subsequent calls from RAM. Turns iter 2+ from
+# ~82s to ~20s (skips 23×~2.5s safetensors re-reads per forward).
+_WEIGHT_NP_CACHE = None
+
+
+def set_weight_cache(cache_dict):
+    """Activate (or clear with None) the process-level weight cache."""
+    global _WEIGHT_NP_CACHE
+    _WEIGHT_NP_CACHE = cache_dict
+
+
 def load_t(key_to_shard, key):
-    """Load a single safetensors tensor as fp32 numpy."""
+    """Load a single safetensors tensor as fp32 numpy. Hits the
+    `_WEIGHT_NP_CACHE` if active (v0.2.6 warm-iter speedup).
+    """
+    if _WEIGHT_NP_CACHE is not None:
+        cached = _WEIGHT_NP_CACHE.get(key)
+        if cached is not None:
+            return cached
     with safe_open(key_to_shard[key], framework="pt") as f:
-        return f.get_tensor(key).float().numpy()
+        arr = f.get_tensor(key).float().numpy()
+    if _WEIGHT_NP_CACHE is not None:
+        _WEIGHT_NP_CACHE[key] = arr
+    return arr
 
 
 def build_key_to_shard():
@@ -198,22 +220,31 @@ def upload_moe_layer_ep(state, key_to_shard, L: int, log) -> dict:
     gate_w = load_t(key_to_shard, f"{mp}.gate.weight")
     bias = load_t(key_to_shard, f"{mp}.gate.e_score_correction_bias")
 
-    # Stack 128 experts into a single big array, pre-transposed for matmul,
-    # then shard along dim 0 (the expert dim) across NCHIPS.
-    # up_w on disk: [INTERMEDIATE, HIDDEN]
-    # Stacked + transposed: [N_EXPERTS, HIDDEN, INTERMEDIATE]
-    up_stack = np.stack([
-        load_t(key_to_shard, f"{mp}.experts.{e}.up_proj.weight").T
-        for e in range(N_ROUTED_EXPERTS)
-    ], axis=0)  # [128, 2688, 1856]
+    # v0.2.6 — cache the pre-stacked + pre-transposed expert blob under a
+    # synthetic key so warm iters skip the 128 individual loads + np.stack
+    # + .T (~750 MB of memory movement per layer).
+    up_stack_key = f"{mp}.__up_stack_pre_T_cached"
+    if _WEIGHT_NP_CACHE is not None and up_stack_key in _WEIGHT_NP_CACHE:
+        up_stack = _WEIGHT_NP_CACHE[up_stack_key]
+    else:
+        up_stack = np.stack([
+            load_t(key_to_shard, f"{mp}.experts.{e}.up_proj.weight").T
+            for e in range(N_ROUTED_EXPERTS)
+        ], axis=0)  # [128, 2688, 1856]
+        if _WEIGHT_NP_CACHE is not None:
+            _WEIGHT_NP_CACHE[up_stack_key] = up_stack
     log(f"  L{L} up_stack:   {up_stack.shape}")
 
-    # down_w on disk: [HIDDEN, INTERMEDIATE]
-    # Stacked + transposed: [N_EXPERTS, INTERMEDIATE, HIDDEN]
-    down_stack = np.stack([
-        load_t(key_to_shard, f"{mp}.experts.{e}.down_proj.weight").T
-        for e in range(N_ROUTED_EXPERTS)
-    ], axis=0)  # [128, 1856, 2688]
+    down_stack_key = f"{mp}.__down_stack_pre_T_cached"
+    if _WEIGHT_NP_CACHE is not None and down_stack_key in _WEIGHT_NP_CACHE:
+        down_stack = _WEIGHT_NP_CACHE[down_stack_key]
+    else:
+        down_stack = np.stack([
+            load_t(key_to_shard, f"{mp}.experts.{e}.down_proj.weight").T
+            for e in range(N_ROUTED_EXPERTS)
+        ], axis=0)  # [128, 1856, 2688]
+        if _WEIGHT_NP_CACHE is not None:
+            _WEIGHT_NP_CACHE[down_stack_key] = down_stack
     log(f"  L{L} down_stack: {down_stack.shape}")
 
     # Upload as sharded along dim 0 (the expert dim)
@@ -467,6 +498,7 @@ class State:
         self.lm_head_tt = None
         self.per_layer_tt: list = []
         self.key_to_shard = None  # set by bootstrap; reused by upload_one_layer
+        self.weight_np_cache: dict = {}  # v0.2.6 — keyed by safetensors name
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────
@@ -512,6 +544,9 @@ def bootstrap(state: State, log=None):
     log("[bootstrap] enumerate shards + load top-level weights to mesh…")
     key_to_shard = build_key_to_shard()
     state.key_to_shard = key_to_shard  # exposed for v0.2.b streaming forward
+    # v0.2.6: activate the process-level numpy cache so subsequent
+    # forwards skip re-reading safetensors.
+    set_weight_cache(state.weight_np_cache)
     log(f"  {len(key_to_shard)} weight keys across "
         f"{len(set(key_to_shard.values()))} shards")
 
