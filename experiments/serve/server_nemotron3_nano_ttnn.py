@@ -1378,19 +1378,23 @@ def moe_block_eager_ep(state: State, h_input_np, layer_idx: int):
     # topk_indices, topk_weights both shape [S_padded, TOP_K_ROUTED].
 
     # ── 3. all_to_all_dispatch (seq-sharded, output_concat_dim=2) ──
-    # Build the dispatch input by reading back the replicated h_norm
-    # and re-uploading SHARDED along seq dim across cluster_axis=1.
-    # Per-chip input: [B, 1, S_per_chip, HIDDEN] in ROW_MAJOR.
-    h_norm_np_padded = _readback(h_norm_tt)  # [B, S_padded, HIDDEN]
-    h_norm_4d_np = h_norm_np_padded.reshape(B, 1, S_padded, HIDDEN)
-    h_norm_sharded_tt = ttnn.from_torch(
-        torch.from_numpy(h_norm_4d_np.astype(np.float32)),
+    # Build the dispatch input by uploading h_padded_np a SECOND time
+    # — once sharded on seq dim — and running rms_norm on the sharded
+    # version. This avoids a host round-trip of h_norm (the only NEW
+    # host bridge v0.1.4 introduced vs v0.1.3.b). rms_norm is per-token,
+    # so sharding the seq dim preserves correctness.
+    h_sharded_tt = ttnn.from_torch(
+        torch.from_numpy(h_padded_np.astype(np.float32)).reshape(B, 1, S_padded, HIDDEN),
         dtype=ttnn.bfloat16,
-        layout=ttnn.ROW_MAJOR_LAYOUT,
+        layout=ttnn.TILE_LAYOUT,
         device=state.mesh,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
         mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=2),
     )
+    h_norm_sharded_tile = ttnn.rms_norm(h_sharded_tt, weight=w["norm"], epsilon=EPS)
+    ttnn.deallocate(h_sharded_tt)
+    # Dispatch op wants ROW_MAJOR layout.
+    h_norm_sharded_tt = ttnn.to_layout(h_norm_sharded_tile, ttnn.ROW_MAJOR_LAYOUT)
+    ttnn.deallocate(h_norm_sharded_tile)
     topk_indices_4d = topk_indices.astype(np.int32).reshape(B, 1, S_padded, TOP_K_ROUTED)
     topk_indices_tt = ttnn.from_torch(
         torch.from_numpy(topk_indices_4d),
