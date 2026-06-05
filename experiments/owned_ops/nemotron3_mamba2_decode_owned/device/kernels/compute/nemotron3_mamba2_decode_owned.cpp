@@ -663,15 +663,19 @@ void kernel_main() {
     const uint32_t ssm_state_tiles   = get_arg_val<uint32_t>(2);
     const uint32_t debug_mode        = get_arg_val<uint32_t>(3);
     // Softplus + clamp config (passed as float32 bits per LLK calling convention).
-    // Defaults match Nemotron-3 config.json: beta=1.0, threshold=20.0,
-    // time_step_floor=1e-4, time_step_max=0.1. The host program_factory will
-    // emit these as runtime args once the new factory lands; for day-3 we
-    // hardcode the bit patterns.
+    //
+    // CORRECTED 2026-06-05 (v0.1.2.d root-cause fix): HF Nemotron uses
+    // `self.time_step_limit = (0.0, inf)` for the clamp — NOT the
+    // `time_step_min`/`time_step_max` config fields (which exist but are
+    // not what HF clamps against). The wrong (0.0001, 0.1) constants
+    // gave dt_eff ~2.77x smaller than HF, dropping y cos to 0.943.
+    // Numpy oracle verified at cos=0.999999 vs HF y_pre_norm after the
+    // fix. See `feedback_nemotron3_time_step_clamp_bug.md`.
     constexpr uint32_t SOFTPLUS_BETA_BITS        = 0x3f800000u;  // 1.0f
     constexpr uint32_t SOFTPLUS_BETA_RECIP_BITS  = 0x3f800000u;  // 1.0f
     constexpr uint32_t SOFTPLUS_THRESHOLD_BITS   = 0x41a00000u;  // 20.0f
-    constexpr uint32_t TIME_STEP_FLOOR_BITS      = 0x38d1b717u;  // 1e-4f
-    constexpr uint32_t TIME_STEP_MAX_BITS        = 0x3dcccccdu;  // 0.1f
+    constexpr uint32_t TIME_STEP_FLOOR_BITS      = 0x00000000u;  // 0.0f (HF: time_step_limit[0])
+    constexpr uint32_t TIME_STEP_MAX_BITS        = 0x7f800000u;  // +inf (HF: time_step_limit[1])
     (void)cb_z;  // not consumed in the kernel; pass-through to caller (decision D10)
 
     binary_op_init_common(cb_state_in, cb_decay, cb_state_scaled);

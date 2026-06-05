@@ -63,10 +63,18 @@ from __future__ import annotations
 
 import numpy as np
 
-# Default time-step clamp values from Nemotron-3 Nano's config.json
-# (also reproduced in research/nemotron3_nano_architecture_brief.md §3).
-DEFAULT_TIME_STEP_FLOOR: float = 1e-4
-DEFAULT_TIME_STEP_MAX: float = 0.1
+# Default time-step clamp values for Nemotron-3 Nano.
+#
+# IMPORTANT (oracle drift root cause, v0.1.2.d 2026-06-05): HF Nemotron
+# uses `self.time_step_limit = (0.0, inf)` for the clamp in torch_forward
+# (modeling_nemotron_h.py: `torch.clamp(dt, self.time_step_limit[0],
+# self.time_step_limit[1])`). The config ALSO ships `time_step_min` and
+# `time_step_max` fields (0.001, 0.1 in Nemotron) but those are NAMES,
+# NOT what HF actually clamps against. We previously hardcoded 0.1 as
+# the max from misreading the config, which gave dt_eff values ~2.77x
+# smaller than HF — visible as cos=0.943 oracle vs HF y_pre_norm.
+DEFAULT_TIME_STEP_FLOOR: float = 0.0
+DEFAULT_TIME_STEP_MAX: float = float("inf")
 
 
 def _stable_softplus(x: np.ndarray) -> np.ndarray:

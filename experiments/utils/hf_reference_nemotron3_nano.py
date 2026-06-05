@@ -242,6 +242,22 @@ def main() -> int:
             # step, BEFORE out_proj. This is the kernel post-condition we
             # validate at v0.1.2: our owned kernel emits `y` (pre-norm),
             # and ttnn rms_norm_gated emits this `norm` output.
+            # Pre-forward hook on `mixer.norm` captures its INPUT — that's
+            # the y output of the SSD step (= what our wrapper should
+            # match). Critical for v0.1.2.d oracle-vs-HF diagnostic.
+            def make_y_pre_norm_hook(layer_idx: int = Nm):
+                def hook(_m, inputs):
+                    # inputs is a tuple; the first positional arg is y,
+                    # the second (kwarg `gate`) is z. Save both.
+                    y = inputs[0] if len(inputs) > 0 else None
+                    if y is not None:
+                        sub_hooks[f"L{layer_idx}_y_pre_norm"] = \
+                            y.detach().float().cpu().numpy()
+                return hook
+            if hasattr(mixer, "norm"):
+                handles.append(
+                    mixer.norm.register_forward_pre_hook(make_y_pre_norm_hook())
+                )
             for name in ["in_proj", "conv1d", "norm", "out_proj"]:
                 sub = getattr(mixer, name, None)
                 if sub is not None:

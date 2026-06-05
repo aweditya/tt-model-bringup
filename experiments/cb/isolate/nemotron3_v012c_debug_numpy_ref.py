@@ -118,6 +118,23 @@ def main() -> int:
     print(f"y_post_ssd numpy shape: {y_flat_np.shape}  "
           f"range [{y_flat_np.min():.3f}, {y_flat_np.max():.3f}]")
 
+    # ── Compare against HF y_pre_norm (now captured by the oracle) ──
+    y_pre_norm_hf_path = ORACLE_DIR / "L0_y_pre_norm.npy"
+    if y_pre_norm_hf_path.exists():
+        y_hf = np.load(y_pre_norm_hf_path)
+        if y_hf.ndim == 3 and y_hf.shape[0] == 1:
+            y_hf = y_hf[0]
+        print(f"\ny_hf shape: {y_hf.shape}  "
+              f"range [{y_hf.min():.3f}, {y_hf.max():.3f}]")
+        cos_y = cos(y_flat_np, y_hf)
+        print(f"cos(numpy oracle y, HF y_pre_norm) = {cos_y:.6f}")
+        # Per-position cosine to see if drift is monotonic
+        for p in range(S):
+            cos_p = cos(y_flat_np[p], y_hf[p])
+            print(f"  pos {p}: cos = {cos_p:.6f}")
+    else:
+        print(f"\n(L0_y_pre_norm.npy not present — re-run oracle with the hook)")
+
     # ── Compare both norm orderings vs HF ─────────────────────
     norm_w = weights["norm.weight"]
     norm_stub = rmsnorm_gated_stub(y_flat_np, norm_w, gate, EPS, GROUP_SIZE)
