@@ -62,18 +62,25 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.0 bootstrap (task #202).
+**Phase 1 — exact next task**: v0.1.1 L5 Attention warmup (task #203).
 Previously DONE 2026-06-05:
 - v0.0 oracle PASS — `.cache/hf_oracle_nemotron3_nano/` 19 artifacts
 - v0.0+ oracle HARDENED — norm + mixer-out + shared-expert hooks, `--gen N` multi-step
 - v0.0.1 tokenizer probe PASS — both `<think>\n` and `<think></think>` suffixes resolved
 - v0.0.2 weights introspect PASS — 0 missing / 0 shape mismatches / 0 extras
+- **v0.1.0 bootstrap PASS — 3/3 gates green** (Gate A embed cos=1.0;
+  Gate B final_norm cos=0.9999; Gate C C1 generation token TT==HF ' Paris',
+  C2 logits cos vs numpy=0.99997, C3 argmax 5/5 vs numpy)
 
-**Real finding from v0.0.2** (must thread into v0.1.3 design): every
-MoE gate has an `e_score_correction_bias` [128] — DeepSeek-V3
-per-expert load-balance bias added to router scores BEFORE the
-group-restricted topk. Not flagged in the architecture brief; only
-surfaced because the introspect script enumerated extras.
+**Real findings threaded into the next gates**:
+1. **DeepSeek-V3 `e_score_correction_bias`** per MoE gate (from v0.0.2):
+   added to router scores BEFORE the group-restricted topk; brief
+   didn't flag this. Threaded into v0.1.3.
+2. **HF `logits.npy` is bf16-imprecise** (from v0.1.0):
+   `nn.Linear(bf16)` is the matmul precision; our HiFi4 path is more
+   accurate. Use numpy fp32 as strict ground truth in every smoke;
+   accept HF only as a soft sanity check. Memory:
+   [[feedback-hf-logits-npy-is-bf16-imprecise]].
 
 Steps for v0.1.0 (bootstrap, after v0.0 lands):
 1. Fork bootstrap from `experiments/serve/server_35b_ttnn.py` (closest
