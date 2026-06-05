@@ -62,8 +62,27 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.4 — MoE Expert-Parallel refactor
-(True EP path, decided by G0 spike — commit `138df8e`). Both
+**Phase 1 — exact next task**: v0.1.4 dim-1 collapse fix (commit
+`c5401a9` landed scaffolding; forward fails at the dim-1 collapse).
+
+Scaffolding shipped (PASSING):
+- `upload_moe_layer_ep` — 128 experts sharded as 32/chip
+- Bootstrap dispatch defaults to EP (NEMOTRON3_MOE_MODE=ep|full|router_only)
+- `moe_block_eager_ep` up to and including the dispatch call
+  (which works — dispatch_out [1, 4, 5, 2688], meta [1, 4, 5, 6])
+- Bootstrap 9.1s (vs full replicated 13.9s — nice win)
+
+KNOWN-OPEN shape contract:
+- Our dispatch_out: dim 1 = NCHIPS=4 (source-device dim)
+- DeepSeek's reshape (tt/moe.py:462) goes [B, ?, S, H] → [1, 1, B*S, H]
+  — requires dim 1 = 1 (DeepSeek targets Galaxy cluster_axis=0
+  with multi-row geometry)
+- For our (1, 4) + cluster_axis=1: need to collapse dim 1.
+  Options: slice [:, 0:1, :, :], sum-reduce, or different cluster_axis.
+- Read `~/tenstorrent/tt-metal/tests/ttnn/unit_tests/operations/ccl/test_all_to_all_dispatch.py`
+  for the canonical output-shape contract before iterating.
+
+Old next-step (v0.1.4 implementation): Both
 `ttnn.all_to_all_dispatch` and `ttnn.all_to_all_combine` validated
 on (1,4) Blackhole P150. PR #39380 (Mar 2026) live in our build.
 cluster_axis=1 for our single-row mesh. Combine contract:
