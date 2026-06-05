@@ -65,7 +65,11 @@ parallel), #186 (G1 single-core), #187 (G2 multi-core), #188 (G3 batched),
   tiles, SPMD partition, cross-tile comm, DRAM streaming).
 - 🟢 Dead-code audit subagent running in background — proposed
   archive layout for stale 27B/35B/Gemma 4 probes.
-- ⏭ Next: rewrite the Mamba2 compute kernel for SSD math per
+- 🟢 **Adoption subagent running in background** — tasks #191 + #192
+  (paged_fused_update_cache on gm4 #44946, redundant to_memory_config
+  audit #44958). Plan at `research/tt_metal_adoption_plan_2026-06-04.md`.
+  Zero file overlap with foreground G1 work.
+- ⏭ Foreground next: rewrite the Mamba2 compute kernel for SSD math per
   `research/mm7_g1_mamba2_kernel_design.md` §6. Then build on qb1 +
   debug_fill smoke + numpy-oracle compare via G0a harness.
 

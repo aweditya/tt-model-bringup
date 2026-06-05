@@ -379,6 +379,26 @@ after is much more predictable.
 
 ------------------------------------------------------------------------
 
+## 6.5. Parallel adoption sidecar (NEW 2026-06-04)
+
+While Phase 0 (kernel) runs in the foreground, the qb1 hardware has
+idle windows between kernel iterations that we're using to land
+**tt-metal adoption wins** from the 3 audits. Tracked separately in
+[`research/tt_metal_adoption_plan_2026-06-04.md`](tt_metal_adoption_plan_2026-06-04.md).
+
+- **NOW (in flight)**: tasks #191 + #192 via background subagent —
+  `paged_fused_update_cache` swap on gm4 (#44946, +1.6 ms/tok) and
+  redundant `to_memory_config` audit on gm4 (#44958, +0.5-1 ms/tok).
+- **NEXT (post-Nemotron G4)**: tasks #193..#197 — GDN bake-off,
+  RMSNorm fusion (+12-15 ms/tok), chunk-outer 2048-tok prefill,
+  masked fixed-bucket prefill, wider deltanet_recurrence op.
+
+Zero file overlap with Phase 0 (subagent touches `experiments/serve/
+server_gemma4_unified_*` only; main agent touches
+`experiments/owned_ops/nemotron3_mamba2_decode_owned/` only).
+
+------------------------------------------------------------------------
+
 ## 7. Concrete next steps (Path B — start here)
 
 **Phase 0 (kernel) first.** The Phase 1 forward / oracle work also has
