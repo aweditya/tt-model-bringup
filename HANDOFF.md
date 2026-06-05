@@ -62,14 +62,19 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.2.5 (on-device tensor flow refactor).
-Inserted 2026-06-05 between v0.2 and v0.3 because the existing block_eager
-functions take numpy / return numpy → 52 host round trips per forward
-(~77s/step measured). Needle-haystack at L=8192 = 7+ days at that rate.
-Refactor adds `attn_block_eager_tt`, `mamba2_block_eager_tt`,
-`moe_block_eager_ep_tt` variants taking + returning `ttnn.Tensor`.
-Streaming weight pattern still works (orthogonal to tensor flow).
-Regression gate: v0.2.b smoke through new tt-flow PASS (argmax=6993).
+**Phase 1 — exact next task**: v0.3 (multi-step decode + long-context smoke).
+
+v0.2.5 COMPLETE 2026-06-05 (commit `926b49c`) — `_tt` block variants
+take/return `ttnn.Tensor`, 0 inter-block readbacks. Regression PASS
+(argmax_last = 6993 = HF). **Honest perf finding**: 82.4s vs v0.2.b's
+77.7s — essentially same. The 52 round trips we eliminated were ~10ms
+each (~520ms); drowned by 23 MoE × ~3s = 69s of MoE weight upload from
+disk per forward. **The bottleneck is weight streaming, not tensor
+flow.** For v0.3 multi-step we need to either fit all layers in memory
+(needs vocab-shard + more aggressive sharding — v0.5 territory) OR
+accept ~minute-per-token decode. Realistic v0.3 plan: 8-token chain
+gate uses ~10 min/run; needle-haystack at L=8192 blocked on weight
+residency (trace path or v0.5 fit-all-in-memory).
 
 v0.2 COMPLETE 2026-06-05 — full 52-layer streamed forward + final_norm
 + lm_head + argmax matches HF (commit `5ffd183`). TT argmax_last = 6993
