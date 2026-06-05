@@ -62,8 +62,26 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.4.G0 — ttnn.all_to_all_dispatch
-spike on (1,4) BH. Decides v0.1.4 path: True EP vs Pattern A fork.
+**Phase 1 — exact next task**: v0.1.4 — MoE Expert-Parallel refactor
+(True EP path, decided by G0 spike — commit `138df8e`). Both
+`ttnn.all_to_all_dispatch` and `ttnn.all_to_all_combine` validated
+on (1,4) Blackhole P150. PR #39380 (Mar 2026) live in our build.
+cluster_axis=1 for our single-row mesh. Combine contract:
+input dim 0 = n_experts/n_devices, post-expert layout
+`[experts_per_device, B, S, H]`.
+
+v0.1.4 implementation will fork DeepSeek-V3 demo
+(`~/tenstorrent/tt-metal/models/demos/deepseek_v3/tt/moe.py`):
+- Shard 128 experts as 32/chip
+- Forward: pre-norm → router → `all_to_all_dispatch` → batched
+  local experts (32 × matmul+relu²+matmul) → `all_to_all_combine`
+  → shared expert (replicated) → residual
+- ~6 expert FFNs/token (vs 128 in Pattern A — 21× less compute)
+- Memory ≤ 7.8 GB/chip; unblocks v0.2 + v0.3.
+
+Earlier path that was discarded: Pattern A fork from 35B (each
+chip runs all 32 local experts, mask unselected, all_reduce).
+Known-good but ~95% wasted compute; saved as fallback.
 
 23 MoE × 1.3 GB > 8 GB/chip → either path needs sharding to 32
 experts/chip. Research round (2026-06-05, 2 parallel agents) found:
