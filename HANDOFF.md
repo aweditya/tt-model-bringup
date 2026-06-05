@@ -62,8 +62,8 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.4 dim-1 collapse fix (commit
-`c5401a9` landed scaffolding; forward fails at the dim-1 collapse).
+**Phase 1 — exact next task**: v0.1.4 shape contract — RESOLVED via
+audit 2026-06-05. Implementation pending.
 
 Scaffolding shipped (PASSING):
 - `upload_moe_layer_ep` — 128 experts sharded as 32/chip
@@ -72,15 +72,33 @@ Scaffolding shipped (PASSING):
   (which works — dispatch_out [1, 4, 5, 2688], meta [1, 4, 5, 6])
 - Bootstrap 9.1s (vs full replicated 13.9s — nice win)
 
-KNOWN-OPEN shape contract:
-- Our dispatch_out: dim 1 = NCHIPS=4 (source-device dim)
-- DeepSeek's reshape (tt/moe.py:462) goes [B, ?, S, H] → [1, 1, B*S, H]
-  — requires dim 1 = 1 (DeepSeek targets Galaxy cluster_axis=0
-  with multi-row geometry)
-- For our (1, 4) + cluster_axis=1: need to collapse dim 1.
-  Options: slice [:, 0:1, :, :], sum-reduce, or different cluster_axis.
-- Read `~/tenstorrent/tt-metal/tests/ttnn/unit_tests/operations/ccl/test_all_to_all_dispatch.py`
-  for the canonical output-shape contract before iterating.
+**Shape contract audit 2026-06-05** ([[reference-all-to-all-dispatch-shape-contract]]):
+
+Dispatch output shape formula (from `ttnn/cpp/ttnn/operations/ccl/all_to_all_dispatch/device/dispatch_op.cpp:99-113`):
+- `output_concat_dim=1` (default): per-chip `[1, B_per_chip*D[A], S, H]`
+- `output_concat_dim=2` (explicit): per-chip `[1, B_per_chip, S_per_chip*D[A], H]`
+
+where `D[A] = dispatch_devices = mesh.shape[A]`. For our `(1,4)` + `cluster_axis=1`: `D[A]=4`.
+
+Semantic meaning of dim 1 under default `output_concat_dim=1`: **"source dispatch device index × B"**. Source chip `d` writes its B*S tokens into slot `[d*B : (d+1)*B]` along dim 1. With our REPLICATED input, all 4 dim-1 slots carry the same 5 tokens — explains the `[1, 4, 5, 2688]` we observed.
+
+**Two-option fix (Option 1 preferred):**
+
+**Option 1 (preferred, mirrors in-tree `b1s8` test at `tests/ttnn/unit_tests/operations/ccl/test_all_to_all_dispatch.py:1189-1286`):**
+- Shard seq dim across cluster_axis=1 (pad S=5→8, 2/chip) via `ShardTensor2dMesh(mesh, dims=(None, 2), mesh_shape=(1,4))`
+- Pass `output_concat_dim=2` to `ttnn.all_to_all_dispatch`
+- Per-chip output: `[1, 1, NCHIPS*S_per_chip=8, HIDDEN]` — directly DS-V3's downstream contract
+- No post-op reshape needed. Drop into `ttnn.repeat(dims=(1, E_LOCAL, 1, 1))` + per-expert matmul exactly as DS-V3 `moe.py:468-474`.
+
+**Option 2 (stopgap, ~4× wasted compute):**
+- Keep replicated input + default `output_concat_dim=1`
+- Reshape `[1, 4, 5, 2688]` → `[1, 1, 20, 2688]` (Option literally = DS-V3 `moe.py:464-467`)
+- Each pair of 5-rows is identical; per-expert matmul runs 4× — combine emits 4 redundant copies needing de-dup.
+- Use only if blocked from changing the dispatch input contract.
+
+**Recommendation: Option 1.** Pad seq 5→8, shard via `ShardTensor2dMesh(dims=(None,2))`, set `output_concat_dim=2`, drop the dim-1 reshape, proceed with `ttnn.repeat` + per-expert matmul.
+
+For combine (when we get there): per-chip input `[E_LOCAL=32, B_global, S, HIDDEN]` (without local_reduce). Validator: `combine_op.cpp:79-90`. Test: `test_all_to_all_combine.py:498-505`.
 
 Old next-step (v0.1.4 implementation): Both
 `ttnn.all_to_all_dispatch` and `ttnn.all_to_all_combine` validated
