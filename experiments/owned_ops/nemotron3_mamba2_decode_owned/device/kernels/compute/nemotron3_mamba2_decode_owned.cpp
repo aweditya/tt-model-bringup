@@ -368,15 +368,27 @@ FORCE_INLINE void transpose_x_to_col(
 FORCE_INLINE void matmul_outer_x_dt_B(
     uint32_t cb_x_col,
     uint32_t cb_dt_B,
+    uint32_t head_dim_tile,    // day-4.2: read cb_x_col at this index (was hardcoded 0)
     uint32_t s_tile_index,
     uint32_t cb_outer) {
-    mm_init(cb_x_col, cb_dt_B, cb_outer);
-    cb_wait_front(cb_x_col, ONE_TILE);
+    // day-4.2b: mm_init_short (light re-init) instead of full mm_init —
+    // matches qwen36_gdn_decode (non-owned) production pattern where the
+    // full mm_init lives outside the loop. UNBLOCKS the 8-iter hang.
+    // Caller must issue a full mm_init OR matmul_reduce_C_state (which
+    // calls full mm_init) BEFORE the loop.
+    //
+    // mm_init_short skips llk_pack_hw_configure / llk_pack_dest_init that
+    // full mm_init does, so we need explicit pack_reconfig_data_format
+    // to set up fp32-dst → bf16-cb_outer conversion. Without this, packed
+    // tile bytes are garbage (~1e+38).
+    mm_init_short(cb_x_col, cb_dt_B);
+    pack_reconfig_data_format(cb_outer);
+    cb_wait_front(cb_x_col, head_dim_tile + 1);
     cb_wait_front(cb_dt_B, s_tile_index + 1);
     cb_reserve_back(cb_outer, ONE_TILE);
 
     tile_regs_acquire();
-    matmul_tiles(cb_x_col, cb_dt_B, 0, s_tile_index, 0);
+    matmul_tiles(cb_x_col, cb_dt_B, head_dim_tile, s_tile_index, 0);
     tile_regs_commit();
     tile_regs_wait();
     pack_tile(0, cb_outer);
@@ -678,42 +690,37 @@ void kernel_main() {
             multiply_decay_by_dt_eff(cb_decay, cb_dt_B);
             compute_dt_B(cb_dt_B, cb_B, ssm_state_tiles);
 
-            // GDN-structural prime: run the C·state reduce FIRST. Real
-            // matmul (not bare-init workaround); produces y_partial we
-            // route to mode=4/5 later; structurally matches GDN's
-            // matmul_reduce-before-loop pattern (see
-            // [[feedback-gdn-vs-mamba2-kernel-delta]]).
+            // Day-4.2 restructure: split transpose and matmul into
+            // separate phases to bypass the iter-count cap on
+            // transpose-interleaved-with-matmul on Blackhole.
             //
-            // Bisect 2026-06-05: this matmul_reduce alone PASSES (2 iters
-            // d=0..1). Adding the full 8-iter state-update loop after
-            // still HANGS — even with the prime, ~5th transpose+matmul
-            // iteration wedges the TRISC pipeline. The cap is iter-count
-            // (8 iters all with d=0 also hangs — bisect-D), not the
-            // d-transition specifically.
+            // Phase 1: pre-transpose x ONCE per d. cb_x_col ends with
+            // head_dim_tiles column-vector tiles queued.
+            // Phase 2: matmul_reduce_C_state — real matmul, primes
+            // engine + produces y_partial for mode=4/5.
+            // Phase 3: 8-iter state-update loop. NO transpose inside;
+            // matmul_outer reads pre-transposed cb_x_col[d] via the
+            // updated head_dim_tile arg.
             //
-            // The hang is real and reproducible regardless of mm_init
-            // priming. Next: try the SDPA escape hatch — fold the
-            // x→col transpose into matmul's transpose=1 B-operand flag,
-            // eliminating `transpose_wh_tile` entirely. SDPA never
-            // hits this class of hang because it never calls
-            // transpose_wh ([[feedback-sdpa-transpose-b-flag-escape-hatch]]).
+            // Rationale: bisect-D confirmed that 8 transpose+matmul
+            // iters in succession hang regardless of mm_init prime. By
+            // moving transposes into a 2-call pre-phase (well under
+            // the ~4-iter cap) and using only matmul+binary ops inside
+            // the loop, we sidestep the sticky-bit accumulator.
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                transpose_x_to_col(cb_x, d, cb_x_col);
+            }
+
             for (uint32_t d = 0; d < head_dim_tiles; ++d) {
                 matmul_reduce_C_state(cb_state_in, cb_C, d, ssm_state_tiles, cb_y_partial);
             }
 
-            // ── State-update loop (KNOWN-HANGING at >4 iters; gates on
-            //    the SDPA escape hatch fix). 4-iter d=0-only path proven
-            //    via step-13. Keeping this code in place so the SDPA
-            //    swap is a focused 1-helper change (replace
-            //    matmul_outer_x_dt_B's call site).
             for (uint32_t d = 0; d < head_dim_tiles; ++d) {
                 for (uint32_t s = 0; s < ssm_state_tiles; ++s) {
                     const uint32_t tile_idx = d * ssm_state_tiles + s;
-                    transpose_x_to_col(cb_x, d, cb_x_col);
-                    matmul_outer_x_dt_B(cb_x_col, cb_dt_B, s, cb_outer);
+                    matmul_outer_x_dt_B(cb_x_col, cb_dt_B, d, s, cb_outer);
                     mul_decay_state_to(cb_state_in, cb_decay, tile_idx, cb_state_scaled);
                     add_state_scaled_outer(cb_state_scaled, cb_outer, tile_idx, cb_state_out);
-                    cb_pop_front(cb_x_col, ONE_TILE);
                     cb_pop_front(cb_outer, ONE_TILE);
                 }
             }
@@ -723,6 +730,7 @@ void kernel_main() {
             }
 
             cb_pop_front(cb_x, head_dim_tiles);
+            cb_pop_front(cb_x_col, head_dim_tiles);  // day-4.2: pre-transposed, drained here
             cb_pop_front(cb_state_in, head_dim_tiles * ssm_state_tiles);
             cb_pop_front(cb_state_scaled, head_dim_tiles * ssm_state_tiles);
             cb_pop_front(cb_decay, ONE_TILE);
