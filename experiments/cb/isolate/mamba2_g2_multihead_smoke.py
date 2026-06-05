@@ -79,6 +79,8 @@ def make_fixture(B: int, num_heads: int, head_dim: int, ssm_state: int,
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int, default=1,
+                        help="batch size (G2 default 1; set to 2+ to exercise G3 batched)")
     parser.add_argument("--num-heads", type=int, default=64,
                         help="number of heads (default: 64 = full Nemotron)")
     parser.add_argument("--n-groups", type=int, default=8,
@@ -89,7 +91,7 @@ def main() -> int:
     parser.add_argument("--cos-gate", type=float, default=0.999)
     args = parser.parse_args()
 
-    B = 1  # G2 stays at B=1; G3 will scale.
+    B = args.batch
     log(f"G2 multi-head smoke: B={B} num_heads={args.num_heads} "
         f"head_dim={args.head_dim} ssm_state={args.ssm_state} "
         f"n_groups={args.n_groups}")
@@ -146,6 +148,19 @@ def main() -> int:
             out[..., 0, 0] = arr
             return out
 
+        def pad_scalar_per_head_per_batch(arr, B_):
+            """G3 helper: tile a per-head (NUM_HEADS,) array across batches
+            to (B, NUM_HEADS, 32, 32). The reader uses `global_block` (which
+            includes batch) as the tile index for per-head weights, so for
+            B>1 we must replicate so each (batch, head) block reads the
+            correct head's weight tile. With B=1 this collapses to the
+            single-batch path above (no replication needed)."""
+            shape = (B_, args.num_heads, 32, 32)
+            out = np.zeros(shape, dtype=np.float32)
+            # arr is (NUM_HEADS,); broadcast over batch axis.
+            out[..., 0, 0] = arr[None, :]
+            return out
+
         def pad_per_head_vector(arr, last_dim):
             """Pad shape (B, NUM_HEADS, last_dim) → (B, NUM_HEADS, 32, last_dim)
             with values in row 0 of each (32, last_dim) plane. This puts each
@@ -177,12 +192,15 @@ def main() -> int:
         B_padded = replicate_per_group_to_per_head(fix_kernel["B_in"], args.num_heads)
         C_padded = replicate_per_group_to_per_head(fix_kernel["C_in"], args.num_heads)
 
+        # Per-head weights (dt_bias, A_log, D) need batch replication for B>1
+        # so the reader's global_block tile-index points at the right head
+        # for every (batch, head) block.
         x_tt        = tt_bf16(x_padded)
         z_tt        = tt_bf16(z_padded)
         dt_tt       = tt_bf16(pad_scalar_per_head(fix_kernel["dt"], leading=(B,)))
-        dt_bias_tt  = tt_bf16(pad_scalar_per_head(fix_kernel["dt_bias"]))
-        A_log_tt    = tt_bf16(pad_scalar_per_head(fix_kernel["A_log"]))
-        D_tt        = tt_bf16(pad_scalar_per_head(fix_kernel["D"]))
+        dt_bias_tt  = tt_bf16(pad_scalar_per_head_per_batch(fix_kernel["dt_bias"], B))
+        A_log_tt    = tt_bf16(pad_scalar_per_head_per_batch(fix_kernel["A_log"], B))
+        D_tt        = tt_bf16(pad_scalar_per_head_per_batch(fix_kernel["D"], B))
         B_in_tt     = tt_bf16(B_padded)
         C_in_tt     = tt_bf16(C_padded)
         ssm_state_tt = tt_fp32(fix_kernel["ssm_state"])
