@@ -62,15 +62,18 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.1 L5 Attention warmup (task #203).
+**Phase 1 — exact next task**: v0.1.2 L0 Mamba2 wrapper drop-in (task #204).
 Previously DONE 2026-06-05:
 - v0.0 oracle PASS — `.cache/hf_oracle_nemotron3_nano/` 19 artifacts
 - v0.0+ oracle HARDENED — norm + mixer-out + shared-expert hooks, `--gen N` multi-step
 - v0.0.1 tokenizer probe PASS — both `<think>\n` and `<think></think>` suffixes resolved
 - v0.0.2 weights introspect PASS — 0 missing / 0 shape mismatches / 0 extras
 - **v0.1.0 bootstrap PASS — 3/3 gates green** (Gate A embed cos=1.0;
-  Gate B final_norm cos=0.9999; Gate C C1 generation token TT==HF ' Paris',
-  C2 logits cos vs numpy=0.99997, C3 argmax 5/5 vs numpy)
+  Gate B final_norm cos=0.9999; Gate C generation token+logits cos+argmax all PASS)
+- **v0.1.1.a L5 projections PASS — 4/4 gates** (H/Q/K/V cos ≥ 0.9999)
+- **v0.1.1.b L5 full attention block PASS — 3/3 gates** (O cos=0.9998,
+  M cos=0.9998, B cos=1.000000 — effectively bit-exact post-residual).
+  SDPA runs in numpy fp32 for now; on-device prefill SDPA = v0.5 perf.
 
 **Real findings threaded into the next gates**:
 1. **DeepSeek-V3 `e_score_correction_bias`** per MoE gate (from v0.0.2):
