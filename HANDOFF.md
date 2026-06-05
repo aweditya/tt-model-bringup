@@ -5,46 +5,62 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## POST-COMPACTION QUICK-START (2026-06-04 22:50 PT)
+## POST-CHECKPOINT QUICK-START (2026-06-05 00:00 PT)
 
-**Where we are**: G1 day-3.9 PASSED. The owned Mamba2 SSD kernel
-scaffolding (compute + reader + writer + program_factory + device_op +
-nanobind) compiles, registers, dispatches, runs end-to-end. Smoke at
-`debug_mode=1` (fill_one path) returns bit-exact `1.0` for both y and
-ssm_state. Commit `0073ef8`.
+**Where we are**: G1 **day-4 PARTIAL** — mode=2 PASSES end-to-end (refactor
+of finalize_decay into compute_dt_eff + multiply_decay_by_dt_eff is sound).
+Mode=3 PARTIAL PASS: works for 4 iters at d=0 only (cos=0.21 with d=1
+tiles filled sentinel). Full 8-iter mode=3 (d=0..1) HANGS at the d=1
+transition. Source checkpoint at commit `b5c93fa`.
 
-**Exact next task**: G1 **day-4** — implement `debug_mode=3` math.
+**🔑 KEY DISCOVERY — `mm_init` PRIME REQUIRED** (memory:
+[[feedback-mm-init-prime-required]]):
+- First matmul in a TRISC kernel must be preceded by a bare
+  `mm_init(in0, in1, out)` call BEFORE the inner loop, or the second
+  matmul hangs the pipeline.
+- GDN gets this for free via its `matmul_reduce` prelude; standalone
+  kernels must issue the prime explicitly.
+- `mm_init` must be the LAST init before the matmul loop — any
+  subsequent `fill_tile_init` / `add_tiles_init` un-primes it.
+- `transpose_x_to_col` MUST keep `unary_op_init_common` (GDN canonical;
+  tt-metal #15930 = no `transpose_wh_uninit`).
+- `cb_outer` is bf16 (matches GDN's tensor_format).
 
-1. Edit `experiments/owned_ops/nemotron3_mamba2_decode_owned/device/kernels/compute/nemotron3_mamba2_decode_owned.cpp`
-2. Add helper `compute_dt_B(cb_dt_eff_scratch, cb_B, cb_dt_B)` — broadcast
-   scalar `dt_eff` across the `[ssm_state]` B vector via
-   `mul_tiles_bcast_scalar`. Fork from the existing `mul_decay_state_to`
-   in the same file (line ~277); the LLK call is identical.
-3. Add helper `add_outer_input(cb_state_scaled, cb_x, cb_dt_B,
-   head_dim_tile, ssm_state_tile, cb_state_out)` — implements
-   `state_out[d,s] = state_scaled[d,s] + dt_B[s] * x[d]`. Per-tile
-   outer-product add. Probably ~50 LOC.
-4. Wire `debug_mode=3` branch in `kernel_main`. Pipeline:
-   ```
-   compute_decay → finalize_decay_with_dt_eff (cb_decay = decay)
-   compute_dt_B (cb_dt_B was scratch-storing dt_eff, now overwrite with
-                 dt_eff * B vector)
-   for d in head_dim_tiles:
-       for s in ssm_state_tiles:
-           mul_decay_state_to → cb_state_scaled
-           add_outer_input → cb_state_out
-   fill_one(cb_y)  # mode 3 still sentinel-fills y
-   ```
-5. Deploy to qb1 + rebuild + smoke. The smoke at `debug_mode=3` should
-   produce state_out ≈ `decay*state_in + dt_eff*B*x` (matching the
-   numpy oracle's state-update step, ignoring the output-reduce).
+**Exact next task**: G1 **day-4.1** — localize the d=1 hang.
 
-**Validation gate**: fork
-`experiments/cb/isolate/mamba2_kernel_smoke.py` → run with
-`debug_mode=3` instead of `debug_fill=True`. Compare state_out against
-`experiments/utils/mamba2_numpy_oracle.py` via the G0a harness
-(`experiments/utils/test_mamba2_decode_isolated.py --kernel-callable
-<py path>`). Pass: per-head cos ≥ 0.999.
+1. Re-test ONE matmul iter at d=1 (tile_index=1) with NO fill_one or
+   any other op between `mm_init` prime and the matmul. Append the
+   sentinel fill_ones for state_out positions 0..3 AFTER the matmul
+   iter (the writer drains in order), not before.
+2. If d=1 passes alone → it's specifically the d-loop transition that
+   hangs. Add re-prime (another `mm_init`) between d-iters.
+3. If d=1 hangs alone → deeper LLK issue with `tile_index=1`. Try
+   `transpose_wh_init` (full, not _short) inside `transpose_x_to_col`.
+
+**Current source state**: the kernel at
+`experiments/owned_ops/nemotron3_mamba2_decode_owned/device/kernels/compute/nemotron3_mamba2_decode_owned.cpp`
+has step-14's WIP code (1 iter d=1 with fill_one before — HANGS).
+Either revert to step-13 logic for a known-working baseline (4 iters
+d=0 only) or write step-15 (1 iter d=1, no fill_one before mm_init).
+
+**Bisect log** (full table in commit `b5c93fa` message):
+- step-1..7, 9, 12, 13: PASS (incremental rebuild from compute_dt_B up
+  to 4-iter d=0 loop)
+- step-3, 4, 6, 10, 11, 14: HANG (each isolates a specific gotcha)
+
+**Validation gate**: smoke probe at
+`experiments/cb/isolate/mamba2_kernel_mode3_smoke.py --mode 3`.
+Mode=2 (regression) should always PASS in ~3s. Mode=3 PASS at any
+non-trivial iter count is progress; full PASS (cos ≥ 0.999) blocked
+on the d=1 fix.
+
+**Dataflow + design refs**:
+- Kernel design: `research/mm7_g1_mamba2_kernel_design.md`
+- Decisions log: `research/mm7_g1_dataflow_decisions.md` (D1-D11)
+- Math primer: `wiki/65_mamba_state_space_models.md` §3
+- GDN production source (fork base):
+  `ssh qb1 cat /home/aditya/tenstorrent/tt-metal/ttnn/cpp/ttnn/operations/experimental/transformer/qwen36_gdn_decode_owned/device/kernels/compute/qwen36_gdn_decode_owned.cpp`
+  — read debug_mode==5 (production) loop pattern (line ~530+).
 
 **Setup commands** (verbatim):
 ```bash

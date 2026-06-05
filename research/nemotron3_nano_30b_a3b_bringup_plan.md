@@ -294,16 +294,33 @@ the per-group broadcast.
     Smoke output: `y_out shape=(1,1,64) finite=True min=+1.000 max=+1.000 |y-1.0|=0.0e+00`
     `state_out shape=(1,1,64,128) finite=True min=+1.000 max=+1.000`
     JIT cache: 11/13 hits (84.6%). End-to-end runtime ~1 s after cache warm.
-  - [ ] **Day-4 (next): implement debug_mode=3 (state correct).**
-    Add `compute_dt_B(cb_dt_eff, cb_B, cb_dt_B)` helper that broadcasts
-    dt_eff across the [ssm_state] vector tile. Then
-    `add_outer_input(cb_state_scaled, cb_x, cb_dt_B, cb_state_out)` for
-    the outer-product update. Wire `debug_mode=3` in kernel_main: full
-    state update (no output reduce yet).
-  - [ ] Day-4.5: C_state_reduce + D*x skip → debug_mode=5 (full math).
-  - [ ] Day-5: G0a harness compare at cos ≥ 0.999 vs numpy oracle.
-  - [ ] Day-4: C_state_reduce + add_skip → debug_mode=4..5 (full math).
-  - [ ] Day-5: build, oracle compare via G0a harness; ship.
+  - [~] **Day-4 PARTIAL (2026-06-04 EOD)**: mode=3 wired but partial.
+    Mode=2 PASSES (decay × state — refactor of finalize_decay into
+    compute_dt_eff + multiply_decay_by_dt_eff is sound). Mode=3 PARTIAL
+    PASS: kernel runs and produces sensible state for d=0 (cos=0.21 with
+    sentinel-fill of d=1 tiles), but HANGS at full 8-tile (d=0..1) loop.
+    Key finding: **`mm_init` PRIME before the inner transpose+matmul loop
+    is REQUIRED** — without it, the first matmul ever in the kernel
+    hangs the TRISC pipeline. GDN avoids this implicitly via its
+    `matmul_reduce` prelude; we have no such prelude until mode=5.
+    Other findings:
+    - `transpose_x_to_col` MUST keep `unary_op_init_common` (GDN pattern);
+      removing it leaks sticky transpose-unpacker state into matmul
+      (tt-metal #15930 — no `transpose_wh_uninit`).
+    - `cb_outer` is bf16 (matches GDN), not fp32. Pack precision OK
+      because matmul accumulates fp32 in dst before quantizing.
+    - Single-phase loop works (transpose+matmul+mul_decay+add+pop per s)
+      once mm_init prime is in place; two-phase split unnecessary.
+    Bisect log + canonical patterns documented in commit `b5c93fa`.
+  - [ ] **Day-4.1 (next)**: localize the d=1 hang. Test ONE matmul iter
+    at d=1 with NO fill_one before (step-14 hung but had fill_one before
+    the matmul, which calls `fill_tile_init` and likely un-primes mm).
+    If d=1 alone passes, then the d-loop transition needs an extra
+    init re-prime. If d=1 hangs, deeper LLK debug.
+  - [ ] Day-4.5: C_state_reduce + D*x skip → debug_mode=4 (D·x only).
+  - [ ] Day-4.6: full mode=5 (production math) → cos ≥ 0.999 vs oracle.
+  - [ ] Day-5: G0a harness compare at cos ≥ 0.999 vs numpy oracle,
+    single-step AND 8-step multi-step replay.
 - [ ] **G2..G4** — sequential, gated on G1.
 
 Phase 0 timeline estimate: **3-5 weeks** depending on how many of the
