@@ -398,6 +398,104 @@ def attn_projections_only(state: State, h_input_np, layer_idx: int):
     return out
 
 
+def numpy_sdpa_gqa_causal(q_np, k_np, v_np, num_q_heads, num_kv_heads, head_dim):
+    """Numpy fp32 reference: causal SDPA with GQA over q/k/v of shape
+    [B, S, NQ*HD], [B, S, NKV*HD], [B, S, NKV*HD]. Returns
+    [B, S, NQ*HD]. Use ONLY for v0.1.1 attention validation —
+    on-device prefill SDPA lands at v0.5 perf.
+    """
+    B, S, _ = q_np.shape
+    HD = head_dim
+    NQ = num_q_heads
+    NKV = num_kv_heads
+    G = NQ // NKV  # GQA group size
+
+    # Reshape to [B, S, NH, HD] → [B, NH, S, HD]
+    q = q_np.reshape(B, S, NQ, HD).transpose(0, 2, 1, 3).astype(np.float32)
+    k = k_np.reshape(B, S, NKV, HD).transpose(0, 2, 1, 3).astype(np.float32)
+    v = v_np.reshape(B, S, NKV, HD).transpose(0, 2, 1, 3).astype(np.float32)
+
+    # GQA broadcast — repeat k, v G times along the head dim.
+    k = np.repeat(k, G, axis=1)  # [B, NQ, S, HD]
+    v = np.repeat(v, G, axis=1)
+
+    # Scores: q @ k.T / sqrt(HD)  →  [B, NQ, S, S]
+    scores = (q @ k.transpose(0, 1, 3, 2)) / np.float32(np.sqrt(HD))
+
+    # Causal mask (upper-triangular -inf)
+    mask = np.triu(np.ones((S, S), dtype=np.float32), k=1) * -1e9
+    scores = scores + mask[None, None, :, :]
+
+    # Softmax over last dim
+    scores -= scores.max(axis=-1, keepdims=True)
+    np.exp(scores, out=scores)
+    scores /= scores.sum(axis=-1, keepdims=True)
+
+    # attn_out = scores @ v → [B, NQ, S, HD] → [B, S, NQ*HD]
+    out = scores @ v
+    out = out.transpose(0, 2, 1, 3).reshape(B, S, NQ * HD)
+    return out
+
+
+def attn_block_eager(state: State, h_input_np, layer_idx: int):
+    """v0.1.1.b — full attention block (pre-norm + qkv + SDPA + o_proj
+    + residual). SDPA runs in numpy fp32 (NKV=2 × NCHIPS=4 doesn't
+    shard; on-device SDPA is a v0.5 perf optimization).
+
+    Input:  h_input_np  numpy fp32  [B, S, HIDDEN] (or [S, HIDDEN])
+    Returns dict with: h_norm, q, k, v (from v0.1.1.a path),
+                       attn_out (post-SDPA, pre-o_proj),
+                       o_proj_out (post-o_proj),
+                       block_out (post-residual = L5 block output).
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "attention"
+
+    # Stage 1: pre-norm + projections on TT (already validated v0.1.1.a).
+    res = attn_projections_only(state, h_input_np, layer_idx)
+    q_np, k_np, v_np = res["q"], res["k"], res["v"]
+    h_input_np_3d = h_input_np if h_input_np.ndim == 3 else h_input_np[None]
+    if q_np.ndim == 2:
+        q_np = q_np[None]; k_np = k_np[None]; v_np = v_np[None]
+
+    # Stage 2: numpy SDPA (causal + GQA broadcast). Replaceable with
+    # an on-device prefill SDPA at v0.5.
+    attn_out_np = numpy_sdpa_gqa_causal(
+        q_np, k_np, v_np,
+        num_q_heads=NUM_Q_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM_ATTN,
+    )
+
+    # Stage 3: o_proj on TT.
+    attn_out_tt = ttnn.from_torch(
+        torch.from_numpy(attn_out_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    o_tt = ttnn.matmul(attn_out_tt, w["o_proj"], compute_kernel_config=HIFI4)
+    o_np = ttnn.to_torch(
+        o_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    )[:1].float().numpy()
+
+    # Stage 4: residual add (host-side; cheap).
+    block_out = h_input_np_3d.astype(np.float32) + o_np
+
+    out = {
+        "h_norm":     res["h_norm"],
+        "q":          q_np,
+        "k":          k_np,
+        "v":          v_np,
+        "attn_out":   attn_out_np,
+        "o_proj_out": o_np,
+        "block_out":  block_out,
+    }
+    if h_input_np.ndim == 2:
+        for k in ["attn_out", "o_proj_out", "block_out"]:
+            out[k] = out[k][0]
+    return out
+
+
 def main():
     """Tiny direct-invoke entry point for ad-hoc smoke testing."""
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
