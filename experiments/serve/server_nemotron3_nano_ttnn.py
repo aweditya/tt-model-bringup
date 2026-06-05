@@ -205,16 +205,26 @@ def upload_mamba2_layer(state, key_to_shard, L: int, log) -> dict:
     assert mixer_norm_w.shape == (D_INNER,)
     assert out_proj_w.shape == (HIDDEN, D_INNER), out_proj_w.shape
 
+    # Conv1d weight needs an extra kernel_height=1 dim for ttnn.conv1d
+    # ([out_channels, in_channels/groups=1, kernel_height=1, kernel_width=4]).
+    # The op itself is implemented as a 2D conv with H=1.
+    conv1d_w_4d = conv1d_w[:, :, None, :]  # [conv_dim, 1, 1, 4]
     out = {
         "kind": "mamba2",
         "norm": np_to_replicated(norm_w, state.mesh),
         # in_proj uploaded pre-transposed for matmul [HIDDEN, in_dim].
         "in_proj": np_to_replicated(in_proj_w.T, state.mesh),
-        # conv1d weights/biases kept as numpy for now; we'll plumb them
-        # into qwen36_conv1d_decode_owned at v0.1.2.b. Host-side copies
-        # mean we don't yet pay the upload cost.
-        "conv1d_w_np": conv1d_w.copy(),
-        "conv1d_b_np": conv1d_b.copy(),
+        # Conv1d weight + bias uploaded for ttnn.conv1d. Depth-wise:
+        # groups=conv_dim makes this a per-channel kernel.
+        "conv1d_w": ttnn.from_torch(
+            torch.from_numpy(conv1d_w_4d.astype(np.float32)),
+            dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+        ),
+        "conv1d_b": ttnn.from_torch(
+            torch.from_numpy(conv1d_b.reshape(1, 1, 1, -1).astype(np.float32)),
+            dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+        ),
+        # The small per-head ops (Mamba2 step's scalars) plumb at v0.1.2.c.
         "dt_bias_np": dt_bias.copy(),
         "A_log_np": A_log.copy(),
         "D_np": D_w.copy(),
@@ -223,7 +233,8 @@ def upload_mamba2_layer(state, key_to_shard, L: int, log) -> dict:
         "out_proj": np_to_replicated(out_proj_w.T, state.mesh),
     }
     log(f"  L{L} (mamba2): norm + in_proj + out_proj uploaded replicated bf16; "
-        f"conv1d / dt_bias / A_log / D / mixer_norm held host-side for v0.1.2.b+")
+        f"conv1d_w/b uploaded as host bf16 (for ttnn.conv1d at v0.1.2.b); "
+        f"dt_bias/A_log/D/mixer_norm held host-side for v0.1.2.c")
     return out
 
 
@@ -267,7 +278,15 @@ def bootstrap(state: State, log=None):
 
     log("[bootstrap] open mesh + fabric…")
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D)
-    state.mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, NCHIPS))
+    # l1_small_size: ttnn.conv1d needs L1_SMALL for its kernel scratch
+    # (default 0 → "0 B per bank" TT_FATAL). 64 KB is generous for our
+    # depth-wise conv at conv_dim=6144.
+    # trace_region_size: mirrors Gemma 4 — 400 MB for v0.4 traces.
+    state.mesh = ttnn.open_mesh_device(
+        ttnn.MeshShape(1, NCHIPS),
+        l1_small_size=65536,
+        trace_region_size=400_000_000,
+    )
     log(f"  mesh: {state.mesh}")
 
     log("[bootstrap] config + tokenizer…")
@@ -600,6 +619,78 @@ def mamba2_in_proj_only(state: State, h_input_np, layer_idx: int):
     out = {
         "h_norm":      _readback(h_norm_tt),
         "in_proj_out": _readback(in_proj_tt),
+    }
+    if squeeze_batch:
+        for k in out:
+            out[k] = out[k][0]
+    return out
+
+
+def mamba2_in_proj_split_conv1d(state: State, h_input_np, layer_idx: int):
+    """v0.1.2.b — pre-norm + in_proj + split + conv1d on x_BC.
+
+    Pipeline (all on-device):
+      pre-norm → in_proj → split into (z, x_BC, dt) along the last dim
+      → ttnn.conv1d(x_BC) [depth-wise, K=4, sym pad=3, groups=conv_dim]
+
+    Returns dict with intermediates incl. `conv1d_out` shape
+    [B, conv_dim, S + 2*pad - K + 1] = [B, 6144, 8] matching the HF
+    hook (HF captures the conv output BEFORE the causal-slice).
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "mamba2"
+    squeeze_batch = h_input_np.ndim == 2
+    if squeeze_batch:
+        h_input_np = h_input_np[None]
+    B, S, _ = h_input_np.shape
+
+    h_tt = ttnn.from_torch(
+        torch.from_numpy(h_input_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    h_norm_tt = ttnn.rms_norm(h_tt, weight=w["norm"], epsilon=EPS)
+    in_proj_tt = ttnn.matmul(h_norm_tt, w["in_proj"], compute_kernel_config=HIFI4)
+
+    # Split last dim into (z [d_inner], x_BC [conv_dim], dt [num_heads]).
+    z_tt   = ttnn.slice(in_proj_tt, [0, 0, 0],                          [B, S, D_INNER])
+    xBC_tt = ttnn.slice(in_proj_tt, [0, 0, D_INNER],                    [B, S, D_INNER + CONV_DIM_M])
+    dt_tt  = ttnn.slice(in_proj_tt, [0, 0, D_INNER + CONV_DIM_M],       [B, S, D_INNER + CONV_DIM_M + MAMBA_HEADS])
+
+    # ttnn.conv1d expects input as [N, 1, W=S, C=conv_dim] (NHWC, with
+    # implicit H=1 since this is a 1D conv). Need ROW_MAJOR for the op.
+    xBC_nhwc = ttnn.to_layout(ttnn.reshape(xBC_tt, [B, 1, S, CONV_DIM_M]),
+                                ttnn.ROW_MAJOR_LAYOUT)
+
+    conv_out_tt = ttnn.conv1d(
+        input_tensor=xBC_nhwc,
+        weight_tensor=w["conv1d_w"],
+        device=state.mesh,
+        in_channels=CONV_DIM_M,
+        out_channels=CONV_DIM_M,
+        batch_size=B,
+        input_length=S,
+        kernel_size=CONV_KERNEL,
+        stride=1,
+        padding=CONV_KERNEL - 1,  # symmetric (= 3)
+        dilation=1,
+        groups=CONV_DIM_M,        # depth-wise
+        bias_tensor=w["conv1d_b"],
+    )
+
+    def _readback(t):
+        arr = ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return arr[:1].float().numpy()
+
+    out = {
+        "h_norm":      _readback(h_norm_tt),
+        "in_proj_out": _readback(in_proj_tt),
+        "z":           _readback(z_tt),
+        "x_BC":        _readback(xBC_tt),
+        "dt":          _readback(dt_tt),
+        "conv1d_out":  _readback(conv_out_tt),
     }
     if squeeze_batch:
         for k in out:
