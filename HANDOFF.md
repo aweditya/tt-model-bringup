@@ -62,7 +62,13 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.2 (full 52-layer forward + argmax).
+**Phase 1 — exact next task**: v0.3 (multi-step decode + long-context smoke).
+v0.2 COMPLETE 2026-06-05 — full 52-layer streamed forward + final_norm
++ lm_head + argmax matches HF (commit `5ffd183`). TT argmax_last = 6993
+= HF argmax_last ✓. Streaming pattern: bootstrap top-level only, then
+per-layer `upload_one_layer → block_forward → deallocate_layer` to fit
+the 23 MoE EP layers (~640 MB/chip each) inside 8 GB budget.
+
 v0.1.4 EP COMPLETE 2026-06-05 — 3/3 gates PASS, cosines bit-equivalent
 to v0.1.3.b naive path (commits `1abce07` forward, `13b111e` h_norm
 host-bridge eliminated). Remaining host bridges = router topk-6, combine
