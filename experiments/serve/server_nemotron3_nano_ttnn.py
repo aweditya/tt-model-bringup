@@ -66,6 +66,7 @@ HEAD_DIM_ATTN = 128
 N_ROUTED_EXPERTS = 128
 N_SHARED_EXPERTS = 1
 TOP_K_ROUTED = 6
+E_LOCAL = N_ROUTED_EXPERTS // 4  # 32 experts per chip (Expert Parallel)
 # n_group=1 + topk_group=1 means the group restriction is degenerate
 # (one big group containing all 128 experts). Verified at MoE config probe
 # 2026-06-05; brief had said n_group=8 but actual config says 1.
@@ -160,6 +161,110 @@ def upload_attn_layer(state, key_to_shard, L: int, log) -> dict:
         "kind":   "attention",
     }
     log(f"  L{L} (attention): norm + q/k/v/o_proj uploaded replicated bf16")
+    return out
+
+
+def upload_moe_layer_ep(state, key_to_shard, L: int, log) -> dict:
+    """v0.1.4 — Expert-Parallel upload (DeepSeek-V3-style).
+
+    Shards 128 routed experts as E_LOCAL=32 per chip along the mesh
+    EP axis. Per-chip memory drops from ~1.3 GB (full replicated) to
+    ~340 MB (only this chip's local experts). Shared expert stays
+    replicated (it's small).
+
+    Forks the structure from `models/demos/deepseek_v3/tt/experts.py`
+    but with Nemotron deltas: no gate_proj (just `up_proj → relu² →
+    down_proj`), no SwiGLU.
+
+    Memory layout per chip:
+      experts_up_local   [E_LOCAL=32, HIDDEN=2688, INTERMEDIATE=1856] bf16
+      experts_down_local [E_LOCAL=32, INTERMEDIATE, HIDDEN]            bf16
+      (sharded along dim 0 — the expert dim — via ShardTensorToMesh)
+
+    Plus the per-MoE-layer overhead (replicated):
+      norm                          [HIDDEN]
+      gate_w                        [HIDDEN, N_ROUTED_EXPERTS]
+      e_score_correction_bias       [N_ROUTED_EXPERTS]
+      shared_up_w                   [HIDDEN, SHARED_INTERMEDIATE]
+      shared_down_w                 [SHARED_INTERMEDIATE, HIDDEN]
+      expert_mapping_tensors        [1, 1, N_ROUTED_EXPERTS, NCHIPS]
+    """
+    prefix = f"backbone.layers.{L}"
+    mp = f"{prefix}.mixer"
+    assert N_ROUTED_EXPERTS % NCHIPS == 0, \
+        f"N_ROUTED_EXPERTS {N_ROUTED_EXPERTS} not divisible by NCHIPS {NCHIPS}"
+
+    norm_w = load_t(key_to_shard, f"{prefix}.norm.weight")
+    gate_w = load_t(key_to_shard, f"{mp}.gate.weight")
+    bias = load_t(key_to_shard, f"{mp}.gate.e_score_correction_bias")
+
+    # Stack 128 experts into a single big array, pre-transposed for matmul,
+    # then shard along dim 0 (the expert dim) across NCHIPS.
+    # up_w on disk: [INTERMEDIATE, HIDDEN]
+    # Stacked + transposed: [N_EXPERTS, HIDDEN, INTERMEDIATE]
+    up_stack = np.stack([
+        load_t(key_to_shard, f"{mp}.experts.{e}.up_proj.weight").T
+        for e in range(N_ROUTED_EXPERTS)
+    ], axis=0)  # [128, 2688, 1856]
+    log(f"  L{L} up_stack:   {up_stack.shape}")
+
+    # down_w on disk: [HIDDEN, INTERMEDIATE]
+    # Stacked + transposed: [N_EXPERTS, INTERMEDIATE, HIDDEN]
+    down_stack = np.stack([
+        load_t(key_to_shard, f"{mp}.experts.{e}.down_proj.weight").T
+        for e in range(N_ROUTED_EXPERTS)
+    ], axis=0)  # [128, 1856, 2688]
+    log(f"  L{L} down_stack: {down_stack.shape}")
+
+    # Upload as sharded along dim 0 (the expert dim)
+    experts_up_local_tt = ttnn.from_torch(
+        torch.from_numpy(up_stack.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0),
+    )
+    experts_down_local_tt = ttnn.from_torch(
+        torch.from_numpy(down_stack.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=0),
+    )
+
+    # Shared expert (small, replicated)
+    sh_up_w = load_t(key_to_shard, f"{mp}.shared_experts.up_proj.weight")
+    sh_dn_w = load_t(key_to_shard, f"{mp}.shared_experts.down_proj.weight")
+    shared_up_tt = np_to_replicated(sh_up_w.T, state.mesh)
+    shared_down_tt = np_to_replicated(sh_dn_w.T, state.mesh)
+
+    # Expert mapping tensor (DeepSeek-V3 pattern, demo line 95-101).
+    # Shape: [1, 1, n_experts, n_devices] — eye(devices) repeated
+    # n_experts_per_device times along dim 0.
+    expert_mapping_torch = (
+        torch.eye(NCHIPS, dtype=torch.int32)
+        .repeat_interleave(E_LOCAL, dim=0)
+        .unsqueeze(0)
+        .unsqueeze(0)
+    )
+    expert_mapping_tt = ttnn.from_torch(
+        expert_mapping_torch,
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        dtype=ttnn.uint16,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+    )
+
+    out = {
+        "kind":            "moe_ep",
+        "norm":            np_to_replicated(norm_w, state.mesh),
+        "gate_w":          np_to_replicated(gate_w.T, state.mesh),
+        "e_score_bias_np": bias.copy(),
+        "experts_up_local":   experts_up_local_tt,
+        "experts_down_local": experts_down_local_tt,
+        "shared_up":      shared_up_tt,
+        "shared_down":    shared_down_tt,
+        "expert_mapping": expert_mapping_tt,
+    }
+    log(f"  L{L} (moe_ep): {E_LOCAL} experts/chip + shared + router + "
+        f"expert_mapping uploaded")
     return out
 
 
@@ -456,14 +561,18 @@ def bootstrap(state: State, log=None):
             elif kind == "mamba2":
                 state.per_layer_tt[L] = upload_mamba2_layer(state, key_to_shard, L, log)
             elif kind == "moe":
-                # Default to FULL upload (router + experts + shared).
-                # NEMOTRON3_MOE_ROUTER_ONLY=1 reverts to the router-only
-                # path for the v0.1.3.a smoke (smaller upload).
-                if _os.environ.get("NEMOTRON3_MOE_ROUTER_ONLY", "") == "1":
+                # Default to Expert Parallel (v0.1.4). NEMOTRON3_MOE_MODE
+                # overrides: "router_only" for the v0.1.3.a smoke,
+                # "full" for the v0.1.3.b naive-replicated path (fallback).
+                _mode = _os.environ.get("NEMOTRON3_MOE_MODE", "ep").lower()
+                if _mode == "router_only":
                     state.per_layer_tt[L] = upload_moe_layer_router_only(
                         state, key_to_shard, L, log)
-                else:
+                elif _mode == "full":
                     state.per_layer_tt[L] = upload_moe_layer_full(
+                        state, key_to_shard, L, log)
+                else:  # "ep" — default
+                    state.per_layer_tt[L] = upload_moe_layer_ep(
                         state, key_to_shard, L, log)
             else:
                 raise NotImplementedError(
@@ -1184,6 +1293,208 @@ def moe_block_eager(state: State, h_input_np, layer_idx: int):
         "topk_indices": topk_indices.astype(np.int32),
         "topk_weights": topk_weights,
         "routed_accum": routed_accum_np,
+        "shared_out":   shared_out_np,
+        "mixer_out":    mixer_out_np,
+        "block_out":    block_out_np,
+    }
+    if squeeze_batch:
+        for k in out:
+            if isinstance(out[k], np.ndarray) and out[k].ndim >= 3:
+                out[k] = out[k][0]
+    return out
+
+
+def moe_block_eager_ep(state: State, h_input_np, layer_idx: int):
+    """v0.1.4 — Expert-Parallel MoE forward (fully on-device).
+
+    Forks the dispatch+combine pattern from
+    `models/demos/deepseek_v3/tt/moe.py:455 + :487` with Nemotron
+    deltas (sigmoid+bias+topk router, relu² activation, scaled weights,
+    shared expert added at the end). Validated on (1,4) BH by the
+    v0.1.4.G0 spike (commit `138df8e`).
+
+    Pipeline:
+      1. TT pre-norm + router (matmul + sigmoid)
+      2. host topk-6 with e_score_correction_bias (small, ~1 KB readback)
+      3. TT all_to_all_dispatch: tokens routed to chips owning each topk
+      4. TT local experts (E_LOCAL=32, batched matmul over expert dim)
+         FFN: up_proj → relu² → down_proj
+      5. TT all_to_all_combine (local_reduce=True for weighted sum)
+      6. TT shared expert (replicated)
+      7. TT residual
+
+    Returns the same dict shape as `moe_block_eager` so the v0.1.3.b
+    smoke validates this against HF without modification.
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "moe_ep", \
+        f"L{layer_idx} not loaded as moe_ep (kind={w.get('kind') if w else None!r})"
+    squeeze_batch = h_input_np.ndim == 2
+    if squeeze_batch:
+        h_input_np = h_input_np[None]
+    B, S, _ = h_input_np.shape
+    assert B == 1, "v0.1.4 single-batch (CB lands later)"
+
+    h_tt = ttnn.from_torch(
+        torch.from_numpy(h_input_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+
+    def _readback(t):
+        arr = ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return arr[:1].float().numpy()
+
+    # ── 1+2. Router (matmul + sigmoid + host topk) ──────────────
+    h_norm_tt = ttnn.rms_norm(h_tt, weight=w["norm"], epsilon=EPS)
+    logits_tt = ttnn.matmul(h_norm_tt, w["gate_w"], compute_kernel_config=HIFI4)
+    scores_tt = ttnn.sigmoid(logits_tt)
+    scores_np = _readback(scores_tt)[0]  # [S, n_experts]
+
+    bias = w["e_score_bias_np"].astype(np.float32)
+    scores_for_choice = scores_np + bias[None, :]
+    topk_indices = np.argpartition(
+        -scores_for_choice, TOP_K_ROUTED, axis=-1
+    )[:, :TOP_K_ROUTED]
+    rows = np.arange(scores_np.shape[0])[:, None]
+    topk_weights = scores_np[rows, topk_indices]
+    denom = topk_weights.sum(axis=-1, keepdims=True) + 1e-20
+    topk_weights = topk_weights / denom
+    topk_weights = topk_weights * np.float32(ROUTED_SCALING)
+
+    # ── 3. all_to_all_dispatch ──────────────────────────────────
+    # Reshape h_norm to [B, 1, S, HIDDEN] for the dispatch op contract.
+    # Need ROW_MAJOR for the dispatch input (TILE layout fails its checks).
+    h_norm_nhwc = ttnn.to_layout(
+        ttnn.reshape(h_norm_tt, [B, 1, S, HIDDEN]),
+        ttnn.ROW_MAJOR_LAYOUT,
+    )
+    topk_indices_tt = ttnn.from_torch(
+        torch.from_numpy(topk_indices.astype(np.int32).reshape(B, 1, S, TOP_K_ROUTED)),
+        device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        dtype=ttnn.uint16,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+    )
+    dispatch_out_tt, dispatch_meta_tt = ttnn.all_to_all_dispatch(
+        h_norm_nhwc,
+        topk_indices_tt,
+        w["expert_mapping"],
+        cluster_axis=1,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    ttnn.deallocate(h_norm_nhwc)
+    ttnn.deallocate(topk_indices_tt)
+
+    print(f"[v014 dbg] dispatch_out shape: {list(dispatch_out_tt.shape)}  "
+          f"meta shape: {list(dispatch_meta_tt.shape)}", flush=True)
+
+    # ── 4. Local experts (batched matmul over E_LOCAL) ──────────
+    # KNOWN-OPEN (v0.1.4 in-progress 2026-06-05):
+    # Our dispatch_out has shape [B, NCHIPS, S, HIDDEN] = [1, 4, 5, 2688]
+    # — dim 1 = NCHIPS, the source-device dim, on our (1,4) mesh with
+    # cluster_axis=1. Volume = B * NCHIPS * S * HIDDEN = 53,760 elements.
+    #
+    # DeepSeek's `tt/moe.py:462` reshapes dispatch_out to
+    # `[1, 1, B*S, HIDDEN]`, which requires volume = B*S*HIDDEN. That
+    # only works if their dispatch output already has dim 1 = 1
+    # (Galaxy mesh with cluster_axis=0 + multi-row geometry).
+    #
+    # Open question: how to collapse dim 1 = NCHIPS for the (1,4)
+    # case. Options to investigate next session:
+    #   - Slice off the chip-0 row (`dispatch_out[:, 0:1, :, :]`)
+    #   - Sum-reduce dim 1 (most slots may be zero for sparse routing)
+    #   - Different cluster_axis / topology config
+    # Need to read tt-metal ttnn unit tests for the exact
+    # output-shape contract.
+    n_tokens = dispatch_out_tt.shape[1] * dispatch_out_tt.shape[2]
+    print(f"[v014 dbg] n_tokens (for reshape): {n_tokens}  "
+          f"target reshape: [1, 1, {n_tokens}, {HIDDEN}]", flush=True)
+    dispatch_chunk = ttnn.reshape(dispatch_out_tt, [1, 1, n_tokens, HIDDEN])
+    dispatch_chunk = ttnn.repeat(dispatch_chunk, ttnn.Shape([1, E_LOCAL, 1, 1]))
+    # Squeeze leading 1 → rank-3 [E_LOCAL, n_tokens, HIDDEN] to match
+    # the rank-3 expert weights for ttnn.matmul (which rejects rank-4
+    # vs rank-3 with TT_FATAL "rank() == rank()").
+    dispatch_chunk = ttnn.reshape(dispatch_chunk, [E_LOCAL, n_tokens, HIDDEN])
+    dispatch_chunk = ttnn.to_layout(dispatch_chunk, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(dispatch_out_tt)
+
+    # Expert FFN: up → relu² → down. Batched over E_LOCAL.
+    up_out = ttnn.matmul(
+        dispatch_chunk, w["experts_up_local"], compute_kernel_config=HIFI4,
+    )
+    ttnn.deallocate(dispatch_chunk)
+    relu_out = ttnn.relu(up_out)
+    relu_sq = ttnn.mul(relu_out, relu_out)
+    ttnn.deallocate(up_out)
+    ttnn.deallocate(relu_out)
+    expert_out = ttnn.matmul(
+        relu_sq, w["experts_down_local"], compute_kernel_config=HIFI4,
+    )
+    ttnn.deallocate(relu_sq)
+
+    # expert_out shape: [E_LOCAL, n_tokens, HIDDEN] (rank-3 since input
+    # was rank-3). Combine expects rank-4 [E_LOCAL, B, S, HIDDEN].
+    expert_out_rm = ttnn.to_layout(expert_out, ttnn.ROW_MAJOR_LAYOUT)
+    ttnn.deallocate(expert_out)
+    expert_out_combine = ttnn.reshape(expert_out_rm, [E_LOCAL, B, S, HIDDEN])
+    ttnn.deallocate(expert_out_rm)
+
+    # ── 5. all_to_all_combine (weighted sum back to source chip) ──
+    combine_out_tt = ttnn.all_to_all_combine(
+        expert_out_combine,
+        dispatch_meta_tt,
+        w["expert_mapping"],
+        cluster_axis=1,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    ttnn.deallocate(expert_out_combine)
+    ttnn.deallocate(dispatch_meta_tt)
+
+    # combine_out shape: [TOP_K, B, S, HIDDEN]. Weighted sum across TOP_K
+    # = the routed contribution. Multiply by topk_weights then sum.
+    combine_np = _readback(combine_out_tt)  # [TOP_K, B, S, HIDDEN] or [..., B, S, H]
+    ttnn.deallocate(combine_out_tt)
+    # combine_np shape: typically [TOP_K, B, S, HIDDEN] after readback.
+    # Normalise:
+    if combine_np.ndim == 5:
+        combine_np = combine_np[0]  # drop the leading 1 from the readback slice
+    if combine_np.shape[0] != TOP_K_ROUTED:
+        # Some BH builds return [1, TOP_K, S, H] — squeeze if so.
+        combine_np = combine_np.squeeze(0)
+    # Weighted sum: [TOP_K, B, S, H] * [B, S, TOP_K] broadcast → sum over TOP_K
+    # Reshape topk_weights to [TOP_K, B, S, 1] for broadcast.
+    w_bc = topk_weights.T[..., None, None]  # [TOP_K, S, 1, 1]
+    if w_bc.shape[1] != combine_np.shape[2]:
+        w_bc = topk_weights.T[:, None, :, None]  # [TOP_K, 1, S, 1]
+    routed_per_topk = combine_np.astype(np.float32) * w_bc.astype(np.float32)
+    routed_np = routed_per_topk.sum(axis=0)  # [B, S, HIDDEN]
+    if routed_np.ndim == 2:
+        routed_np = routed_np[None]  # → [1, B?, ...] — ensure rank-3
+
+    # ── 6. Shared expert (replicated) ──────────────────────────
+    sh_up_out = ttnn.matmul(h_norm_tt, w["shared_up"], compute_kernel_config=HIFI4)
+    sh_relu = ttnn.relu(sh_up_out)
+    sh_relu_sq = ttnn.mul(sh_relu, sh_relu)
+    ttnn.deallocate(sh_up_out)
+    ttnn.deallocate(sh_relu)
+    sh_down_out = ttnn.matmul(sh_relu_sq, w["shared_down"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(sh_relu_sq)
+    shared_out_np = _readback(sh_down_out)
+    ttnn.deallocate(sh_down_out)
+
+    # ── 7. Combine + residual ───────────────────────────────────
+    mixer_out_np = routed_np + shared_out_np
+    block_out_np = h_input_np.astype(np.float32) + mixer_out_np
+
+    out = {
+        "h_norm":       _readback(h_norm_tt),
+        "topk_indices": topk_indices.astype(np.int32),
+        "topk_weights": topk_weights,
+        "routed_accum": routed_np,
         "shared_out":   shared_out_np,
         "mixer_out":    mixer_out_np,
         "block_out":    block_out_np,
