@@ -105,11 +105,38 @@ def _add_test_paths():
             sys.path.insert(0, p)
 
 
+class _Tee:
+    """Write to multiple file-likes so the smoke's prints land in
+    trig/last.log AND the tmux session simultaneously."""
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, s):
+        for st in self.streams:
+            try:
+                st.write(s)
+                st.flush()
+            except Exception:
+                pass
+        return len(s)
+    def flush(self):
+        for st in self.streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+
 def run_test(state, trigger_name: str) -> int:
     if LOG_PATH.exists():
         LOG_PATH.unlink()
     log(f"[harness] running {trigger_name}")
+    last_fh = None
+    saved_stdout = sys.stdout
     try:
+        # Tee stdout into last.log so `cat trig/last.log` shows the full
+        # smoke output (observability: ~10-20 lines per run instead of 2).
+        last_fh = open(LOG_PATH, "a", buffering=1)
+        sys.stdout = _Tee(saved_stdout, last_fh)
         # Reload server_nemotron3_nano_ttnn so code edits land without
         # re-bootstrap. Long-lived `state` keeps the weights resident.
         importlib.reload(base)
@@ -132,6 +159,13 @@ def run_test(state, trigger_name: str) -> int:
     except Exception:
         log(traceback.format_exc())
         return 1
+    finally:
+        sys.stdout = saved_stdout
+        if last_fh is not None:
+            try:
+                last_fh.close()
+            except Exception:
+                pass
 
 
 def main():
