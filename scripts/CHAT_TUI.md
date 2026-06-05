@@ -6,7 +6,7 @@ robust enough to live-demo at a tech conference.
 ## Quickstart
 
 ```
-ssh -L 8000:localhost:8000 qb1
+ssh -L 8000:localhost:8000 $TT_HOST     # tunnel the CB server (QuietBox)
 python3 scripts/chat.py                # default: greedy, max 1024, <think> shown
 python3 scripts/chat.py --tools        # enable shell / read_file / write_file / calc
 python3 scripts/chat.py --hide-think   # hide the model's <think>…</think> reasoning

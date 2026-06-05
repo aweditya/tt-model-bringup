@@ -36,5 +36,5 @@ op's `INTEGRATION.md`.
 | `qwen36_moe_ffn_decode_owned` | **In progress** (35B MoE FFN kernel, G0–G4). Not built into prod. |
 
 `scripts/build_owned_ops.sh` (no args) installs only the two production ops,
-since those are what the 27B server calls at runtime; `--all` matches the dev
-hosts (qb1/qb2 have the full `qwen36_gdn_*` set built).
+since those are what the 27B server calls at runtime; `--all` matches a
+fully-populated dev QuietBox (where the complete `qwen36_gdn_*` set is built).

@@ -1,8 +1,10 @@
 # experiments/
 
-Device code for Qwen3.6 bringup. **Runs on a TT host only** (`ssh qb1`/`qb2`) —
-local execution of device code is forbidden (`CLAUDE.md`). The dev loop +
-full repo map are in [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
+Device code for Qwen3.6 bringup. **Runs on a [Tenstorrent QuietBox][quietbox]
+only** — local execution of device code is forbidden (`CLAUDE.md`). The
+dev loop + full repo map are in [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
+
+[quietbox]: https://tenstorrent.com/hardware/quietbox
 
 ## Layout
 
