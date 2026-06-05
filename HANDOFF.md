@@ -62,12 +62,18 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.0.1 Nemotron tokenizer verification
-(task #200). v0.0 DONE 2026-06-05 — oracle artifacts in
-`.cache/hf_oracle_nemotron3_nano/` (15 npys + 4 new from hardening:
-L0_norm, L0_mamba2_mixer_out, L1_moe_shared_out, L1_moe_mixer_out,
-L5_attn_mixer_out). argmax=6993 ' Paris' ✓. Multi-step `--gen N`
-flag verified for v0.3 validation.
+**Phase 1 — exact next task**: v0.1.0 bootstrap (task #202).
+Previously DONE 2026-06-05:
+- v0.0 oracle PASS — `.cache/hf_oracle_nemotron3_nano/` 19 artifacts
+- v0.0+ oracle HARDENED — norm + mixer-out + shared-expert hooks, `--gen N` multi-step
+- v0.0.1 tokenizer probe PASS — both `<think>\n` and `<think></think>` suffixes resolved
+- v0.0.2 weights introspect PASS — 0 missing / 0 shape mismatches / 0 extras
+
+**Real finding from v0.0.2** (must thread into v0.1.3 design): every
+MoE gate has an `e_score_correction_bias` [128] — DeepSeek-V3
+per-expert load-balance bias added to router scores BEFORE the
+group-restricted topk. Not flagged in the architecture brief; only
+surfaced because the introspect script enumerated extras.
 
 Steps for v0.1.0 (bootstrap, after v0.0 lands):
 1. Fork bootstrap from `experiments/serve/server_35b_ttnn.py` (closest
