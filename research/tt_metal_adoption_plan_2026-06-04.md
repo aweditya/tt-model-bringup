@@ -103,6 +103,89 @@ foreground.
 
 ------------------------------------------------------------------------
 
+## 2a. Adoption results 2026-06-04
+
+### Task #191 — `paged_fused_update_cache` — BLOCKED (input-overlap contract)
+
+**Outcome**: REVERTED. The op exists in our tt-metal build
+(`ttnn.experimental.paged_fused_update_cache` — `paged_cache.hpp:23`,
+`paged_cache_nanobind.cpp:67`) but its device-op asserts that
+`input_tensor1` and `input_tensor2` shard grids **must not overlap**
+(`paged_fused_update_cache_device_operation.cpp:226`).
+
+Our `_shard_for_paged_write{,_b}` puts both K and V on the same
+`state.paged_write_mem_cfg_sliding` / `state.paged_write_mem_cfg_global`
+core grid (32 cores: `{[(x=0,y=0)-(x=10,y=1)], [(x=0,y=2)-(x=9,y=2)]}`),
+so the fused op raises `TT_FATAL: is_overlap` on first call. Server
+crashed during bootstrap.
+
+The 4 call sites swap was clean — single-stream sliding (line 1139-1148),
+single-stream global (1233-1242), CB sliding (323-328), CB global
+(394-399). All reverted to the original 2-call pattern.
+
+**To unblock**: build a second HEIGHT_SHARDED L1 mem_cfg on a disjoint
+core grid for the V shard. The 32-core grid in question is partially
+filled (11×2 + 10 = 32 in cols 0-10 of rows 0-1 + cols 0-9 of row 2);
+a clean disjoint split for [1, 1, BLOCK_SIZE, head_dim] (which fits in
+1 core for NKV=1) would put K on core (0,0) and V on core (1,0). This
+is a ~30 LOC change to `setup_state` (build a paired
+`paged_write_mem_cfg_*_kv` pair instead of one) plus updating
+`_shard_for_paged_write{,_b}` callers to pass the right cfg.
+
+**Effort to actually land**: 2-4 hours including disjoint-cfg build,
+contract verification via small probe (fork from
+`experiments/cb/isolate/paged_update_cache.py`), then deploy +
+multi-turn smoke. Bumped from NOW → NEXT-F.
+
+### Task #192 — `to_memory_config` / `to_layout` audit — AUDIT-ONLY (no shipped removal)
+
+**Outcome**: AUDIT DONE, NO REDUNDANT CALLS FOUND.
+
+Enumeration of every `to_memory_config` / `to_layout` site in both
+servers:
+
+| File:line | Call | Classification |
+|---|---|---|
+| `server_gemma4_unified_ttnn.py:623` | `to_layout(embed, TILE)` after `ttnn.embedding` | Necessary — embedding returns ROW_MAJOR; rms_norm needs TILE |
+| `server_gemma4_unified_ttnn.py:737` | `to_layout(embed2, TILE)` post-embedding | Necessary — same reason |
+| `server_gemma4_unified_ttnn.py:1035-1036` | `to_layout(cos_row/sin_row, TILE)` post-embedding | Necessary — RoPE table is RM after lookup; elementwise wants TILE |
+| `server_gemma4_unified_ttnn.py:1049,1058,1061` | `_shard_for_paged_write`: RM → reshape → pad → TILE → HEIGHT_SHARDED | All necessary — explicit layout pipeline mandated by `paged_update_cache` contract |
+| `server_gemma4_unified_ttnn.py:1369,1411,1488` | Post-embed `to_layout(.., TILE)` × `EMBED_SCALE` | Necessary (same as 737) |
+| `server_gemma4_unified_cb.py:266,271,273` | CB `_shard_for_paged_write_b`: RM → reshape → pad → TILE → HEIGHT_SHARDED | Necessary |
+| `server_gemma4_unified_cb.py:303-304, 381-382` | CB sliding/global RoPE `to_layout` post-`ttnn.embedding` lookup | Necessary |
+| `server_gemma4_unified_cb.py:467` | CB top-of-forward `to_layout(embed, TILE)` × `EMBED_SCALE` | Necessary |
+
+Total call sites enumerated: **17** across both files. Of these, **0**
+are unambiguously redundant — every site is a real layout/memory-config
+transition between an `ttnn.embedding` (row-major output) and a
+downstream tile-mode consumer, or part of the explicit `paged_update_cache`
+shard pipeline.
+
+The actual decode hot path has no spurious round-trips. The Tenstorrent
+audit category #44958 doesn't fire on our codebase. Likely savings
+< 0.5 ms/tok (probably < 0.1 ms/tok), insufficient to risk a wrong-fix
+regression.
+
+**Future work**: a Tracy capture on a steady-state decode iteration
+might still reveal sub-op-level TM overhead (e.g. inside the
+`_apply_full_rope` chain), but the Python-level audit shows nothing
+removable. Closing this task as "AUDIT DONE, NO ACTION".
+
+### Cumulative outcome
+
+- **#191**: BLOCKED (contract violation). Reverted; effort to actually
+  land is 2-4h. Promoted to **NEXT-F**.
+- **#192**: AUDIT DONE, no action. Closed.
+
+**Recommended next step**: send the email reply (§6) but downgrade the
+"#44946 question" — instead of "is the fused op in main?" (we now
+know it is), ask the more useful question: "what's your preferred
+disjoint-shard pattern for NKV_PER_CHIP=1 / per-KV-head split layouts?
+The Llama70b shape-restricted RM path doesn't fit, and we'd rather
+fork your pattern than invent a new one."
+
+------------------------------------------------------------------------
+
 ## 3. NEXT batch — to schedule after Nemotron G4 lands
 
 Each gets its own plan-of-action doc (TBD). Sketch only here:
