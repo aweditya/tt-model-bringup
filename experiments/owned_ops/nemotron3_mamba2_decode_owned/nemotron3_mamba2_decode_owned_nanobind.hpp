@@ -6,8 +6,8 @@
 
 #include <nanobind/nanobind.h>
 
-namespace ttnn::operations::experimental::qwen36_gdn_decode_owned::detail {
+namespace ttnn::operations::experimental::nemotron3_mamba2_decode_owned::detail {
 
-void bind_qwen36_gdn_decode_owned(nanobind::module_& mod);
+void bind_nemotron3_mamba2_decode_owned(nanobind::module_& mod);
 
-}  // namespace ttnn::operations::experimental::qwen36_gdn_decode_owned::detail
+}  // namespace ttnn::operations::experimental::nemotron3_mamba2_decode_owned::detail

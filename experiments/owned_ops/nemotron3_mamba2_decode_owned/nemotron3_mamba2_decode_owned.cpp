@@ -2,40 +2,29 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "qwen36_gdn_decode_owned.hpp"
+#include "nemotron3_mamba2_decode_owned.hpp"
 
-#include "device/qwen36_gdn_decode_owned_device_operation.hpp"
+#include "device/nemotron3_mamba2_decode_owned_device_operation.hpp"
 
 namespace ttnn::experimental {
 
-std::tuple<Tensor, Tensor> qwen36_gdn_decode_owned(
-    const Tensor& state,
-    const Tensor& q,
-    const Tensor& k,
-    const Tensor& value,
-    const Tensor& alpha,
-    const Tensor& beta,
-    const std::optional<Tensor>& k_col,
+std::tuple<Tensor, Tensor> nemotron3_mamba2_decode_owned(
+    const Tensor& x,
+    const Tensor& z,
+    const Tensor& dt,
+    const Tensor& dt_bias,
+    const Tensor& A_log,
+    const Tensor& D,
+    const Tensor& B_in,
+    const Tensor& C_in,
+    const Tensor& ssm_state,
     bool debug_fill,
-    bool compact_vectors,
-    bool native_io,
     uint32_t debug_mode,
     const std::optional<MemoryConfig>& output_memory_config,
-    const std::optional<Tensor>& output_tensor) {
-    return ttnn::prim::qwen36_gdn_decode_owned(
-        state,
-        q,
-        k,
-        value,
-        alpha,
-        beta,
-        k_col,
-        debug_fill,
-        compact_vectors,
-        native_io,
-        debug_mode,
-        output_memory_config,
-        output_tensor);
+    const std::optional<Tensor>& preallocated_y) {
+    return ttnn::prim::nemotron3_mamba2_decode_owned(
+        x, z, dt, dt_bias, A_log, D, B_in, C_in, ssm_state,
+        debug_fill, debug_mode, output_memory_config, preallocated_y);
 }
 
 }  // namespace ttnn::experimental

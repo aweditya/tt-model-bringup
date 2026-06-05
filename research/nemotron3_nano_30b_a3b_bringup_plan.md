@@ -272,10 +272,19 @@ the per-group broadcast.
     marked RESOLVED with the scratch-CB pattern documented. debug_mode=2
     output now: state_out = decay * state_in (matches oracle's
     decay-only term; full math at debug_mode=5).
-  - [ ] Day-3.75: program_factory + reader/writer for the new 15-CB
-    Mamba2 layout (currently still GDN's 18-CB layout — kernel won't
-    actually run until factory updated). First build + debug_mode=1
-    smoke on qb1.
+  - [x] Day-3.75: full Mamba2 plumbing landed in 6 files —
+    device_operation_types.hpp (Mamba2 Params + Inputs structs),
+    device_operation.hpp/.cpp (validate + compute_output_specs +
+    create_output_tensors + ttnn::prim wrapper),
+    program_factory.hpp/.cpp (15 CBs sized per per-block tile counts,
+    compute compile-time args 0..14, reader/writer compile-time +
+    runtime args), reader (loads x/z/dt/dt_bias/A_log/D/B/C/state),
+    writer (drains state_out + y), outer wrapper hpp/cpp, nanobind
+    binding registering ttnn.experimental.nemotron3_mamba2_decode_owned.
+    Next: install via integrate_into_ttmetal.py → build on qb1 →
+    debug_mode=1 smoke (output all 1.0).
+  - [ ] Day-3.9: install + build on qb1; debug_mode=1 smoke; harden
+    any compile errors from header path / API drift.
   - [ ] Day-4: compute_dt_B + add_outer_input → debug_mode=3 (state correct).
   - [ ] Day-4: C_state_reduce + add_skip → debug_mode=4..5 (full math).
   - [ ] Day-5: build, oracle compare via G0a harness; ship.
