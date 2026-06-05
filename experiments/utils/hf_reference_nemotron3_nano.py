@@ -53,6 +53,25 @@ import numpy as np
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+
+# CPU-only oracle: NemotronHBlock.forward (modeling_nemotron_h.py:769)
+# wraps the layer body in `torch.cuda.stream(torch.cuda.default_stream(...))`
+# unconditionally, which calls _lazy_init() and crashes on a host with
+# no NVIDIA driver. Patch them to no-ops *before* the model is loaded.
+if not torch.cuda.is_available():
+    import contextlib
+
+    @contextlib.contextmanager
+    def _noop_stream(_stream=None):
+        yield
+
+    torch.cuda.stream = _noop_stream
+
+    def _noop_default_stream(_device=None):
+        return None
+
+    torch.cuda.default_stream = _noop_default_stream
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 DEFAULT_OUT_DIR = PROJECT_ROOT / ".cache" / "hf_oracle_nemotron3_nano"
@@ -172,19 +191,24 @@ def main() -> int:
                 f"{[a for a in dir(model) if not a.startswith('_')][:20]})"
             )
         if args.hook_mamba2_layer is not None:
-            N = args.hook_mamba2_layer
-            if layer_kinds[N] != "mamba2":
+            Nm = args.hook_mamba2_layer
+            if layer_kinds[Nm] != "mamba2":
                 raise ValueError(
-                    f"--hook-mamba2-layer {N} is {layer_kinds[N]!r}, not mamba2")
-            layer = decoder_layers[N]
+                    f"--hook-mamba2-layer {Nm} is {layer_kinds[Nm]!r}, not mamba2")
+            layer = decoder_layers[Nm]
             mixer = getattr(layer, "mixer", None) or getattr(layer, "mamba", None)
             if mixer is None:
-                raise RuntimeError(f"could not find Mamba2 mixer on layer {N}")
+                raise RuntimeError(f"could not find Mamba2 mixer on layer {Nm}")
 
-            def hook_named(submodule_path: str):
+            # NB: capture Nm and submodule_path as default args to dodge
+            # the Python closure-late-binding trap — `N` was being rebound
+            # by the moe/attn blocks below, so all hooks fired with the
+            # final value (L5_*) regardless of intended layer.
+            def hook_named(submodule_path: str, layer_idx: int = Nm):
                 def hook(_m, _inp, output):
                     out_t = output[0] if isinstance(output, tuple) else output
-                    sub_hooks[f"L{N}_{submodule_path}"] = out_t.detach().float().cpu().numpy()
+                    sub_hooks[f"L{layer_idx}_{submodule_path}"] = \
+                        out_t.detach().float().cpu().numpy()
                 return hook
 
             for name in ["in_proj", "conv1d", "out_proj"]:
@@ -192,35 +216,47 @@ def main() -> int:
                 if sub is not None:
                     handles.append(sub.register_forward_hook(hook_named(name)))
                 else:
-                    log(f"  warn: {name} not found on layer {N}'s mixer (sub-hook skipped)")
+                    log(f"  warn: {name} not found on layer {Nm}'s mixer (sub-hook skipped)")
 
         if args.hook_moe_layer is not None:
-            N = args.hook_moe_layer
-            if layer_kinds[N] != "moe":
-                raise ValueError(f"--hook-moe-layer {N} is {layer_kinds[N]!r}, not moe")
-            layer = decoder_layers[N]
+            Ne = args.hook_moe_layer
+            if layer_kinds[Ne] != "moe":
+                raise ValueError(f"--hook-moe-layer {Ne} is {layer_kinds[Ne]!r}, not moe")
+            layer = decoder_layers[Ne]
             # NemotronHBlock uses a uniform `mixer` attr for all layer types
             # (modeling_nemotron_h.py:752-758) — including MoE.
             mlp = getattr(layer, "mixer", None) or getattr(layer, "mlp", None)
             if mlp is None:
-                raise RuntimeError(f"could not find MoE mixer on layer {N}")
+                raise RuntimeError(f"could not find MoE mixer on layer {Ne}")
             if hasattr(mlp, "gate"):
-                handles.append(mlp.gate.register_forward_hook(
-                    lambda m, i, o: sub_hooks.__setitem__(
-                        f"L{N}_moe_router", o.detach().float().cpu().numpy())))
+                # NemotronHTopkRouter.forward returns a tuple
+                # (topk_indices, topk_weights) — save both for v0.1.3
+                # group-restricted topk validation.
+                def moe_router_hook(_m, _inp, output, layer_idx: int = Ne):
+                    if isinstance(output, tuple):
+                        idx, w = output[0], output[1]
+                        sub_hooks[f"L{layer_idx}_moe_router_idx"] = \
+                            idx.detach().float().cpu().numpy()
+                        sub_hooks[f"L{layer_idx}_moe_router_w"] = \
+                            w.detach().float().cpu().numpy()
+                    else:
+                        sub_hooks[f"L{layer_idx}_moe_router"] = \
+                            output.detach().float().cpu().numpy()
+                handles.append(mlp.gate.register_forward_hook(moe_router_hook))
 
         if args.hook_attn_layer is not None:
-            N = args.hook_attn_layer
-            if layer_kinds[N] != "attention":
-                raise ValueError(f"--hook-attn-layer {N} is {layer_kinds[N]!r}, not attention")
-            layer = decoder_layers[N]
+            Na = args.hook_attn_layer
+            if layer_kinds[Na] != "attention":
+                raise ValueError(f"--hook-attn-layer {Na} is {layer_kinds[Na]!r}, not attention")
+            layer = decoder_layers[Na]
             attn = getattr(layer, "self_attn", None) or getattr(layer, "mixer", None)
             for name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
                 sub = getattr(attn, name, None)
                 if sub is not None:
-                    def make_hook(n):
+                    def make_hook(n: str, layer_idx: int = Na):
                         def hook(_m, _inp, output):
-                            sub_hooks[f"L{N}_attn_{n}"] = output.detach().float().cpu().numpy()
+                            sub_hooks[f"L{layer_idx}_attn_{n}"] = \
+                                output.detach().float().cpu().numpy()
                         return hook
                     handles.append(sub.register_forward_hook(make_hook(name)))
 
@@ -253,8 +289,16 @@ def main() -> int:
 
     # Pull final-norm output (everything before lm_head). Same trick the 35B
     # oracle uses — we re-run final_norm on the LAST hidden_states tensor.
-    decoder = model.get_decoder() if hasattr(model, "get_decoder") else model.model
-    final_norm = getattr(decoder, "norm", None) or getattr(decoder, "final_layernorm", None)
+    # Same Nemotron-H attr-naming quirk as register_sub_hooks above: decoder
+    # is `model.backbone`, NOT `model.model`.
+    if hasattr(model, "backbone"):
+        decoder = model.backbone
+    elif hasattr(model, "model"):
+        decoder = model.model
+    else:
+        raise RuntimeError("could not find decoder module")
+    final_norm = getattr(decoder, "norm", None) or getattr(decoder, "final_layernorm", None) \
+        or getattr(decoder, "norm_f", None)
     if final_norm is None:
         raise RuntimeError("could not find final norm module")
     with torch.no_grad():
