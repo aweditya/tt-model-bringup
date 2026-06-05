@@ -38,3 +38,17 @@ Append-only. Each entry is timestamped.
   - 88 (was 176) PagedFusedUpdateCache after fix
   - 1932 BinaryNg, 1504 UntilizeWithUnpadding, 1028 TilizeWithValPadding — layout-shuffle volume hints redundant `to_memory_config` may be present (tt-metal #44958 audit candidate)
 
+- 23:48 — Wrote `experiments/utils/tracy_profile_one_gemma4_layer_v2.py` (single-forward, no-warmup) to dodge the marker-buffer overflow. Captured a forward (CSV: `.cache/perf_logs/tracy_gemma4_v2/reports/2026_06_05_23_49_39/`). Partial-data findings (cold JIT contaminates first-pass kernel times; ops that survived):
+  - **Matmul: 340 ops × 56.7 μs mean = 19.3 ms / forward** (37% of 51 ms traced budget)
+  - **TilizeDevice: 316 valid samples × 61.0 μs mean = 19.3 ms / forward** (37% — huge surprise; matches matmul!)
+  - **TilizeWithValPadding: 676 × 12.6 μs = 8.5 ms** (~16%)
+  - LayerNorm, SDPA, PagedFusedUpdateCache, AllGather, ReduceScatter, Untilize: marker-dropped, kernel time unknown (likely the remaining ~10 ms)
+- Conclusion for the next opt round: **Tilize + TilizeWithValPadding total ~28 ms / forward = >50% of traced budget**. The "1504 UntilizeWithUnpadding + 1728 Slice + 704 ReshapeView" volume hints that `_shard_for_paged_write` (5+ ops per K/V staging × 4 per sliding layer = ~800/forward) is a fat dispatch-tax site. Audit candidate for #44958 (tt-metal) / tt-metal-adoption-plan §"memory-config audit" items.
+
+## Final state
+
+- **Landed**: `paged_fused_update_cache` on Gemma 4 12B sliding+global decode paths. Commit `de0384a`. **Traced delta: -0.5% (within noise)**, eager delta: -52.6% (2.11×). 3×100/100 token match.
+- **NOT landed (risk/scope vs time budget)**: distributed RMSNorm (P2, +12-15 ms/tok projected, requires sharding hidden state across mesh — hour-scale work + medium regression risk). Tracy probe v2 confirmed that LayerNorm marker data is missing so we can't sanity-check the projection without more profiling work.
+- **Open next**: eliminate redundant TM ops in `_shard_for_paged_write` (5-op chain per K/V staging; ~800 dispatches/forward). Could fold the row-major→pad→tile→to_memory_config into the upstream matmul output spec. Estimated savings: 0.5-2 ms/tok traced.
+- **Open further out**: distributed RMSNorm via `ttnn.rms_norm_pre_all_gather` + `all_gather` + `ttnn.rms_norm_post_all_gather` (or the all-in-one `ttnn.fused_rms_minimal`). All three ops are available in qb2's ttnn build. Requires sharding `h` from REPLICATED → 1/4 width on each chip. Major surgery.
+
