@@ -1332,11 +1332,23 @@ def moe_block_eager_ep(state: State, h_input_np, layer_idx: int):
     squeeze_batch = h_input_np.ndim == 2
     if squeeze_batch:
         h_input_np = h_input_np[None]
-    B, S, _ = h_input_np.shape
+    B, S_orig, _ = h_input_np.shape
     assert B == 1, "v0.1.4 single-batch (CB lands later)"
 
+    # ── Seq-shard pad (Option 1, [[reference-all-to-all-dispatch-shape-contract]]) ──
+    # Pad S to a multiple of NCHIPS so the dispatch op can shard the
+    # seq dim across cluster_axis=1. Padded positions get arbitrary
+    # router outputs / experts and are sliced off at the end.
+    S_padded = ((S_orig + NCHIPS - 1) // NCHIPS) * NCHIPS
+    S_per_chip = S_padded // NCHIPS
+    if S_padded != S_orig:
+        h_padded_np = np.zeros((B, S_padded, HIDDEN), dtype=h_input_np.dtype)
+        h_padded_np[:, :S_orig, :] = h_input_np
+    else:
+        h_padded_np = h_input_np
+
     h_tt = ttnn.from_torch(
-        torch.from_numpy(h_input_np.astype(np.float32)),
+        torch.from_numpy(h_padded_np.astype(np.float32)),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
@@ -1351,7 +1363,7 @@ def moe_block_eager_ep(state: State, h_input_np, layer_idx: int):
     h_norm_tt = ttnn.rms_norm(h_tt, weight=w["norm"], epsilon=EPS)
     logits_tt = ttnn.matmul(h_norm_tt, w["gate_w"], compute_kernel_config=HIFI4)
     scores_tt = ttnn.sigmoid(logits_tt)
-    scores_np = _readback(scores_tt)[0]  # [S, n_experts]
+    scores_np = _readback(scores_tt)[0]  # [S_padded, n_experts]
 
     bias = w["e_score_bias_np"].astype(np.float32)
     scores_for_choice = scores_np + bias[None, :]
@@ -1363,66 +1375,56 @@ def moe_block_eager_ep(state: State, h_input_np, layer_idx: int):
     denom = topk_weights.sum(axis=-1, keepdims=True) + 1e-20
     topk_weights = topk_weights / denom
     topk_weights = topk_weights * np.float32(ROUTED_SCALING)
+    # topk_indices, topk_weights both shape [S_padded, TOP_K_ROUTED].
 
-    # ── 3. all_to_all_dispatch ──────────────────────────────────
-    # Reshape h_norm to [B, 1, S, HIDDEN] for the dispatch op contract.
-    # Need ROW_MAJOR for the dispatch input (TILE layout fails its checks).
-    h_norm_nhwc = ttnn.to_layout(
-        ttnn.reshape(h_norm_tt, [B, 1, S, HIDDEN]),
-        ttnn.ROW_MAJOR_LAYOUT,
-    )
-    topk_indices_tt = ttnn.from_torch(
-        torch.from_numpy(topk_indices.astype(np.int32).reshape(B, 1, S, TOP_K_ROUTED)),
+    # ── 3. all_to_all_dispatch (seq-sharded, output_concat_dim=2) ──
+    # Build the dispatch input by reading back the replicated h_norm
+    # and re-uploading SHARDED along seq dim across cluster_axis=1.
+    # Per-chip input: [B, 1, S_per_chip, HIDDEN] in ROW_MAJOR.
+    h_norm_np_padded = _readback(h_norm_tt)  # [B, S_padded, HIDDEN]
+    h_norm_4d_np = h_norm_np_padded.reshape(B, 1, S_padded, HIDDEN)
+    h_norm_sharded_tt = ttnn.from_torch(
+        torch.from_numpy(h_norm_4d_np.astype(np.float32)),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
         device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=2),
+    )
+    topk_indices_4d = topk_indices.astype(np.int32).reshape(B, 1, S_padded, TOP_K_ROUTED)
+    topk_indices_tt = ttnn.from_torch(
+        torch.from_numpy(topk_indices_4d),
+        device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=2),
         dtype=ttnn.uint16,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         layout=ttnn.ROW_MAJOR_LAYOUT,
     )
     dispatch_out_tt, dispatch_meta_tt = ttnn.all_to_all_dispatch(
-        h_norm_nhwc,
+        h_norm_sharded_tt,
         topk_indices_tt,
         w["expert_mapping"],
         cluster_axis=1,
+        output_concat_dim=2,  # → per-chip [1, 1, S_per_chip*NCHIPS=S_padded, HIDDEN]
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
-    ttnn.deallocate(h_norm_nhwc)
+    ttnn.deallocate(h_norm_sharded_tt)
     ttnn.deallocate(topk_indices_tt)
-
     print(f"[v014 dbg] dispatch_out shape: {list(dispatch_out_tt.shape)}  "
-          f"meta shape: {list(dispatch_meta_tt.shape)}", flush=True)
+          f"meta shape: {list(dispatch_meta_tt.shape)}  "
+          f"(S_orig={S_orig} S_padded={S_padded} S_per_chip={S_per_chip})",
+          flush=True)
 
     # ── 4. Local experts (batched matmul over E_LOCAL) ──────────
-    # KNOWN-OPEN (v0.1.4 in-progress 2026-06-05):
-    # Our dispatch_out has shape [B, NCHIPS, S, HIDDEN] = [1, 4, 5, 2688]
-    # — dim 1 = NCHIPS, the source-device dim, on our (1,4) mesh with
-    # cluster_axis=1. Volume = B * NCHIPS * S * HIDDEN = 53,760 elements.
-    #
-    # DeepSeek's `tt/moe.py:462` reshapes dispatch_out to
-    # `[1, 1, B*S, HIDDEN]`, which requires volume = B*S*HIDDEN. That
-    # only works if their dispatch output already has dim 1 = 1
-    # (Galaxy mesh with cluster_axis=0 + multi-row geometry).
-    #
-    # Open question: how to collapse dim 1 = NCHIPS for the (1,4)
-    # case. Options to investigate next session:
-    #   - Slice off the chip-0 row (`dispatch_out[:, 0:1, :, :]`)
-    #   - Sum-reduce dim 1 (most slots may be zero for sparse routing)
-    #   - Different cluster_axis / topology config
-    # Need to read tt-metal ttnn unit tests for the exact
-    # output-shape contract.
-    n_tokens = dispatch_out_tt.shape[1] * dispatch_out_tt.shape[2]
-    print(f"[v014 dbg] n_tokens (for reshape): {n_tokens}  "
-          f"target reshape: [1, 1, {n_tokens}, {HIDDEN}]", flush=True)
-    dispatch_chunk = ttnn.reshape(dispatch_out_tt, [1, 1, n_tokens, HIDDEN])
-    dispatch_chunk = ttnn.repeat(dispatch_chunk, ttnn.Shape([1, E_LOCAL, 1, 1]))
-    # Squeeze leading 1 → rank-3 [E_LOCAL, n_tokens, HIDDEN] to match
-    # the rank-3 expert weights for ttnn.matmul (which rejects rank-4
-    # vs rank-3 with TT_FATAL "rank() == rank()").
-    dispatch_chunk = ttnn.reshape(dispatch_chunk, [E_LOCAL, n_tokens, HIDDEN])
+    # dispatch_out_tt per-chip: [1, 1, S_padded, HIDDEN]. Repeat to
+    # [1, E_LOCAL, S_padded, HIDDEN] so each local expert sees a copy,
+    # then squeeze the leading 1 → rank-3 for matmul against rank-3
+    # expert weights (ttnn.matmul TT_FATALs on rank-4 vs rank-3).
+    dispatch_chunk = ttnn.repeat(dispatch_out_tt, ttnn.Shape([1, E_LOCAL, 1, 1]))
+    dispatch_chunk = ttnn.reshape(dispatch_chunk, [E_LOCAL, S_padded, HIDDEN])
     dispatch_chunk = ttnn.to_layout(dispatch_chunk, ttnn.TILE_LAYOUT)
     ttnn.deallocate(dispatch_out_tt)
 
-    # Expert FFN: up → relu² → down. Batched over E_LOCAL.
     up_out = ttnn.matmul(
         dispatch_chunk, w["experts_up_local"], compute_kernel_config=HIFI4,
     )
@@ -1436,46 +1438,75 @@ def moe_block_eager_ep(state: State, h_input_np, layer_idx: int):
     )
     ttnn.deallocate(relu_sq)
 
-    # expert_out shape: [E_LOCAL, n_tokens, HIDDEN] (rank-3 since input
-    # was rank-3). Combine expects rank-4 [E_LOCAL, B, S, HIDDEN].
+    # Combine input contract: [E_LOCAL, B, S_padded, HIDDEN] per chip.
     expert_out_rm = ttnn.to_layout(expert_out, ttnn.ROW_MAJOR_LAYOUT)
     ttnn.deallocate(expert_out)
-    expert_out_combine = ttnn.reshape(expert_out_rm, [E_LOCAL, B, S, HIDDEN])
+    expert_out_combine = ttnn.reshape(expert_out_rm, [E_LOCAL, B, S_padded, HIDDEN])
     ttnn.deallocate(expert_out_rm)
 
-    # ── 5. all_to_all_combine (weighted sum back to source chip) ──
+    # ── 5. all_to_all_combine (scatter back to source chips) ─────
+    # output_shard_dim=2 → per-chip [TOP_K, B, S_per_chip, HIDDEN].
+    # Default output_shard_dim=1 would give [TOP_K, B/D[A]=0, ...] for
+    # B=1 / D[A]=4 (integer division) → moreh_full asserts shape[1] > 0.
+    # See all_to_all_combine_nanobind.cpp:79 for the contract.
     combine_out_tt = ttnn.all_to_all_combine(
         expert_out_combine,
         dispatch_meta_tt,
         w["expert_mapping"],
         cluster_axis=1,
+        output_shard_dim=2,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
     ttnn.deallocate(expert_out_combine)
     ttnn.deallocate(dispatch_meta_tt)
+    print(f"[v014 dbg] combine_out shape: {list(combine_out_tt.shape)}",
+          flush=True)
 
-    # combine_out shape: [TOP_K, B, S, HIDDEN]. Weighted sum across TOP_K
-    # = the routed contribution. Multiply by topk_weights then sum.
-    combine_np = _readback(combine_out_tt)  # [TOP_K, B, S, HIDDEN] or [..., B, S, H]
+    # Readback. With seq-sharded dispatch (output_concat_dim=2), the
+    # combine op scatters results back; each chip should hold its
+    # source-seq slice. Try seq-concat (dim 2) first; fall back to
+    # chip-0 if the op returns replicated.
+    try:
+        combine_torch = ttnn.to_torch(
+            combine_out_tt,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=2),
+        )
+        combine_np = combine_torch.float().numpy()
+        print(f"[v014 dbg] combine_np (concat dim=2): {combine_np.shape}",
+              flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[v014 dbg] concat dim=2 failed ({type(e).__name__}: {e}); "
+              f"falling back to dim=0 + chip-0 slice", flush=True)
+        combine_torch = ttnn.to_torch(
+            combine_out_tt,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        combine_np = combine_torch[:1].float().numpy()
+        print(f"[v014 dbg] combine_np (chip-0 slice): {combine_np.shape}",
+              flush=True)
     ttnn.deallocate(combine_out_tt)
-    # combine_np shape: typically [TOP_K, B, S, HIDDEN] after readback.
-    # Normalise:
-    if combine_np.ndim == 5:
-        combine_np = combine_np[0]  # drop the leading 1 from the readback slice
-    if combine_np.shape[0] != TOP_K_ROUTED:
-        # Some BH builds return [1, TOP_K, S, H] — squeeze if so.
-        combine_np = combine_np.squeeze(0)
-    # Weighted sum: [TOP_K, B, S, H] * [B, S, TOP_K] broadcast → sum over TOP_K
-    # Reshape topk_weights to [TOP_K, B, S, 1] for broadcast.
-    w_bc = topk_weights.T[..., None, None]  # [TOP_K, S, 1, 1]
-    if w_bc.shape[1] != combine_np.shape[2]:
-        w_bc = topk_weights.T[:, None, :, None]  # [TOP_K, 1, S, 1]
-    routed_per_topk = combine_np.astype(np.float32) * w_bc.astype(np.float32)
-    routed_np = routed_per_topk.sum(axis=0)  # [B, S, HIDDEN]
-    if routed_np.ndim == 2:
-        routed_np = routed_np[None]  # → [1, B?, ...] — ensure rank-3
 
-    # ── 6. Shared expert (replicated) ──────────────────────────
+    # Normalise to rank-4 [TOP_K, B, S_padded, HIDDEN]
+    if combine_np.ndim == 5:
+        combine_np = combine_np[0]
+    if combine_np.shape[0] != TOP_K_ROUTED and combine_np.ndim == 4:
+        # Some BH builds may return [1, TOP_K, S, H]; squeeze if so.
+        combine_np = combine_np.squeeze(0)
+    assert combine_np.shape[0] == TOP_K_ROUTED, \
+        f"unexpected combine shape {combine_np.shape}; want axis 0 = TOP_K={TOP_K_ROUTED}"
+
+    # Weighted sum across TOP_K.
+    # topk_weights: [S_padded, TOP_K] → broadcast to [TOP_K, 1, S_padded, 1]
+    w_bc = topk_weights.T[:, None, :, None]
+    routed_per_topk = combine_np.astype(np.float32) * w_bc.astype(np.float32)
+    routed_np = routed_per_topk.sum(axis=0)  # [B, S_padded, HIDDEN]
+    if routed_np.ndim == 2:
+        routed_np = routed_np[None]
+
+    # Slice back to original S.
+    routed_np = routed_np[:, :S_orig, :]
+
+    # ── 6. Shared expert (replicated, on padded h_norm) ─────────
     sh_up_out = ttnn.matmul(h_norm_tt, w["shared_up"], compute_kernel_config=HIFI4)
     sh_relu = ttnn.relu(sh_up_out)
     sh_relu_sq = ttnn.mul(sh_relu, sh_relu)
@@ -1485,15 +1516,16 @@ def moe_block_eager_ep(state: State, h_input_np, layer_idx: int):
     ttnn.deallocate(sh_relu_sq)
     shared_out_np = _readback(sh_down_out)
     ttnn.deallocate(sh_down_out)
+    shared_out_np = shared_out_np[:, :S_orig, :]  # slice off pad
 
     # ── 7. Combine + residual ───────────────────────────────────
     mixer_out_np = routed_np + shared_out_np
     block_out_np = h_input_np.astype(np.float32) + mixer_out_np
 
     out = {
-        "h_norm":       _readback(h_norm_tt),
-        "topk_indices": topk_indices.astype(np.int32),
-        "topk_weights": topk_weights,
+        "h_norm":       _readback(h_norm_tt)[:, :S_orig, :],
+        "topk_indices": topk_indices[:S_orig, :].astype(np.int32),
+        "topk_weights": topk_weights[:S_orig, :],
         "routed_accum": routed_np,
         "shared_out":   shared_out_np,
         "mixer_out":    mixer_out_np,
