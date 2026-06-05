@@ -312,30 +312,30 @@ the per-group broadcast.
     - Single-phase loop works (transpose+matmul+mul_decay+add+pop per s)
       once mm_init prime is in place; two-phase split unnecessary.
     Bisect log + canonical patterns documented in commit `b5c93fa`.
-  - [x] **Day-4.1 (2026-06-05): Option A IMPLEMENTED, did not unblock.**
-    Added `matmul_reduce_C_state` (forks GDN's `matmul_reduce` at
-    qwen36_gdn_decode_owned.cpp:215) with `transpose=1` for correct
-    A @ B^T math against C's row-vector layout. Helper alone PASSES
-    (both d iterations). Drops the bare-mm_init workaround. **But the
-    full 8-iter state-update loop still HANGS.** Commit `44342ff`.
-    Bisects A/B/C/D in commit message confirm: the hang is iter-count,
-    NOT d-transition or init-config mismatch. ~4 transpose+matmul
-    iterations is the hardcoded Blackhole TRISC cap regardless of
-    mm_init priming. Option A is *necessary* (correct math + structural
-    GDN match + produces y_partial for mode=5) but *not sufficient*.
-  - [ ] **Day-4.2 (next): SDPA escape hatch**. Drop `transpose_wh_tile`
-    from the inner loop. Replace `transpose_x_to_col +
-    matmul_outer_x_dt_B` with a single matmul call using
-    `mm_init(cb_x, cb_dt_B, cb_outer, transpose=1)` and
-    `matmul_tiles(cb_x, cb_dt_B, d, s, 0)`. SDPA does this for K^T and
-    never hits the >4-iter hang (memory:
-    [[feedback-sdpa-transpose-b-flag-escape-hatch]]). The
-    `transpose_x_to_col` helper and `cb_x_col` CB go away entirely.
-  - [ ] Day-4.3: mode=4 wires D·x (using `cb_y_partial` from
-    matmul_reduce_C_state + `D · x[d]` add). y_partial gets fixup
-    `+= C · outer` for production mode=5.
-  - [ ] Day-5: G0a harness compare at cos ≥ 0.999 vs numpy oracle,
-    single-step AND 8-step multi-step replay.
+  - [x] **Day-4 PASS (2026-06-05): mode=3 cos = 0.9997 vs oracle.**
+    Full SSM state-update math working end-to-end:
+    `state_out[d, s] = decay * state_in[d, s] + dt_eff * x[d] * B[s]`.
+    Commit `d239875`. The 4-ingredient recipe (memory:
+    [[feedback-mm-init-prime-required]]):
+      1. matmul_reduce_C_state as GDN-structural prime (real matmul,
+         transpose=1, produces y_partial for mode=4/5).
+      2. Pre-transpose phase: transpose_x_to_col called ONCE per d
+         in a separate pre-loop.
+      3. Inner loop uses mm_init_short (NOT full mm_init) per iter.
+         Full mm_init each iter triggers the ~4-iter Blackhole TRISC
+         cap; light short variant bypasses it.
+      4. Explicit pack_reconfig_data_format(cb_outer) after
+         mm_init_short. Full mm_init implicitly does
+         llk_pack_hw_configure; short doesn't.
+    Each ingredient is necessary; any 3 alone don't unblock.
+  - [ ] **Day-4.5 (next): debug_mode=4 — wire D·x via y_partial.**
+    cb_y_partial currently has the C·state_in^T reduce. Add
+    `y[d] = y_partial[d] + D · x[d]` to compute (almost-)full y.
+    Gate: cos ≥ 0.999 vs `oracle_y = C·state_out + D·x`.
+  - [ ] Day-4.6: full mode=5 — add `y_partial += C · outer` fixup.
+    `oracle_y` matches exactly the production-path y output.
+  - [ ] Day-5: G0a harness multi-step replay (8 steps), 64-head, B=1.
+    Gate: per-head cos ≥ 0.999 at every step.
 - [ ] **G2..G4** — sequential, gated on G1.
 
 Phase 0 timeline estimate: **3-5 weeks** depending on how many of the

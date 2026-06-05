@@ -5,70 +5,68 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## POST-CHECKPOINT QUICK-START (2026-06-05 00:00 PT)
+## POST-WIN QUICK-START (2026-06-05 08:38 PT) — DAY-4 PASSED ✓
 
-**Where we are**: G1 **day-4 PARTIAL** — mode=2 PASSES end-to-end (refactor
-of finalize_decay into compute_dt_eff + multiply_decay_by_dt_eff is sound).
-Mode=3 PARTIAL PASS: works for 4 iters at d=0 only (cos=0.21 with d=1
-tiles filled sentinel). Full 8-iter mode=3 (d=0..1) HANGS at the d=1
-transition. Source checkpoint at commit `b5c93fa`.
+**Where we are**: G1 **day-4 PASSED** at cos = 0.9997 vs numpy oracle.
+Mode=2 and mode=3 both validated end-to-end. Commit `d239875`.
+Full SSM math working:
+`state_out[d, s] = decay * state_in[d, s] + dt_eff * x[d] * B[s]`.
 
-**🔑 KEY DISCOVERY — `mm_init` PRIME REQUIRED** (memory:
-[[feedback-mm-init-prime-required]]):
-- First matmul in a TRISC kernel must be preceded by a bare
-  `mm_init(in0, in1, out)` call BEFORE the inner loop, or the second
-  matmul hangs the pipeline.
-- GDN gets this for free via its `matmul_reduce` prelude; standalone
-  kernels must issue the prime explicitly.
-- `mm_init` must be the LAST init before the matmul loop — any
-  subsequent `fill_tile_init` / `add_tiles_init` un-primes it.
-- `transpose_x_to_col` MUST keep `unary_op_init_common` (GDN canonical;
-  tt-metal #15930 = no `transpose_wh_uninit`).
-- `cb_outer` is bf16 (matches GDN's tensor_format).
+**🔑 THE 4-INGREDIENT RECIPE** (memory: [[feedback-mm-init-prime-required]]):
+The Blackhole TRISC pipeline hangs at ~4 transpose+matmul+binary iters
+regardless of mm_init priming. The working pattern needs ALL FOUR:
 
-**Where we landed (2026-06-05 morning)**: Option A (matmul_reduce_C_state
-prime) IMPLEMENTED — math correct, structurally matches GDN, drops the
-bare-mm_init workaround. But mode=3 still HANGS at the 8-iter
-transpose+matmul+bcast+add loop.
+1. **Full `mm_init` ONCE before the loop**, via a real matmul whose
+   result the model needs anyway. We use `matmul_reduce_C_state` which
+   computes `y_partial = C · state_in^T` (mm_init transpose=1 — the
+   SDPA-style B-operand transpose flag, no transpose_wh_tile needed
+   for C). Structurally matches GDN's `matmul_reduce(k, state_scaled)`.
 
-**Critical bisect (commit `44342ff`)**:
-- **A** matmul_reduce_C_state alone (2 iters d=0..1) → PASS. Helper is sound.
-- **B** matmul_reduce + 8-iter state-update loop → HANG.
-- **C** matmul_reduce with `transpose=0` (matching downstream's mm_init
-  params) → HANG. Not the transpose-flag transition.
-- **D** 8 iters all with d=0 (no d-transition) → HANG.
-- **Conclusion**: the hang is **iter-count itself**, not d-transition,
-  not init-config mismatch. The `transpose_wh_tile + matmul_tiles`
-  inner-loop class of hang has a hardcoded cap (~4 iters) on Blackhole
-  regardless of mm_init priming. Option A is necessary (correct math,
-  produces the y_partial we'll need at mode=5) but not sufficient.
+2. **Pre-transpose phase outside the loop**: `transpose_x_to_col` is
+   called ONCE per d in a pre-loop, NOT inside the inner loop.
+   `cb_x_col` ends with `head_dim_tiles` pre-transposed col-vector
+   tiles queued.
 
-**Exact next task**: G1 **day-4.2** — try the SDPA escape hatch.
+3. **`mm_init_short` inside the inner loop**, NOT full `mm_init`. The
+   light variant skips `llk_unpack_hw_configure`, `llk_pack_hw_configure`,
+   and `llk_pack_dest_init` — and one of those is what hits the iter
+   cap when repeated. Matches `qwen36_gdn_decode` (older non-owned)
+   pattern.
 
-SDPA never calls `transpose_wh_tile` — it folds Kᵀ into matmul's
-`transpose=1` B-operand flag, sidestepping the sticky-bit class of hang
-entirely. Apply the same pattern to our outer-product:
+4. **Explicit `pack_reconfig_data_format(cb_outer)` after `mm_init_short`**.
+   The full `mm_init` does this implicitly via `llk_pack_hw_configure`;
+   the short variant doesn't. Without it, packed bytes are garbage
+   (~1e+38 runaway values observed during debug).
 
-1. Drop the `transpose_x_to_col` helper from the inner loop. The x[d]
-   tile stays in its native row-vector layout.
-2. Rewrite `matmul_outer_x_dt_B` to call `mm_init(cb_x, cb_dt_B,
-   cb_outer, transpose=1)` and `matmul_tiles(cb_x, cb_dt_B, d, s, 0)`.
-   The `transpose=1` flag flips B (cb_dt_B's row-vector) into col-vector
-   orientation on the fly. Result: outer-product `x[d, i] * dt_B[s, j]`
-   in the output tile.
-3. Inner loop becomes: matmul_outer (no transpose_wh) + mul_decay + add
-   + pop cb_outer. No cb_x_col, no transpose_wh_tile.
-4. Run smoke. If the 8-iter loop now passes, the SDPA hypothesis is
-   confirmed.
+**Why all four**: each one alone fails. matmul_reduce alone: no state
+update math. Pre-transpose alone: 8 full-mm_init iters still hang.
+mm_init_short alone: passes but values garbage. pack_reconfig alone:
+no effect without the short init.
 
-**Validation sanity**: bisect-A (matmul_reduce_C_state alone) still
-PASSES, so mode=2 + matmul_reduce regression is sound. We have a working
-foundation; the SDPA swap is a focused 1-helper change.
+`cb_outer` is bf16 (matches GDN's tensor_format).
+
+**Exact next task**: G1 **day-4.5** — wire mode=4 (D·x via y_partial).
+
+`cb_y_partial` already has `C · state_in^T` (from `matmul_reduce_C_state`).
+For mode=4, add `D · x[d]` to get (almost-)full y:
+1. `bcast_mul_tile_scalar(cb_x, cb_D, d, 0, cb_tmp)` — D as broadcast
+   scalar across x[d]'s 32-element vector.
+2. `add_tiles(cb_y_partial, cb_tmp, d, 0, cb_y)` — sum into y.
+
+Gate: `oracle_y = C·state_out + D·x` cos ≥ 0.999 vs the smoke's y_out.
+
+Then day-4.6 (full mode=5) adds the `y_partial += C · outer` fixup so
+y reflects the post-update state instead of pre-update.
+
+Then day-5: G0a multi-step harness (8 steps), per-head cos ≥ 0.999.
+
+**Then G2-G4**: multi-core (shard 64 heads), batched, server wiring.
 
 **Memory entries**:
-- [[feedback-mm-init-prime-required]] — original workaround
+- [[feedback-mm-init-prime-required]] — the 4-ingredient recipe
 - [[feedback-gdn-vs-mamba2-kernel-delta]] — structural math reason
-- [[feedback-sdpa-transpose-b-flag-escape-hatch]] — the next move
+- [[feedback-sdpa-transpose-b-flag-escape-hatch]] — transpose=1 B flag
+  (used in matmul_reduce_C_state)
 - [[tt-llk-frozen-in-tt-metal]] — repo state + missing L3 docs
 
 **Current source state**: the kernel at
