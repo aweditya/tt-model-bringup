@@ -370,13 +370,24 @@ the per-group broadcast.
   instrumentation. Parked: NOT a Phase 1 blocker because B=1 + full
   64-head (G2) is correct and the CB engine drives per-slot at the
   server layer (same pattern as 27B/35B). Commit `765e9c7`. Task #188 done.
-- [ ] **G4 (next): server-side Python wrapper + Phase 1 unblock**.
-  Build `experiments/serve/nemotron3_mamba2_owned_step.py` (or similar)
-  that wraps the kernel call, handles per-(batch, head) reshape, and
-  exposes a step-fn signature compatible with the CB engine's slot
-  interface. Then `server_nemotron3_ttnn.py` scaffold to drive the
-  forward (Mamba2 + MoE + 6 GQA attention layers per the
-  hybrid_override_pattern). Phase 1 begins. Task #189 in progress.
+- [x] **G4 step 1 PASS (2026-06-05): Mamba2 wrapper module**.
+  `experiments/serve/nemotron3_mamba2_step.py` exposes
+  `mamba2_decode_step_ttnn(...)` with signature matching the numpy
+  oracle. Wrapper smoke at full Nemotron shapes: state cos=0.999999,
+  y cos=0.999995 (commit `243cc0a`). Server scaffold can drop it in
+  as the Mamba2-layer step function 1:1.
+- [x] **v0.0 config probe PASS (2026-06-05)**:
+  `experiments/utils/nemotron3_nano_config_probe.py` confirms model
+  exists on HF, `trust_remote_code=True` loads `NemotronHForCausalLM`,
+  hybrid_override_pattern present (52 layers: 23 M + 23 E + 6 *).
+  Tokenizer is ChatML (TokenizersBackend). Kernel-relevant shape match:
+  Mamba2 = 64 heads × 64 head_dim × 128 ssm_state, n_groups=8 — exactly
+  matches our G2 multi-core kernel.
+- [ ] **v0.0 HF oracle (running in background)**: downloading model
+  weights now (~63 GB shards). Uses `use_mamba_kernels=False` to
+  bypass the modeling code's hard CUDA-mamba_ssm dependency. Outputs
+  to `.cache/hf_oracle_nemotron3_nano/`. Tmux session
+  `nemotron_oracle` on the QuietBox.
 
 Phase 0 timeline estimate: **3-5 weeks** depending on how many of the
 G-stages hit unexpected snags. Each stage gates the next; do NOT

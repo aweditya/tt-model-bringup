@@ -60,36 +60,35 @@ no effect without the short init.
 
 `cb_outer` is bf16 (matches GDN's tensor_format).
 
-**Exact next task**: G4 — Python wrapper + Phase 1 server scaffold.
+**Exact next task**: v0.1.0 bootstrap — embed lookup + final_norm on
+the QuietBox mesh.
 
-The kernel is drop-ready. Phase 1 server integration is the next
-substantial unit of work. Steps:
+Already done this session:
+- ✓ G4 step 1: Mamba2 Python wrapper (`experiments/serve/nemotron3_mamba2_step.py`)
+  PASS at full Nemotron shapes (state cos=0.999999, y cos=0.999995). Drop-in
+  step function for the server scaffold.
+- ✓ v0.0 config probe: model exists on HF, modeling code loads with
+  `trust_remote_code=True`. Architecture matches brief (52 layers, 64
+  Mamba2 heads × 64 head_dim × 128 ssm_state, n_groups=8 — kernel-shape match).
+- ⏳ v0.0 HF oracle: downloading weights (~63 GB) in background. Tmux
+  session `nemotron_oracle` on the QuietBox. Output:
+  `.cache/hf_oracle_nemotron3_nano/`.
 
-1. **Python wrapper** at `experiments/serve/nemotron3_mamba2_step.py` (or
-   similar) — wraps the per-step kernel call, takes a per-(batch, head)
-   fixture from the CB engine's slot store, handles tile-row padding +
-   per-group B/C replication, returns y + updated state. Pattern fork
-   from `experiments/serve/server_35b_ttnn.py`'s `dn_forward_ttnn`.
-2. **Architecture scaffold** at `experiments/serve/server_nemotron3_ttnn.py`
-   — bootstrap, weight upload, 52-layer hybrid dispatch
-   (`hybrid_override_pattern` = 23 Mamba2 + 23 MoE + 6 GQA Attention).
-   Heavy fork from `server_35b_ttnn.py` (also a hybrid model).
-3. **HF oracle** at `experiments/utils/hf_reference_nemotron3_nano.py` —
-   `trust_remote_code=True`, per-layer hooks for `state_out`, `y`,
-   attention K/V cache to feed v0.1.x per-layer cosine ladders.
+Steps for v0.1.0:
+1. Fork bootstrap from `experiments/serve/server_35b_ttnn.py` (which is
+   also a hybrid model). New file `experiments/serve/server_nemotron3_ttnn.py`.
+2. Open (1, 4) mesh + fabric. Verify on the QuietBox.
+3. Upload weights — 4-shard safetensors (8 GB/chip). Verify with a
+   sample shape (e.g., `embed_tokens` should be `[131072, 2688]`).
+4. Embed lookup on the QuietBox: feed `prompt_ids` → returns
+   `[1, seq, 2688]` hidden. Gate: cos ≥ 0.999 vs HF oracle's `hidden_states[0]`.
+5. Final norm + lm_head + argmax at pos 0. Gate: argmax matches HF.
 
-**G3 batched (B>1) parked** — see plan §3a. Hangs/NaN when
-`blocks_per_core > 1` at full 64-head shapes. Not a Phase 1 blocker
-(CB engine handles concurrency at server layer; same pattern as 27B/35B).
-Resume after Phase 1 server validates end-to-end correctness.
-
-**Phase 1 sub-stages** (after G4 lands):
-- v0.0: HF oracle + tokenizer + RAM check on the QuietBox host
-- v0.1: bootstrap mesh + embed lookup + final_norm
-- v0.1.1: L0 (Mamba2) eager composite using the owned kernel — cos ≥ 0.999 vs HF
+**Phase 1 sub-stages** (after v0.1.0 lands):
+- v0.1.1: L0 (Mamba2) eager composite — drop in the wrapper, cos ≥ 0.999 vs HF
 - v0.1.2: L1 (MoE) — fork from 35B's Pattern A batched
-- v0.1.3: L5 (Attention) — simplest attention we've shipped (no RoPE, no Q-gate)
-- v0.2: all 52 layers + final_norm + lm_head + argmax — argmax match HF at pos 0
+- v0.1.3: L5 (Attention) — simplest attention we've shipped (no RoPE)
+- v0.2: all 52 layers + final_norm + lm_head — argmax match HF at pos 0
 - v0.3+: multi-step decode + chat smoke + CB integration
 
 Plan: `research/nemotron3_nano_30b_a3b_bringup_plan.md` §3b.
