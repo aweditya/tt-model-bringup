@@ -62,7 +62,20 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.2.d — single-position SSD oracle vs HF.
+**Phase 1 — exact next task**: v0.1.3 — L1 MoE (Pattern A fork + DeepSeek-V3
+e_score_correction_bias). v0.1.2 COMPLETE 2026-06-05 (commits `587ae06` +
+`dd7b80d`): L0 Mamba2 fully on-device, all gates PASS at cos ≥ 0.99990.
+Root-cause that closed it: hardcoded clamp constants (1e-4, 0.1) in BOTH
+the numpy oracle and the kernel; HF Nemotron uses
+`self.time_step_limit = (0.0, inf)` for the actual clamp — the
+`time_step_min`/`max` config fields are not what HF uses. After
+fixing (oracle defaults + kernel constants 0x7f800000 for inf),
+oracle vs HF y_pre_norm cos jumped 0.943 → 0.999999. Memory:
+[[feedback-nemotron3-time-step-clamp-bug]] (durable: any future
+Mamba/SSM bringup must search the modeling code for `time_step_limit`).
+
+v0.1.2.c smoke: Gate N 0.999904; O 0.999937; M 0.999937; B 0.999930.
+Bootstrap 5.8s; forward 2.4s.
 v0.1.2.c PARTIAL (commit `587ae06`): the full on-device L0 Mamba2 chain
 mechanically runs end-to-end (pre-norm + in_proj + conv1d + silu + split
 + SSD-via-wrapper + MambaRMSNormGated + out_proj + residual), but the
