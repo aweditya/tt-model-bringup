@@ -678,8 +678,8 @@ same noise budget.
 
 ### 7.11 No license-gating, but commercial license is Nvidia-specific
 
-NVIDIA Nemotron Open Model License — not Apache/MIT. For Stanford
-CS440LX research use this is fine; no download blocker.
+NVIDIA Nemotron Open Model License — not Apache/MIT. For research use
+this is fine; no download blocker.
 
 ------------------------------------------------------------------------
 
@@ -688,22 +688,21 @@ CS440LX research use this is fine; no download blocker.
 For first-time planners, these three files together give the entire
 ladder + reuse philosophy:
 
-- `/Users/adityasriram/Labs/stanford/cs440lx/tt-model-bringup/research/35b_cb_bringup_plan.md`
-  — closest precedent (MoE + recurrent mixer + (1,4) mesh + CB v0..v4
+- [`research/35b_cb_bringup_plan.md`](35b_cb_bringup_plan.md) —
+  closest precedent (MoE + recurrent mixer + (1,4) mesh + CB v0..v4
   ladder + dev harness pattern). The MoE Pattern A and CB scheduler
   pieces port DIRECTLY.
 
-- `/Users/adityasriram/Labs/stanford/cs440lx/tt-model-bringup/research/gemma4_12b_bringup_plan.md`
-  — hybrid-attention precedent (sliding + global dispatch). The
+- [`research/gemma4_12b_bringup_plan.md`](gemma4_12b_bringup_plan.md) —
+  hybrid-attention precedent (sliding + global dispatch). The
   per-layer-type dispatch pattern, the bootstrap skeleton, the v0.1.x
   sub-staging table, and the kernel-source-first discipline all carry
   over. The Llama-style RMSNorm (`w`, not `(1+w)`) is the same here.
 
-- `/Users/adityasriram/Labs/stanford/cs440lx/tt-model-bringup/research/model_bringup_recipe.md`
-  — the meta-recipe that took Gemma 4 from oracle to HTTP chat in 36
-  hours. Read first. The 12-bug catalog (§1) is mostly applicable;
-  Mamba2-specific bugs not yet in the catalog (will populate during
-  bringup).
+- [`research/model_bringup_recipe.md`](model_bringup_recipe.md) — the
+  meta-recipe that took Gemma 4 from oracle to HTTP chat in 36 hours.
+  Read first. The 12-bug catalog (§1) is mostly applicable; Mamba2-
+  specific bugs not yet in the catalog (will populate during bringup).
 
 Other useful references:
 - `archive/superseded_research_2026-06-04/27b_continuous_batching_plan.md`

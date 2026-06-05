@@ -1,7 +1,7 @@
-# External Blog Synthesis: Tenstorrent Kernel Wisdom Curated for tt-xla
+# External Blog Synthesis: Tenstorrent Kernel Wisdom Curated for tt-model-bringup
 
 **Corpus path:** `tt_docs_corpus/blogs/` (10 Marty posts + 7 Corsix Wormhole-series posts; see per-author `INDEX.md`).
-**Audience:** tt-xla team working on Qwen3.6-27B decode optimization, in-place KV scatter, multi-chip TP (qb2, 4 P150s), and custom Tensix kernels.
+**Audience:** anyone working on Qwen3.6-27B decode optimization, in-place KV scatter, multi-chip TP (QuietBox, 4 P150s), and custom Tensix kernels.
 **Scope:** what these external authors got right that the official docs don't say loudly enough.
 
 ---

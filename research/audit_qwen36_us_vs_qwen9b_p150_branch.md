@@ -8,10 +8,10 @@ for the upstream chunked-SDPA audit (archived 2026-06-04). Their branch:
 https://github.com/tenstorrent/tt-metal/tree/qwen9b-p150 (branch HEAD
 `14be5b9` as of fetch).
 
-A Tenstorrent engineer (CS440LX poster-session attendee) shared the branch
-as their WIP supporting "Qwen3.5/3.6 with 256K context + all other
-features". This doc cross-checks that claim against what's actually on
-the branch and against our shipped 27B / 35B-A3B work.
+A Tenstorrent engineer (2026-06-04 poster-session attendee) shared the
+branch as their WIP supporting "Qwen3.5/3.6 with 256K context + all
+other features". This doc cross-checks that claim against what's
+actually on the branch and against our shipped 27B / 35B-A3B work.
 
 ---
 

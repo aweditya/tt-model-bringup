@@ -183,7 +183,7 @@ SERVING:
 
 ### The Big Picture
 
-This started as a Stanford CS440LX class project to "understand Tenstorrent hardware and JAX/XLA internals." What we built is a from-scratch LLM inference engine on novel hardware that runs 7 models at competitive throughput, including the first MoE model on Tenstorrent Blackhole. The wiki (60 entries) and experiment suite (91 experiments) constitute a reference implementation that didn't exist before this project.
+This started as a research project to "understand Tenstorrent hardware and JAX/XLA internals." What we built is a from-scratch LLM inference engine on novel hardware that runs 7 models at competitive throughput, including the first MoE model on Tenstorrent Blackhole. The wiki (60 entries) and experiment suite (91 experiments) constitute a reference implementation that didn't exist before this project.
 
 The path from here to a real JAX backend is clear: PJRT plugin for device discovery, StableHLO lowering for the ~35 ops that cover transformers, and the Metal Trace infrastructure we already understand for graph execution. The question is whether to build the plugin ourselves (months of C++ work) or wait for Tenstorrent's official plugin to mature past the segfault stage.
 

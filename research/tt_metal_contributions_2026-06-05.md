@@ -1,8 +1,8 @@
-# tt-metal Contributions Packet — CS440LX / tt-model-bringup (2026-06-05)
+# tt-metal Contributions Packet — tt-model-bringup (2026-06-05)
 
-**Project**: <https://github.com/aweditya/tt-model-bringup> (Stanford CS440LX,
+**Project**: <https://github.com/aweditya/tt-model-bringup> (research project;
 direct TT-Metal bringup of Qwen3.6-27B dense TP, Qwen3.6-35B-A3B MoE, and
-Gemma 4 12B `gemma4_unified` on Blackhole P150 — qb1 / qb2 (1,4) mesh).
+Gemma 4 12B `gemma4_unified` on Blackhole P150 — QuietBox `(1,4)` mesh).
 
 **Audience**: tt-metal kernel maintainers, tt-llk maintainers, docs owners,
 and dev-blog editors.
@@ -443,8 +443,8 @@ maintainer-hour-to-triage):
 
 **Suggested submission format**:
 
-- **Single umbrella issue** ("CS440LX / tt-model-bringup contributions
-  packet, 2026-06-05") with one checkbox per finding above. Easier to
+- **Single umbrella issue** ("tt-model-bringup contributions packet,
+  2026-06-05") with one checkbox per finding above. Easier to
   triage than 20 separate issues; we can split out individual issues
   per maintainer request.
 - **Two grouped docs PRs**: one against tt-metal docs (Findings #1,

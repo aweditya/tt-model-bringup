@@ -1,4 +1,4 @@
-# tt-metal Design Discussions — Synthesis for tt-xla Kernel Work
+# tt-metal Design Discussions — Synthesis for tt-model-bringup Kernel Work
 
 Mined 2026-05-13 from tt-metal issues + PRs to surface kernel-design patterns and
 pitfalls. Quotes are verbatim from the linked artifacts. Where a passage maps to
@@ -39,13 +39,13 @@ the issue body was retrievable, not the full discussion. Noted inline.
 - **Implication:** anything that mutates host state mid-trace (events, host scalars, DRAM writes) is a footgun. This is the formal reason our [`feedback_trace_capture`] memory note says "Python scalars baked into trace; use device tensor buffers for dynamic values" — there is no public design doc, the constraint is enforced via runtime asserts.
 
 ### PR [#43849 — Feature: capture trace SW provenance and add qwen-32b_3 trace target](https://github.com/tenstorrent/tt-metal/pull/43849)
-- Merged 2026-05-08 by `stevendae`. Indicates Tenstorrent is investing in **trace-provenance metadata** so that captured traces remember which Python ops produced them. Useful template if we want to debug PJRT traces.
+- Merged 2026-05-08 by `stevendae`. Indicates Tenstorrent is investing in **trace-provenance metadata** so that captured traces remember which Python ops produced them. Useful template if we want to debug TT-NN traces.
 
 ### PR [#43069 — Fix graph trace output size: use aligned_size_per_bank for accurate per-core L1 estimation](https://github.com/tenstorrent/tt-metal/pull/43069)
 - Merged 2026-05-07 by `bmalesevicTT`. Closes [tt-mlir#8044](https://github.com/tenstorrent/tt-mlir/issues/8044).
 - Quote: > "`extract_l1_output_buffer_allocation_size_per_core` was computing per-core L1 output buffer size using `buffer->size()` (unpadded logical tensor size)."
   > Fix: use `buffer->aligned_size_per_bank()` — > "calls the same `calculate_bank_size_spread` the runtime allocator uses — giving the correct padded per-bank reservation for both interleaved and all sharded layouts."
-- **Implications:** when our PJRT plugin starts emitting L1 budgets, we have to use `aligned_size_per_bank()` — not `buffer->size()` — or we'll under-account by the tile-padding amount on sharded tensors. Directly affects `phase_b1_pass: weight skeleton + per-chip memory budget` (most recent commit).
+- **Implications:** when accounting for L1 budgets, use `aligned_size_per_bank()` — not `buffer->size()` — or we'll under-account by the tile-padding amount on sharded tensors. Relevant to anything that does per-chip memory budgeting.
 
 ---
 
@@ -133,10 +133,10 @@ This is the template our scatter / DeltaNet-scan kernel proposals should follow 
 
 ---
 
-## Top-5 actionable items for tt-xla
+## Top-5 actionable items for tt-model-bringup
 
-1. **Adopt the #14540 pre-implementation-review template for our scatter kernel proposal.** Before any C++, file an issue with: shapes, sharded grid, CB assignments, producer/consumer ops, and "current design only supports..." limitations. This is also good practice for the PJRT op-by-op rollout — see `pjrt_plugin_design.md` for the existing skeleton.
-2. **Switch our L1 budget accounting to `aligned_size_per_bank()`.** PR #43069 is the canonical fix. Our `phase_b1_pass` weight skeleton currently uses logical tensor size; this is wrong for any sharded weight. Affects `experiments/.../weight_skeleton.*`.
+1. **Adopt the #14540 pre-implementation-review template for our scatter kernel proposal.** Before any C++, file an issue with: shapes, sharded grid, CB assignments, producer/consumer ops, and "current design only supports..." limitations.
+2. **Switch L1 budget accounting to `aligned_size_per_bank()`.** PR #43069 is the canonical fix. Any pre-pivot weight-skeleton code that uses logical tensor size is wrong for any sharded weight.
 3. **Add explicit NoC flushes to any in-place writer we author** (custom scatter, custom in-place RoPE if we revisit C'3, fused DeltaNet scan). Use Watcher + L1 cache disabled while bringing up. Single biggest lesson from #16674's root-cause family.
 4. **Promote exhaustive `cur_pos` sweep to nightly CI for at least one Qwen shape.** #30362 showed that stride-sampling missed real PCC failures. Our daily-driver context path (`feedback_long_context_is_the_real_gate`) needs this exact coverage.
 5. **Pin dtype combinations through decode** to avoid program-cache thrash (#21534 lesson). If we run bf8 KV + bf16 Q, **never** drop to bf16 KV mid-decode — it forces a re-cache and silently breaks `num_program_cache_entries`-style assertions in downstream tests.

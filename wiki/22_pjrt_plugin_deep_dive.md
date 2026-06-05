@@ -109,7 +109,7 @@ Three viable approaches, ordered by effort:
 
 ### Recommendation
 
-For CS440LX: **Path 1 is the win**. We've already demonstrated the core concept. Path 2 is the stretch goal if we want the full `jax.jit` experience. Path 3 is out of our control.
+For this project: **Path 1 is the win**. We've already demonstrated the core concept. Path 2 is the stretch goal if we want the full `jax.jit` experience. Path 3 is out of our control.
 
 ## Key Insight
 

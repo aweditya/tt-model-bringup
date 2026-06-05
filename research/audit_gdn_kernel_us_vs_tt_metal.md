@@ -1,9 +1,9 @@
 # Audit: our `qwen36_gdn_decode_owned` vs `tenstorrent/tt-metal` GDN/DeltaNet work
 
-**Date**: 2026-06-04. **Author**: Aditya Sriram (CS440LX). **Trigger**:
-a Tenstorrent engineer at the CS440LX poster session asked whether we should
-share approaches with them for the GDN kernel. This is the audit before the
-reply.
+**Date**: 2026-06-04. **Author**: Aditya Sriram. **Trigger**:
+a Tenstorrent engineer at the 2026-06-04 poster session asked whether
+we should share approaches with them for the GDN kernel. This is the
+audit before the reply.
 
 **Sources**:
 

@@ -6,9 +6,9 @@ Date: 2026-06-04. Source-of-truth for "their side": GitHub issue
 (`arginugaTT`), assigned to Benjamin Goel + Ashai. Source-of-truth for
 "our side": local files cited inline.
 
-Audience: the Tenstorrent engineer who shared #44962 during the CS440LX
-poster session. Goal is to surface alignment, gaps, and a concrete
-two-way engagement.
+Audience: the Tenstorrent engineer who shared #44962 during the
+2026-06-04 poster session. Goal is to surface alignment, gaps, and a
+concrete two-way engagement.
 
 ---
 

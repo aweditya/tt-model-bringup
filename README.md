@@ -9,8 +9,6 @@ Qwen3.6-35B-A3B MoE, Gemma 4 12B, Nemotron-3 Nano 30B-A3B, plus a model zoo
 of single-chip Llama / Qwen2.5 / SmolLM ports.
 **Why:** Squeeze production-grade per-token throughput out of Blackhole P150s
 by owning the compute graph end-to-end — kernels, scheduler, HTTP server.
-**Who:** Stanford CS440LX research project; pivoted from a JAX/XLA PJRT
-backend (`tt-xla`) to direct bringup.
 **How:** Custom fused-op kernels under `experiments/owned_ops/`, a
 continuous-batching engine under `experiments/serve/`, and a learning-wiki
 documenting every design decision.
@@ -85,9 +83,9 @@ Stop gracefully (hard-killing can wedge the fabric):
 bash experiments/serve/scripts/serve_cb.sh stop
 ```
 
-> The repo's working directory is `~/tt-xla` for historical reasons (the
-> project was originally a JAX/XLA PJRT backend). Renaming breaks too many
-> rsync paths to be worth it.
+> The local working directory stays `~/tt-xla` for historical reasons
+> (the repo was originally a JAX/XLA PJRT-backend exploration). Renaming
+> breaks too many rsync paths to be worth it.
 
 See [`REPRODUCE.md`](REPRODUCE.md) for the full reproducible-on-any-QuietBox
 recipe, tested-versions matrix, and per-demo expected numbers.
@@ -101,7 +99,7 @@ recipe, tested-versions matrix, and per-demo expected numbers.
 | Qwen3.6-27B | 27 B dense | Hybrid attention + GatedDeltaNet | Production CB + TP, prefix-cache live |
 | Qwen3.6-35B-A3B | 35 B / 3 B-A | Hybrid + GatedDeltaNet + MoE | CB shipped; B>1 blocked on slot-poisoning fix |
 | Gemma 4 12B (base + IT) | 12 B dense | Dual sliding/global attention | End-to-end CB + HTTP chat |
-| Nemotron-3 Nano 30B-A3B | 30 B / 3 B-A | Mamba2-Transformer hybrid MoE | In progress — owned Mamba2 SSD kernel (G0→G4) |
+| Nemotron-3 Nano 30B-A3B | 30 B / 3 B-A | Mamba2-Transformer hybrid MoE | In progress — owned Mamba2 SSD kernel G1 single-core complete (modes 1–5 PASS); G2 multi-core next |
 | Llama 1B/3B/8B, SmolLM3, Qwen2.5/3 small | up to 8 B | Decoder-only Transformer | Legacy single-chip demos (see [`models/`](models/)) |
 
 Per-token throughput numbers drift across kernel work — see
@@ -139,7 +137,7 @@ A Claude-Code-style chat TUI lives at
 | `wiki/` | Q&A wiki — learning-by-building notes on JAX/XLA + TT-Metal internals |
 | `scripts/` | Dev-loop scripts: `deploy.sh`, `run_remote.sh`, `build_owned_ops.sh`, chat TUI |
 | `models/` | Legacy single-chip multi-model demos (Llama, SmolLM, Qwen2.5/3) |
-| `archive/` | Retired probes, the original PJRT plugin (`legacy/`), the CS440LX poster + measurements, and dated cleanup buckets |
+| `archive/` | Retired probes, the founding JAX/PJRT-era sources (`legacy/`), the 2026-06-04 poster + measurements, and dated cleanup buckets |
 
 ---
 
@@ -183,8 +181,4 @@ Probe: [`experiments/utils/needle_haystack_qb2_tp.py`](experiments/utils/needle_
 - [`REPRODUCE.md`](REPRODUCE.md) — reproduce the chat server + legacy demos on a fresh QuietBox.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — dev loop, canary gates, code style.
 - [`CLAUDE.md`](CLAUDE.md) — project non-negotiables (host-specific).
-
-> **Origin:** the repo was originally a JAX/XLA PJRT backend — hence the
-> `tt-xla` directory name. PJRT sources live in
-> [`archive/legacy/pjrt_plugin/`](archive/legacy/pjrt_plugin/) and are off
-> the active path.
+- [`research/perf_summary_2026-06-05.md`](research/perf_summary_2026-06-05.md) — single perf-table summary across every shipped model.

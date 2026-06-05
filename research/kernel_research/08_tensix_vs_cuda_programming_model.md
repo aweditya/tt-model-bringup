@@ -1,6 +1,6 @@
 # 08 — Tensix vs CUDA: A Mental Model for Kernel Designers
 
-**Audience**: anyone on tt-xla who has written CUDA and now needs to think in Tensix. This is the conceptual doc — what to internalize before designing a custom op, not an API reference.
+**Audience**: anyone on tt-model-bringup who has written CUDA and now needs to think in Tensix. This is the conceptual doc — what to internalize before designing a custom op, not an API reference.
 
 **Stance**: empirical, not aspirational. Tensix is a different machine, not a different syntax for the same machine.
 

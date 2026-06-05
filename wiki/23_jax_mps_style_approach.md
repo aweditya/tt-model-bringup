@@ -585,7 +585,7 @@ With the key enhancement: replace CPU broadcast with `ttnn.repeat` so trace capt
 - Effort: 1-2 days for broadcast fix, 1 week for polish
 - Gets: ~2-3x speedup from trace, all ops on-device, potentially 500+ fwd/sec
 - Loses: No jax.jit, no vmap, no Flax compatibility
-- For CS440LX: this is the pragmatic choice
+- For this project: this is the pragmatic choice
 
 ### Q: What's the progressive migration strategy?
 
