@@ -465,7 +465,8 @@ class State:
         self.embed_w_np = None
         self.final_norm_tt = None
         self.lm_head_tt = None
-        self.per_layer_tt: list[dict] = []
+        self.per_layer_tt: list = []
+        self.key_to_shard = None  # set by bootstrap; reused by upload_one_layer
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────
@@ -510,6 +511,7 @@ def bootstrap(state: State, log=None):
 
     log("[bootstrap] enumerate shards + load top-level weights to mesh…")
     key_to_shard = build_key_to_shard()
+    state.key_to_shard = key_to_shard  # exposed for v0.2.b streaming forward
     log(f"  {len(key_to_shard)} weight keys across "
         f"{len(set(key_to_shard.values()))} shards")
 
@@ -580,6 +582,50 @@ def bootstrap(state: State, log=None):
         log(f"[bootstrap] v0.1.1 ready (sparse layer upload: {targets}).")
     else:
         log("[bootstrap] v0.1.0 ready (top-level only — no layers uploaded).")
+
+
+# ── Streaming layer upload (v0.2.b) ──────────────────────────────────
+def upload_one_layer(state, L: int, log) -> dict:
+    """Lazy-upload a single layer's weights and return the per-layer
+    weight dict. Wraps the per-kind dispatch already used in bootstrap.
+
+    Requires `state.key_to_shard` to be populated (set during bootstrap).
+    Used by the v0.2.b streaming forward to fit 23 MoE × ~640 MB/chip
+    in the 8 GB P150 budget by uploading-then-deallocating each layer.
+    """
+    import os as _os
+    assert state.key_to_shard is not None, \
+        "state.key_to_shard not set; bootstrap was not run"
+    kind = state.layer_types[L]
+    if kind == "attention":
+        return upload_attn_layer(state, state.key_to_shard, L, log)
+    if kind == "mamba2":
+        return upload_mamba2_layer(state, state.key_to_shard, L, log)
+    if kind == "moe":
+        _mode = _os.environ.get("NEMOTRON3_MOE_MODE", "ep").lower()
+        if _mode == "router_only":
+            return upload_moe_layer_router_only(state, state.key_to_shard, L, log)
+        if _mode == "full":
+            return upload_moe_layer_full(state, state.key_to_shard, L, log)
+        return upload_moe_layer_ep(state, state.key_to_shard, L, log)
+    raise NotImplementedError(f"L{L} kind={kind!r}")
+
+
+def deallocate_layer(state, L: int):
+    """Deallocate every TT tensor in state.per_layer_tt[L] and clear
+    the slot. No-op if the slot is already empty.
+    """
+    if state.per_layer_tt is None or L >= len(state.per_layer_tt):
+        return
+    w = state.per_layer_tt[L]
+    if not w:
+        return
+    for k, v in list(w.items()):
+        try:
+            ttnn.deallocate(v)
+        except (TypeError, RuntimeError, AttributeError):
+            pass  # not a TT tensor (e.g. numpy bias array)
+    state.per_layer_tt[L] = None
 
 
 # ── Forward fragments for v0.1.0 validation ───────────────────────────
