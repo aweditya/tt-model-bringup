@@ -16,7 +16,6 @@ GitHub: `aweditya/tt-model-bringup` (renamed 2026-05-19). Local working dir stay
 3. **No code bloat.** Spend more time thinking, less time implementing. When we implement, it's correct and concise.
 4. **Remote execution only — `ssh qb1` or `ssh qb2`.** All experiments and code run on a remote host. (Previous host `ssh tenstorrent` is no longer available.)
 5. **Two hosts now available**: `qb1` (4 P150s, **inter-chip fabric WORKS as of 2026-05-21** — both single-chip and multi-chip TP workloads) and `qb2` (4 P150s with working fabric, hosts production Qwen3.6-27B TP server). Either host can run TP work; prefer qb1 for experimental mesh work so qb2 prod stays up. **Owned kernels** (`qwen36_gdn_decode_owned`, `qwen36_decay_gate_decode_owned`) are present in BOTH hosts' ttnn builds — verified on qb1 2026-05-28 (`ttnn.experimental` exposes all 8 `qwen36_gdn_*` ops). The earlier "qb2-only" note was stale. NOTE: `qwen36_gdn_decode_owned` hard-asserts batch=1 (`state_logical[0] == 1`); batching it for continuous batching needs device-op + program-factory changes.
-6. **Single device for now.** Both hosts have 4 Blackhole chips — stick to ONE device until we've saturated it. Multi-chip is a real-need decision (memory or throughput), not a workaround for poor single-chip util.
 6. **No inline scripts** unless absolutely necessary. Write permanent files in `scripts/`, `experiments/`, or the relevant package.
 7. **No `/tmp` for anything.** Use project directories for outputs, logs, caches, scratch — anything.
 8. **Frequent commits.** Commit early and often.
