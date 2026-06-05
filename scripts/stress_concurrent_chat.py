@@ -17,7 +17,7 @@ Usage:
         --max-tokens 64
 
 Outputs:
-    presentation/screenshots/stress_concurrent_chat_<timestamp>.json
+    .cache/stress_results/stress_concurrent_chat_<timestamp>.json
     Stdout: live progress + final table.
 """
 from __future__ import annotations
@@ -120,7 +120,7 @@ def main():
                     help="comma-sep N values for parallel client count")
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--out", default=None,
-                    help="JSON output path (default: presentation/screenshots/...)")
+                    help="JSON output path (default: .cache/stress_results/...)")
     args = ap.parse_args()
 
     clients = [int(x) for x in args.clients.split(",")]
@@ -150,7 +150,7 @@ def main():
               f"{s['aggregate_tok_s']:>12.2f}  {speedup:>13.2f}×", flush=True)
 
     if args.out is None:
-        out_dir = Path(__file__).resolve().parents[1] / "presentation" / "screenshots"
+        out_dir = Path(__file__).resolve().parents[1] / ".cache" / "stress_results"
         out_dir.mkdir(parents=True, exist_ok=True)
         args.out = str(out_dir / f"stress_concurrent_chat_{int(time.time())}.json")
     Path(args.out).write_text(json.dumps({"args": vars(args), "rounds": summary}, indent=2))

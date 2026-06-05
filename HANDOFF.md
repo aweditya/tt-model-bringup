@@ -8,8 +8,8 @@ Read top to bottom; everything else is linked.
 ## NEW HEADLINE (2026-06-04, post-demo): MM7 — Nemotron-3 Nano 30B-A3B
 
 Stanford CS440LX **demo shipped successfully** 2026-06-04 (27B + Gemma 4 12B
-live chat via the TUI, [poster v5](presentation/poster.pdf), Qwen 27B PC
-verified end-to-end at 5.1× / 8.0× per-token speedup).
+live chat via the TUI, [poster v5](archive/presentation_cs440lx_2026-06-04/poster.pdf),
+Qwen 27B PC verified end-to-end at 5.1× / 8.0× per-token speedup).
 
 **Next bringup target**: `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`.
 This is a **Mamba2-Transformer HYBRID MoE**, NOT a clean Qwen-MoE clone.
@@ -114,7 +114,7 @@ For Gemma 4: `TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it ...`. Do NOT pass `TT_C
 - `/paste` multi-line mode (terminal-level bracketed-paste also enabled)
 - `/yank` copies last assistant reply / code block to system clipboard
 - `/metrics [N]` live Prometheus dashboard for N refresh cycles
-- `/screenshot` saves to `presentation/screenshots/tui_<ts>.png`
+- `/screenshot` saves to `.cache/tui_screenshots/tui_<ts>.png`
 - Expanded shell allow-list (`git`, `grep`, `find`, `python -V/-c`, etc.) with strict deny-list
 - `write_file(path, content, mode)` and line-ranged `read_file(path, start=N, n=M)` tools
 - Graceful HTTP-error recovery + terminal-state reset on exit
@@ -201,10 +201,10 @@ python3 scripts/chat.py --url http://qb1:8000 --model 'google/gemma-4-12B' --too
 - `use_multicore=False` on lm_head argmax (commit `918c025`) — needs server test to confirm perf cost + determinism win.
 - TUI screenshots for poster (task #177) — needs server up to demonstrate.
 
-**Poster**: v3 at `presentation/poster.pdf`. Sky-blue Tenstorrent theme, columns rebalanced, both models' streaming numbers in. Compile with `presentation/compile.sh` (lualatex 2-pass) if you edit `poster.tex`.
+**Poster** (archived, demo done 2026-06-04): `archive/presentation_cs440lx_2026-06-04/poster.pdf`. Sky-blue Tenstorrent theme, columns rebalanced, both models' streaming numbers in.
 
 **Key reference files** (read first if confused):
-- `presentation/06_live_measurements.md` — single source of truth for all measurements
+- `archive/presentation_cs440lx_2026-06-04/06_live_measurements.md` — historical record of demo-day measurements
 - `research/tokenizer_chat_template_reference.md` — universal tokenizer/chat-template gotchas (so we never re-debug this)
 - `research/cb_perf_regression_audit_2026-06-04.md` — explains the 13 → 232 tok/s recovery
 - `scripts/CHAT_TUI.md` — TUI commands + tools

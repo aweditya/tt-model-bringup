@@ -26,7 +26,7 @@ Net result: the HTTP path runs (a) a **slower per-step kernel mix** (manual DN, 
 | Bench used argmax-tail trace (no kwargs to `forward_batch_tp_inner`) | `experiments/cb/bench/trace.py` | 65 (`am = cb.forward_batch_tp_inner(state)`), 69 (capture handle), 85 (8-byte readback) |
 | Bench called with manual+kdim by default; `--owned-gdn --shiftacc` opt-in | `experiments/cb/bench/trace.py` | 135–146 |
 | HTTP engine is forced sampling=True | `experiments/serve/cb_api.py` | 341–346 (`engine = CBEngine(..., sampling=True, topk_k=topk_k, ...)`) |
-| HTTP topk_k default for 27B/Gemma4 = `os.environ["TT_CB_TOPK_K"]` or `"0"` (= None for these backends per the `or None` check) — **but** the live measurements run with TT_CB_TOPK_K=128 (per the live header) | `experiments/serve/cb_api.py` | 336–337; `presentation/06_live_measurements.md:9,19` |
+| HTTP topk_k default for 27B/Gemma4 = `os.environ["TT_CB_TOPK_K"]` or `"0"` (= None for these backends per the `or None` check) — **but** the live measurements run with TT_CB_TOPK_K=128 (per the live header) | `experiments/serve/cb_api.py` | 336–337; `archive/presentation_cs440lx_2026-06-04/06_live_measurements.md:9,19` |
 | Topk path at low B is the cost | `experiments/serve/cb_scheduler.py` | 173–176 ("topk adds ~100ms of fixed device cost that HURTS at low B (e.g. B=4 step grew 131→232ms in measurement)"); 641–682 (`_step_sampled_topk`) |
 | Argmax fast path: in-trace `_argmax_handle`, no per-step `_step_sampled_*` host loop | `experiments/serve/cb_scheduler.py` | 240–256, 567–574 |
 | `cb_dn_recurrence_mode` defaults to `'manual'` everywhere except where explicitly set | `experiments/serve/server_tp_cb.py` | 454 (`getattr(state, 'cb_dn_recurrence_mode', 'manual')`); never set in `server_tp.MeshServerState.__init__` or in `cb_api.lifespan` |
@@ -34,7 +34,7 @@ Net result: the HTTP path runs (a) a **slower per-step kernel mix** (manual DN, 
 | `017665e` removed `deltanet_*` overrides (single-stream path), not CB flags | `git show 017665e` | `experiments/serve/cb_api.py` only; deleted 7 lines that set `st.deltanet_recurrence_mode = "manual"` etc. |
 | `deltanet_*` flags read by `forward_token_tp_inner`, NOT `forward_batch_tp_inner` | `experiments/serve/server_tp.py` | 724, 774, 821 (all inside the single-stream decode); CB code reads only `cb_dn_recurrence_mode` |
 | Historical 593.12 tok/s = B=64 + owned_gdn + 3-col shiftacc | `research/27b_cb_scope.md` | 682–693 (table; the 593.12 row is "owned_gdn + 3-col conv" benchmark only) |
-| Live measurements log already calls this out as an open bug | `presentation/06_live_measurements.md` | 77 ("B=4 step time scaling 4-5× over B=1 single-seq … UNDER INVESTIGATION") |
+| Live measurements log already calls this out as an open bug | `archive/presentation_cs440lx_2026-06-04/06_live_measurements.md` | 77 ("B=4 step time scaling 4-5× over B=1 single-seq … UNDER INVESTIGATION") |
 | User-recalled "370/600 tok/s" = `B=32 376.92 / B=64 593.12` in `27b_cb_scope.md:687–688` | `research/27b_cb_scope.md` | 687–688 |
 | `feedback_cb_batching_free.md`'s 150.5 / 183.5 numbers are the **older** owned_gdn+kdim (no shiftacc) sweep; the 376.92 / 593.12 are after the 3-col conv refactor | `feedback_cb_batching_free.md` (memory) | lines 32–45, 66–77 |
 
@@ -131,14 +131,14 @@ Risk: dual-trace memory budget on Blackhole; the two-phase warmup note in `MEMOR
 Once Fix 1 (drop TT_CB_TOPK_K) AND Fix 2 (set cb_dn_recurrence_mode='owned_gdn', cb_conv_mode='shiftacc') are in:
 
 1. Restart `serve_cb.sh` with no `TT_CB_TOPK_K` env. Confirm `/metrics` shows `cb_engine_sampling 1.0` and the engine reports `topk_k=None` in startup logs.
-2. Run `presentation/screenshots/stress_concurrent_chat.py` (or the equivalent stress harness already in the tree — the JSONs exist at `presentation/screenshots/stress_*.json`) at 1, 2, 4 concurrent clients. Record `cb_step_seconds_sum/count` and aggregate tok/s.
+2. Run `scripts/stress_concurrent_chat.py` (or the equivalent stress harness already in the tree — historical JSONs exist at `archive/presentation_cs440lx_2026-06-04/screenshots/stress_*.json`) at 1, 2, 4 concurrent clients. Record `cb_step_seconds_sum/count` and aggregate tok/s.
 3. Compare to `experiments/cb/bench/trace.py --batches 1,4,32 --owned-gdn --shiftacc` (argmax-tail). At B=4 both should now be in the same neighborhood (≤ 1.5× delta is "sampling-mode overhead"; > 2× means another bug).
-4. Update `presentation/06_live_measurements.md` with the new numbers AND a new column "engine sampling tail" so future runs are unambiguous (argmax / logits / topk-128).
+4. Update `archive/presentation_cs440lx_2026-06-04/06_live_measurements.md` with the new numbers AND a new column "engine sampling tail" so future runs are unambiguous (argmax / logits / topk-128).
 5. If Fix 3 lands as well: target ≤ 1.05× of bench/trace.py at all greedy clients (the only remaining cost is per-step scheduler bookkeeping in `step()` lines 559–594, which is pure Python and trivial).
 6. Update `MEMORY.md` `feedback_cb_batching_free.md` entry with a "HTTP-path caveat" note pointing at this audit, so the next session doesn't repeat the question.
 
 ## Open follow-ups (not blocking)
 
-- `presentation/04_throughput.md:38–40` interleaves pre- and post-shiftacc CB numbers in one table. Add an explicit "shiftacc" column or split into two tables.
+- `archive/presentation_cs440lx_2026-06-04/04_throughput.md:38–40` interleaves pre- and post-shiftacc CB numbers in one table. Add an explicit "shiftacc" column or split into two tables.
 - The "B=4 step time scaling 4-5× over B=1 single-seq" line in `06_live_measurements.md:77` should be marked RESOLVED once Fix 1/2/3 land.
 - The unintentional ambiguity in `_topk_default = "64" if TT_BACKEND == "35b" else "0"` (where `"0"` becomes `None` via `int(...) or None`) reads cleanly but is brittle; `code_cleanup_plan_2026-06-04.md` A3 already proposes folding it into a per-backend registry.

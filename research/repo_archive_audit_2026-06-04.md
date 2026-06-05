@@ -108,7 +108,7 @@ even if they look orphan:
   `research/kernel_dataflow_representation.md`,
   `research/nemotron3_nano_30b_a3b_bringup_plan.md`,
   `research/mm7_g1_mamba2_kernel_design.md`
-- `presentation/` (poster + measurements; demo deliverables)
+- `archive/presentation_cs440lx_2026-06-04/` (poster + measurements; archived 2026-06-04 after demo)
 
 ### "Reuse-from" pattern: kept anything cited by an active plan
 

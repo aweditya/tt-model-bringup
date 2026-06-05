@@ -49,7 +49,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import textwrap
 import time
 from urllib.parse import urlparse
 
@@ -788,7 +787,7 @@ COMMANDS
   /metrics              fetch server /metrics (live dashboard)
   /paste [header]       multi-line paste mode (end with ':end:' or 3 blanks)
   /yank [code]          copy last reply (or its last code block) to clipboard
-  /screenshot           save a screenshot of the terminal (presentation/)
+  /screenshot           save a screenshot of the terminal (.cache/tui_screenshots/)
   /help                 this
   /exit  /quit          leave
 
@@ -970,7 +969,7 @@ def main():
                 _render_metrics_dashboard(args.url, refresh_s=1.0, cycles=cyc)
                 continue
             elif cmd == "screenshot":
-                shot_dir = os.path.join(PROJECT_ROOT, "presentation", "screenshots")
+                shot_dir = os.path.join(PROJECT_ROOT, ".cache", "tui_screenshots")
                 os.makedirs(shot_dir, exist_ok=True)
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 out_path = os.path.join(shot_dir, f"tui_{ts}.png")

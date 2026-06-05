@@ -48,7 +48,7 @@ suppress them (the renderer replaces the block with a single dim
 | `/paste [header]`      | Multi-line paste mode (terminator: `:end:` or 3 blanks)   |
 | `/yank [code]`         | Copy last reply (or its last code block) to clipboard     |
 | `/metrics [N\|raw]`    | Live Prometheus dashboard (N cycles, default 10)          |
-| `/screenshot`          | Save `presentation/screenshots/tui_<ts>.png`              |
+| `/screenshot`          | Save `.cache/tui_screenshots/tui_<ts>.png`                |
 | `/help`                | Show in-app help                                          |
 | `/exit` / `/quit`      | Leave                                                     |
 
