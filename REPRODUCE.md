@@ -66,43 +66,24 @@ and load-test (`experiments/cb/load/concurrent_chat.py`) examples.
 P5 SLO (qb1, 8 clients × 60 s, 2026-05-30): 0 errors / 36 requests /
 15 tok/s aggregate / TTFT p99 = 176 ms.
 
-## Reproduce — single-seq TP server (Qwen3.6-27B, frozen prod reference)
+## Reproduce — legacy pre-CB single-stream servers (ARCHIVED)
 
-```bash
-bash experiments/serve/scripts/serve_tp.sh start   # ~17 min bootstrap
-uv run python -m experiments.serve.client_tp status
-uv run python -m experiments.serve.client_tp generate_tp \
-    --prompt "The capital of France is" --max-tokens 32
-bash experiments/serve/scripts/serve_tp.sh stop    # graceful drain
-```
-
-Steady-state: **12.93 tok/s** on qb2 (`num_links=2` all_reduce + `owned_gdn` +
-`owned_decay_gate`). Bootstrap time and graceful-stop matter — see
-README §Troubleshooting.
-
-## Reproduce — single P150 server (Qwen3.6-27B, single-chip)
-
-```bash
-bash experiments/serve/scripts/serve.sh start      # ~11 min bootstrap
-uv run python -m experiments.serve.client status
-uv run python -m experiments.serve.client generate \
-    --prompt "The capital of France is" --max-tokens 32
-bash experiments/serve/scripts/serve.sh stop
-```
-
-Steady-state: **5.14 tok/s** on qb1.
-
-Both servers generate `Paris.\n\n<think>...</think>\n\nThat is correct. Paris is
-the capital and most populous city of France.` at `max_tokens=32`.
+The pre-CB single-stream Unix-socket servers (`server.py`, `server_tp.py`
+wrapper, `server_35b.py`) and their launch scripts (`serve.sh`,
+`serve_tp.sh`, `serve_35b.sh`) were moved to
+`archive/pre_cb_server_stack_2026-06-04/` on 2026-06-04. They were
+superseded by the continuous-batching HTTP server (`serve_cb.sh` above)
+and are kept for historical reference only. Steady-state numbers at
+retirement: single-seq TP 12.93 tok/s on qb2, single-chip 5.14 tok/s on qb1.
 
 ## Reproduce — legacy multi-model demos (single P150)
 
 The prod server holds device 0 — stop it first.
 
 ```bash
-bash experiments/serve/scripts/serve.sh stop       # or serve_tp.sh stop on qb2
+bash experiments/serve/scripts/serve_cb.sh stop
 make run PY=models/80_8b_diverse_qa_demo.py        # or scripts/run_remote.sh models/<file>.py
-bash experiments/serve/scripts/serve.sh start      # restart after
+bash experiments/serve/scripts/serve_cb.sh start   # restart after
 ```
 
 | Demo | What it tests | Expected | qb1 (2026-05-21) |

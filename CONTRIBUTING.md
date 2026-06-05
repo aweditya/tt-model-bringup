@@ -72,11 +72,10 @@ make run PY=experiments/cb/validate/forward.py    # use --max-pos 6 for a short 
 ```
 
 Expect `verdict: PASS` with CB B=1 vs production B=1 `logit_cos = 1.000000`
-(bit-identical). Mesh-free sanity (~30 s; catches import/dispatch breakage):
-
-```bash
-scripts/run_remote.sh --no-reset -m experiments.serve.import_smoke
-```
+(bit-identical). (A pre-CB mesh-free import sanity smoke once lived at
+`experiments/serve/import_smoke.py`; it was archived to
+`archive/pre_cb_server_stack_2026-06-04/import_smoke.py` on 2026-06-04
+after the CB stack subsumed its coverage.)
 
 ## Adding a custom kernel
 

@@ -40,7 +40,7 @@ ssh qb2 'cp /home/aditya/tenstorrent/tt-metal/build_tracy_gcc12_nodist/ttnn/_ttn
 Stop the resident server first (chip contention):
 
 ```bash
-ssh qb2 'cd ~/tt-xla && bash experiments/serve/scripts/serve_tp.sh stop'
+ssh qb2 'cd ~/tt-xla && bash experiments/serve/scripts/serve_cb.sh stop'
 ```
 
 Then run the test (TT_METAL_HOME required for kernel search path):

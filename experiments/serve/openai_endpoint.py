@@ -1,16 +1,13 @@
-"""OpenAI-compatible HTTP endpoint over the Unix-socket TP server.
+"""OpenAI-compatible HTTP endpoint (chat-template + protocol translation).
 
-A thin host-side proxy: HTTP /v1/chat/completions (and /v1/completions) ->
-chat-template -> the server's `generate_tp` over the Unix socket -> OpenAI
-response (streaming SSE or single JSON). No device code; the model runs in the
-persistent server (start it with experiments/serve/scripts/serve_tp.sh).
+Originally a thin host-side proxy over the pre-CB Unix-socket TP server
+(`server.py` / `server_tp.sh`, now in
+`archive/pre_cb_server_stack_2026-06-04/`). The translation helpers
+(_messages_to_prompt, _chat_completion, _chat_chunk) survived and are
+now imported by `experiments/serve/cb_api.py` (the live CB HTTP server).
 
-Run on the TT host (after `serve_tp.sh start`):
-    uv run --extra serve uvicorn experiments.serve.openai_endpoint:app \
-        --host 0.0.0.0 --port 8000
-
-The translation helpers (_messages_to_prompt, _chat_completion, _chat_chunk) are
-pure + unit-tested in experiments/serve/tests/test_openai_endpoint.py.
+Helpers are pure + unit-tested in
+`experiments/serve/tests/test_openai_endpoint.py`.
 """
 from __future__ import annotations
 

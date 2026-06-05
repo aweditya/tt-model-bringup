@@ -32,7 +32,7 @@ ssh qb2 'cd ~/tenstorrent/tt-metal && cmake --build build_tracy_gcc12_nodist --t
 Incremental build; only the new op + the nanobind binding rebuild
 (~3-10 minutes). After the build completes, the refreshed
 `build_tracy_gcc12_nodist/ttnn/_ttnn.so` (and `_ttnncpp.so` if also rebuilt)
-already lives in the place serve_tp.sh points PYTHONPATH at.
+already lives in the place serve_cb.sh points PYTHONPATH at.
 
 ## Smoke-test (debug-fill: scaffold sanity, no real math)
 

@@ -8,7 +8,7 @@ full repo map are in [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
 
 | Dir | What |
 |---|---|
-| `serve/` | Production servers — `server_tp.py` (27B TP, qb2 prod), `server.py` (single-chip 27B), `server_35b_ttnn.py` (35B-A3B MoE), the shared on-device kernels + loaders (`ondevice_27b.py`, `generate_27b.py`), `cb_scheduler.py`, `protocol.py`, clients. |
+| `serve/` | Production servers — `cb_api.py` + `cb_engine.py` + `cb_scheduler.py` (continuous-batching HTTP), `server_tp.py` / `server_35b_ttnn.py` / `server_gemma4_unified_ttnn.py` (per-backend forward graphs), the shared on-device kernels + loaders (`ondevice_27b.py`, `generate_27b.py`), and `protocol.py`. Pre-CB Unix-socket servers + clients live in `../archive/pre_cb_server_stack_2026-06-04/`. |
 | `cb/` | Continuous-batching suite — `validate/`, `bench/`, `profile/`, `isolate/`, `needle.py`. |
 | `owned_ops/` | Custom TT-NN ops (rebuild ttnn) — see [`owned_ops/README.md`](owned_ops/README.md). |
 | `kernel_patches/` | JIT device-kernel patches (no rebuild). |
