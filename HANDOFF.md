@@ -62,14 +62,27 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.2 L0 Mamba2 wrapper drop-in (task #204).
-v0.1.1.c DONE 2026-06-05 — L5 attention now FULLY ON-DEVICE on (1,4) mesh.
-Single `ttnn.transformer.scaled_dot_product_attention` call handles 16:1
-GQA natively (forked from 27B `server_tp.py:1832` per
-[[reference-ttnn-sdpa-gqa-native]]). All 3 gates PASS (O/M cos=0.9995,
-B cos=1.000000 bit-exact). The NKV>1 hack is decode-only — will fire at
-v0.3+ via the Gemma 4 two-call workaround
-([[reference-gemma4-two-call-paged-decode]]).
+**Phase 1 — exact next task**: v0.1.2.b — L0 Mamba2 conv1d step.
+v0.1.2.a DONE 2026-06-05 (commit `490f89f`): `upload_mamba2_layer`
+adds {norm, in_proj, out_proj} replicated on the mesh; tiny ops
+(conv1d_w/b, dt_bias, A_log, D, mixer_norm_w) held host-side for now.
+`mamba2_in_proj_only` PASS — H pre-norm cos=0.999949, I in_proj
+cos=0.999949 vs HF L0_in_proj. Bootstrap (L0 only) 7.0s.
+
+v0.1.2.b design (next):
+- Depth-wise conv1d on x_BC slice (out of in_proj), K=4, pad=3 sym
+- HF hook captures the full [1, 6144, 8] symmetric-padded output
+  (pre-causal-slice)
+- Two paths: (a) compose ~10 ttnn ops (slice+mul+add) on
+  padded [1, 11, 6144] across 4 kernel offsets, OR (b) ttnn.conv1d
+  with groups=conv_dim if supported. Quick API probe first.
+- Then ttnn.silu after.
+
+v0.1.2.c design: SSD loop using `mamba2_decode_step_ttnn` wrapper
+(5 iters for 5 prefill positions, accumulating ssm_state) +
+MambaRMSNormGated + out_proj + residual.
+
+v0.1.1 final state: fully on-device, all gates PASS, block cos=1.0.
 Previously DONE 2026-06-05:
 - v0.0 oracle PASS — `.cache/hf_oracle_nemotron3_nano/` 19 artifacts
 - v0.0+ oracle HARDENED — norm + mixer-out + shared-expert hooks, `--gen N` multi-step
