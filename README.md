@@ -23,7 +23,7 @@ entry point.
 | `wiki/`        | Q&A wiki — learning-by-building notes on JAX/XLA + TT-Metal internals.  |
 | `scripts/`     | Dev-loop scripts: `deploy.sh`, `run_remote.sh`, `build_owned_ops.sh`, chat TUI. |
 | `models/`      | Legacy multi-model demos (Llama, SmolLM, Qwen2.5/3) kept as references. |
-| `archive/`     | Retired probes, the PJRT plugin, and the CS440LX poster + measurements. |
+| `archive/`     | Retired probes, the PJRT plugin (`legacy/`), the CS440LX poster + measurements, and six dated cleanup buckets (`*_2026-06-04/`) for the pre-CB server stack, top-level one-off probes, CB engine scaffolding, 35B drift wrappers, superseded research plans, and the May-14 drift/chat sweep scripts. |
 
 Top-level entry points:
 
