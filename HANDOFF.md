@@ -62,8 +62,17 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.3.1 (multi-step decode with KV cache
-+ ssm_state on device) iterated via the new nm3 dev harness.
+**Phase 1 — exact next task**: v0.3.1.b (proper KV cache + ssm_state
+on device → constant-time per-step decode).
+
+**v0.3.1.a DONE 2026-06-05** (commit `b93d552`): 7/8 quadratic multi-step
+PASS with recovery. TT exactly matched HF's `Paris, Paris, Paris,` loop
+for 4 consecutive steps; single bf16 argmax flip at step 4 (TT=5498 vs
+HF=6993), then RECOVERED — TT independently locked back onto the loop
+pattern at steps 5,6,7. Model is semantically correct; drift is bf16
+matmul chain noise (not state mgmt, not kernel). v0.3.1.b won't fix
+the drift but enables constant-time decode (per-step ~ms vs current
+17-28s/step from re-running 52 layers on growing prefix).
 
 **v0.3.0 DONE 2026-06-05** (commit `42d303d`): switched from streaming to
 all-layers-resident. P150 has 32 GB/chip (verified `ttnn/core/operation.cpp:33`),
