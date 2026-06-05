@@ -5,91 +5,95 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## POST-WIN QUICK-START (2026-06-05 09:46 PT) — **G1 + G2 DONE** ✓
+## POST-WIN QUICK-START (2026-06-05 12:00 PT) — **Phase 0 DONE, Phase 1 LIVE** ✓
 
-**Where we are**: G1 single-core kernel + G2 multi-core sharding (64
-heads, full Nemotron shapes) are both complete. G3 partial (B>1 single
-or small-multi heads PASS; B>1 + 64 heads parked). Drop-ready for
-Phase 1 server integration at B=1.
+**Where we are**: Phase 0 (owned Mamba2 SSD decode kernel G0..G4)
+COMPLETE 2026-06-05. The drop-in `mamba2_decode_step_ttnn(...)` wrapper
+PASSES at full Nemotron shapes (state cos=0.999999, y cos=0.999995).
+Phase 1 single-stream correctness ladder is LIVE — currently at v0.0
+(HF oracle re-running on qb1 after the `model.backbone` fix).
 
-Production math (mode=5):
-- `state_out[d, s] = decay * state_in[d, s] + dt_eff * x[d] * B[s]`
-- `y[d] = C · state_out^T[d] + D · x[d]`
+**Locked ordering (user, 2026-06-05): 27B path**.
+Phase 1 (single-stream correctness, v0.0 → v0.3) →
+Phase 2 (single-stream perf, v0.4 trace + v0.5 perf pass → ≥30 tok/s) →
+Phase 3 (continuous batching, DEFERRED) →
+Phase 4 (HTTP server, LAST).
+CB and HTTP are explicitly deprioritised until v0.5 single-stream is
+shipping. Mirrors `[[feedback-correctness-first]]`: never scale before
+correctness floor.
 
-Regression sweep (single-head precision after multi-step fix):
+**Within Phase 1, L5 Attention is brought up BEFORE L0 Mamba2** as the
+warmup — Attention is the simplest layer block we've ever shipped (no
+RoPE, no q_norm/k_norm, standard `1/sqrt(128)` scale). Building the
+bootstrap + paged SDPA + KV cache scaffold on a boring layer means
+v0.1.2 (Mamba2) and v0.1.3 (MoE) integrate on a known-good foundation.
+
+**Live task chain (#199 → #211)**: see `TaskList` or
+`research/nemotron3_nano_30b_a3b_bringup_plan.md` §7.
+
+Regression sweep (kernel still PASSES — run at any time as a
+sanity check before kernel-adjacent work):
 - mode=2: state cos=1.000000
-- mode=3: state cos=1.000000 (was 0.999707 pre-fix)
+- mode=3: state cos=1.000000
 - mode=4: state cos=1.000000, y cos=0.999996
 - mode=5: state cos=1.000000, y cos=0.999996
 - 8-step multi-step replay: per-step cos ≥ 0.9999 ✓
 - G2 multi-head smoke (B=1, NUM_HEADS=64): state cos=0.999999, y cos=0.999995 ✓
+- G4 wrapper smoke (full Nemotron shapes): state cos=0.999999, y cos=0.999995 ✓
+  (`experiments/cb/isolate/mamba2_step_wrapper_smoke.py`)
 
-Run the full regression at any time:
+Run the kernel regression sweep:
   `ssh $TT_HOST 'cd ~/tt-xla && bash experiments/cb/isolate/mamba2_regression_sweep.sh'`
 
-**🔑 THE 4-INGREDIENT RECIPE** (memory: [[feedback-mm-init-prime-required]]):
-The Blackhole TRISC pipeline hangs at ~4 transpose+matmul+binary iters
-regardless of mm_init priming. The working pattern needs ALL FOUR:
+**Phase 0 (kernel) takeaways** (kept here as reference — see plan
+§3a for the full G-ladder):
 
-1. **Full `mm_init` ONCE before the loop**, via a real matmul whose
-   result the model needs anyway. We use `matmul_reduce_C_state` which
-   computes `y_partial = C · state_in^T` (mm_init transpose=1 — the
-   SDPA-style B-operand transpose flag, no transpose_wh_tile needed
-   for C). Structurally matches GDN's `matmul_reduce(k, state_scaled)`.
+- **🔑 4-INGREDIENT RECIPE** ([[feedback-mm-init-prime-required]]) for
+  Blackhole TRISC hangs at ~4 transpose+matmul+binary iters: full
+  `mm_init` ONCE via a real prime matmul (we used `matmul_reduce_C_state`),
+  pre-transpose phase outside the loop, `mm_init_short` inside the
+  inner loop, explicit `pack_reconfig_data_format(cb_outer)`. All four
+  required; any 3 alone fail.
+- **bf16/fp32 mixed-format pitfall** (multi-step replay caught it):
+  `add_tiles(fp32, bf16)` silently drops the bf16 source on Blackhole
+  when pack_hw_config is stale. Fix: cb_outer is fp32 in production
+  (matmul_outer_x_dt_B uses full mm_init).
+- **G3 batched parked**: B>1 + 64 heads HANGS when blocks_per_core > 1.
+  Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
+  CB engine drives per-slot at the server layer (same as 27B/35B).
 
-2. **Pre-transpose phase outside the loop**: `transpose_x_to_col` is
-   called ONCE per d in a pre-loop, NOT inside the inner loop.
-   `cb_x_col` ends with `head_dim_tiles` pre-transposed col-vector
-   tiles queued.
+**Phase 1 — exact next task**: v0.0 HF oracle re-running on qb1
+(tmux `nemotron_oracle`). Once `.cache/hf_oracle_nemotron3_nano/`
+populates, proceed through the gated chain #199 → #211.
 
-3. **`mm_init_short` inside the inner loop**, NOT full `mm_init`. The
-   light variant skips `llk_unpack_hw_configure`, `llk_pack_hw_configure`,
-   and `llk_pack_dest_init` — and one of those is what hits the iter
-   cap when repeated. Matches `qwen36_gdn_decode` (older non-owned)
-   pattern.
-
-4. **Explicit `pack_reconfig_data_format(cb_outer)` after `mm_init_short`**.
-   The full `mm_init` does this implicitly via `llk_pack_hw_configure`;
-   the short variant doesn't. Without it, packed bytes are garbage
-   (~1e+38 runaway values observed during debug).
-
-**Why all four**: each one alone fails. matmul_reduce alone: no state
-update math. Pre-transpose alone: 8 full-mm_init iters still hang.
-mm_init_short alone: passes but values garbage. pack_reconfig alone:
-no effect without the short init.
-
-`cb_outer` is bf16 (matches GDN's tensor_format).
-
-**Exact next task**: v0.1.0 bootstrap — embed lookup + final_norm on
-the QuietBox mesh.
-
-Already done this session:
-- ✓ G4 step 1: Mamba2 Python wrapper (`experiments/serve/nemotron3_mamba2_step.py`)
-  PASS at full Nemotron shapes (state cos=0.999999, y cos=0.999995). Drop-in
-  step function for the server scaffold.
-- ✓ v0.0 config probe: model exists on HF, modeling code loads with
-  `trust_remote_code=True`. Architecture matches brief (52 layers, 64
-  Mamba2 heads × 64 head_dim × 128 ssm_state, n_groups=8 — kernel-shape match).
-- ⏳ v0.0 HF oracle: downloading weights (~63 GB) in background. Tmux
-  session `nemotron_oracle` on the QuietBox. Output:
-  `.cache/hf_oracle_nemotron3_nano/`.
-
-Steps for v0.1.0:
-1. Fork bootstrap from `experiments/serve/server_35b_ttnn.py` (which is
-   also a hybrid model). New file `experiments/serve/server_nemotron3_ttnn.py`.
-2. Open (1, 4) mesh + fabric. Verify on the QuietBox.
-3. Upload weights — 4-shard safetensors (8 GB/chip). Verify with a
-   sample shape (e.g., `embed_tokens` should be `[131072, 2688]`).
-4. Embed lookup on the QuietBox: feed `prompt_ids` → returns
-   `[1, seq, 2688]` hidden. Gate: cos ≥ 0.999 vs HF oracle's `hidden_states[0]`.
+Steps for v0.1.0 (bootstrap, after v0.0 lands):
+1. Fork bootstrap from `experiments/serve/server_35b_ttnn.py` (closest
+   structural match — hybrid recurrent + MoE). New file
+   `experiments/serve/server_nemotron3_nano_ttnn.py`.
+2. Open (1, 4) mesh + fabric on qb1.
+3. Upload safetensors weights (~8 GB/chip). Sanity check:
+   `embed_tokens` should be `[131072, 2688]`.
+4. Embed lookup: feed `prompt_ids` → returns `[1, seq, 2688]` hidden.
+   Gate: cos ≥ 0.999 vs HF oracle's `hidden_states[0]`.
 5. Final norm + lm_head + argmax at pos 0. Gate: argmax matches HF.
+6. **Llama-style RMSNorm — NO `+1.0`** (vs 35B's Qwen-style with
+   `+1.0`; this bit us hard on 35B —
+   [[feedback-qwen36-qnorm-knorm-zero-centered]]).
 
-**Phase 1 sub-stages** (after v0.1.0 lands):
-- v0.1.1: L0 (Mamba2) eager composite — drop in the wrapper, cos ≥ 0.999 vs HF
-- v0.1.2: L1 (MoE) — fork from 35B's Pattern A batched
-- v0.1.3: L5 (Attention) — simplest attention we've shipped (no RoPE)
-- v0.2: all 52 layers + final_norm + lm_head — argmax match HF at pos 0
-- v0.3+: multi-step decode + chat smoke + CB integration
+**Phase 1 sub-stages** (reordered 2026-06-05 — L5 before L0):
+- v0.1.1: L5 (Attention) — simplest layer (no RoPE/q_norm/k_norm),
+  warmup for bootstrap+SDPA+KV scaffold
+- v0.1.2: L0 (Mamba2) — drop in `mamba2_decode_step_ttnn` wrapper
+- v0.1.3: L1 (MoE) — fork 35B Pattern A; deltas = sigmoid router,
+  group-restricted topk, relu², scaling 2.5
+- v0.2: all 52 layers + final_norm + lm_head — argmax match HF
+- v0.3: multi-step decode + long-context at L=8192
+
+**Phase 2 sub-stages**:
+- v0.4: trace capture (BIGGEST RISK — fp32 ssm in trace; mirror of
+  35B fp32-H hang). Fallback: bf16 ssm + measure drift.
+- v0.5: single-stream PERF pass (target ≥30 tok/s) — vocab-shard,
+  HiFi2, RMSNorm fusion, etc. **This is the demo-ready milestone.**
 
 Plan: `research/nemotron3_nano_30b_a3b_bringup_plan.md` §3b.
 
@@ -100,30 +104,18 @@ Plan: `research/nemotron3_nano_30b_a3b_bringup_plan.md` §3b.
   (used in matmul_reduce_C_state)
 - [[tt-llk-frozen-in-tt-metal]] — repo state + missing L3 docs
 
-**Current source state**: the kernel at
+**Current kernel source state**: PRODUCTION. All modes 1-5 PASS in
+the regression sweep. The kernel at
 `experiments/owned_ops/nemotron3_mamba2_decode_owned/device/kernels/compute/nemotron3_mamba2_decode_owned.cpp`
-has step-14's WIP code (1 iter d=1 with fill_one before — HANGS).
-Either revert to step-13 logic for a known-working baseline (4 iters
-d=0 only) or write step-15 (1 iter d=1, no fill_one before mm_init).
+is drop-ready for Phase 1 integration via the wrapper at
+`experiments/serve/nemotron3_mamba2_step.py` (G4).
 
-**Bisect log** (full table in commit `b5c93fa` message):
-- step-1..7, 9, 12, 13: PASS (incremental rebuild from compute_dt_B up
-  to 4-iter d=0 loop)
-- step-3, 4, 6, 10, 11, 14: HANG (each isolates a specific gotcha)
-
-**Validation gate**: smoke probe at
-`experiments/cb/isolate/mamba2_kernel_mode3_smoke.py --mode 3`.
-Mode=2 (regression) should always PASS in ~3s. Mode=3 PASS at any
-non-trivial iter count is progress; full PASS (cos ≥ 0.999) blocked
-on the d=1 fix.
-
-**Dataflow + design refs**:
+**Dataflow + design refs** (still valid as reference):
 - Kernel design: `research/mm7_g1_mamba2_kernel_design.md`
 - Decisions log: `research/mm7_g1_dataflow_decisions.md` (D1-D11)
 - Math primer: `wiki/65_mamba_state_space_models.md` §3
 - GDN production source (fork base):
   `ssh qb1 cat /home/aditya/tenstorrent/tt-metal/ttnn/cpp/ttnn/operations/experimental/transformer/qwen36_gdn_decode_owned/device/kernels/compute/qwen36_gdn_decode_owned.cpp`
-  — read debug_mode==5 (production) loop pattern (line ~530+).
 
 **Setup commands** (verbatim):
 ```bash

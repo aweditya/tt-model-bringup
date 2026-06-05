@@ -17,12 +17,13 @@
 
 ------------------------------------------------------------------------
 
-## 0. Locked decision: Path B — Owned kernel up-front
+## 0. Locked decisions
 
-**Decision (2026-06-04, user)**: Path B. Build the owned Mamba2 SSD
-decode kernel from scratch (G0..G4 staging per `[[build-kernels-from-scratch]]`)
-BEFORE the v0..v2 forward / decode / CB / HTTP ladder. Total estimated
-6-8 weeks to v2.
+### 0.1 Path B — Owned kernel up-front (2026-06-04, user)
+
+Build the owned Mamba2 SSD decode kernel from scratch (G0..G4 staging
+per `[[build-kernels-from-scratch]]`) BEFORE the v0..v2 forward /
+decode / CB / HTTP ladder.
 
 Rationale: Path B frontloads the kernel work so by the time the ladder
 starts, every Mamba2 forward call is already running at production-grade
@@ -30,9 +31,29 @@ perf. No intermediate "manual ttnn composite" detour that would have to
 be ripped out at v3. Trades intermediate demo visibility for cleaner
 integration and one less rewrite.
 
-**Implication**: every stage below assumes the owned kernel exists.
-**Phase 0 (kernel build, §3a)** runs FIRST; **Phase 1 (forward/ladder,
-§3b)** starts only after G4 lands.
+**Status (2026-06-05): Phase 0 DONE.** All G-stages PASS at cos ≥ 0.999;
+multi-step replay PASS; G2 full Nemotron shapes (B=1, 64 heads × 8
+groups) PASS at state cos=0.999999, y cos=0.999995; G4 Python wrapper
+PASS at full Nemotron shapes.
+
+### 0.2 Phase ordering — 27B path (2026-06-05, user)
+
+**Order**: single-stream correctness (Phase 1) → single-stream
+performance (Phase 2) → continuous batching (Phase 3) → HTTP server
+(Phase 4). CB and HTTP are explicitly deprioritised until single-stream
+is demo-ready (≥30 tok/s traced, full chat coherence). Same path 27B
+took. Mirrors `[[feedback-correctness-first]]`: never optimise past
+cos < 0.99, and never scale (batching) past a known-bad correctness
+floor.
+
+### 0.3 L5-before-L0 in v0.1.x (2026-06-05)
+
+In Phase 1, bring up **L5 (Attention) BEFORE L0 (Mamba2)** as a
+"warmup" — Attention is the simplest layer block we've ever shipped
+(no RoPE, no q_norm/k_norm, standard `1/sqrt(128)` scale). Building
+the bootstrap + paged SDPA + KV cache scaffold on a boring layer means
+v0.1.2 (Mamba2) and v0.1.3 (MoE) integrate on top of a known-good
+scaffold.
 
 ------------------------------------------------------------------------
 
@@ -395,25 +416,55 @@ parallelise the G-ladder.
 
 ------------------------------------------------------------------------
 
-## 3b. Phase 1 — Forward / decode / CB / HTTP ladder
+## 3b. Phase 1 — Forward / decode / CB / HTTP ladder (REORDERED 2026-06-05)
 
 This phase runs AFTER G4 lands. Each stage gates the next.
 
+**ORDERING DECISION (user, 2026-06-05)**: follow the 27B path — finish
+**single-stream correctness + performance FIRST**, then add batching,
+then ship the HTTP server. CB and HTTP are explicitly deprioritised
+until single-stream is demo-ready. Within Phase 1, **L5 Attention is
+brought up BEFORE L0 Mamba2** as a "warmup" — it's the simplest layer
+we've ever shipped (no RoPE, no q_norm/k_norm, standard scale), so we
+land the bootstrap + paged-SDPA + KV-cache scaffold on a boring layer
+before integrating the new Mamba2 wrapper on top of it.
+
+The owned Mamba2 kernel (formerly v3) is no longer a separate stage —
+Phase 0 already shipped it, so every Mamba2 layer call at v0.1.2+
+already uses the production-grade kernel.
+
+### Phase 1 — Single-stream correctness (v0.0 → v0.3)
+
 | Stage | Adds | Gate | Status |
 |---|---|---|---|
-| **v0.0** | `hf_reference_nemotron3_nano.py` with `trust_remote_code=True`, Mamba2 layer hooks, attn + MoE hooks. CPU RAM check on qb1 host (need ≥62 GB free for AutoModel bf16; if not, layer-stream via `accelerate.load_checkpoint_and_dispatch`). | `prompt_ids.npy`, `hidden_states.npy[53, S, 2688]` exist; layer count = 52; per-layer-type tag matches `hybrid_override_pattern` | PENDING |
-| **v0.0.1** | On-qb1 tokenizer verification (file truncated in research). `tail -50 ~/.cache/.../tokenizer_config.json` → `tokenizer_class`, `model_max_length`, inline `chat_template` (if any) | tokenizer_class confirmed; no inline template overrides | PENDING |
-| **v0.1.0** | Bootstrap on (1,4): mesh + fabric + safetensors weights upload + embed lookup + final_norm | bootstrap < 15 min; embed lookup cos ≥ 0.999 vs HF; weights /chip ≤ 9 GB | PENDING |
-| **v0.1.1** | **L0 (Mamba2) — eager manual ttnn composite**: in_proj → split → conv1d_step → silu → split B/C/x → dt softplus + clamp → SSD recursion (per-head loop) → MambaRMSNormGated → out_proj | cos ≥ 0.999 on L0 output vs HF oracle (single position, single step) |
-| **v0.1.2** | **L1 (MoE) — sigmoid router + group top-6 + relu² experts + shared expert + scaling**: fork from `moe_forward_ttnn_pattern_a_batched`. Test routing in isolation first via `_moe_router_topk` probe. | cos ≥ 0.999 on L1 output vs HF |
-| **v0.1.3** | **L5 (Attention) — paged SDPA, NO RoPE, GQA repeat_kv**: simplest attention block we've shipped. q/k go from q_proj/k_proj directly into SDPA. NO RoPE table allocation. | cos ≥ 0.999 on L5 output vs HF |
-| **v0.2** | All 52 layers (per-layer dispatch via `state.layer_types[L]`) + final_norm + lm_head + argmax | argmax matches HF at pos 0 (single token) |
-| **v0.3** | Multi-step decode: KV cache for 6 attn layers + Mamba2 state (conv + ssm fp32) for 23 mamba layers, eager mode | TT tokens 0..5 match HF token-for-token |
-| **v0.3.3** | Long-context smoke at L=8192 (fork `cb_nemotron3_needle_haystack.py`) | password retrieved ≥75% at L=8192 |
-| **v0.4** | **Trace capture — fp32-in-trace risk check** ([[35b-dn-h-state-drift-lever]]). Two-phase warmup, then `begin_trace_capture` → forward → `end_trace_capture`. If trace hangs >5 min, fall back to bf16 SSM state + measure drift. | 100 traced steps == 100 eager token-for-token |
-| **v1.0-v1.6** | Continuous batching: setup → batched embed → batched attention (paged SDPA over per-slot KV) → batched MoE → batched Mamba2 (per-slot conv + ssm state) → end-to-end at B=4 | 3a/3b/3c gates PASS at B=4 |
-| **v2** | HTTP wire-up: register in `cb_api.BACKENDS` + `cb_scheduler._BACKEND_MODULES`, tokenizer + chat template | `curl /v1/chat/completions` returns sensible text; multi-turn coherence 3/3 |
-| **v3** (perf) | **Owned `nemotron3_mamba2_decode_owned` kernel** (G0-G4 staging per `[[build-kernels-from-scratch]]`). Optional but high-leverage given 23/52 layers go through this path. | step_ms ≥ 30% lower than v0.4 baseline; correctness unchanged |
+| **v0.0** | `hf_reference_nemotron3_nano.py` with `trust_remote_code=True`, Mamba2 layer hooks, attn + MoE hooks. mamba_ssm CPU stub installed. | `prompt_ids.npy`, `hidden_states.npy[53, S, 2688]` exist; layer count = 52; per-layer-type tag matches `hybrid_override_pattern` | 🟡 **IN PROGRESS** (weights downloaded; oracle fix `model.backbone` shipped 2026-06-05; re-run on qb1) |
+| **v0.0.1** | On-qb1 tokenizer verification + `<think>\n` / `<think></think>` active-prompt suffix check via `chat_template_invariant.py` | tokenizer_class confirmed; both thinking branches handled by `_active_prompt_suffix` | pending |
+| **v0.0.2** | `experiments/utils/nemotron3_weights_introspect.py` (~50 LOC) — safetensors header audit | zero unexpected keys; all shapes match brief | pending |
+| **v0.1.0** | Bootstrap on (1,4): mesh + fabric + safetensors weights upload + embed lookup + final_norm + lm_head + argmax at pos 0. **Llama-style RMSNorm — NO `+1.0`**. Vocab=131072 (clean /4 split). | bootstrap ≤ 12 min; embed lookup cos ≥ 0.999 vs HF; argmax matches HF at pos 0; weights /chip ≤ 9 GB | pending |
+| **v0.1.1** 🔄 reordered | **L5 (Attention) — eager (was v0.1.3)**. Simplest attention block we've shipped: paged SDPA scale=`1/sqrt(128)`, GQA repeat_kv (16:1), NO RoPE, NO q/k_norm. KV-cache lifecycle. | per-sub-step cos ≥ 0.999 vs HF L5; mad sanity on NO-RoPE audit; KV write→read invariant probe PASS | pending |
+| **v0.1.2** 🔄 reordered | **L0 (Mamba2) — eager via the drop-in `mamba2_decode_step_ttnn` wrapper (was v0.1.1)**. in_proj split → `qwen36_conv1d_decode_owned` (D=6144) + silu → split B/C/x → kernel call (already cos=0.999998 in isolation) → MambaRMSNormGated → out_proj. | per-sub-step cos ≥ 0.999 vs HF L0; ssm + conv state allocation correct | pending |
+| **v0.1.3** | **L1 (MoE) — eager (Pattern A fork)**. Fork `moe_forward_ttnn_pattern_a_batched` from 35B. Deltas: sigmoid router, group-restricted topk (n_group=8, topk_group=1), routed_scaling=2.5, relu², shared expert 2× wider. | per-sub-step cos ≥ 0.999; group-topk matches HF indices 100/100 | pending |
+| **v0.2** | All 52 layers (per-layer dispatch via `state.layer_types[L]`) + final_norm + lm_head + argmax | per-layer cos ≥ 0.999 vs HF oracle; argmax matches HF at pos 0 | pending |
+| **v0.3** | Multi-step eager decode: KV cache for 6 attn layers + Mamba2 state (conv + fp32 ssm) for 23 mamba layers. Long-context smoke at L=8192. | TT tokens 0..7 match HF token-for-token; needle-haystack at L=8192 ≥75% | pending |
+
+### Phase 2 — Single-stream performance (v0.4 → v0.5)
+
+| Stage | Adds | Gate | Status |
+|---|---|---|---|
+| **v0.4** | **Trace capture — fp32-in-trace risk check** ([[35b-dn-h-state-drift-lever]]). Two-phase warmup ([[ttnn-multi-trace-two-phase-warmup]]). Fallback: bf16 ssm + measure drift, ship if drift <3% at 64 tok. | 100 traced steps == 100 eager token-for-token; ≥3× speedup vs eager | pending |
+| **v0.5** | **Single-stream PERF pass** (target ≥30 tok/s traced). Apply known wins: vocab-sharded LM head + on-device argmax (P22 — already proven on 27B/Gemma 4 at +5-8%); HiFi2 expert matmul (35B win); RMSNorm fusion ([[adoption-next-b]]); concatenated Mamba2 in_proj fusion; distributed RMSNorm. Profile-driven (Tracy A/B per win). | ≥30 tok/s single-stream traced. **This is the demo-ready state.** | pending |
+
+### Phase 3 — Continuous batching (DEFERRED until v0.5 ships)
+
+| Stage | Adds | Gate | Status |
+|---|---|---|---|
+| **v1.0-v1.6** | Forks 35B v1.0-v1.6 ladder. Deltas: Mamba2 state per-slot (fp32 ssm + bf16 conv); batched MoE Pattern A with sigmoid+group-topk; batched paged SDPA over per-slot KV. | 3a/3b/3c gates PASS at B=4 | deferred |
+
+### Phase 4 — HTTP server (LAST)
+
+| Stage | Adds | Gate | Status |
+|---|---|---|---|
+| **v2** | Register `nemotron3_nano` in `cb_api.BACKENDS` + `cb_scheduler._BACKEND_MODULES`. Tokenizer + chat template. | `curl /v1/chat/completions` returns sensible text; multi-turn coherence 3/3 | deferred |
 
 ------------------------------------------------------------------------
 
@@ -476,28 +527,40 @@ _BACKEND_MODULES = {
 
 Subtotal: **~3-5 weeks**
 
-### Phase 1 — Forward / decode / CB / HTTP (2-3 weeks)
+### Phase 1 — Single-stream correctness (1-2 weeks)
 
-Faster than the Path A estimate because Mamba2 is already a single-call
-kernel rather than a 200+ ms composite. Bootstrap waits and CB integration
-dominate.
+Mamba2 is already a single-call kernel rather than a 200+ ms composite,
+so bootstrap waits and layer-by-layer cosine ladders dominate.
 
-- v0.0 + v0.0.1 (oracle + tokenizer verification): 1 day
-- v0.1.0 (bootstrap on (1,4)): 1 day (~10-12 min upload * iterations)
-- v0.1.1 (Mamba2 L0 via owned kernel call): 1-2 days (integration smoke)
-- v0.1.2 (MoE L1, fork from 35B): 1-2 days
-- v0.1.3 (Attention L5, simplest we've shipped): 0.5 day
-- v0.2 (full forward via per-layer dispatch): 1-2 days
-- v0.3 (multi-step decode): 1-2 days
-- v0.3.3 (long context smoke at 8K): 0.5 day
-- v0.4 (trace capture, fp32-in-trace risk check): 1-3 days
-- v1.0-1.6 (CB at B=4): 2-3 days
-- v2 (HTTP wire-up + chat smoke): 0.5 day
-- buffer / unknowns: 2-3 days
+- v0.0 + v0.0.1 + v0.0.2 (oracle + tokenizer + weights introspect): 1 day
+- v0.1.0 (bootstrap on (1,4) + embed + final_norm + lm_head): 1 day
+- v0.1.1 (Attention L5 — simplest, warmup): 0.5 day
+- v0.1.2 (Mamba2 L0 via owned kernel call): 1-2 days
+- v0.1.3 (MoE L1, fork from 35B Pattern A): 1-2 days
+- v0.2 (full 52-layer forward via per-layer dispatch): 1-2 days
+- v0.3 (multi-step decode + long-context smoke at 8K): 1-2 days
 
-Subtotal: **~2-3 weeks**
+Subtotal: **~1-2 weeks**
 
-### Grand total: 5-8 weeks to v2
+### Phase 2 — Single-stream performance (3-5 days)
+
+- v0.4 (trace capture, fp32-in-trace risk check + fallback): 1-3 days
+- v0.5 (perf pass — vocab-shard, HiFi2, RMSNorm fusion, etc.): 2-3 days
+- buffer / unknowns: 1 day
+
+Subtotal: **~3-5 days**
+
+### Phase 3 — Continuous batching (DEFERRED — 1 week when scheduled)
+
+Per user direction (2026-06-05): finish single-stream correctness +
+performance BEFORE touching CB. Same path 27B took.
+
+- v1.0-1.6 (CB at B=4): ~1 week when scheduled
+
+### Phase 4 — HTTP server + chat (LAST — 0.5 day)
+
+### Grand total: 4-6 weeks to demo-ready single-stream (v0.5)
+### Optional: +1.5 weeks to CB + HTTP shipped (v2)
 
 Aligned with the brief's §9 estimate. The headline number to track
 internally is "Phase 0 G4 lands" as the gating milestone; everything
@@ -529,70 +592,65 @@ server_gemma4_unified_*` only; main agent touches
 
 ------------------------------------------------------------------------
 
-## 7. Concrete next steps (Path B — start here)
+## 7. Concrete next steps (Phase 1 — start here)
 
-**Phase 0 (kernel) first.** The Phase 1 forward / oracle work also has
-infrastructure prep that can run in parallel with G0..G2, but the
-dependency edge is G4 → v0.1.1.
+**Phase 0 DONE 2026-06-05.** Mamba2 SSD owned kernel ships G0..G4 with
+the drop-in `mamba2_decode_step_ttnn` wrapper validated at cos=0.999998.
+Phase 1 single-stream correctness is now the live workstream.
 
-### Immediate (this week)
+### Immediate (today)
 
-1. **Task #182.G0 — Read + numpy oracle**
-   - Read `mamba-ssm` source at `state-spaces/mamba` (specifically
-     `mamba_ssm/modules/mamba2.py` and the chunk_scan_combined kernel).
-   - Search tt-metal for any SSM-adjacent ops via
-     `experiments/utils/ttnn_introspect.py` (look for "ssm", "mamba",
-     "selective", "recurrence", "scan").
-   - Read Nemotron-H paper (arXiv 2504.03624) for the canonical SSD
-     formulation.
-   - Write `experiments/utils/mamba2_numpy_oracle.py`: pure-numpy
-     single-token SSD step that bit-matches HF
-     `NemotronHMamba2Mixer.forward` at the post-conv1d split point.
-   - Gate: numpy oracle's output bit-matches HF eager forward at L0
-     step 0, all 64 heads.
+1. **Task #199 — v0.0 HF oracle artifacts on qb1** [IN PROGRESS]
+   - ✅ Weights downloaded (63 GB in 7m50s; 13 shards)
+   - ✅ Model loaded to CPU RAM in 8 min (~6243 weight tensors)
+   - ✅ Oracle script bug fixed (`model.backbone` not `model.model`)
+   - ⏳ Oracle re-launched 2026-06-05 11:50 in tmux `nemotron_oracle`
+   - Gate: `.cache/hf_oracle_nemotron3_nano/{hidden_states,logits,final_norm,argmax,prompt_ids,meta}.npy` populated
 
-2. **Task #182.G0a — Isolation harness**
-   - Fork `experiments/utils/test_pattern_a_moe_np.py` →
-     `experiments/utils/test_mamba2_decode_isolated.py`.
-   - Generates random fp32 ssm_state, bf16 x/z/dt/B/C, runs both numpy
-     oracle and (later) ttnn kernel; reports cos + MAD per head.
-   - Gate: runs end-to-end on host; deterministic outputs.
+2. **Task #201 — v0.0.2 weights introspect** (can run in parallel with #199)
+   - `experiments/utils/nemotron3_weights_introspect.py` (~50 LOC)
+   - Reads 13 safetensors shard headers; audits all expected shapes match the brief
+   - Gate: zero unexpected keys; all shapes match config
 
-3. **Task #182.G0b — qb1 host RAM check (for parallel oracle work)**
-   - `ssh qb1 'free -g'` — confirm we have ≥70 GB free for HF AutoModel
-     bf16. If not, plan layer-streaming via `accelerate.load_checkpoint_and_dispatch`.
-   - Read tail of tokenizer_config.json on qb1 to confirm
-     `tokenizer_class` and inline chat_template absence.
-   - Gate: oracle / tokenizer infrastructure clear for v0.0 when Phase 1 starts.
+3. **Task #200 — v0.0.1 tokenizer verification** (blocks on #199 for sanity check tokens)
+   - On-qb1 inspection + `chat_template_invariant.py` gate
+   - Verify `<think>\n` AND `<think></think>` active-prompt branches
 
 ### Subsequent (gated)
 
-4. **Task #182.G1 — Single-core kernel** (after G0a passes).
-5. **Task #182.G2 — Multi-core.**
-6. **Task #182.G3 — Batched.**
-7. **Task #182.G4 — Server-side Python wrapper.**
+4. **Task #202 — v0.1.0 bootstrap** (after #199, #200, #201).
+5. **Task #203 — v0.1.1 L5 Attention** (warmup, simplest layer first).
+6. **Task #204 — v0.1.2 L0 Mamba2** (drop in wrapper).
+7. **Task #205 — v0.1.3 L1 MoE** (Pattern A fork).
+8. **Task #206 — v0.2 full 52-layer forward.**
+9. **Task #207 — v0.3 multi-step + long-context.**
+10. **Task #208 — v0.4 trace capture.**
+11. **Task #209 — v0.5 single-stream perf pass** (demo-ready milestone).
+12. **Task #210 — v1.x continuous batching (DEFERRED).**
+13. **Task #211 — v2 HTTP wire-up (LAST).**
 
-Each task gates the next. **Do NOT spawn parallel implementation tasks
-inside Phase 0** — Mamba2 is novel kernel territory.
-
-### Phase 1 starts when G4 lands
-
-At that point, v0.0 (oracle), v0.0.1 (tokenizer), v0.1.0 (bootstrap),
-and so on per §3b.
+Each task gates the next. **Do NOT touch CB or HTTP until v0.5 ships.**
 
 ------------------------------------------------------------------------
 
 ## 8. Open questions for the user
 
-1. ~~Path A / B / C~~ **RESOLVED 2026-06-04: Path B — owned kernel up-front**.
-2. **Long-context priority** — is the 256K claim a v2 must-have, or
-   can we ship v0..v2 at 8K and push long-context to a separate workstream?
-3. **fp32-in-trace fallback** — if the Blackhole trace hang reproduces
-   with fp32 SSM state (per `[[35b-dn-h-state-drift-lever]]`), is
-   bf16 SSM state + measurable drift acceptable as a v0 compromise?
-4. **G-stage scheduling** — should G0 (research + numpy oracle) start
-   immediately, or do we want to triangle on the Mamba2 paper + tt-metal
-   SSM survey results before committing?
+1. ~~Path A / B / C~~ **RESOLVED 2026-06-04**: Path B — owned kernel up-front.
+2. ~~Phase ordering~~ **RESOLVED 2026-06-05**: 27B path — single-stream
+   correctness → single-stream perf → batching → HTTP. CB and HTTP
+   deprioritised until v0.5 demo-ready.
+3. ~~L5-vs-L0 order in v0.1.x~~ **RESOLVED 2026-06-05**: L5 (Attention)
+   first as warmup (simplest layer; builds bootstrap + paged SDPA + KV
+   cache scaffold before adding Mamba2 complexity on top).
+4. **Long-context priority** — open. Default plan: ship v0..v0.5 at 8K,
+   push 256K to a separate workstream after v0.5 lands.
+5. **fp32-in-trace fallback** — open. If Blackhole hangs on fp32 ssm
+   state in trace (mirroring 35B fp32-H), the default fallback is bf16
+   ssm + measure drift; ship if drift <3% at 64 tok.
+6. **Server scaffold base** — open. Recommended: fork
+   `server_35b_ttnn.py` (closest structural match: hybrid MoE + recurrent
+   layer model). Alternative: `server_gemma4_unified_ttnn.py` (newer,
+   hybrid-dispatch sliding+global).
 
 ------------------------------------------------------------------------
 

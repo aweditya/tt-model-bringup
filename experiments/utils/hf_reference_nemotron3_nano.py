@@ -157,8 +157,20 @@ def main() -> int:
     def register_sub_hooks() -> list:
         """Optionally install sub-module hooks on the requested layer indices."""
         handles = []
-        decoder_layers = model.get_decoder().layers if hasattr(model, "get_decoder") else \
-            model.model.layers
+        # Nemotron-H stores the decoder at `model.backbone` (set in
+        # `NemotronHForCausalLM.__init__`, modeling_nemotron_h.py:1585).
+        # The inherited `get_decoder()` returns `self.model` which is only
+        # set if `set_decoder()` was called first — so go direct.
+        if hasattr(model, "backbone"):
+            decoder_layers = model.backbone.layers
+        elif hasattr(model, "model") and hasattr(model.model, "layers"):
+            decoder_layers = model.model.layers
+        else:
+            raise RuntimeError(
+                "could not find decoder layers on model "
+                f"(type {type(model).__name__}, attrs: "
+                f"{[a for a in dir(model) if not a.startswith('_')][:20]})"
+            )
         if args.hook_mamba2_layer is not None:
             N = args.hook_mamba2_layer
             if layer_kinds[N] != "mamba2":
@@ -187,7 +199,11 @@ def main() -> int:
             if layer_kinds[N] != "moe":
                 raise ValueError(f"--hook-moe-layer {N} is {layer_kinds[N]!r}, not moe")
             layer = decoder_layers[N]
-            mlp = layer.mlp
+            # NemotronHBlock uses a uniform `mixer` attr for all layer types
+            # (modeling_nemotron_h.py:752-758) — including MoE.
+            mlp = getattr(layer, "mixer", None) or getattr(layer, "mlp", None)
+            if mlp is None:
+                raise RuntimeError(f"could not find MoE mixer on layer {N}")
             if hasattr(mlp, "gate"):
                 handles.append(mlp.gate.register_forward_hook(
                     lambda m, i, o: sub_hooks.__setitem__(
