@@ -62,7 +62,23 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.3 (multi-step decode with KV cache + ssm_state on device).
+**Phase 1 — exact next task**: v0.3.1 (multi-step decode with KV cache
++ ssm_state on device) iterated via the new nm3 dev harness.
+
+**v0.3.0 DONE 2026-06-05** (commit `42d303d`): switched from streaming to
+all-layers-resident. P150 has 32 GB/chip (verified `ttnn/core/operation.cpp:33`),
+full Nemotron-3 Nano load ≈ 21 GB/chip — fits with 11 GB headroom.
+Streaming was over-engineered for a non-existent memory problem.
+Bootstrap 106.5s, iter 17s, argmax = HF = 6993 ✓. **3.69×** vs v0.2.6 warm,
+4.6× vs v0.2.5.
+
+**v0.3.2 IN PROGRESS**: `nm3_dev_harness.py` (forks `cb35_dev_harness`)
++ `run_harness_tmux.sh nm3` (adds nm3 case). Bootstrap once → drop
+trigger files for ~10s iteration instead of 108s.
+- Launch: `bash scripts/run_harness_tmux.sh nm3 qb1`
+- Iterate: `bash scripts/deploy.sh <files> && ssh qb1 'touch ~/tt-xla/.cache/nm3_runtime/trig/<test>'`
+- Result: `ssh qb1 'cat ~/tt-xla/.cache/nm3_runtime/trig/last.log'`
+- Smokes accept `state=None`; harness passes a live State.
 
 **Background work in flight 2026-06-05**: Gemma 4 perf optimization
 agent running on qb2 (all 4 P150s free). Brief: read
@@ -74,9 +90,8 @@ fusion — pick from profile, not queue order). Reports to
 the foreground Nemotron path. agent ID `aece88b1979f5345c`.
 
 **v0.2.6 DONE 2026-06-05** (commit `1685827`): host numpy weight cache
-+ MoE pre-stack cache. Iter 1 cold=183.8s, iter 2 warm=61.8s, **2.97×**
-warm speedup (not the 4× I originally planned — the bottleneck is
-mesh upload not disk I/O). argmax_last=6993 on both iters ✓.
++ MoE pre-stack cache. Got 2.97× warm speedup. **Now superseded by
+v0.3.0 all-resident** which is 3.69× faster than v0.2.6 warm.
 
 v0.2.5 COMPLETE 2026-06-05 (commit `926b49c`) — `_tt` block variants
 take/return `ttnn.Tensor`, 0 inter-block readbacks. Regression PASS

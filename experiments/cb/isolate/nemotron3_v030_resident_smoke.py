@@ -93,7 +93,9 @@ def run_forward(state, prompt_ids, srv, ttnn) -> tuple[int, float]:
     return int(argmax_np[-1]), time.time() - t0
 
 
-def main() -> int:
+def main(state=None) -> int:
+    """Run the v0.3.0 resident smoke. If `state` is provided (dev harness
+    flow), skip bootstrap and reuse the live process state."""
     os.environ.setdefault("NEMOTRON3_UPLOAD_LAYERS", "all")
     os.environ.setdefault("NEMOTRON3_MOE_MODE", "ep")
 
@@ -102,14 +104,18 @@ def main() -> int:
     hf_argmax_last = int(np.load(ORACLE_DIR / "argmax.npy").flatten()[-1])
     log(f"  prompt_ids {prompt_ids.shape}  HF argmax_last={hf_argmax_last}")
 
-    log("bootstrap (ALL 52 layers resident — expect ~2-3 min)…")
     import server_nemotron3_nano_ttnn as srv
     import ttnn
-    state = srv.State()
-    t0 = time.time()
-    srv.bootstrap(state, log)
-    t_boot = time.time() - t0
-    log(f"  bootstrap in {t_boot:.1f}s")
+    t_boot = 0.0
+    if state is None:
+        log("bootstrap (ALL 52 layers resident — expect ~108s)…")
+        state = srv.State()
+        t0 = time.time()
+        srv.bootstrap(state, log)
+        t_boot = time.time() - t0
+        log(f"  bootstrap in {t_boot:.1f}s")
+    else:
+        log("[harness] reusing live state — skipping bootstrap ✓")
 
     try:
         # Iter 1 — first forward (JIT compilation included)
@@ -138,8 +144,11 @@ def main() -> int:
         log(f"v0.3.0 {'PASS ✓' if all_ok else 'FAIL ✗'}")
         return 0 if all_ok else 1
     finally:
-        log("closing mesh…")
-        ttnn.close_mesh_device(state.mesh)
+        # Only close the mesh if we OWN bootstrap (standalone run).
+        # In the harness flow, state is provided and owned externally.
+        if t_boot > 0:
+            log("closing mesh…")
+            ttnn.close_mesh_device(state.mesh)
 
 
 if __name__ == "__main__":

@@ -19,13 +19,15 @@ HOST="${2:-qb1}"
 case "$MODEL" in
   cb35) HARNESS_PATH="experiments/cb/dev/cb35_dev_harness.py"; RUNTIME_DIR="cb35_runtime";;
   gm4)  HARNESS_PATH="experiments/cb/dev/gm4_dev_harness.py";  RUNTIME_DIR="gm4_runtime";;
-  *) echo "unknown model: $MODEL (expected cb35|gm4)"; exit 1;;
+  nm3)  HARNESS_PATH="experiments/cb/dev/nm3_dev_harness.py";  RUNTIME_DIR="nm3_runtime";;
+  *) echo "unknown model: $MODEL (expected cb35|gm4|nm3)"; exit 1;;
 esac
 
 # Propagate select env vars into the tmux session so model-variant
 # switches don't need a code edit. Add new vars here as bringups need them.
 PASS_THROUGH_ENV=""
-for var in TT_GEMMA4_VARIANT TT_GEMMA4_MODEL_ID TT_CB_SLOTS TT_CB_TOPK_K; do
+for var in TT_GEMMA4_VARIANT TT_GEMMA4_MODEL_ID TT_CB_SLOTS TT_CB_TOPK_K \
+           NEMOTRON3_UPLOAD_LAYERS NEMOTRON3_MOE_MODE; do
   if [ -n "${!var:-}" ]; then
     PASS_THROUGH_ENV="$PASS_THROUGH_ENV $var=${!var}"
   fi
