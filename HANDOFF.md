@@ -62,43 +62,34 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.4 shape contract — RESOLVED via
-audit 2026-06-05. Implementation pending.
+**Phase 1 — exact next task**: v0.2 (full 52-layer forward + argmax).
+v0.1.4 EP COMPLETE 2026-06-05 — 3/3 gates PASS, cosines bit-equivalent
+to v0.1.3.b naive path (commit `1abce07`).
 
-Scaffolding shipped (PASSING):
+**v0.1.4 COMPLETE — what shipped:**
 - `upload_moe_layer_ep` — 128 experts sharded as 32/chip
-- Bootstrap dispatch defaults to EP (NEMOTRON3_MOE_MODE=ep|full|router_only)
-- `moe_block_eager_ep` up to and including the dispatch call
-  (which works — dispatch_out [1, 4, 5, 2688], meta [1, 4, 5, 6])
-- Bootstrap 9.1s (vs full replicated 13.9s — nice win)
+- Bootstrap dispatch with NEMOTRON3_MOE_MODE=ep|full|router_only (default ep)
+- `moe_block_eager_ep` — full True-EP forward:
+  - Seq-shard on dim 2 via `ShardTensorToMesh(dim=2)` (pad S=5 → 8)
+  - `ttnn.all_to_all_dispatch(..., output_concat_dim=2)` → per-chip `[1, 1, 8, 2688]`
+  - Per-expert FFN over E_LOCAL=32 on full padded seq per chip
+  - `ttnn.all_to_all_combine(..., output_shard_dim=2)` → per-chip `[6, 1, 2, 2688]`
+  - `ConcatMeshToTensor(dim=2)` readback → full `[6, 1, 8, 2688]`
+  - Slice routed_np back to S_orig=5
+- Bootstrap 9.2s; forward 1.8s; per-chip compute drops 128 → 32 experts.
 
-**Shape contract audit 2026-06-05** ([[reference-all-to-all-dispatch-shape-contract]]):
+**Smoke gates (commit `1abce07`):**
+- Gate S shared_out cos=0.999713 mad=2.82e-4 PASS ✓
+- Gate M mixer_out  cos=0.999826 mad=1.09e-3 PASS ✓
+- Gate B block_out  cos=0.999805 mad=1.10e-3 PASS ✓
 
-Dispatch output shape formula (from `ttnn/cpp/ttnn/operations/ccl/all_to_all_dispatch/device/dispatch_op.cpp:99-113`):
-- `output_concat_dim=1` (default): per-chip `[1, B_per_chip*D[A], S, H]`
-- `output_concat_dim=2` (explicit): per-chip `[1, B_per_chip, S_per_chip*D[A], H]`
+Cosines bit-equivalent to v0.1.3.b naive Pattern A (6-digit match across
+all 3 gates). True-EP path is now correctness-verified on (1,4) BH.
 
-where `D[A] = dispatch_devices = mesh.shape[A]`. For our `(1,4)` + `cluster_axis=1`: `D[A]=4`.
-
-Semantic meaning of dim 1 under default `output_concat_dim=1`: **"source dispatch device index × B"**. Source chip `d` writes its B*S tokens into slot `[d*B : (d+1)*B]` along dim 1. With our REPLICATED input, all 4 dim-1 slots carry the same 5 tokens — explains the `[1, 4, 5, 2688]` we observed.
-
-**Two-option fix (Option 1 preferred):**
-
-**Option 1 (preferred, mirrors in-tree `b1s8` test at `tests/ttnn/unit_tests/operations/ccl/test_all_to_all_dispatch.py:1189-1286`):**
-- Shard seq dim across cluster_axis=1 (pad S=5→8, 2/chip) via `ShardTensor2dMesh(mesh, dims=(None, 2), mesh_shape=(1,4))`
-- Pass `output_concat_dim=2` to `ttnn.all_to_all_dispatch`
-- Per-chip output: `[1, 1, NCHIPS*S_per_chip=8, HIDDEN]` — directly DS-V3's downstream contract
-- No post-op reshape needed. Drop into `ttnn.repeat(dims=(1, E_LOCAL, 1, 1))` + per-expert matmul exactly as DS-V3 `moe.py:468-474`.
-
-**Option 2 (stopgap, ~4× wasted compute):**
-- Keep replicated input + default `output_concat_dim=1`
-- Reshape `[1, 4, 5, 2688]` → `[1, 1, 20, 2688]` (Option literally = DS-V3 `moe.py:464-467`)
-- Each pair of 5-rows is identical; per-expert matmul runs 4× — combine emits 4 redundant copies needing de-dup.
-- Use only if blocked from changing the dispatch input contract.
-
-**Recommendation: Option 1.** Pad seq 5→8, shard via `ShardTensor2dMesh(dims=(None,2))`, set `output_concat_dim=2`, drop the dim-1 reshape, proceed with `ttnn.repeat` + per-expert matmul.
-
-For combine (when we get there): per-chip input `[E_LOCAL=32, B_global, S, HIDDEN]` (without local_reduce). Validator: `combine_op.cpp:79-90`. Test: `test_all_to_all_combine.py:498-505`.
+**Critical kwarg combo** ([[reference-all-to-all-dispatch-shape-contract]]):
+- `all_to_all_dispatch(..., output_concat_dim=2)` → per-chip `[1, 1, S_padded, H]`
+- `all_to_all_combine(..., output_shard_dim=2)` → per-chip `[K, B, S_per_chip, H]`
+- DEFAULT `output_shard_dim=1` FAILS on our setup: `batch_size*replicate_dim/num_devices = 1*1/4 = 0` (integer div) → moreh_full TT_FATAL `shape[1] = 0`. Contract documented at `all_to_all_combine_nanobind.cpp:79`.
 
 Old next-step (v0.1.4 implementation): Both
 `ttnn.all_to_all_dispatch` and `ttnn.all_to_all_combine` validated
