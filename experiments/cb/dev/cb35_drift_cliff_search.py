@@ -2,17 +2,21 @@
 
 Step 1 of `research/35b_drift_next_session_plan.md` §"What to do next".
 
-Baseline data (`cb35_drift_long_bf16` with sparse positions
-0,1,5,10,25,40,60,80) showed cos_L32 = 0.99 @ pos 1 → 0.32 @ pos 5.
-This probe linearly scans 0..7 to pinpoint the position where the
-cliff lands (the first pos where cos_L32 drops below 0.95).
+Baseline data (`archive/cb35_drift_wrappers_2026-06-04/cb35_drift_long_bf16.py`
+with sparse positions 0,1,5,10,25,40,60,80) showed cos_L32 = 0.99 @ pos 1
+→ 0.32 @ pos 5. This probe linearly scans 0..7 to pinpoint the position
+where the cliff lands (the first pos where cos_L32 drops below 0.95).
 
 Result lands as JSON in `.cache/cb35_runtime/` and `last.log`.
 Headline metric: `P_cliff` = smallest pos with cos_L32 < 0.95.
 
-Configuration is identical to `cb35_drift_long_bf16` (owned_gdn=ON,
-owned_decay_gate=ON, bf16 DN state, long ladder oracle); only
-`CB35_LADDER_POSITIONS` changes.
+Configuration is identical to the archived `cb35_drift_long_bf16.py`
+(owned_gdn=ON, owned_decay_gate=ON, bf16 DN state, long ladder oracle);
+only `CB35_LADDER_POSITIONS` changes.
+
+NOTE 2026-06-04: 35B drift cliff RESOLVED per
+`feedback_35b_drift_resolved_2026-06-04`; this probe is kept as a
+regression-watch tool in case the cliff returns.
 """
 import os
 from cb35_drift_ladder import main as _main

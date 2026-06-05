@@ -44,7 +44,9 @@ We spent ~4 hours today getting to this picture:
   `~/tt-xla/.cache/cb35_runtime/trig/` map to
   `experiments/cb/{validate,isolate,bench,dev}/cb35_<name>.py` and
   iterate in ~30 sec on resident state.
-- ✅ **6 probe wrappers DEPLOYED** to qb1:
+- ✅ **6 probe wrappers DEPLOYED** to qb1 (ARCHIVED 2026-06-04 to
+  `archive/cb35_drift_wrappers_2026-06-04/` once the drift cliff
+  resolved — `feedback_35b_drift_resolved_2026-06-04`):
   - `cb35_drift_bf16` / `cb35_drift_fp32_h` / `cb35_drift_fp32_h_no_dg`
     (5-position oracle — fast headline)
   - `cb35_drift_long_bf16` / `cb35_drift_long_fp32_h` /
@@ -111,7 +113,8 @@ the broken manual path. The current owned_gdn baseline at pos 1 is
 ### Finding 2: Real drift is a CLIFF between pos 1 and pos 5
 
 Measured 2026-06-03 on the 85-token ladder prompt with owned_gdn=ON
-(default config), via `cb35_drift_long_bf16`:
+(default config), via `cb35_drift_long_bf16` (now archived to
+`archive/cb35_drift_wrappers_2026-06-04/cb35_drift_long_bf16.py`):
 
 | pos | cos_L32 | cos_final | top1 |
 |---|---|---|---|
@@ -159,13 +162,16 @@ fp32 storage ever mattered. Memory:
 - HF oracles at `.cache/hf_oracle_35b_100tok/` (5 pos),
   `.cache/hf_oracle_35b_long/` (85 pos).
 - Probe core `experiments/cb/dev/cb35_drift_ladder.py` + 6 thin
-  env-config wrappers deployed.
+  env-config wrappers (archived 2026-06-04 to
+  `archive/cb35_drift_wrappers_2026-06-04/`; fork back into
+  `experiments/cb/dev/` if reviving).
 - Trigger directory `~/tt-xla/.cache/cb35_runtime/trig/`.
 
 **Step 1 — Localize the cliff between pos 1 and pos 5 (one probe, ~30 sec):**
 
 ```bash
-# Edit experiments/cb/dev/cb35_drift_long_bf16.py to set:
+# Fork archive/cb35_drift_wrappers_2026-06-04/cb35_drift_long_bf16.py
+# back into experiments/cb/dev/, then edit it to set:
 #   os.environ["CB35_LADDER_POSITIONS"] = "0,1,2,3,4,5,6,7"
 # (the wrapper is a thin env-setter calling cb35_drift_ladder.main)
 

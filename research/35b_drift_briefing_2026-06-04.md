@@ -14,7 +14,9 @@ overnight investigation. Reference plan:
   (default). Cliff goes `cos_L32: 0.99 → 0.32` in 4 positions —
   NOT a gradual per-step decay.
 - Measured 2026-06-03 on qb1 via
-  `experiments/cb/dev/cb35_drift_long_bf16.py` against
+  `archive/cb35_drift_wrappers_2026-06-04/cb35_drift_long_bf16.py`
+  (archived 2026-06-04 after the cliff resolved per
+  `feedback_35b_drift_resolved_2026-06-04`) against
   `.cache/hf_oracle_35b_long` (85-tok math ladder prompt). See
   `feedback_35b_drift_cliff_pos1_to_pos5.md` and §REAL findings in
   the next-session plan.
@@ -52,8 +54,9 @@ decay (which would be gradual).
 
 ## 3. Next concrete investigation step
 
-**Step 1 — Bisect the cliff position (pos 2/3/4/5).** Edit
-`experiments/cb/dev/cb35_drift_long_bf16.py` to set
+**Step 1 — Bisect the cliff position (pos 2/3/4/5).** Edit the
+archived `archive/cb35_drift_wrappers_2026-06-04/cb35_drift_long_bf16.py`
+(fork it back into `experiments/cb/dev/` if reviving the probe) to set
 `CB35_LADDER_POSITIONS = "0,1,2,3,4,5,6,7"`, deploy, trigger. Find
 `P_cliff` = position where `cos_L32` first drops below 0.95.
 
@@ -74,13 +77,18 @@ PASS/FAIL ladder + "FIRST CLIFF" tag) — but target the 35B server
 
 ## 4. Other relevant probes / kernels
 
-- `experiments/cb/isolate/` 35B-relevant: `owned_gdn.py`,
-  `paged_sdpa.py`, `dn_recurrence.py`, `chunked_sdpa.py`,
-  `conv_reform.py`, `paged_update_cache.py`. `gm4_per_layer_drift_pos1.py`
-  is the forkable bisection pattern.
-- `experiments/cb/dev/`: `cb35_drift_ladder.py` (core) + 6 env wrappers
-  + `cb35_drift_cliff_search.py` (may already cover Step 1 — check
-  before forking).
+- `experiments/cb/isolate/` 35B-relevant: `paged_sdpa.py`,
+  `chunked_sdpa.py`, `paged_update_cache.py`.
+  `gm4_per_layer_drift_pos1.py` is the forkable bisection pattern.
+  The owned_gdn / dn_recurrence / conv_reform probes were archived
+  2026-06-04 to `archive/cb_engine_scaffolding_2026-06-04/`.
+- `experiments/cb/dev/`: `cb35_drift_ladder.py` (core) +
+  `cb35_drift_cliff_search.py` (may already cover Step 1 — check
+  before forking). The 6 env-wrapper variants
+  (cb35_drift_bf16 / cb35_drift_fp32_h{,_no_dg} /
+  cb35_drift_long_bf16{,_manual} / cb35_drift_long_fp32_h{,_no_dg})
+  were archived 2026-06-04 to `archive/cb35_drift_wrappers_2026-06-04/`
+  after the cliff resolved.
 - HF oracle: `experiments/utils/hf_reference_35b.py`. Outputs at
   `.cache/hf_oracle_35b_long/` (85 pos) and
   `.cache/hf_oracle_35b_100tok/` (5 pos).
