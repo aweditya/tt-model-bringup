@@ -132,6 +132,7 @@ Each owned op ships an `INTEGRATION.md` with the validation gate and a
 |---|---|---|
 | `qwen36_gdn_decode_owned` | Production fused GatedDeltaNet decode recurrence | state/out PCC > 0.9999 |
 | `qwen36_decay_gate_decode_owned` | Production fused decay/gate (+2.5 % tok/s) | PCC > 0.9999 |
+| `nemotron3_mamba2_decode_owned` | Owned Mamba2 SSD decode kernel — **G1 single-core complete** (modes 1–5 PASS, mode=5 production) | state cos ≥ 0.999707, y cos ≥ 0.999852 (mode=5) |
 
 Run a gate (stop the prod server so device 0 is free):
 
