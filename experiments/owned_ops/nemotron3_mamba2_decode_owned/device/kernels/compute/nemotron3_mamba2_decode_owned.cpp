@@ -433,6 +433,45 @@ FORCE_INLINE void add_state_scaled_outer(
     cb_push_back(cb_state_out, ONE_TILE);
 }
 
+// add_state_scaled_outer_two(cb_state_scaled, cb_outer, tile_index,
+//                            cb_state_out, cb_state_post_update)
+//
+// Mode=5 variant of add_state_scaled_outer that packs the SAME computed
+// state_out value to TWO destination CBs:
+//   - cb_state_out: the writer-bound output (drained by the dataflow kernel)
+//   - cb_state_post_update: an internal copy that compute reads back in
+//     Phase 4 to compute the corrected y = C · state_out^T + D·x.
+//
+// REUSE: direct fork of
+//   qwen36_gdn_decode_owned/device/kernels/compute/qwen36_gdn_decode_owned.cpp
+//   line 389: `add_state_to_two`. GDN uses the exact same dual-pack pattern
+//   for the same reason (one output for writer, one for downstream compute).
+FORCE_INLINE void add_state_scaled_outer_two(
+    uint32_t cb_state_scaled,
+    uint32_t cb_outer,
+    uint32_t tile_index,
+    uint32_t cb_state_out,
+    uint32_t cb_state_post_update) {
+    reconfig_data_format(cb_state_scaled, cb_outer);
+    pack_reconfig_data_format(cb_state_out);
+    add_tiles_init(cb_state_scaled, cb_outer);
+    cb_wait_front(cb_state_scaled, tile_index + 1);
+    cb_wait_front(cb_outer, ONE_TILE);
+    cb_reserve_back(cb_state_out, ONE_TILE);
+    cb_reserve_back(cb_state_post_update, ONE_TILE);
+
+    tile_regs_acquire();
+    add_tiles(cb_state_scaled, cb_outer, tile_index, 0, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_state_out);
+    pack_tile(0, cb_state_post_update);
+    tile_regs_release();
+
+    cb_push_back(cb_state_out, ONE_TILE);
+    cb_push_back(cb_state_post_update, ONE_TILE);
+}
+
 // matmul_reduce_C_state(cb_C, cb_state_in, head_dim_tile, ssm_state_tiles,
 //                       cb_y_partial)
 //
@@ -610,6 +649,8 @@ void kernel_main() {
     // G1 day-4 (debug_mode=3) scratch CBs:
     constexpr uint32_t cb_x_col      = get_compile_time_arg_val(15);
     constexpr uint32_t cb_outer      = get_compile_time_arg_val(16);
+    // G1 day-4.6 (debug_mode=5):
+    constexpr uint32_t cb_state_post_update = get_compile_time_arg_val(17);
 
     // Runtime args:
     //   block_count       : how many (batch, head) blocks this core owns
@@ -867,12 +908,84 @@ void kernel_main() {
             cb_pop_front(cb_z, head_dim_tiles);
             cb_pop_front(cb_y_partial, head_dim_tiles);
         }
-        //
-        // TODO(G1 day-4.6): debug_mode == 5 (production)
-        //
-        // Add the y_partial += C · outer fixup so y reflects state_out
-        // instead of state_in. Then mode=5 ≡ production.
-        // Gate: G0a harness PASS at cos ≥ 0.999 vs numpy oracle, both 1-step
-        //       AND 8-step multi-step replay.
+        else if (debug_mode == 5) {
+            // ── Mode 5: PRODUCTION-EQUIVALENT y = C · state_out^T + D·x ──
+            // Differs from mode=4 only in that y reflects POST-update state.
+            //
+            // Math: state_out = decay*state_in + outer = state_scaled + outer.
+            // So C · state_out^T = C · (state_scaled + outer)^T. We capture
+            // state_out per (d, s) tile in cb_state_post_update via
+            // add_state_scaled_outer_two (forked from GDN's add_state_to_two),
+            // then run matmul_reduce_C_state against it in Phase 4.
+            //
+            // Phase 2's matmul_reduce_C_state on cb_state_in is kept for
+            // its prime-engine role; its 2 tiles in cb_y_partial are
+            // drained at the start of Phase 4 before the correct reduce
+            // overwrites them.
+            compute_decay(cb_A_log, cb_decay);
+            compute_dt_eff(
+                cb_dt, cb_dt_bias, cb_dt_B,
+                SOFTPLUS_BETA_BITS, SOFTPLUS_BETA_RECIP_BITS,
+                SOFTPLUS_THRESHOLD_BITS,
+                TIME_STEP_FLOOR_BITS, TIME_STEP_MAX_BITS);
+            multiply_decay_by_dt_eff(cb_decay, cb_dt_B);
+            compute_dt_B(cb_dt_B, cb_B, ssm_state_tiles);
+
+            // Phase 1: pre-transpose x.
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                transpose_x_to_col(cb_x, d, cb_x_col);
+            }
+
+            // Phase 2: matmul_reduce_C_state PRIME (on state_in, value
+            // discarded later).
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                matmul_reduce_C_state(cb_C, cb_state_in, d, ssm_state_tiles, cb_y_partial);
+            }
+
+            // Phase 3: state-update loop. add_state_scaled_outer_two
+            // packs state_out to BOTH cb_state_out (writer) AND
+            // cb_state_post_update (compute reads back in Phase 4).
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                for (uint32_t s = 0; s < ssm_state_tiles; ++s) {
+                    const uint32_t tile_idx = d * ssm_state_tiles + s;
+                    matmul_outer_x_dt_B(cb_x_col, cb_dt_B, d, s, cb_outer);
+                    mul_decay_state_to(cb_state_in, cb_decay, tile_idx, cb_state_scaled);
+                    add_state_scaled_outer_two(cb_state_scaled, cb_outer, tile_idx,
+                                                cb_state_out, cb_state_post_update);
+                    cb_pop_front(cb_outer, ONE_TILE);
+                }
+            }
+
+            // Phase 4a: drain Phase 2's naive y_partial so Phase 4b can
+            // push fresh correct values without CB overflow.
+            cb_pop_front(cb_y_partial, head_dim_tiles);
+
+            // Phase 4b: correct y_partial = C · state_out^T. Use
+            // cb_state_post_update (which has the full 8 post-update tiles).
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                matmul_reduce_C_state(cb_C, cb_state_post_update, d, ssm_state_tiles,
+                                       cb_y_partial);
+            }
+
+            // Phase 5: y[d] = y_partial[d] + D · x[d] (same as mode=4).
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                mul_D_x_to(cb_x, cb_D, d, cb_outer);
+                add_y_partial_D_x(cb_y_partial, cb_outer, d, cb_y);
+                cb_pop_front(cb_outer, ONE_TILE);
+            }
+
+            // Drain.
+            cb_pop_front(cb_x, head_dim_tiles);
+            cb_pop_front(cb_x_col, head_dim_tiles);
+            cb_pop_front(cb_state_in, head_dim_tiles * ssm_state_tiles);
+            cb_pop_front(cb_state_scaled, head_dim_tiles * ssm_state_tiles);
+            cb_pop_front(cb_state_post_update, head_dim_tiles * ssm_state_tiles);
+            cb_pop_front(cb_decay, ONE_TILE);
+            cb_pop_front(cb_dt_B, ssm_state_tiles);
+            cb_pop_front(cb_C, ssm_state_tiles);
+            cb_pop_front(cb_D, ONE_TILE);
+            cb_pop_front(cb_z, head_dim_tiles);
+            cb_pop_front(cb_y_partial, head_dim_tiles);
+        }
     }
 }

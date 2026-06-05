@@ -46,6 +46,11 @@ constexpr uint32_t CB_Y            = tt::CBIndex::c_14;
 // before it gets added to state_scaled.
 constexpr uint32_t CB_X_COL        = tt::CBIndex::c_15;
 constexpr uint32_t CB_OUTER        = tt::CBIndex::c_16;
+// G1 day-4.6 (mode=5): post-update state buffer for the C·state_out^T reduce.
+// add_state_scaled_outer_two packs to BOTH cb_state_out (writer) AND this CB
+// (compute reads it back in Phase 4 to compute y_partial_full).
+// Same fp32 format as cb_state_scaled / cb_state_in. 8 tiles per (B, head).
+constexpr uint32_t CB_STATE_POST_UPDATE = tt::CBIndex::c_17;
 
 CBHandle create_circular_buffer(
     Program& program,
@@ -152,6 +157,10 @@ Nemotron3Mamba2DecodeOwnedProgramFactory::cached_program_t Nemotron3Mamba2Decode
     // term; the state itself stays fp32 throughout.
     create_circular_buffer(program, all_cores, CB_X_COL, 2, bf16_tile_size, bf16_format);
     create_circular_buffer(program, all_cores, CB_OUTER, 2, bf16_tile_size, bf16_format);
+    // G1 day-4.6: post-update state buffer for mode=5's C·state_out^T reduce.
+    // Same size + format as cb_state_in / cb_state_scaled.
+    create_circular_buffer(program, all_cores, CB_STATE_POST_UPDATE,
+                           head_dim_tiles * ssm_state_tiles * 2, fp32_tile_size, fp32_format);
 
     // Reader compile-time args: 9 CB indices + 9 TensorAccessorArgs.
     std::vector<uint32_t> reader_compile_time_args = {
@@ -173,7 +182,9 @@ Nemotron3Mamba2DecodeOwnedProgramFactory::cached_program_t Nemotron3Mamba2Decode
         CB_STATE_IN, CB_DECAY, CB_DT_B, CB_STATE_SCALED, CB_Y_PARTIAL,
         CB_STATE_OUT, CB_Y,
         // G1 day-4 additions:
-        CB_X_COL, CB_OUTER};
+        CB_X_COL, CB_OUTER,
+        // G1 day-4.6 (mode=5):
+        CB_STATE_POST_UPDATE};
 
     // Writer compile-time args: 2 CB indices + 2 TensorAccessorArgs.
     std::vector<uint32_t> writer_compile_time_args = {CB_STATE_OUT, CB_Y};

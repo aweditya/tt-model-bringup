@@ -119,9 +119,10 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=int, default=3, choices=[2, 3, 4],
+    parser.add_argument("--mode", type=int, default=3, choices=[2, 3, 4, 5],
                         help="debug_mode to test (2=decay only, 3=full state update, "
-                             "4=state correct + y = C·state_in^T + D·x)")
+                             "4=state correct + y_naive = C·state_in^T + D·x, "
+                             "5=PRODUCTION: y = C·state_out^T + D·x)")
     args = parser.parse_args()
     mode = args.mode
     log(f"smoke target: debug_mode={mode}")
@@ -212,7 +213,7 @@ def main() -> int:
             state_in=state_np,
             # For mode=2 (decay×state only) we zero out x so the input
             # contribution drops out and the oracle reduces to decay*state.
-            x=bf16_roundtrip(_pad_x_to_tile(x_np_flat if mode in (3, 4)
+            x=bf16_roundtrip(_pad_x_to_tile(x_np_flat if mode in (3, 4, 5)
                                              else np.zeros_like(x_np_flat))),
             dt=bf16_roundtrip(dt_np),
             dt_bias=bf16_roundtrip(dt_bias_np),
@@ -230,19 +231,19 @@ def main() -> int:
         log(f"\n  state_out vs oracle:  cos = {cos:.6f}   max|err| = {mad:.4e}   "
             f"rel = {rel:.4e}   max|oracle| = {np.max(np.abs(oracle_2d)):.4f}")
 
-        # y check — sentinel at mode=2/3, real math at mode=4.
-        if mode == 4:
-            # y_oracle[d] = sum_global_s(state_in[d, i, s] * C[s]) + D * x[d]
-            # state_np shape: (B, NUM_HEADS, HEAD_DIM, SSM_STATE) = (1, 1, 64, 128)
-            # C_np_flat shape: (1, N_GROUPS, SSM_STATE) = (1, 1, 128)
-            # D_np[..., 0, 0] = the scalar D value (broadcast across head_dim)
-            state_in_bf16 = bf16_roundtrip(state_np).astype(np.float32)
+        # y check — sentinel at mode=2/3, real math at mode=4/5.
+        if mode in (4, 5):
+            # mode=4: y_oracle[d] = sum_s(state_IN[d, s] * C[s]) + D · x[d]
+            # mode=5: y_oracle[d] = sum_s(state_OUT[d, s] * C[s]) + D · x[d]
+            #   = production formula. state_OUT = decay*state_in + outer.
             C_bf16 = bf16_roundtrip(C_np_flat).astype(np.float32)
             x_bf16 = bf16_roundtrip(x_np_flat).astype(np.float32)
             D_scalar = float(bf16_roundtrip(D_np)[0, 0, 0])
-            # Reduce: y_partial[b, h, d] = sum_s(state_in[b, h, d, s] * C[b, group, s])
-            # With B=1, NUM_HEADS=1, N_GROUPS=1 (single head/group): just dot along s.
-            y_partial = np.einsum("bhds,bgs->bhd", state_in_bf16, C_bf16)
+            if mode == 4:
+                state_for_y_bf16 = bf16_roundtrip(state_np).astype(np.float32)
+            else:  # mode == 5: use the oracle's state_out (post-update)
+                state_for_y_bf16 = oracle  # (B, NUM_HEADS, HEAD_DIM, SSM_STATE)
+            y_partial = np.einsum("bhds,bgs->bhd", state_for_y_bf16, C_bf16)
             y_oracle = y_partial + D_scalar * x_bf16  # (1, 1, HEAD_DIM)
 
             y_tt_1d = y_tt[0, 0, :HEAD_DIM]
