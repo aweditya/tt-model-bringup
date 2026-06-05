@@ -18,8 +18,6 @@ using namespace tt::tt_metal;
 
 namespace {
 
-constexpr uint32_t TILE = tt::constants::TILE_HEIGHT;
-
 void check_tile_layout(const Tensor& t, std::string_view name) {
     TT_FATAL(t.layout() == Layout::TILE, "{} must be tile layout", name);
 }
@@ -103,11 +101,6 @@ Nemotron3Mamba2DecodeOwnedDeviceOperation::create_output_tensors(
 
 namespace ttnn::prim {
 
-constexpr auto nemotron3_mamba2_decode_owned_op =
-    ttnn::register_operation<
-        "ttnn::prim::nemotron3_mamba2_decode_owned",
-        ttnn::experimental::prim::Nemotron3Mamba2DecodeOwnedDeviceOperation>();
-
 std::tuple<Tensor, Tensor> nemotron3_mamba2_decode_owned(
     const Tensor& x,
     const Tensor& z,
@@ -122,22 +115,24 @@ std::tuple<Tensor, Tensor> nemotron3_mamba2_decode_owned(
     uint32_t debug_mode,
     const std::optional<MemoryConfig>& output_memory_config,
     const std::optional<Tensor>& preallocated_y) {
-    ttnn::experimental::prim::Nemotron3Mamba2DecodeOwnedParams params{
-        .output_memory_config = output_memory_config,
-        .debug_fill = debug_fill,
-        .debug_mode = debug_mode,
-        // Softplus + clamp defaults from Nemotron-3 config.json.
-        .softplus_beta_bits        = 0x3f800000u,  // 1.0f
-        .softplus_beta_recip_bits  = 0x3f800000u,  // 1.0f
-        .softplus_threshold_bits   = 0x41a00000u,  // 20.0f
-        .time_step_floor_bits      = 0x38d1b717u,  // 1e-4f
-        .time_step_max_bits        = 0x3dcccccdu,  // 0.1f
-    };
-    ttnn::experimental::prim::Nemotron3Mamba2DecodeOwnedInputs inputs{
-        .x = x, .z = z, .dt = dt, .dt_bias = dt_bias,
-        .A_log = A_log, .D = D, .B_in = B_in, .C_in = C_in,
-        .ssm_state = ssm_state, .preallocated_y = preallocated_y};
-    return nemotron3_mamba2_decode_owned_op(params, inputs);
+    using OperationType = ttnn::experimental::prim::Nemotron3Mamba2DecodeOwnedDeviceOperation;
+    return ttnn::device_operation::launch<OperationType>(
+        OperationType::operation_attributes_t{
+            .output_memory_config = output_memory_config,
+            .debug_fill = debug_fill,
+            .debug_mode = debug_mode,
+            // Softplus + clamp defaults from Nemotron-3 config.json.
+            .softplus_beta_bits        = 0x3f800000u,  // 1.0f
+            .softplus_beta_recip_bits  = 0x3f800000u,  // 1.0f
+            .softplus_threshold_bits   = 0x41a00000u,  // 20.0f
+            .time_step_floor_bits      = 0x38d1b717u,  // 1e-4f
+            .time_step_max_bits        = 0x3dcccccdu,  // 0.1f
+        },
+        OperationType::tensor_args_t{
+            .x = x, .z = z, .dt = dt, .dt_bias = dt_bias,
+            .A_log = A_log, .D = D, .B_in = B_in, .C_in = C_in,
+            .ssm_state = ssm_state, .preallocated_y = preallocated_y,
+        });
 }
 
 }  // namespace ttnn::prim
