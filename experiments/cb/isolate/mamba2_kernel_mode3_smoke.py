@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""MM7 G1 day-4 — debug_mode=3 smoke for the Mamba2 SSD owned kernel.
+"""MM7 G1 day-4 — debug_mode=2/3 smoke for the Mamba2 SSD owned kernel.
 
-Validates the FULL SSM state-update math against a numpy oracle:
+Validates the SSM state-update math against a numpy oracle. Mode is
+selectable via CLI (defaults to 3, the full state update):
 
-    state_out[d, s] = decay * state_in[d, s] + dt_eff * x[d] * B[s]
-    where:
-      dt_eff = clamp(softplus(dt + dt_bias), 1e-4, 0.1)
-      decay  = exp(-exp(A_log) * dt_eff)
+  mode=2: state_out = decay * state_in  (no input contribution)
+  mode=3: state_out = decay * state_in + dt_eff * x[d] * B[s]
 
-`y` is still sentinel-1.0 at debug_mode=3 (the C·state reduce + D·x skip
-land at day-4.5 modes 4/5). We assert y == 1.0 and validate state_out
-against the oracle at per-tile precision (cos ≥ 0.999, max abs err < 1e-2
-for bf16 inputs with fp32 accumulator).
+In both modes `y` is sentinel-1.0 (the C·state reduce + D·x skip land at
+day-4.5 modes 4/5). Pass criteria: per-tile cos ≥ 0.999, rel err < 5e-2
+(bf16 inputs + fp32 accumulator), |y - 1.0| < 0.05.
 
 Fork base: `experiments/cb/isolate/mamba2_kernel_smoke.py` (the day-3.9
 mode=1 scaffolding smoke).
@@ -22,10 +20,11 @@ Run on qb1:
         TT_BUILD_DIR=$TT_METAL_HOME/build_Release ARCH_NAME=blackhole \\
         PYTHONPATH=$TT_METAL_HOME/ttnn \\
         LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib \\
-        .venv/bin/python -u experiments/cb/isolate/mamba2_kernel_mode3_smoke.py
+        .venv/bin/python -u experiments/cb/isolate/mamba2_kernel_mode3_smoke.py [--mode 2|3]
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 
@@ -119,6 +118,13 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=int, default=3, choices=[2, 3],
+                        help="debug_mode to test (2=decay only, 3=full state update)")
+    args = parser.parse_args()
+    mode = args.mode
+    log(f"smoke target: debug_mode={mode}")
+
     log("import ttnn …")
     import ttnn
     log(f"  ttnn.__file__ = {ttnn.__file__}")
@@ -182,10 +188,10 @@ def main() -> int:
         C_in      = tt_bf16(C_np_flat)
         ssm_state = tt_fp32(state_np)
 
-        log("invoking kernel with debug_mode=3 …")
+        log(f"invoking kernel with debug_mode={mode} …")
         state_out, y_out = fn(
             x, z, dt, dt_bias, A_log, D, B_in, C_in, ssm_state,
-            debug_mode=3,
+            debug_mode=mode,
         )
         log("  kernel returned without exception ✓")
 
@@ -203,7 +209,10 @@ def main() -> int:
 
         oracle = numpy_oracle_state_out(
             state_in=state_np,
-            x=bf16_roundtrip(_pad_x_to_tile(x_np_flat)),
+            # For mode=2 (decay×state only) we zero out x so the input
+            # contribution drops out and the oracle reduces to decay*state.
+            x=bf16_roundtrip(_pad_x_to_tile(x_np_flat if mode == 3
+                                             else np.zeros_like(x_np_flat))),
             dt=bf16_roundtrip(dt_np),
             dt_bias=bf16_roundtrip(dt_bias_np),
             A_log=bf16_roundtrip(A_log_np),

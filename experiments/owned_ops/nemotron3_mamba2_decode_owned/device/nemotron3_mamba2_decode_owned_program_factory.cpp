@@ -37,6 +37,15 @@ constexpr uint32_t CB_STATE_SCALED = tt::CBIndex::c_11;
 constexpr uint32_t CB_Y_PARTIAL    = tt::CBIndex::c_12;
 constexpr uint32_t CB_STATE_OUT    = tt::CBIndex::c_13;
 constexpr uint32_t CB_Y            = tt::CBIndex::c_14;
+// G1 day-4 (debug_mode=3): scratch CBs for the outer-product update.
+// cb_x_col holds the transposed [head_dim] vector (col-vector tile) so that
+// matmul_tiles(cb_x_col, cb_dt_B) computes the outer product x[d] ⊗ dt_B[s]
+// directly into a full 32×32 tile (pattern forked from GDN's mul_outer /
+// transpose_k_indexed at qwen36_gdn_decode_owned.cpp:328 + :312).
+// cb_outer holds that outer-product tile per (d, s) inner-loop iteration
+// before it gets added to state_scaled.
+constexpr uint32_t CB_X_COL        = tt::CBIndex::c_15;
+constexpr uint32_t CB_OUTER        = tt::CBIndex::c_16;
 
 CBHandle create_circular_buffer(
     Program& program,
@@ -132,6 +141,17 @@ Nemotron3Mamba2DecodeOwnedProgramFactory::cached_program_t Nemotron3Mamba2Decode
     create_circular_buffer(program, all_cores, CB_STATE_OUT,
                            head_dim_tiles * ssm_state_tiles * 2, fp32_tile_size, fp32_format);
     create_circular_buffer(program, all_cores, CB_Y, head_dim_tiles * 2, bf16_tile_size, bf16_format);
+    // G1 day-4: outer-product scratch (decision D11, see kernel header).
+    // cb_x_col is one transposed head-dim tile per d-iter (bf16).
+    // cb_outer is one outer-product tile per (d, s) inner-iter (bf16). The
+    // matmul accumulates in fp32 dst (fp32_dest_acc_en=true), then packs
+    // to bf16 — matching GDN's CB_OUTER pattern exactly (qwen36_gdn_decode_owned
+    // program_factory line 105). The precision loss on this single
+    // bf16 round-trip is bounded because the outer-product is the
+    // INPUT-contribution term added on top of the dominant `decay*state`
+    // term; the state itself stays fp32 throughout.
+    create_circular_buffer(program, all_cores, CB_X_COL, 2, bf16_tile_size, bf16_format);
+    create_circular_buffer(program, all_cores, CB_OUTER, 2, bf16_tile_size, bf16_format);
 
     // Reader compile-time args: 9 CB indices + 9 TensorAccessorArgs.
     std::vector<uint32_t> reader_compile_time_args = {
@@ -151,7 +171,9 @@ Nemotron3Mamba2DecodeOwnedProgramFactory::cached_program_t Nemotron3Mamba2Decode
     std::vector<uint32_t> compute_compile_time_args = {
         CB_X, CB_Z, CB_DT, CB_DT_BIAS, CB_A_LOG, CB_D, CB_B, CB_C,
         CB_STATE_IN, CB_DECAY, CB_DT_B, CB_STATE_SCALED, CB_Y_PARTIAL,
-        CB_STATE_OUT, CB_Y};
+        CB_STATE_OUT, CB_Y,
+        // G1 day-4 additions:
+        CB_X_COL, CB_OUTER};
 
     // Writer compile-time args: 2 CB indices + 2 TensorAccessorArgs.
     std::vector<uint32_t> writer_compile_time_args = {CB_STATE_OUT, CB_Y};

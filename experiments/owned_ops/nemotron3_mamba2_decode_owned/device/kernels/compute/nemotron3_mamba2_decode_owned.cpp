@@ -46,11 +46,10 @@
 //   4 = state correct + y = D·x (output ignores C·state)
 //   5 = production equivalent (mode 0)
 //
-// Each subsequent commit lands one more debug_mode step. THIS commit
-// ships mode=1 (fill_one smoke) only — the rest are TODO blocks with
-// explicit math comments. This lets us validate the scaffolding
-// (build → register → dispatch → output non-NaN) before any math
-// touches the TRISC tile engine.
+// Each subsequent commit lands one more debug_mode step. As of G1 day-4,
+// modes 1, 2, and 3 are wired (1 = fill_one smoke; 2 = decay×state only;
+// 3 = full state update with input contribution). Modes 4, 5 land at
+// day-4.5 (D·x skip and full math).
 
 #include <cstdint>
 
@@ -66,6 +65,7 @@
 #include "api/compute/matmul.h"
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/tile_move_copy.h"
+#include "api/compute/transpose_wh.h"  // G1 day-4: transpose_wh_tile for x → col-vec
 
 namespace {
 
@@ -138,45 +138,35 @@ FORCE_INLINE void compute_decay(uint32_t cb_A_log, uint32_t cb_decay) {
     cb_pop_front(cb_A_log, ONE_TILE);
 }
 
-// finalize_decay_with_dt_eff(cb_decay_inout, cb_dt, cb_dt_bias,
-//                            cb_dt_eff_scratch, softplus/clamp constants)
+// compute_dt_eff(cb_dt, cb_dt_bias, cb_dt_eff_dst, softplus/clamp constants)
 //
-// Stage B of the decay computation. Reads A from cb_decay_inout (placed
-// there by compute_decay), computes dt_eff = clamp(softplus(dt+dt_bias),
-// floor, max) into cb_dt_eff_scratch, multiplies A * dt_eff and exps the
-// result, overwrites cb_decay_inout with the final decay value.
+// Stage 1 of the decay computation, split from the old monolithic
+// `finalize_decay_with_dt_eff` at G1 day-4 so that dt_eff stays alive in
+// cb_dt_eff_dst for the downstream `compute_dt_B` (mode=3 needs dt_eff for
+// both the decay-finalize multiply AND the dt_eff*B outer-product
+// precompute).
 //
-// The caller passes `cb_dt_B` as `cb_dt_eff_scratch`. cb_dt_B is intended
-// for the production `dt_eff * B` outer product (used at debug_mode=3+);
-// reusing it here as a scalar dt_eff scratch is decision-D11-style
-// double-duty. The scratch is empty by the time debug_mode=3 wants it
-// for B-multiply (this helper pops it before exit), so no conflict.
-//
-// Three-stage pipeline:
-//   Stage 1: dt_eff = clamp(softplus(dt + dt_bias), floor, max)  → cb_dt_eff_scratch
-//   Stage 2: A_dt   = A * dt_eff                                  (binary mul_tiles,
-//                                                                  reads both CBs)
-//   Stage 3: decay  = exp(A_dt)                                   → cb_decay_inout
-//                                                                  (overwrites A)
-FORCE_INLINE void finalize_decay_with_dt_eff(
-    uint32_t cb_decay_inout,
+// Pushes 1 tile to cb_dt_eff_dst (dt_eff = clamp(softplus(dt+dt_bias))).
+// Pops cb_dt and cb_dt_bias (consumes both). Does NOT pop cb_dt_eff_dst —
+// the caller (multiply_decay_by_dt_eff, then compute_dt_B at mode=3)
+// reuses the dt_eff tile.
+FORCE_INLINE void compute_dt_eff(
     uint32_t cb_dt,
     uint32_t cb_dt_bias,
-    uint32_t cb_dt_eff_scratch,
+    uint32_t cb_dt_eff_dst,
     uint32_t softplus_beta_bits,
     uint32_t softplus_beta_recip_bits,
     uint32_t softplus_threshold_bits,
     uint32_t time_step_floor_bits,
     uint32_t time_step_max_bits) {
 
-    // ── Stage 1: dt_eff = clamp(softplus(dt + dt_bias), floor, max)
     cb_wait_front(cb_dt, ONE_TILE);
     cb_wait_front(cb_dt_bias, ONE_TILE);
 
-    pack_reconfig_data_format(cb_dt_eff_scratch);
+    pack_reconfig_data_format(cb_dt_eff_dst);
     reconfig_data_format(cb_dt, cb_dt_bias);
     add_tiles_init(cb_dt, cb_dt_bias);
-    cb_reserve_back(cb_dt_eff_scratch, ONE_TILE);
+    cb_reserve_back(cb_dt_eff_dst, ONE_TILE);
 
     tile_regs_acquire();
     add_tiles(cb_dt, cb_dt_bias, 0, 0, 0);
@@ -187,38 +177,95 @@ FORCE_INLINE void finalize_decay_with_dt_eff(
     clamp_tile(0, time_step_floor_bits, time_step_max_bits);
     tile_regs_commit();
     tile_regs_wait();
-    pack_tile(0, cb_dt_eff_scratch);
+    pack_tile(0, cb_dt_eff_dst);
     tile_regs_release();
-    cb_push_back(cb_dt_eff_scratch, ONE_TILE);
+    cb_push_back(cb_dt_eff_dst, ONE_TILE);
 
     cb_pop_front(cb_dt, ONE_TILE);
     cb_pop_front(cb_dt_bias, ONE_TILE);
+}
 
-    // ── Stage 2 + 3: decay = exp(A * dt_eff) → overwrite cb_decay_inout
+// multiply_decay_by_dt_eff(cb_decay_inout, cb_dt_eff)
+//
+// Stage 2+3 of the decay computation, split from the old
+// `finalize_decay_with_dt_eff`. Reads A from cb_decay_inout (placed there by
+// compute_decay) and dt_eff from cb_dt_eff (placed by compute_dt_eff).
+// Computes decay = exp(A * dt_eff) and overwrites cb_decay_inout.
+//
+// Does NOT pop cb_dt_eff. The caller is responsible: at debug_mode=2 the
+// kernel-main pops cb_dt_eff after this returns; at debug_mode=3
+// compute_dt_B consumes it via the queue-pop-after-push pattern.
+FORCE_INLINE void multiply_decay_by_dt_eff(
+    uint32_t cb_decay_inout,
+    uint32_t cb_dt_eff) {
+
     // CB queue semantics: cb_decay_inout currently has [A]. We compute
     // [A * dt_eff → exp] in dest, push as a new tile, then pop the OLD
-    // A from the front, leaving [decay] for the downstream mul_decay_state_to.
-    cb_wait_front(cb_dt_eff_scratch, ONE_TILE);
+    // A from the front, leaving [decay] for the downstream
+    // mul_decay_state_to.
+    cb_wait_front(cb_dt_eff, ONE_TILE);
     cb_wait_front(cb_decay_inout, ONE_TILE);
 
     pack_reconfig_data_format(cb_decay_inout);
-    reconfig_data_format(cb_decay_inout, cb_dt_eff_scratch);
-    mul_tiles_init(cb_decay_inout, cb_dt_eff_scratch);
+    reconfig_data_format(cb_decay_inout, cb_dt_eff);
+    mul_tiles_init(cb_decay_inout, cb_dt_eff);
     cb_reserve_back(cb_decay_inout, ONE_TILE);
 
     tile_regs_acquire();
-    mul_tiles(cb_decay_inout, cb_dt_eff_scratch, 0, 0, 0);  // A * dt_eff
+    mul_tiles(cb_decay_inout, cb_dt_eff, 0, 0, 0);  // A * dt_eff
     exp_tile_init();
-    exp_tile(0);                                              // exp(...)
+    exp_tile(0);                                     // exp(...)
     tile_regs_commit();
     tile_regs_wait();
-    pack_tile(0, cb_decay_inout);                             // push new decay
+    pack_tile(0, cb_decay_inout);                    // push new decay
     tile_regs_release();
     cb_push_back(cb_decay_inout, ONE_TILE);
     // Queue is now [OLD_A, decay]. Pop the OLD_A so the front exposes decay.
     cb_pop_front(cb_decay_inout, ONE_TILE);
+}
 
-    cb_pop_front(cb_dt_eff_scratch, ONE_TILE);
+// compute_dt_B(cb_dt_eff_inout, cb_B, ssm_state_tiles)
+//
+// Implements (for the per-block dt_eff scalar and B vector):
+//   dt_B[s] = dt_eff * B[s]   (broadcast scalar across each ssm_state tile)
+//
+// In the kernel, the same physical CB (cb_dt_B) holds dt_eff transiently at
+// the front, then gets overwritten with ssm_state_tiles dt_B tiles. The
+// queue-pop-after-push pattern is the same one used by
+// multiply_decay_by_dt_eff: push all dt_B tiles before popping the dt_eff
+// tile, so dt_eff stays addressable at index 0 during each mul_tiles_bcast_scalar
+// call. Capacity check (program_factory):
+//   CB_DT_B size = ssm_state_tiles * 2 = 8 slots; transient peak = 1 + 4 = 5. OK.
+//
+// Pops cb_dt_eff_inout's dt_eff tile (1) and cb_B's vector tiles (ssm_state_tiles).
+// Net: cb_dt_eff_inout front = [dt_B[0], dt_B[1], …, dt_B[ssm_state_tiles-1]].
+FORCE_INLINE void compute_dt_B(
+    uint32_t cb_dt_eff_inout,
+    uint32_t cb_B,
+    uint32_t ssm_state_tiles) {
+
+    cb_wait_front(cb_dt_eff_inout, ONE_TILE);
+    cb_wait_front(cb_B, ssm_state_tiles);
+
+    reconfig_data_format(cb_B, cb_dt_eff_inout);
+    pack_reconfig_data_format(cb_dt_eff_inout);
+    mul_tiles_bcast_scalar_init_short(cb_B, cb_dt_eff_inout);
+
+    for (uint32_t s = 0; s < ssm_state_tiles; ++s) {
+        cb_reserve_back(cb_dt_eff_inout, ONE_TILE);
+
+        tile_regs_acquire();
+        mul_tiles_bcast_scalar(cb_B, cb_dt_eff_inout, s, 0, 0);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile(0, cb_dt_eff_inout);
+        tile_regs_release();
+
+        cb_push_back(cb_dt_eff_inout, ONE_TILE);
+    }
+
+    cb_pop_front(cb_dt_eff_inout, ONE_TILE);  // pop dt_eff
+    cb_pop_front(cb_B, ssm_state_tiles);
 }
 
 // mul_decay_state_to(cb_state, cb_decay, head_dim_tile, ssm_state_tile,
@@ -259,38 +306,119 @@ FORCE_INLINE void mul_decay_state_to(
     cb_push_back(cb_state_scaled, ONE_TILE);
 }
 
-// TODO(G1 day-3): compute_dt_B(cb_dt_eff, cb_B, cb_dt_B)
+// transpose_x_to_col(cb_x, tile_index, cb_x_col)
 //
-// Implements:
-//   dt_B[s] = dt_eff * B[s]   (broadcast scalar over [ssm_state] vector tile)
+// Reads cb_x at `tile_index` (the d-th head_dim tile, a row-vector tile with
+// 32 head_dim values along row 0) and writes the transposed tile to cb_x_col
+// (col-vector tile with 32 head_dim values along col 0). Used to feed
+// matmul_outer_x_dt_B, where matmul_tiles(col_vec, row_vec) computes a
+// rank-1 outer product directly.
 //
-// LLK calls expected:
-//   bcast_mul_tile_scalar(cb_dt_eff, cb_B, 0, 0, cb_dt_B)
+// REUSE: direct fork of
+//   qwen36_gdn_decode_owned/device/kernels/compute/qwen36_gdn_decode_owned.cpp
+//   line 312: `transpose_k_indexed`
+// renamed for clarity (cb_k → cb_x). Same LLK pattern.
+FORCE_INLINE void transpose_x_to_col(
+    uint32_t cb_x,
+    uint32_t tile_index,
+    uint32_t cb_x_col) {
+    // DAY-4-DEBUG bisect-step-5: removed unary_op_init_common (was causing
+    // hang likely by re-initializing pipeline state in a way that breaks
+    // the SHORT inits used by subsequent binary ops). Rely on the
+    // transpose_wh_init_short alone — the inner-loop helpers re-issue
+    // their own short inits.
+    transpose_wh_init_short(cb_x);
+    pack_reconfig_data_format(cb_x_col);
+    cb_wait_front(cb_x, tile_index + 1);
+    cb_reserve_back(cb_x_col, ONE_TILE);
 
-// TODO(G1 day-4): mul_decay_state_to(
-//     cb_state, cb_decay, head_dim_tile, cb_state_scaled)
-//
-// Implements (for the d-th head_dim tile):
-//   state_scaled[d, s] = decay * state[d, s]
-//
-// decay is scalar; state is [head_dim, ssm_state] = 2×4 tiles per head.
-// head_dim_tile selects which of the 2 head_dim tiles to multiply.
-//
-// LLK calls expected:
-//   bcast_mul_tile_scalar(cb_state, cb_decay, head_dim_tile, 0, ...)
+    tile_regs_acquire();
+    transpose_wh_tile(cb_x, tile_index, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_x_col);
+    tile_regs_release();
 
-// TODO(G1 day-4): add_outer_input(
-//     cb_state_scaled, cb_x, cb_dt_B, head_dim_tile, cb_state_out)
+    cb_push_back(cb_x_col, ONE_TILE);
+}
+
+// matmul_outer_x_dt_B(cb_x_col, cb_dt_B, s_tile_index, cb_outer)
 //
-// Implements:
-//   state_out[d, s] = state_scaled[d, s] + dt_B[s] * x[d]
+// Computes the outer-product tile:
+//   outer[i, j] = x_col[i, 0] * dt_B[s][0, j]
+//              = x[d][i] * (dt_eff * B[s])[j]
 //
-// dt_B[s] * x[d] is the outer-product portion of the SSD update. Per
-// head_dim tile, we have [d=tile, s=4 tiles] × [s=4 tiles] = 4 muladds.
+// for the s-th ssm_state tile. cb_x_col holds the transposed head_dim
+// vector (col-vector); cb_dt_B holds the (dt_eff * B) vector across
+// ssm_state_tiles row-vector tiles. matmul_tiles on a col-vector × row-vector
+// is exactly a rank-1 outer product (other rows/cols of both inputs are
+// zero-padded by the tilizer).
 //
-// LLK calls expected:
-//   outer_product_add(cb_x, cb_dt_B, head_dim_tile, ssm_state_tile, ...)
-//   OR (decomposed): bcast_mul + add_tiles for each (d, s) pair.
+// Reads cb_x_col at index 0 (caller pushes 1 tile per d-iter) and cb_dt_B
+// at index `s_tile_index`. Pushes 1 outer tile to cb_outer. Does NOT pop
+// either input — caller drains cb_x_col after the inner s-loop and
+// cb_dt_B after the entire mode-3 block.
+//
+// REUSE: forked from
+//   qwen36_gdn_decode_owned/device/kernels/compute/qwen36_gdn_decode_owned.cpp
+//   line 346: `matmul_outer`
+// extended with a tile_index arg so we can select dt_B[s] within the
+// inner loop.
+FORCE_INLINE void matmul_outer_x_dt_B(
+    uint32_t cb_x_col,
+    uint32_t cb_dt_B,
+    uint32_t s_tile_index,
+    uint32_t cb_outer) {
+    mm_init(cb_x_col, cb_dt_B, cb_outer);
+    cb_wait_front(cb_x_col, ONE_TILE);
+    cb_wait_front(cb_dt_B, s_tile_index + 1);
+    cb_reserve_back(cb_outer, ONE_TILE);
+
+    tile_regs_acquire();
+    matmul_tiles(cb_x_col, cb_dt_B, 0, s_tile_index, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_outer);
+    tile_regs_release();
+
+    cb_push_back(cb_outer, ONE_TILE);
+}
+
+// add_state_scaled_outer(cb_state_scaled, cb_outer, tile_index, cb_state_out)
+//
+// Implements (for one (d, s) tile of the state update):
+//   state_out[d, s] = state_scaled[d, s] + outer[d, s]
+//                   = decay * state_in[d, s] + dt_eff * x[d] * B[s]
+//
+// Reads cb_state_scaled at `tile_index` and cb_outer at index 0. Pushes
+// to cb_state_out. Does NOT pop either input — caller drains
+// cb_state_scaled after the entire mode-3 block and pops cb_outer at the
+// bottom of each inner-loop iteration.
+//
+// REUSE: direct fork of
+//   qwen36_gdn_decode_owned/device/kernels/compute/qwen36_gdn_decode_owned.cpp
+//   line 389: `add_state_to_out` (renamed for Mamba2 readability).
+FORCE_INLINE void add_state_scaled_outer(
+    uint32_t cb_state_scaled,
+    uint32_t cb_outer,
+    uint32_t tile_index,
+    uint32_t cb_state_out) {
+    reconfig_data_format(cb_state_scaled, cb_outer);
+    pack_reconfig_data_format(cb_state_out);
+    add_tiles_init(cb_state_scaled, cb_outer);
+    cb_wait_front(cb_state_scaled, tile_index + 1);
+    cb_wait_front(cb_outer, ONE_TILE);
+    cb_reserve_back(cb_state_out, ONE_TILE);
+
+    tile_regs_acquire();
+    add_tiles(cb_state_scaled, cb_outer, tile_index, 0, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_state_out);
+    tile_regs_release();
+
+    cb_push_back(cb_state_out, ONE_TILE);
+}
 
 // TODO(G1 day-4): C_state_reduce(cb_C, cb_state, head_dim_tile, cb_y_partial)
 //
@@ -358,6 +486,9 @@ void kernel_main() {
     constexpr uint32_t cb_y_partial  = get_compile_time_arg_val(12);
     constexpr uint32_t cb_state_out  = get_compile_time_arg_val(13);
     constexpr uint32_t cb_y          = get_compile_time_arg_val(14);
+    // G1 day-4 (debug_mode=3) scratch CBs:
+    constexpr uint32_t cb_x_col      = get_compile_time_arg_val(15);
+    constexpr uint32_t cb_outer      = get_compile_time_arg_val(16);
 
     // Runtime args:
     //   block_count       : how many (batch, head) blocks this core owns
@@ -427,26 +558,23 @@ void kernel_main() {
         else if (debug_mode == 2) {
             // ── Mode 2: state_out = decay * state_in, no input contribution ───
             // Pipeline:
-            //   compute_decay(cb_A_log → cb_decay)               // packs A
-            //   finalize_decay(cb_decay, cb_dt, cb_dt_bias, cb_dt_B)
-            //                                                    // overwrites
-            //                                                    // cb_decay with
-            //                                                    // exp(dt_eff*A)
+            //   compute_decay(cb_A_log → cb_decay)
+            //   compute_dt_eff(cb_dt, cb_dt_bias → cb_dt_B [scratch slot])
+            //   multiply_decay_by_dt_eff(cb_decay, cb_dt_B)
             //   loop: mul_decay_state_to over (head_dim, ssm_state) tiles
             //
-            // Day-3.5 status: compute_decay + finalize_decay both functional.
-            // Output of mode 2: state_out = decay * state_in (matches oracle's
-            // decay-state-update without the input contribution term).
-            //
-            // cb_dt_B is reused as dt_eff scratch (decision D11 double-duty —
-            // safe because debug_mode=2 does NOT consume cb_dt_B for its
-            // intended dt_eff*B production purpose; that fires at mode 3+).
+            // cb_dt_B is reused as the dt_eff scratch (decision D11 double-duty).
+            // Mode 2 doesn't need dt_eff for anything past the decay-finalize,
+            // so we pop the dt_eff tile from cb_dt_B at end-of-block.
+            // (At day-4 mode=3, compute_dt_B consumes the dt_eff tile and
+            // pushes ssm_state_tiles dt_B tiles in its place.)
             compute_decay(cb_A_log, cb_decay);
-            finalize_decay_with_dt_eff(
-                cb_decay, cb_dt, cb_dt_bias, cb_dt_B,
+            compute_dt_eff(
+                cb_dt, cb_dt_bias, cb_dt_B,
                 SOFTPLUS_BETA_BITS, SOFTPLUS_BETA_RECIP_BITS,
                 SOFTPLUS_THRESHOLD_BITS,
                 TIME_STEP_FLOOR_BITS, TIME_STEP_MAX_BITS);
+            multiply_decay_by_dt_eff(cb_decay, cb_dt_B);
 
             // state has shape [head_dim_tiles, ssm_state_tiles] tiles.
             // Tile index = head_dim_tile * ssm_state_tiles + ssm_state_tile.
@@ -465,32 +593,87 @@ void kernel_main() {
 
             cb_pop_front(cb_state_in, head_dim_tiles * ssm_state_tiles);
             cb_pop_front(cb_decay, ONE_TILE);
-            // cb_dt, cb_dt_bias, cb_A_log all popped by the helpers above.
-            // cb_dt_B used as scratch and popped by finalize_decay.
+            cb_pop_front(cb_dt_B, ONE_TILE);  // dt_eff scratch (mode=2 doesn't need it)
+            // cb_dt, cb_dt_bias, cb_A_log all popped by helpers above.
+        }
+        else if (debug_mode == 3) {
+            // ── Mode 3: state_out = decay * state_in + dt_eff * x ⊗ B ────────
+            // y still sentinel (output reduce + D·x skip wire at mode=4+).
+            //
+            // Pipeline (G1 day-4):
+            //   compute_decay(cb_A_log → cb_decay)                 [A scalar]
+            //   compute_dt_eff(cb_dt, cb_dt_bias → cb_dt_B)        [dt_eff @ front]
+            //   multiply_decay_by_dt_eff(cb_decay, cb_dt_B)        [decay scalar]
+            //   compute_dt_B(cb_dt_B, cb_B, ssm_state_tiles)       [dt_B[0..3]]
+            //   for d in head_dim_tiles:
+            //     transpose_x_to_col(cb_x, d → cb_x_col)
+            //     for s in ssm_state_tiles:
+            //       mul_decay_state_to → cb_state_scaled
+            //       matmul_outer_x_dt_B → cb_outer
+            //       add_state_scaled_outer → cb_state_out
+            //       pop cb_outer
+            //     pop cb_x_col
+            //   fill_one(cb_y) × head_dim_tiles
+            //
+            // Per-tile math:
+            //   state_out[d, s][i, j] = decay * state_in[d, s][i, j]
+            //                         + x[d][i] * (dt_eff * B[s])[j]
+            //
+            // The outer product is realized as matmul(x_col_vec, dt_B_row_vec)
+            // → full 32×32 tile. Pattern forked from GDN's mul_outer /
+            // matmul_outer (see helper comments).
+            compute_decay(cb_A_log, cb_decay);
+            compute_dt_eff(
+                cb_dt, cb_dt_bias, cb_dt_B,
+                SOFTPLUS_BETA_BITS, SOFTPLUS_BETA_RECIP_BITS,
+                SOFTPLUS_THRESHOLD_BITS,
+                TIME_STEP_FLOOR_BITS, TIME_STEP_MAX_BITS);
+            multiply_decay_by_dt_eff(cb_decay, cb_dt_B);
+            compute_dt_B(cb_dt_B, cb_B, ssm_state_tiles);
+
+            // DAY-4-DEBUG bisect-step-7: pure isolation — ONE transpose and
+            // ONE matmul total, then fill_one all 8 state_out tiles. If
+            // this hangs, matmul itself in our context is the bug. If it
+            // passes, the issue is matmul-in-loop (state accumulation
+            // between iterations).
+            transpose_x_to_col(cb_x, 0, cb_x_col);
+            matmul_outer_x_dt_B(cb_x_col, cb_dt_B, 0, cb_outer);
+            for (uint32_t i = 0; i < head_dim_tiles * ssm_state_tiles; ++i) {
+                fill_one(cb_state_out);
+            }
+            cb_pop_front(cb_x_col, ONE_TILE);
+            cb_pop_front(cb_outer, ONE_TILE);
+            // Phase 1 sentinel (not used) — drain cb_state_scaled at the bottom
+            // would be wrong here because we never push to it. Skip the phase
+            // 1 drain in this bisect.
+
+            // y still sentinel at mode=3 (mode=4 will wire D*x; mode=5 the full reduce).
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                fill_one(cb_y);
+            }
+
+            // Drain (DAY-4-DEBUG bisect-step-2: cb_x_col untouched).
+            cb_pop_front(cb_x, head_dim_tiles);
+            cb_pop_front(cb_state_in, head_dim_tiles * ssm_state_tiles);
+            cb_pop_front(cb_state_scaled, head_dim_tiles * ssm_state_tiles);
+            cb_pop_front(cb_decay, ONE_TILE);
+            cb_pop_front(cb_dt_B, ssm_state_tiles);
+            cb_pop_front(cb_C, ssm_state_tiles);
+            cb_pop_front(cb_D, ONE_TILE);
+            cb_pop_front(cb_z, head_dim_tiles);
         }
         //
-        // TODO(G1 day-3.5): debug_mode == 3
-        //
-        // Add compute_dt_B + add_outer_input(cb_state_scaled, cb_x, cb_dt_B,
-        //                                    cb_state_out)
-        // State now correct. y still sentinel.
-        // Gate: state_out matches oracle's post-update state; y == 1.0.
-        //
-        // TODO(G1 day-4): debug_mode == 4
+        // TODO(G1 day-4.5): debug_mode == 4
         //
         // Wire add_skip(cb_y_partial, cb_x, cb_D, cb_y) with cb_y_partial == 0.
         // i.e. y = D * x only (skip C·state reduce).
         // Gate: y == D·x bit-close.
         //
-        // TODO(G1 day-4.5): debug_mode == 0 / 5 (production)
+        // TODO(G1 day-4.5+): debug_mode == 0 / 5 (production)
         //
         // Wire C_state_reduce(cb_C, cb_state_out, _, cb_y_partial) ahead of
         // add_skip. Full math live.
         // Gate: G0a harness PASS at cos ≥ 0.999 vs numpy oracle, both 1-step
         //       AND 8-step multi-step replay.
-        //
-        // (For now, debug_mode != 1 paths are NOT IMPLEMENTED — kernel will
-        // produce no output and the reader/writer pipeline will stall.
-        // This is intentional: the day's gate is mode=1 only.)
     }
 }
