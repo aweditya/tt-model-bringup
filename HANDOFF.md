@@ -62,7 +62,15 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.3 (multi-step decode + long-context smoke).
+**Phase 1 — exact next task**: v0.2.5 (on-device tensor flow refactor).
+Inserted 2026-06-05 between v0.2 and v0.3 because the existing block_eager
+functions take numpy / return numpy → 52 host round trips per forward
+(~77s/step measured). Needle-haystack at L=8192 = 7+ days at that rate.
+Refactor adds `attn_block_eager_tt`, `mamba2_block_eager_tt`,
+`moe_block_eager_ep_tt` variants taking + returning `ttnn.Tensor`.
+Streaming weight pattern still works (orthogonal to tensor flow).
+Regression gate: v0.2.b smoke through new tt-flow PASS (argmax=6993).
+
 v0.2 COMPLETE 2026-06-05 — full 52-layer streamed forward + final_norm
 + lm_head + argmax matches HF (commit `5ffd183`). TT argmax_last = 6993
 = HF argmax_last ✓. Streaming pattern: bootstrap top-level only, then
