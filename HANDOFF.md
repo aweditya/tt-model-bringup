@@ -62,7 +62,29 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.2.c — silu + split + SSD loop + MambaRMSNormGated + out_proj + residual.
+**Phase 1 — exact next task**: v0.1.2.d — single-position SSD oracle vs HF.
+v0.1.2.c PARTIAL (commit `587ae06`): the full on-device L0 Mamba2 chain
+mechanically runs end-to-end (pre-norm + in_proj + conv1d + silu + split
++ SSD-via-wrapper + MambaRMSNormGated + out_proj + residual), but the
+gates fail at cos 0.957-0.982 (gate ≥ 0.999).
+
+**Root cause** (debug helper `nemotron3_v012c_debug_numpy_ref.py`):
+even with HF-correct in_proj + conv1d inputs + pure numpy fp32 SSD via
+our oracle + numpy MambaRMSNormGated, cos vs HF L0_norm is only 0.957
+(norm-then-gate) or 0.838 (gate-then-norm). Our
+`experiments/utils/mamba2_numpy_oracle.py:mamba2_decode_step` drifts
+from HF `mamba_chunk_scan_combined`. The on-device kernel + wrapper
+match our oracle perfectly (cos=0.999998 in isolation per memory) —
+but the oracle itself differs from HF.
+
+v0.1.2.d: focused single-position SSD probe. Feed HF L0_in_proj +
+L0_conv1d (post-causal-slice + post-silu) → split → run our numpy
+oracle for ONE position → compare to HF's actual SSD output at that
+step. Localize the drift (dt path? clamp? GQA broadcast?). Once
+oracle matches HF, kernel + wrapper auto-match → v0.1.2.c gates flip.
+
+Wrapper mesh-awareness landed (`isinstance(device, ttnn.MeshDevice)`
+branches the upload + readback).
 v0.1.2.b DONE 2026-06-05 (`745a438`): `ttnn.conv1d(groups=conv_dim=6144,
 kernel=4, padding=3 sym)` works first try after fixing the L1_SMALL
 bootstrap config ([[reference-l1-small-for-conv1d]]). 3/3 gates PASS
