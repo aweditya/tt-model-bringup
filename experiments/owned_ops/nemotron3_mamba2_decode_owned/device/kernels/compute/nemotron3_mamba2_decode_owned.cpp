@@ -322,11 +322,12 @@ FORCE_INLINE void transpose_x_to_col(
     uint32_t cb_x,
     uint32_t tile_index,
     uint32_t cb_x_col) {
-    // DAY-4-DEBUG bisect-step-5: removed unary_op_init_common (was causing
-    // hang likely by re-initializing pipeline state in a way that breaks
-    // the SHORT inits used by subsequent binary ops). Rely on the
-    // transpose_wh_init_short alone — the inner-loop helpers re-issue
-    // their own short inits.
+    // GDN canonical pattern: unary_op_init_common is required to fully
+    // re-init the LLK pipeline so subsequent matmul calls don't inherit
+    // sticky unpacker state. Verified empirically — without this, multiple
+    // matmuls in the inner loop hang (step-10). With it (+ transpose
+    // inside the inner loop per GDN), the kernel runs.
+    unary_op_init_common(cb_x, cb_x_col);
     transpose_wh_init_short(cb_x);
     pack_reconfig_data_format(cb_x_col);
     cb_wait_front(cb_x, tile_index + 1);
@@ -631,31 +632,52 @@ void kernel_main() {
             multiply_decay_by_dt_eff(cb_decay, cb_dt_B);
             compute_dt_B(cb_dt_B, cb_B, ssm_state_tiles);
 
-            // DAY-4-DEBUG bisect-step-7: pure isolation — ONE transpose and
-            // ONE matmul total, then fill_one all 8 state_out tiles. If
-            // this hangs, matmul itself in our context is the bug. If it
-            // passes, the issue is matmul-in-loop (state accumulation
-            // between iterations).
-            transpose_x_to_col(cb_x, 0, cb_x_col);
-            matmul_outer_x_dt_B(cb_x_col, cb_dt_B, 0, cb_outer);
-            for (uint32_t i = 0; i < head_dim_tiles * ssm_state_tiles; ++i) {
+            // Prime the matmul engine with a bare mm_init before the
+            // inner loop. GDN does an actual matmul_reduce before its
+            // analogous transpose+matmul_outer loop, which warms up the
+            // LLK matmul state; we don't have an analogous prior matmul
+            // (the C·state reduce lands at day-4.5 / mode=5), so issue
+            // a bare mm_init here. Without this, the second matmul in
+            // the inner loop hangs the TRISC pipeline.
+            //
+            // GDN canonical pattern: transpose INSIDE the inner loop,
+            // once per matmul. transpose_x_to_col's unary_op_init_common
+            // fully re-inits the LLK pipeline before each matmul, which
+            // is required to avoid the sticky-unpacker-state hang
+            // (research: tt-metal #15930, no transpose_wh_uninit).
+            // The trade-off: per-iter transpose duplicates work
+            // (we transpose x[d] ssm_state_tiles=4× per d). G2 perf
+            // pass can revisit if it materially matters.
+            mm_init(cb_x, cb_dt_B, cb_outer);
+
+            // DAY-4-DEBUG bisect-step-14: 1 iter with d=1, s=0.
+            // (state_out positions 0..3 are sentinel, position 4 real,
+            // 5..7 sentinel.) If this hangs, d=1 itself is the problem.
+            for (uint32_t s = 0; s < 4; ++s) {
                 fill_one(cb_state_out);
             }
-            cb_pop_front(cb_x_col, ONE_TILE);
-            cb_pop_front(cb_outer, ONE_TILE);
-            // Phase 1 sentinel (not used) — drain cb_state_scaled at the bottom
-            // would be wrong here because we never push to it. Skip the phase
-            // 1 drain in this bisect.
+            {
+                const uint32_t tile_idx = 1 * ssm_state_tiles + 0;
+                transpose_x_to_col(cb_x, 1, cb_x_col);
+                matmul_outer_x_dt_B(cb_x_col, cb_dt_B, 0, cb_outer);
+                mul_decay_state_to(cb_state_in, cb_decay, tile_idx, cb_state_scaled);
+                add_state_scaled_outer(cb_state_scaled, cb_outer, tile_idx, cb_state_out);
+                cb_pop_front(cb_x_col, ONE_TILE);
+                cb_pop_front(cb_outer, ONE_TILE);
+            }
+            for (uint32_t s = 5; s < ssm_state_tiles * head_dim_tiles; ++s) {
+                fill_one(cb_state_out);
+            }
 
             // y still sentinel at mode=3 (mode=4 will wire D*x; mode=5 the full reduce).
             for (uint32_t d = 0; d < head_dim_tiles; ++d) {
                 fill_one(cb_y);
             }
 
-            // Drain (DAY-4-DEBUG bisect-step-2: cb_x_col untouched).
+            // Drain. (step-14: state_scaled has 1 tile pushed.)
             cb_pop_front(cb_x, head_dim_tiles);
             cb_pop_front(cb_state_in, head_dim_tiles * ssm_state_tiles);
-            cb_pop_front(cb_state_scaled, head_dim_tiles * ssm_state_tiles);
+            cb_pop_front(cb_state_scaled, ONE_TILE);
             cb_pop_front(cb_decay, ONE_TILE);
             cb_pop_front(cb_dt_B, ssm_state_tiles);
             cb_pop_front(cb_C, ssm_state_tiles);
