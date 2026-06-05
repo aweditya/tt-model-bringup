@@ -62,7 +62,19 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.2.b — L0 Mamba2 conv1d step.
+**Phase 1 — exact next task**: v0.1.2.c — silu + split + SSD loop + MambaRMSNormGated + out_proj + residual.
+v0.1.2.b DONE 2026-06-05 (`745a438`): `ttnn.conv1d(groups=conv_dim=6144,
+kernel=4, padding=3 sym)` works first try after fixing the L1_SMALL
+bootstrap config ([[reference-l1-small-for-conv1d]]). 3/3 gates PASS
+(H/I 0.999949, C 0.999991). Now adding:
+- ttnn.silu on conv1d_out
+- split into x[B,S,NUM_HEADS,HEAD_DIM]/B[B,S,N_GROUPS,SSM_STATE]/C[same]
+- per-position SSD loop using `mamba2_decode_step_ttnn` wrapper
+  (5 calls; ssm_state accumulates across positions)
+- MambaRMSNormGated (head_dim=64 groups, gated by z·silu) — needs
+  to be composed of ttnn ops; check existing wiki/35B code first
+- out_proj matmul
+- residual add
 v0.1.2.a DONE 2026-06-05 (commit `490f89f`): `upload_mamba2_layer`
 adds {norm, in_proj, out_proj} replicated on the mesh; tiny ops
 (conv1d_w/b, dt_bias, A_log, D, mixer_norm_w) held host-side for now.
