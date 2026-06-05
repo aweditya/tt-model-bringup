@@ -132,11 +132,15 @@ def main() -> int:
 
     log("loading model (bf16, CPU)…")
     t0 = time.time()
+    # use_mamba_kernels=False avoids the modeling code's hard import of
+    # `mamba-ssm` (which is CUDA-only). On CPU we route through a slower
+    # but pure-PyTorch Mamba2 path — fine for one-shot oracle generation.
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
+        use_mamba_kernels=False,
     )
     model.eval()
     log(f"  model loaded in {time.time() - t0:.1f}s")
