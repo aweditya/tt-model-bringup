@@ -85,11 +85,14 @@ def main(state=None) -> int:
     os.environ.setdefault("NEMOTRON3_MOE_MODE", "ep")
 
     log("loading HF oracle…")
-    prompt_ids = np.load(ORACLE_DIR / "prompt_ids.npy")
+    # Read structured fields from meta.json — prompt_ids.npy is overwritten
+    # to full_ids when --gen N is used (matches the per-position oracle layout).
     meta = json.loads((ORACLE_DIR / "meta.json").read_text())
-    full_ids = np.asarray(meta.get("full_ids", []), dtype=np.int64)
+    prompt_ids = np.asarray(meta["prompt_ids"], dtype=np.int64)
+    full_ids = np.asarray(meta.get("full_ids", meta["prompt_ids"]), dtype=np.int64)
     n_gen = int(meta.get("gen", 0))
-    log(f"  prompt_ids ({len(prompt_ids)}): {prompt_ids.tolist()}")
+    prompt_len = int(meta.get("prompt_len", len(prompt_ids)))
+    log(f"  prompt_ids ({prompt_len}): {prompt_ids.tolist()}")
     log(f"  oracle gen={n_gen}; full_ids ({len(full_ids)}): {full_ids.tolist()}")
     if n_gen < 1:
         log("WARNING: oracle has gen=0 — only step 0 has HF ground truth.")
