@@ -499,14 +499,28 @@ class State:
         self.per_layer_tt: list = []
         self.key_to_shard = None  # set by bootstrap; reused by upload_one_layer
         self.weight_np_cache: dict = {}  # v0.2.6 — keyed by safetensors name
-        # v0.3.1.b — multi-step decode state. Lazily populated per layer.
+        # v0.3.1.b/c — multi-step decode state. Lazily populated per layer.
         # ssm_state_np[L]: numpy fp32 [B, NH, HD, SS] for Mamba2 layers
-        # kv_K_cache_tt[L], kv_V_cache_tt[L]: ttnn tensors for Attention layers
+        # kv_K_cache_tt[L] / kv_V_cache_tt[L]: list-of-2 ttnn tensors per Attention layer
+        #   (Gemma-4-style two-call: one cache per KV head; NKV_PER_CHIP=1)
         # cur_pos: int — position of the next token to be processed
         self.ssm_state_np: list = []
         self.kv_K_cache_tt: list = []
         self.kv_V_cache_tt: list = []
         self.cur_pos: int = 0
+        # v0.3.1.c paged decode support buffers (lifted from server_35b_ttnn.py:1875-1924).
+        # cur_pos_buf: int32 [1] device, ROW_MAJOR replicated — updated each
+        #   decode step via ttnn.copy_host_to_device_tensor (NEVER realloc).
+        # page_table_tt: int32 [1, NUM_BLOCKS] ROW_MAJOR replicated, identity.
+        # paged_write_mem_cfg: HEIGHT_SHARDED L1 for paged_update_cache input tile.
+        # paged_sdpa_progcfg: SDPAProgramConfig(CoreCoord(4,4), 0, 0, exp_approx=False).
+        # sdpa_compute_kernel_config: B3 recipe (HiFi2 + math_approx=False +
+        #   fp32_dest_acc_en=False + packer_l1_acc=False).
+        self.cur_pos_buf = None
+        self.page_table_tt = None
+        self.paged_write_mem_cfg = None
+        self.paged_sdpa_progcfg = None
+        self.sdpa_compute_kernel_config = None
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────
