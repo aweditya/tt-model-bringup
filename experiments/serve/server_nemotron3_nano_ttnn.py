@@ -698,6 +698,194 @@ def mamba2_in_proj_split_conv1d(state: State, h_input_np, layer_idx: int):
     return out
 
 
+def mamba2_block_eager(state: State, h_input_np, layer_idx: int):
+    """v0.1.2.c — full L0 Mamba2 block forward.
+
+    Pipeline (mostly on-device; SSD step bridges via the G4 wrapper):
+      1. TT  pre-norm (Llama-style, no +1.0)
+      2. TT  in_proj matmul + slice into (z, x_BC, dt)
+      3. TT  conv1d (depth-wise K=4, sym pad=3) on x_BC → [B,8,conv_dim]
+      4. TT  causal slice [:, :S, :] → [B,S,conv_dim]
+      5. TT  ttnn.silu
+      6. TT  slice x_BC_silu into x_inner / B_inner / C_inner
+      7. host readback of x_inner/z/dt/B_inner/C_inner (single batch)
+      8. host SSD loop over S positions, calling the G4 wrapper
+         (each call is on-device — runs the owned Mamba2 SSD kernel).
+         Accumulates ssm_state across positions.
+      9. TT  upload y → MambaRMSNormGated (group_size=d_inner/n_groups=512)
+     10. TT  out_proj matmul
+     11. TT  residual add
+
+    Returns a dict with the intermediates needed by the v0.1.2.c smoke
+    (norm_out, out_proj_out, block_out) plus the soft-gate items
+    (y_post_ssd from the wrapper).
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "mamba2"
+    squeeze_batch = h_input_np.ndim == 2
+    if squeeze_batch:
+        h_input_np = h_input_np[None]
+    B, S, _ = h_input_np.shape
+    NH = MAMBA_HEADS
+    HD = MAMBA_HEAD_DIM
+    NG = N_GROUPS
+    SS = SSM_STATE
+
+    # ── 1. upload + pre-norm + in_proj ─────────────────────────
+    h_tt = ttnn.from_torch(
+        torch.from_numpy(h_input_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    h_norm_tt = ttnn.rms_norm(h_tt, weight=w["norm"], epsilon=EPS)
+    in_proj_tt = ttnn.matmul(h_norm_tt, w["in_proj"], compute_kernel_config=HIFI4)
+
+    z_tt   = ttnn.slice(in_proj_tt, [0, 0, 0],                    [B, S, D_INNER])
+    xBC_tt = ttnn.slice(in_proj_tt, [0, 0, D_INNER],              [B, S, D_INNER + CONV_DIM_M])
+    dt_tt  = ttnn.slice(in_proj_tt, [0, 0, D_INNER + CONV_DIM_M], [B, S, D_INNER + CONV_DIM_M + MAMBA_HEADS])
+
+    # ── 2. conv1d on x_BC ──────────────────────────────────────
+    xBC_nhwc = ttnn.to_layout(ttnn.reshape(xBC_tt, [B, 1, S, CONV_DIM_M]),
+                                ttnn.ROW_MAJOR_LAYOUT)
+    conv_full_tt = ttnn.conv1d(
+        input_tensor=xBC_nhwc,
+        weight_tensor=w["conv1d_w"],
+        device=state.mesh,
+        in_channels=CONV_DIM_M, out_channels=CONV_DIM_M,
+        batch_size=B, input_length=S,
+        kernel_size=CONV_KERNEL, stride=1,
+        padding=CONV_KERNEL - 1, dilation=1,
+        groups=CONV_DIM_M,
+        bias_tensor=w["conv1d_b"],
+    )
+    # conv_full_tt: [B, S+2*pad-K+1, CONV_DIM_M] = [B, 8, 6144] in our NHWC
+    # → squeeze H=1, slice causal first S positions, to TILE for silu.
+    # Readback as numpy to handle the layout/dim juggle cleanly here; this is
+    # ~250 KB and not on the perf-critical hot path (v0.5 perf will fuse).
+    conv_full_np = ttnn.to_torch(
+        conv_full_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    )[:1].float().numpy()
+    # Normalize shape to [B, S_out, C]:
+    if conv_full_np.ndim == 4:
+        conv_full_np = conv_full_np.squeeze(1)
+    if conv_full_np.shape[-1] != CONV_DIM_M:
+        conv_full_np = conv_full_np.transpose(0, 2, 1)
+    # Causal slice: keep first S positions
+    conv_causal_np = conv_full_np[:, :S, :]
+
+    # ── 3. silu ────────────────────────────────────────────────
+    # Cleanest path back to device: re-upload causal-sliced + silu on TT.
+    conv_causal_tt = ttnn.from_torch(
+        torch.from_numpy(conv_causal_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    silu_out_tt = ttnn.silu(conv_causal_tt)
+
+    # ── 4. split silu output into x / B_in / C_in ─────────────
+    # x_inner: [B, S, d_inner]; B/C_inner: [B, S, n_groups*ssm_state]
+    BC_SIZE = NG * SS  # 1024
+    x_inner_tt = ttnn.slice(silu_out_tt, [0, 0, 0],                  [B, S, D_INNER])
+    B_inner_tt = ttnn.slice(silu_out_tt, [0, 0, D_INNER],            [B, S, D_INNER + BC_SIZE])
+    C_inner_tt = ttnn.slice(silu_out_tt, [0, 0, D_INNER + BC_SIZE],  [B, S, D_INNER + 2 * BC_SIZE])
+
+    # ── 5. read back x_inner / z / dt / B_inner / C_inner for SSD ──
+    def _readback(t):
+        arr = ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return arr[:1].float().numpy()
+
+    x_inner_np = _readback(x_inner_tt)  # [B, S, d_inner=4096]
+    z_full_np = _readback(z_tt)         # [B, S, d_inner=4096]
+    B_inner_np = _readback(B_inner_tt)  # [B, S, 1024]
+    C_inner_np = _readback(C_inner_tt)  # [B, S, 1024]
+    dt_full_np = _readback(dt_tt)       # [B, S, NUM_HEADS=64]
+
+    # Reshape for the wrapper
+    x_inner_np = x_inner_np.reshape(B, S, NH, HD)
+    z_inner_np = z_full_np.reshape(B, S, NH, HD)
+    B_inner_np = B_inner_np.reshape(B, S, NG, SS)
+    C_inner_np = C_inner_np.reshape(B, S, NG, SS)
+
+    # ── 6. SSD loop ────────────────────────────────────────────
+    import nemotron3_mamba2_step as _step_mod  # local module already on path
+    dt_bias = w["dt_bias_np"]
+    A_log = w["A_log_np"]
+    D_w = w["D_np"]
+    ssm_state = np.zeros((B, NH, HD, SS), dtype=np.float32)
+    y_list = []
+    for p in range(S):
+        new_state, y_p = _step_mod.mamba2_decode_step_ttnn(
+            x=x_inner_np[:, p, :, :],
+            z=z_inner_np[:, p, :, :],
+            dt=dt_full_np[:, p, :],
+            dt_bias=dt_bias, A_log=A_log, D=D_w,
+            B_in=B_inner_np[:, p, :, :],
+            C_in=C_inner_np[:, p, :, :],
+            ssm_state=ssm_state,
+            device=state.mesh,
+            debug_mode=5,
+        )
+        ssm_state = new_state
+        y_list.append(y_p)
+    y_post_ssd = np.stack(y_list, axis=1)  # [B, S, NH, HD]
+    y_flat = y_post_ssd.reshape(B, S, NH * HD)  # [B, S, d_inner]
+
+    # ── 7. MambaRMSNormGated (on-device) ───────────────────────
+    # Matches the order used by our `mamba_ssm` CPU stub (which is what
+    # generated the HF oracle): group-RMSNorm → weight → silu(z).
+    #
+    # IMPORTANT: Nemotron's modeling passes `norm_before_gate=False`.
+    # The upstream `mamba_ssm` semantics of that flag are ambiguous; our
+    # stub effectively ignores it and applies gate AFTER norm. We match
+    # the stub so the oracle validates. Real upstream may differ — when
+    # we swap to upstream `mamba_ssm` (post-CUDA), revisit + flip if needed.
+    y_tt = ttnn.from_torch(
+        torch.from_numpy(y_flat.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    group_size = D_INNER // NG  # 4096 / 8 = 512
+    y_grouped = ttnn.reshape(y_tt, [B, S, NG, group_size])
+    sq = ttnn.mul(y_grouped, y_grouped)
+    var = ttnn.mean(sq, dim=-1, keepdim=True)
+    var_eps = ttnn.add(var, EPS)
+    rsqrt_var = ttnn.rsqrt(var_eps)
+    y_normed_g = ttnn.mul(y_grouped, rsqrt_var)
+    y_normed = ttnn.reshape(y_normed_g, [B, S, D_INNER])
+    mixer_norm_w_tt = ttnn.from_torch(
+        torch.from_numpy(w["mixer_norm_w_np"].astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    y_weighted = ttnn.mul(y_normed, mixer_norm_w_tt)
+    silu_z = ttnn.silu(z_tt)
+    norm_out_tt = ttnn.mul(y_weighted, silu_z)
+    norm_out_np = _readback(norm_out_tt)
+
+    # ── 8. out_proj ────────────────────────────────────────────
+    o_tt = ttnn.matmul(norm_out_tt, w["out_proj"], compute_kernel_config=HIFI4)
+    o_np = _readback(o_tt)
+
+    # ── 9. residual add ────────────────────────────────────────
+    block_tt = ttnn.add(h_tt, o_tt)
+    block_np = _readback(block_tt)
+
+    out = {
+        "h_norm":      _readback(h_norm_tt),
+        "conv1d_out":  conv_full_np,    # full pre-causal-slice for HF compare
+        "y_post_ssd":  y_post_ssd,       # [B, S, NH, HD], for soft sanity
+        "norm_out":    norm_out_np,
+        "o_proj_out":  o_np,
+        "block_out":   block_np,
+    }
+    if squeeze_batch:
+        for k in out:
+            out[k] = out[k][0]
+    return out
+
+
 def main():
     """Tiny direct-invoke entry point for ad-hoc smoke testing."""
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)

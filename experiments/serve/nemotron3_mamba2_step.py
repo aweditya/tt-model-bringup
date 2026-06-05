@@ -163,17 +163,29 @@ def mamba2_decode_step_ttnn(
     C_padded = _replicate_per_group_to_per_head(C_in_np, num_heads)
 
     # ── Upload ──────────────────────────────────────────────────────
+    # Detect mesh device — needs ReplicateTensorToMesh on upload AND
+    # ConcatMeshToTensor + [:1] on readback. Single-device path stays
+    # as-is. The Nemotron-3 server uses a (1,4) mesh; the original G2/G3
+    # smoke probes used a single device.
+    is_mesh = isinstance(device, ttnn.MeshDevice)
+
     def tt_bf16(arr):
-        return ttnn.from_torch(
-            torch.from_numpy(np.ascontiguousarray(arr)),
+        kwargs = dict(
             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device,
         )
+        if is_mesh:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(device)
+        return ttnn.from_torch(torch.from_numpy(np.ascontiguousarray(arr)),
+                                 **kwargs)
 
     def tt_fp32(arr):
-        return ttnn.from_torch(
-            torch.from_numpy(np.ascontiguousarray(arr)),
+        kwargs = dict(
             dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device,
         )
+        if is_mesh:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(device)
+        return ttnn.from_torch(torch.from_numpy(np.ascontiguousarray(arr)),
+                                 **kwargs)
 
     x_tt        = tt_bf16(x_padded)
     z_tt        = tt_bf16(z_padded)
@@ -192,10 +204,20 @@ def mamba2_decode_step_ttnn(
         debug_mode=debug_mode,
     )
 
-    # ── Read back ────────────────────────────────────────────────────
-    state_kernel = ttnn.to_torch(state_out_tt).cpu().numpy()
-    y_kernel_padded = ttnn.to_torch(
-        ttnn.typecast(y_out_tt, ttnn.float32)).cpu().numpy()
+    # ── Read back (mesh-aware) ───────────────────────────────────────
+    if is_mesh:
+        composer = ttnn.ConcatMeshToTensor(device, dim=0)
+        state_kernel = ttnn.to_torch(state_out_tt, mesh_composer=composer)
+        # Replicated → 4 identical chip slabs along dim 0; keep chip 0.
+        state_kernel = state_kernel[:B_].cpu().numpy()
+        y_kernel_padded = ttnn.to_torch(
+            ttnn.typecast(y_out_tt, ttnn.float32),
+            mesh_composer=composer)
+        y_kernel_padded = y_kernel_padded[:B_].cpu().numpy()
+    else:
+        state_kernel = ttnn.to_torch(state_out_tt).cpu().numpy()
+        y_kernel_padded = ttnn.to_torch(
+            ttnn.typecast(y_out_tt, ttnn.float32)).cpu().numpy()
 
     # y came back at (B, NUM_HEADS, 32, HEAD_DIM); extract row 0.
     if y_kernel_padded.ndim == 4 and y_kernel_padded.shape[-2] == 32:
