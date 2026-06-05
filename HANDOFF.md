@@ -5,13 +5,21 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## POST-WIN QUICK-START (2026-06-05 08:57 PT) — DAY-4.5 PASSED ✓
+## POST-WIN QUICK-START (2026-06-05 09:09 PT) — **G1 KERNEL COMPLETE** ✓
 
-**Where we are**: G1 **day-4.5 PASSED** — mode=4 ships y math at
-**cos = 0.999998** (essentially bit-perfect). Commit `978f23e`.
-Modes 2/3/4 all green in regression sweep. Full SSM math + y:
+**Where we are**: G1 **single-core kernel DONE**. Modes 1-5 all PASS.
+The Nemotron-3 Mamba2 SSD decode kernel is end-to-end correct on
+single-core, B=1, single-head. Commit `b2c4ccc`.
+
+Production math:
 - `state_out[d, s] = decay * state_in[d, s] + dt_eff * x[d] * B[s]`
-- `y[d] = C · state_in^T[d] + D · x[d]`  (mode 5 will swap state_in→state_out)
+- `y[d] = C · state_out^T[d] + D · x[d]`  ← mode=5 = production
+
+Latest regression sweep:
+- mode=2: state cos=1.000000
+- mode=3: state cos=0.999707, y sentinel
+- mode=4: state cos=0.999707, y cos=**0.999998** (y_naive vs state_in)
+- mode=5: state cos=0.999707, y cos=**0.999852** (PRODUCTION)
 
 **🔑 THE 4-INGREDIENT RECIPE** (memory: [[feedback-mm-init-prime-required]]):
 The Blackhole TRISC pipeline hangs at ~4 transpose+matmul+binary iters
@@ -46,29 +54,33 @@ no effect without the short init.
 
 `cb_outer` is bf16 (matches GDN's tensor_format).
 
-**Exact next task**: G1 **day-4.6** — mode=5 (production-equivalent y).
+**Exact next task**: G1 **day-5** — multi-step replay via G0a harness.
 
-Mode=4's y uses `C · state_in^T` (pre-update state); production needs
-`C · state_out^T` (post-update). The delta is `C · outer`. Add a fixup
-phase that accumulates `delta_y[d] = sum_s(C[s] · outer[d, s])` into
-y_partial before the D·x add. Sketch:
+The kernel is correct for ONE decode step. Production decode runs
+hundreds of sequential steps with state feedback. The G0a harness at
+`experiments/utils/test_mamba2_decode_isolated.py` exercises this:
+1. Initial `state_in[0]`, run kernel → produces `state_out[0], y[0]`
+2. Feed `state_in[1] = state_out[0]`, run kernel → produces step 1
+3. Repeat 8 times; compare each step's outputs to the numpy oracle.
 
-1. New helper `add_C_outer_to_y_partial(cb_C, cb_outer, head_dim_tile,
-   ssm_state_tile, cb_y_partial)` — like a matmul reduce against
-   outer products. Could be done as a small matmul (transpose=1) or as
-   per-tile bcast operations.
-2. In mode=5: same Phase 1-3 as mode=4. In Phase 3 (state-update loop)
-   don't pop cb_outer after add_state_scaled_outer — keep it queued
-   for the C·outer reduce. After the state-update loop, do another
-   matmul-reduce-style phase consuming cb_outer + cb_C, accumulating
-   into cb_y_partial. THEN do the D·x add.
-3. Watch cb_outer capacity (currently 2 tiles); may need bigger CB or
-   redesign to consume per-iteration.
+Gate: per-step cos ≥ 0.999, **no drift past pos 8**. If drift appears
+at later positions, that's a precision / fp32-acc / pack-format issue
+to investigate (not a fundamental correctness bug — single-step is
+proven).
 
-Gate: cos ≥ 0.999 vs `oracle_y = C · state_out^T + D · x` (production
-math, no shortcut).
+Recipe:
+1. Drive the harness with `--kernel-callable ttnn.experimental.nemotron3_mamba2_decode_owned`
+2. Wrap our op signature into the harness's expected callable interface
+3. Run 8 steps, check per-step cos + accumulated drift
 
-**Then G2-G4**: multi-core (shard 64 heads), batched, server wiring.
+**Then G2-G4** (each blocks the next):
+- **G2**: multi-core sharding — fan 64 heads across the Tensix grid
+  (currently 1 core / 1 head). Program-factory work + per-block
+  per-core runtime arg assignment.
+- **G3**: batched (B > 1). Likely needs a different SPMD partition
+  (per-(batch, head) blocks) and minor reader/writer changes.
+- **G4**: Python wrapper + Phase 1 server integration. Replaces the
+  per-step manual ttnn composite in `experiments/serve/server_*_ttnn.py`.
 
 **Memory entries**:
 - [[feedback-mm-init-prime-required]] — the 4-ingredient recipe

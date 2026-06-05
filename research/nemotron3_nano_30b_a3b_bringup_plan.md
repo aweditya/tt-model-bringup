@@ -335,14 +335,22 @@ the per-group broadcast.
     (row-vec form), matching x's layout so the D·x add works with
     plain `add_tiles`. 2 new helpers: mul_D_x_to + add_y_partial_D_x.
     cb_outer reused as D·x scratch.
-  - [ ] **Day-4.6 (next): mode=5 — y_partial fixup with C·outer.**
-    Mode=4's y uses state_in (pre-update); production needs state_out
-    (post-update). Add `y_partial += C · outer` term: for each (d, s),
-    `delta_y[d] = sum_s(C[s] * outer[d, s])` where outer = dt_eff*x⊗B.
-    Then `y[d] = y_partial_corrected[d] + D·x[d]`. Gate: cos ≥ 0.999
-    vs `oracle_y = C·state_out^T + D·x` (production-equivalent).
-  - [ ] Day-5: G0a harness multi-step replay (8 steps), 64-head, B=1.
-    Gate: per-head cos ≥ 0.999 at every step.
+  - [x] **Day-4.6 PASS (2026-06-05): mode=5 — PRODUCTION y = C·state_out^T + D·x.**
+    y_out cos = **0.999852** vs numpy oracle. Commit `b2c4ccc`.
+    Implementation: add CB_STATE_POST_UPDATE (8 tiles fp32) +
+    add_state_scaled_outer_two helper (dual-pack to writer cb_state_out
+    AND compute-read cb_state_post_update). Phase 4 runs a SECOND
+    matmul_reduce_C_state on cb_state_post_update for the corrected
+    y_partial. Phase 2's prime matmul on cb_state_in stays for engine
+    warm-up; its 2 tiles drained before Phase 4 pushes correct values.
+    Forked from GDN's add_state_to_two two-output pattern.
+  - [x] **G1 single-core kernel COMPLETE.** Modes 1-5 all PASS. The
+    Nemotron-3 Mamba2 SSD decode kernel is end-to-end correct on
+    single-core, B=1, single-head. Task #186 DONE.
+  - [ ] **Day-5 (next): G0a harness multi-step replay**. Drive the
+    kernel through 8 sequential decode steps with state feedback
+    (state_out[t] → state_in[t+1]). Gate: per-step cos ≥ 0.999, no
+    drift past pos 8. Harness: `experiments/utils/test_mamba2_decode_isolated.py`.
 - [ ] **G2..G4** — sequential, gated on G1.
 
 Phase 0 timeline estimate: **3-5 weeks** depending on how many of the
