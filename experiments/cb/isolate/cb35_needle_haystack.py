@@ -1,10 +1,11 @@
 """Long-context needle-haystack gate for 35B — runs in the resident
 cb35 dev harness so we don't pay the 14-min bootstrap.
 
-Forks `experiments/needle_haystack_35b_ttnn_inproc.py` (the bootstraps-
-its-own-state version that gated A002+A003+A004+A008 perf wins). Same
-prompt construction, same classify(); only difference is the
-`main(state)` signature that reuses the resident bootstrap.
+Forks `archive/experiments_oneoff_probes_2026-06-04/needle_haystack_35b_ttnn_inproc.py`
+(the bootstraps-its-own-state version that gated A002+A003+A004+A008
+perf wins; archived 2026-06-04). Same prompt construction, same
+classify(); only difference is the `main(state)` signature that
+reuses the resident bootstrap.
 
 This is the user-facing gate for the 2026-06-04 drift-resolution
 finding ([[35b-drift-resolved-2026-06-04]]). Teacher-forced cosine
@@ -37,7 +38,7 @@ import ttnn  # noqa: F401  (kept for harness consistency)
 import server_35b_ttnn as srv
 
 # Reuse the same haystack distractor for apples-to-apples comparison
-# against `experiments/needle_haystack_35b_ttnn_inproc.py`.
+# against `archive/experiments_oneoff_probes_2026-06-04/needle_haystack_35b_ttnn_inproc.py`.
 DISTRACTOR = (
     "The history of computing spans many centuries from the abacus to "
     "modern silicon chips. Early mechanical calculators like the "

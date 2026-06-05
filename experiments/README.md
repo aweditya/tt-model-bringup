@@ -14,8 +14,8 @@ full repo map are in [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
 | `kernel_patches/` | JIT device-kernel patches (no rebuild). |
 | `utils/` | Re-usable diagnostics — see `utils/README.md`. |
 
-Loose top-level scripts are one-off benches/tests (`bench_*`, `test_*`,
-`demo_qwen36_27b.py`). Retired bringup probes live in `../archive/`; the
+Retired bringup probes (top-level `bench_*` / `test_*` one-offs,
+`demo_qwen36_27b.py`, pre-CB serve stack) live in `../archive/`. The
 multi-model demos (Llama/Qwen/SmolLM/8B) are in [`../models/`](../models/README.md).
 
 ## Playbooks
