@@ -19,12 +19,18 @@ def main():
     show_doc = "--doc" in sys.argv
     keyword = args[0].lower()
     ns = args[1] if len(args) > 1 else "ttnn"
-    parts = ns.split(".")
     import importlib
     import inspect
-    mod = importlib.import_module(parts[0])
-    for p in parts[1:]:
-        mod = getattr(mod, p)
+    # importlib.import_module handles dotted paths AND lazy-imports
+    # submodules (e.g. `ttnn.experimental`); plain `getattr` does not.
+    try:
+        mod = importlib.import_module(ns)
+    except ImportError:
+        # Fallback for non-importable attribute paths (e.g. a class method).
+        parts = ns.split(".")
+        mod = importlib.import_module(parts[0])
+        for p in parts[1:]:
+            mod = getattr(mod, p)
     matches = [x for x in dir(mod) if keyword in x.lower()]
     print(f"{ns}: {len(matches)} matches for '{keyword}'")
     for m in matches:

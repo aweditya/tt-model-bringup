@@ -5,9 +5,45 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## POST-COMPACTION QUICK-START (2026-06-04 11:55 PT)
+## NEW HEADLINE (2026-06-04, post-demo): MM7 — Nemotron-3 Nano 30B-A3B
 
-**User's current priorities (in order)**:
+Stanford CS440LX **demo shipped successfully** 2026-06-04 (27B + Gemma 4 12B
+live chat via the TUI, [poster v5](presentation/poster.pdf), Qwen 27B PC
+verified end-to-end at 5.1× / 8.0× per-token speedup).
+
+**Next bringup target**: `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`.
+This is a **Mamba2-Transformer HYBRID MoE**, NOT a clean Qwen-MoE clone.
+
+- 52 layers, `MEMEM*EMEMEM*...` pattern → **23 Mamba2 + 23 MoE + 6 Attention**
+- 30-31.6B total / ~3.5B active per token
+- 6 attention layers have NO RoPE (positional info lives in Mamba2 state)
+- MoE is DeepSeek-V3-style (sigmoid + group-restricted top-k + scaling=2.5)
+- Experts use `relu²` activation; shared expert is 2× wider than routed
+- ssm_state must be fp32 on device
+
+**The blocker**: tt-metal does NOT ship a Mamba2 SSD kernel. 23 of 52
+layers depend on it.
+
+**User decision (2026-06-04): Path B — owned Mamba2 SSD kernel up-front.**
+G0..G4 staging mirrors the 35B `qwen36_gdn_decode_owned` build. Phase 0
+(kernel) before Phase 1 (forward/decode/CB/HTTP ladder). Estimated total
+5-8 weeks to v2.
+
+**Plan-of-action**: [`research/nemotron3_nano_30b_a3b_bringup_plan.md`](research/nemotron3_nano_30b_a3b_bringup_plan.md)
+**Architecture brief**: [`research/nemotron3_nano_architecture_brief.md`](research/nemotron3_nano_architecture_brief.md)
+**Tasks**: #183 (G0 numpy oracle), #184 (G0a harness), #185 (G0b qb1 prep,
+parallel), #186 (G1 single-core), #187 (G2 multi-core), #188 (G3 batched),
+#189 (G4 server wrapper) — each blocks the next.
+
+**Current work (2026-06-04)**: G0 in progress — Mamba architecture
+primer for learning (`wiki/`), then numpy oracle + tt-metal SSM survey.
+User explicitly wants to learn the Mamba math themselves.
+
+---
+
+## OLD HEADLINE (kept for reference): demo-day priorities
+
+**Demo-day priorities (2026-06-04 11:55 PT)** — superseded by Nemotron above:
 1. **Get the chat TUI rock-solid** — this is the live demo. 27B + Gemma 4 12B are the demo models. Hardening already shipped (commits `c523d28`, `c88f6d5`, `f20bb81`, `0e5a8f5`, `ee7cd20`). Test it live as soon as server is back.
 2. **Make sure the server runs perfectly on 27B + 12B**. Existing perf numbers are great (see headline below); just verify nothing broke and screenshots get captured for the poster.
 3. **De-prioritise 35B work**. 35B perf/drift/PC fixes can wait — user explicitly said "we can do performance and drift checking for the 35b model haha" meaning skip it.
