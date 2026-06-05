@@ -499,6 +499,14 @@ class State:
         self.per_layer_tt: list = []
         self.key_to_shard = None  # set by bootstrap; reused by upload_one_layer
         self.weight_np_cache: dict = {}  # v0.2.6 — keyed by safetensors name
+        # v0.3.1.b — multi-step decode state. Lazily populated per layer.
+        # ssm_state_np[L]: numpy fp32 [B, NH, HD, SS] for Mamba2 layers
+        # kv_K_cache_tt[L], kv_V_cache_tt[L]: ttnn tensors for Attention layers
+        # cur_pos: int — position of the next token to be processed
+        self.ssm_state_np: list = []
+        self.kv_K_cache_tt: list = []
+        self.kv_V_cache_tt: list = []
+        self.cur_pos: int = 0
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────
@@ -679,6 +687,27 @@ def deallocate_layer(state, L: int):
         except (TypeError, RuntimeError, AttributeError):
             pass  # not a TT tensor (e.g. numpy bias array)
     state.per_layer_tt[L] = None
+
+
+def reset_decode_state(state, B: int = 1):
+    """Initialize/clear the multi-step decode state buffers (v0.3.1.b).
+
+    Mamba2 ssm_state: zero numpy buffers, [B, NH=64, HD=64, SS=128] fp32
+    Attention KV cache: cleared (real allocation lands in v0.3.1.c)
+    cur_pos: 0
+    """
+    n = len(state.layer_types) if state.layer_types else N_LAYERS
+    state.ssm_state_np = [None] * n
+    for L, kind in enumerate(state.layer_types):
+        if kind == "mamba2":
+            state.ssm_state_np[L] = np.zeros(
+                (B, MAMBA_HEADS, MAMBA_HEAD_DIM, SSM_STATE), dtype=np.float32,
+            )
+    # Attention KV cache plumbing lands in v0.3.1.c (paged_update_cache +
+    # paged_sdpa_decode). For v0.3.1.b just clear the slots.
+    state.kv_K_cache_tt = [None] * n
+    state.kv_V_cache_tt = [None] * n
+    state.cur_pos = 0
 
 
 # ── Forward fragments for v0.1.0 validation ───────────────────────────
@@ -1324,7 +1353,22 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     dt_bias = w["dt_bias_np"]
     A_log = w["A_log_np"]
     D_w = w["D_np"]
-    ssm_state = np.zeros((B, NH, HD, SS), dtype=np.float32)
+    # v0.3.1.b: use persistent ssm_state if state.ssm_state_np[L] is
+    # populated (set by reset_decode_state); else fresh zeros. After the
+    # SSD loop, save the final state back so the next call (decode step)
+    # can pick it up. With no persistent buffer (v0.3.0 / v0.3.1.a
+    # quadratic), the state stays internal as before.
+    # Defensive getattr handles harness state-version skew (live State
+    # objects from before this attr existed — [[harness-state-version-skew]]).
+    _ssm_list = getattr(state, "ssm_state_np", None)
+    if (_ssm_list
+            and layer_idx < len(_ssm_list)
+            and _ssm_list[layer_idx] is not None):
+        ssm_state = _ssm_list[layer_idx].copy()
+        _persistent = True
+    else:
+        ssm_state = np.zeros((B, NH, HD, SS), dtype=np.float32)
+        _persistent = False
     y_list = []
     for p in range(S):
         new_state, y_p = _step_mod.mamba2_decode_step_ttnn(
@@ -1340,6 +1384,10 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
         )
         ssm_state = new_state
         y_list.append(y_p)
+    if _persistent:
+        # _ssm_list is the live list; mutate it in place so reload-without-bootstrap
+        # paths see the carry too.
+        _ssm_list[layer_idx] = ssm_state
     y_post_ssd = np.stack(y_list, axis=1)
     y_flat = y_post_ssd.reshape(B, S, NH * HD)
 
