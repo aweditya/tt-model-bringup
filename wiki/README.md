@@ -100,5 +100,19 @@ Each wiki entry follows this format:
 ### Journey Reflection (Wiki 60)
 - [60 — Journey Reflection](60_journey_reflection.md) — Full project retrospective: 91 experiments, 7 models, 3 days
 
+### MoE Dispatch + Trace (Wiki 61-64)
+- [61 — MoE Dispatch Optimization](61_moe_dispatch_optimization.md) — 12.8 → 22.7 tok/s; on-device accumulation, host-device transfer removal
+- [62 — Metal Trace on Blackhole](62_metal_trace_blackhole.md) — Capture/replay mechanics + Blackhole-specific limitations
+- [63 — Dispatch Overhead Analysis](63_dispatch_overhead_analysis.md) — Where MoE time actually goes
+- [64 — PJRT Plugin Environment Probe](64_pjrt_environment_probe.md) — Versions + status on the bringup host
+
+### Kernel Bringup Foundations (Wiki 65-66)
+- [65 — Mamba and state-space models](65_mamba_state_space_models.md) — SSM/SSD math primer; prerequisite for the Nemotron-3 Mamba2 owned kernel
+- [66 — Anatomy of a Blackhole kernel](66_blackhole_kernel_dataflow_anatomy.md) — Tensix tiles, CBs, SPMD work units; mental model before staring at LLK
+
 ### Reference
 - [Q&A: Correctness and Architecture](qa_correctness_and_architecture.md)
+- [Model bringup checklist](bringup_checklist.md) — 7-bug playbook from the Qwen3.6-27B port
+- [Debugging methodology](debugging_methodology.md) — When generation is wrong: how to narrow the search
+- [Profiling guide](profiling_guide.md) — Three views (sync-bounded host timing, Tracy, tt-perf-report)
+- [Seven bugs of Qwen3.6-27B](seven_bugs_case_studies.md) — Detection recipes for each bug
