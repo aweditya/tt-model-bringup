@@ -220,31 +220,71 @@ when we fork the kernel for batching is huge.
 
 ------------------------------------------------------------------------
 
-## D8 — `softplus_tile` via decomposition (TBD: confirm at G1 day-3)
+## D8 — `softplus_tile` direct call (RESOLVED 2026-06-04 G1 day-3)
 
-**Decision (proposed)**: implement `softplus(x) = log1p(exp(x))` as
-two LLK calls (`exp_tile` then `log1p_tile`). If `log1p_tile` doesn't
-exist, decompose to `log(1 + exp(x))` via `exp_tile + add_tile_with_1
-+ log_tile`.
+**Decision**: use `softplus_tile`, `clamp_tile`, `exp_tile`,
+`negative_tile` directly as first-class LLK SFPU primitives. NO
+decomposition.
+
+**LLK API survey result** (G1 day-3): all four primitives ship in
+`/home/aditya/tenstorrent/tt-metal/tt_metal/hw/inc/api/compute/
+eltwise_unary/{softplus,clamp,exp,negative}.h`. Each is a one-line
+SFPU dispatch (`MATH(SFPU_UNARY_…)` macros). Per the user's
+"don't reinvent the wheel for nonlinearity" directive, we adopt
+them as-is.
+
+Specific signatures (verbatim from headers):
+- `softplus_tile(idst, beta, beta_recip, threshold)` —
+  computes `1/beta * log(1 + exp(beta * x))` (clamps above threshold).
+  Standard softplus is beta=1.0, threshold=20.0.
+- `clamp_tile(idst, min_bits, max_bits)` — direct fit for our
+  `clamp(dt_eff, time_step_floor, time_step_max)`. All bit-cast
+  uint32.
+- `exp_tile<approx, scale, InputClamping>()` — template-parameterised.
+  Default `ClampToNegative` handles inputs < ~-88.5 safely (relevant
+  since A = -exp(A_log) can be very negative for large A_log).
+- `negative_tile(idst)` — in-place negate. Used for `A = -exp(A_log)`.
+
+**Future opportunity (deferred)**: a fused `softplus_clamp_tile` would
+save 2-3 cycles per (batch, head). Upstream-able if Tracy shows the
+discretization stage non-trivial at v3.
+
+**Revisit trigger**: at v3 perf pass if discretization shows up in
+Tracy as >5% of per-block time.
+
+------------------------------------------------------------------------
+
+## D11 — Split `compute_decay` into two helpers due to SFPU dest-reg lifetime
+
+**Decision (G1 day-3)**: implement decay computation as TWO helpers:
+1. `compute_decay(...)` — produces `A = -exp(A_log)` in `cb_decay`.
+2. `finalize_decay_with_dt_eff(...)` — multiplies `cb_decay` by
+   recomputed `dt_eff`, then `exp`s the result. Stubbed at day-3;
+   wired at day-3.5.
 
 **Alternatives considered**:
-- **Direct `softplus_tile`** if it exists in the LLK API. Survey
-  needed at G1 day-3.
-- **High-precision stable form**: `max(x, 0) + log1p(exp(-|x|))`. Avoids
-  overflow for large x. Mamba2's dt is bounded after `dt_bias + dt`
-  so direct softplus should be fine.
+- **One monolithic helper**: keep `dt_eff` alive in dest reg across
+  multiple SFPU stages. Blackhole's dest reg is 8 tiles deep; cross-
+  cycle persistence requires careful `tile_regs_*` sequencing.
+- **Recompute `dt_eff` inline twice**: one recompute is cheap (~5
+  cycles) vs adding a CB store/load round-trip (~30 cycles).
 
-**Rationale**: tt-metal's tile-level eltwise unary has `exp_tile` and
-likely `log_tile`. Need to verify `log1p_tile` at G1 day-3 via
-`grep softplus /home/aditya/tenstorrent/tt-metal/tt_metal/llk_api/`.
-If absent, decompose.
+**Rationale**: SFPU primitives consume a single dest tile and produce
+into the same slot. To compute `decay = exp(dt_eff * A)` we need both
+`dt_eff` and `A` in two dest slots simultaneously. The first pass
+fills cb_decay with `A`; the second pass recomputes `dt_eff` (cheap
+since dt + dt_bias scalars are still in their CBs) and multiplies by
+A in-dest, then exps. The recompute is decision-D5-style (one extra
+add + softplus + clamp per block) but keeps each helper as one
+`tile_regs_acquire`/`release` cycle — much easier to debug.
 
-**Future opportunity**: a fused `softplus_tile_clamp` LLK op (one
-unary op for the whole `clamp(softplus(x+bias), floor, max)` chain)
-would save 2-3 cycles per (batch, head). Upstream-able.
+**Future opportunity**: when LLK exposes dst-to-dst SFPU mul (or we
+write a custom `compute_decay_fused` that stashes `dt_eff` in a
+secondary dest slot via `copy_tile_init` patterns), we collapse both
+helpers into one. Saves ~30 cycles per (batch, head). Minor at v3.
 
-**Revisit trigger**: at G1 day-3 (LLK API survey). At v3 if profiling
-shows the discretization stage non-trivial.
+**Revisit trigger**: if Tracy shows >5% time in discretization stage
+at v3 perf pass.
 
 ------------------------------------------------------------------------
 

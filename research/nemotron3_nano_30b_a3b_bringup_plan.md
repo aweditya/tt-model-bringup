@@ -259,9 +259,14 @@ the per-group broadcast.
     pattern. CB layout pinned (15 CBs, cb_x..cb_y). debug_mode=1
     (fill_one smoke) implemented for first-build gate. Six TODO
     blocks for the math helpers with explicit LLK call sequences.
-  - [ ] Day-3: LLK API survey for softplus_tile; implement compute_decay +
-    mul_decay_state_to → debug_mode=2 wired. Program factory +
-    reader/writer tweaks for the new CB layout.
+  - [-] Day-3 (partial): LLK API survey done — softplus/clamp/exp/negative
+    all ship as first-class SFPU primitives (decision D8 RESOLVED, "use
+    what they provide" rule). compute_decay (packs A=-exp(A_log) into
+    cb_decay) + mul_decay_state_to (forked from GDN line 57) + sentinel
+    finalize_decay_with_dt_eff stub shipped. debug_mode=2 wired. New
+    decision D11 documents the split-helper approach.
+    Remaining day-3 work: finalize_decay_with_dt_eff body, program
+    factory + reader/writer for new CB layout.
   - [ ] Day-3.5: compute_dt_B + add_outer_input → debug_mode=3 (state correct).
   - [ ] Day-4: C_state_reduce + add_skip → debug_mode=4..5 (full math).
   - [ ] Day-5: build, oracle compare via G0a harness; ship.
