@@ -20,6 +20,7 @@ uploads ship at v0.1.x). Key deltas vs 35B:
   - Weight key prefix `backbone.*` (vs 35B's `model.language_model.*`)
   - tie_word_embeddings=False — separate `lm_head.weight`
 """
+import math
 import sys
 import time
 from pathlib import Path
@@ -398,100 +399,100 @@ def attn_projections_only(state: State, h_input_np, layer_idx: int):
     return out
 
 
-def numpy_sdpa_gqa_causal(q_np, k_np, v_np, num_q_heads, num_kv_heads, head_dim):
-    """Numpy fp32 reference: causal SDPA with GQA over q/k/v of shape
-    [B, S, NQ*HD], [B, S, NKV*HD], [B, S, NKV*HD]. Returns
-    [B, S, NQ*HD]. Use ONLY for v0.1.1 attention validation —
-    on-device prefill SDPA lands at v0.5 perf.
-    """
-    B, S, _ = q_np.shape
-    HD = head_dim
-    NQ = num_q_heads
-    NKV = num_kv_heads
-    G = NQ // NKV  # GQA group size
-
-    # Reshape to [B, S, NH, HD] → [B, NH, S, HD]
-    q = q_np.reshape(B, S, NQ, HD).transpose(0, 2, 1, 3).astype(np.float32)
-    k = k_np.reshape(B, S, NKV, HD).transpose(0, 2, 1, 3).astype(np.float32)
-    v = v_np.reshape(B, S, NKV, HD).transpose(0, 2, 1, 3).astype(np.float32)
-
-    # GQA broadcast — repeat k, v G times along the head dim.
-    k = np.repeat(k, G, axis=1)  # [B, NQ, S, HD]
-    v = np.repeat(v, G, axis=1)
-
-    # Scores: q @ k.T / sqrt(HD)  →  [B, NQ, S, S]
-    scores = (q @ k.transpose(0, 1, 3, 2)) / np.float32(np.sqrt(HD))
-
-    # Causal mask (upper-triangular -inf)
-    mask = np.triu(np.ones((S, S), dtype=np.float32), k=1) * -1e9
-    scores = scores + mask[None, None, :, :]
-
-    # Softmax over last dim
-    scores -= scores.max(axis=-1, keepdims=True)
-    np.exp(scores, out=scores)
-    scores /= scores.sum(axis=-1, keepdims=True)
-
-    # attn_out = scores @ v → [B, NQ, S, HD] → [B, S, NQ*HD]
-    out = scores @ v
-    out = out.transpose(0, 2, 1, 3).reshape(B, S, NQ * HD)
-    return out
-
-
 def attn_block_eager(state: State, h_input_np, layer_idx: int):
-    """v0.1.1.b — full attention block (pre-norm + qkv + SDPA + o_proj
-    + residual). SDPA runs in numpy fp32 (NKV=2 × NCHIPS=4 doesn't
-    shard; on-device SDPA is a v0.5 perf optimization).
+    """v0.1.1.c — full attention block FULLY ON-DEVICE.
+
+    Forks the 27B prefill pattern at `experiments/serve/server_tp.py:1832`:
+    a single `ttnn.transformer.scaled_dot_product_attention` call. Per
+    [[reference-ttnn-sdpa-gqa-native]], the non-paged prefill kernel
+    takes Q[b,nqh,s,dh] + K/V[b,nkv,s,dh] with `nqh ≠ nkv` as a 1st-class
+    contract — NO caller-side K/V repeat. The NKV>1 contract issue
+    (tt-metal #12330) is decode-only; doesn't fire here.
+
+    Replicated across the mesh (no head sharding yet — v0.5 perf concern).
 
     Input:  h_input_np  numpy fp32  [B, S, HIDDEN] (or [S, HIDDEN])
-    Returns dict with: h_norm, q, k, v (from v0.1.1.a path),
-                       attn_out (post-SDPA, pre-o_proj),
-                       o_proj_out (post-o_proj),
-                       block_out (post-residual = L5 block output).
+    Returns dict with: h_norm, q, k, v, o_proj_out, block_out
+    (all post-readback fp32 numpy for the validator).
     """
     w = state.per_layer_tt[layer_idx]
     assert w is not None and w["kind"] == "attention"
 
-    # Stage 1: pre-norm + projections on TT (already validated v0.1.1.a).
-    res = attn_projections_only(state, h_input_np, layer_idx)
-    q_np, k_np, v_np = res["q"], res["k"], res["v"]
-    h_input_np_3d = h_input_np if h_input_np.ndim == 3 else h_input_np[None]
-    if q_np.ndim == 2:
-        q_np = q_np[None]; k_np = k_np[None]; v_np = v_np[None]
+    squeeze_batch = h_input_np.ndim == 2
+    if squeeze_batch:
+        h_input_np = h_input_np[None]
+    B, S, _ = h_input_np.shape
+    NQ = NUM_Q_HEADS
+    NKV = NUM_KV_HEADS
+    HD = HEAD_DIM_ATTN
 
-    # Stage 2: numpy SDPA (causal + GQA broadcast). Replaceable with
-    # an on-device prefill SDPA at v0.5.
-    attn_out_np = numpy_sdpa_gqa_causal(
-        q_np, k_np, v_np,
-        num_q_heads=NUM_Q_HEADS,
-        num_kv_heads=NUM_KV_HEADS,
-        head_dim=HEAD_DIM_ATTN,
-    )
-
-    # Stage 3: o_proj on TT.
-    attn_out_tt = ttnn.from_torch(
-        torch.from_numpy(attn_out_np.astype(np.float32)),
+    h_input_tt = ttnn.from_torch(
+        torch.from_numpy(h_input_np.astype(np.float32)),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    o_tt = ttnn.matmul(attn_out_tt, w["o_proj"], compute_kernel_config=HIFI4)
-    o_np = ttnn.to_torch(
-        o_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
-    )[:1].float().numpy()
 
-    # Stage 4: residual add (host-side; cheap).
-    block_out = h_input_np_3d.astype(np.float32) + o_np
+    def _readback(t):
+        arr = ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return arr[:1].float().numpy()
+
+    # Stage 1: pre-norm (Llama-style)
+    h_norm_tt = ttnn.rms_norm(h_input_tt, weight=w["norm"], epsilon=EPS)
+    h_norm_np = _readback(h_norm_tt)
+
+    # Stage 2: Q/K/V projections
+    q_tt = ttnn.matmul(h_norm_tt, w["q_proj"], compute_kernel_config=HIFI4)
+    k_tt = ttnn.matmul(h_norm_tt, w["k_proj"], compute_kernel_config=HIFI4)
+    v_tt = ttnn.matmul(h_norm_tt, w["v_proj"], compute_kernel_config=HIFI4)
+    q_np = _readback(q_tt); k_np = _readback(k_tt); v_np = _readback(v_tt)
+
+    # Stage 3: reshape + transpose to [B, NH, S, HD] for SDPA.
+    # ttnn.reshape splits the last dim into (heads, head_dim);
+    # ttnn.transpose then swaps the seq and head axes (B, S, NH, HD)
+    # → (B, NH, S, HD).
+    q4 = ttnn.transpose(ttnn.reshape(q_tt, [B, S, NQ, HD]), 1, 2)
+    k4 = ttnn.transpose(ttnn.reshape(k_tt, [B, S, NKV, HD]), 1, 2)
+    v4 = ttnn.transpose(ttnn.reshape(v_tt, [B, S, NKV, HD]), 1, 2)
+    ttnn.deallocate(q_tt); ttnn.deallocate(k_tt); ttnn.deallocate(v_tt)
+
+    # Stage 4: single on-device SDPA call. GQA is native (NQ ≠ NKV
+    # is part of the contract); the kernel broadcasts K/V internally.
+    # Scale = 1/sqrt(HD) is the standard attention scale Nemotron uses.
+    attn_tt = ttnn.transformer.scaled_dot_product_attention(
+        q4, k4, v4,
+        is_causal=True,
+        scale=1.0 / math.sqrt(HD),
+        compute_kernel_config=B3_HIFI2,
+    )
+    ttnn.deallocate(q4); ttnn.deallocate(k4); ttnn.deallocate(v4)
+
+    # Stage 5: transpose + reshape back to [B, S, NQ*HD] for o_proj.
+    attn_tt = ttnn.transpose(attn_tt, 1, 2)
+    attn_tt = ttnn.reshape(attn_tt, [B, S, NQ * HD])
+
+    # Stage 6: o_proj
+    o_tt = ttnn.matmul(attn_tt, w["o_proj"], compute_kernel_config=HIFI4)
+    o_np = _readback(o_tt)
+    ttnn.deallocate(attn_tt)
+
+    # Stage 7: residual add on-device
+    block_tt = ttnn.add(h_input_tt, o_tt)
+    block_np = _readback(block_tt)
+    ttnn.deallocate(h_input_tt); ttnn.deallocate(o_tt); ttnn.deallocate(block_tt)
+    ttnn.deallocate(h_norm_tt)
 
     out = {
-        "h_norm":     res["h_norm"],
+        "h_norm":     h_norm_np,
         "q":          q_np,
         "k":          k_np,
         "v":          v_np,
-        "attn_out":   attn_out_np,
         "o_proj_out": o_np,
-        "block_out":  block_out,
+        "block_out":  block_np,
     }
-    if h_input_np.ndim == 2:
-        for k in ["attn_out", "o_proj_out", "block_out"]:
+    if squeeze_batch:
+        for k in out:
             out[k] = out[k][0]
     return out
 
