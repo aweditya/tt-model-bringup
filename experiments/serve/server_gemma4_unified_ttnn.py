@@ -518,6 +518,29 @@ def bootstrap(state, log=None):
                        [state.sdpa_block_size, HEAD_DIM_GLOBAL],
                        ttnn.ShardOrientation.ROW_MAJOR),
     )
+    # paged_fused_update_cache requires K and V tensors to be sharded on
+    # DISJOINT cores with the same total core count
+    # (`paged_fused_update_cache_device_operation.cpp:226`: !is_overlap).
+    # The K cfgs above start at core (0,0); build matching V cfgs that
+    # offset by the K width into the next column.
+    state.paged_write_mem_cfg_sliding_v = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
+        ttnn.ShardSpec(
+            ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 0))]),
+            [state.sdpa_block_size, HEAD_DIM_SLIDING],
+            ttnn.ShardOrientation.ROW_MAJOR),
+    )
+    # Global: K uses cores [0..NKV-1], V uses cores [NKV..2*NKV-1] on the
+    # same row (row_wise=True). For NUM_KV_HEADS_GLOBAL=1, V is core (1,0).
+    state.paged_write_mem_cfg_global_v = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
+        ttnn.ShardSpec(
+            ttnn.CoreRangeSet([ttnn.CoreRange(
+                ttnn.CoreCoord(NUM_KV_HEADS_GLOBAL, 0),
+                ttnn.CoreCoord(2 * NUM_KV_HEADS_GLOBAL - 1, 0))]),
+            [state.sdpa_block_size, HEAD_DIM_GLOBAL],
+            ttnn.ShardOrientation.ROW_MAJOR),
+    )
     # Sliding (head_dim=256): CoreCoord(4,4) = 16 cores, same as 35B.
     state.paged_sdpa_progcfg = ttnn.SDPAProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
@@ -1134,15 +1157,16 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None):
         v_i = ttnn.slice(v_n, [kv_idx, 0], [kv_idx + 1, HEAD_DIM_SLIDING])
         k_sharded = _shard_for_paged_write(k_i, state, 1, HEAD_DIM_SLIDING,
                                             state.paged_write_mem_cfg_sliding)
+        # V on disjoint core so the fused-update kernel can dispatch both in
+        # parallel (see paged_write_mem_cfg_sliding_v above).
         v_sharded = _shard_for_paged_write(v_i, state, 1, HEAD_DIM_SLIDING,
-                                            state.paged_write_mem_cfg_sliding)
-        ttnn.experimental.paged_update_cache(
-            kc, k_sharded,
-            update_idxs_tensor=state.cur_pos_buf,
-            page_table=state.page_table_tt,
-        )
-        ttnn.experimental.paged_update_cache(
-            vc, v_sharded,
+                                            state.paged_write_mem_cfg_sliding_v)
+        # Fused K+V cache update: one device dispatch instead of two.
+        # Forks tt-metal `models/demos/llama3_70b_galaxy/tt/llama_attention.py:509-511`.
+        # tt-metal #44946 / multi-chip-opt menu item #11. K, V have identical
+        # shapes/layouts here so the kernel can write both in lockstep.
+        ttnn.experimental.paged_fused_update_cache(
+            kc, k_sharded, vc, v_sharded,
             update_idxs_tensor=state.cur_pos_buf,
             page_table=state.page_table_tt,
         )
@@ -1224,19 +1248,17 @@ def _layer_pos0_global_paged(state, h_norm, w, layer_idx):
     ttnn.deallocate(k_n_pre)
     ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
 
-    # Write K_rope, V to cache (NKV=1).
+    # Write K_rope, V to cache (NKV=1). Fused K+V dispatch — same op as
+    # the sliding path above. Forks tt-metal `llama_attention.py:509-511`.
+    # V is sharded to disjoint cores from K so the fused-update kernel
+    # parallelism contract holds (see paged_write_mem_cfg_global_v).
     k_sharded = _shard_for_paged_write(k_n, state, NUM_KV_HEADS_GLOBAL,
                                         HEAD_DIM_GLOBAL, state.paged_write_mem_cfg_global)
     v_sharded = _shard_for_paged_write(v_n, state, NUM_KV_HEADS_GLOBAL,
-                                        HEAD_DIM_GLOBAL, state.paged_write_mem_cfg_global)
+                                        HEAD_DIM_GLOBAL, state.paged_write_mem_cfg_global_v)
     ttnn.deallocate(k_n); ttnn.deallocate(v_n)
-    ttnn.experimental.paged_update_cache(
-        kc, k_sharded,
-        update_idxs_tensor=state.cur_pos_buf,
-        page_table=state.page_table_tt,
-    )
-    ttnn.experimental.paged_update_cache(
-        vc, v_sharded,
+    ttnn.experimental.paged_fused_update_cache(
+        kc, k_sharded, vc, v_sharded,
         update_idxs_tensor=state.cur_pos_buf,
         page_table=state.page_table_tt,
     )
