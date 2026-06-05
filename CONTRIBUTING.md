@@ -37,7 +37,6 @@ models/                    multi-model bringup demos (Llama / Qwen / SmolLM / 8B
 research/                  design notes + living plans (index: research/README.md)
 wiki/                      learning-by-building Q&A wiki
 archive/                   retired probes + bringup intermediates (not maintained)
-scratch/                   legacy demos kept for reference
 scripts/                   run_remote.sh, deploy.sh, build_owned_ops.sh,
                            check_setup.sh, install_ttnn.sh, ci_check_deploy_sync.py
 ```
