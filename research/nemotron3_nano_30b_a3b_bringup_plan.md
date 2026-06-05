@@ -246,21 +246,25 @@ the per-group broadcast.
 - [x] **G0a** — isolation harness (multi-step replay + per-head
       cos/MAD + kernel-compare hook via `--kernel-callable`). Commit
       `4352baf`.
-- [-] **G1** — in progress (task #186, commit `58267c0`):
+- [-] **G1** — in progress (task #186, latest commit `e96b9a9`):
   - ✅ Kernel design doc: `research/mm7_g1_mamba2_kernel_design.md`
-    (file map, op signature, CB layout, compute pseudocode, 5-day
-    order of ops)
+  - ✅ Dataflow decisions log (10 D-numbered choices, each a future
+    optimization lever): `research/mm7_g1_dataflow_decisions.md`
   - ✅ Conv1d reuse discovered: `qwen36_conv1d_decode_owned`
-    parametrised at D=6144 IS Mamba2's `conv1d_step`. Zero new conv
-    code.
+    parametrised at D=6144 IS Mamba2's `conv1d_step`. Zero new
+    conv code.
   - ✅ Day-1 fork: `experiments/owned_ops/nemotron3_mamba2_decode_owned/`
-    cloned from GDN base, all identifiers renamed (file names,
-    class names, macros). Compute math still GDN — next commit
-    rewrites for SSD math.
-  - [ ] Day-2: reader + writer rewrite for Mamba2 input/output tensors
-  - [ ] Day-3: compute kernel discretization stage (dt_eff, A, decay, dt_B)
-  - [ ] Day-4: compute kernel state update + output reduce
-  - [ ] Day-5: build, debug_fill smoke, oracle compare via G0a harness
+  - ✅ Day-1.5 compute kernel skeleton (commit `e96b9a9`): full
+    file header documenting the math + SPMD + fp32 acc + debug_mode
+    pattern. CB layout pinned (15 CBs, cb_x..cb_y). debug_mode=1
+    (fill_one smoke) implemented for first-build gate. Six TODO
+    blocks for the math helpers with explicit LLK call sequences.
+  - [ ] Day-3: LLK API survey for softplus_tile; implement compute_decay +
+    mul_decay_state_to → debug_mode=2 wired. Program factory +
+    reader/writer tweaks for the new CB layout.
+  - [ ] Day-3.5: compute_dt_B + add_outer_input → debug_mode=3 (state correct).
+  - [ ] Day-4: C_state_reduce + add_skip → debug_mode=4..5 (full math).
+  - [ ] Day-5: build, oracle compare via G0a harness; ship.
 - [ ] **G2..G4** — sequential, gated on G1.
 
 Phase 0 timeline estimate: **3-5 weeks** depending on how many of the
@@ -386,12 +390,16 @@ idle windows between kernel iterations that we're using to land
 **tt-metal adoption wins** from the 3 audits. Tracked separately in
 [`research/tt_metal_adoption_plan_2026-06-04.md`](tt_metal_adoption_plan_2026-06-04.md).
 
-- **NOW (in flight)**: tasks #191 + #192 via background subagent —
-  `paged_fused_update_cache` swap on gm4 (#44946, +1.6 ms/tok) and
-  redundant `to_memory_config` audit on gm4 (#44958, +0.5-1 ms/tok).
-- **NEXT (post-Nemotron G4)**: tasks #193..#197 — GDN bake-off,
+- **NOW results (commit `058bedd`)**: task #191 BLOCKED on input-overlap
+  shard contract (reverted; bumped to NEXT-F #198 — needs ~30 LOC
+  disjoint K/V mem_cfg in `setup_state`); task #192 AUDIT-ONLY (our
+  gm4 already clean — no redundant `to_memory_config` calls found).
+  See `research/tt_metal_adoption_plan_2026-06-04.md` §2a for the
+  detailed findings.
+- **NEXT (post-Nemotron G4)**: tasks #193..#198 — GDN bake-off,
   RMSNorm fusion (+12-15 ms/tok), chunk-outer 2048-tok prefill,
-  masked fixed-bucket prefill, wider deltanet_recurrence op.
+  masked fixed-bucket prefill, wider deltanet_recurrence op,
+  disjoint K/V mem_cfg for paged_fused (#198, unblocks +1.6 ms/tok).
 
 Zero file overlap with Phase 0 (subagent touches `experiments/serve/
 server_gemma4_unified_*` only; main agent touches
