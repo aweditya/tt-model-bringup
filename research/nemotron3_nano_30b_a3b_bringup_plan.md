@@ -328,12 +328,19 @@ the per-group broadcast.
          mm_init_short. Full mm_init implicitly does
          llk_pack_hw_configure; short doesn't.
     Each ingredient is necessary; any 3 alone don't unblock.
-  - [ ] **Day-4.5 (next): debug_mode=4 — wire D·x via y_partial.**
-    cb_y_partial currently has the C·state_in^T reduce. Add
-    `y[d] = y_partial[d] + D · x[d]` to compute (almost-)full y.
-    Gate: cos ≥ 0.999 vs `oracle_y = C·state_out + D·x`.
-  - [ ] Day-4.6: full mode=5 — add `y_partial += C · outer` fixup.
-    `oracle_y` matches exactly the production-path y output.
+  - [x] **Day-4.5 PASS (2026-06-05): mode=4 — y = C·state_in^T + D·x**.
+    y_out cos = **0.999998** (essentially bit-perfect), rel = 2.4e-3.
+    Commit `978f23e`. Operand swap of matmul_reduce_C_state to
+    (cb_C, cb_state_in) + mm_init transpose=1 puts the reduce in row 0
+    (row-vec form), matching x's layout so the D·x add works with
+    plain `add_tiles`. 2 new helpers: mul_D_x_to + add_y_partial_D_x.
+    cb_outer reused as D·x scratch.
+  - [ ] **Day-4.6 (next): mode=5 — y_partial fixup with C·outer.**
+    Mode=4's y uses state_in (pre-update); production needs state_out
+    (post-update). Add `y_partial += C · outer` term: for each (d, s),
+    `delta_y[d] = sum_s(C[s] * outer[d, s])` where outer = dt_eff*x⊗B.
+    Then `y[d] = y_partial_corrected[d] + D·x[d]`. Gate: cos ≥ 0.999
+    vs `oracle_y = C·state_out^T + D·x` (production-equivalent).
   - [ ] Day-5: G0a harness multi-step replay (8 steps), 64-head, B=1.
     Gate: per-head cos ≥ 0.999 at every step.
 - [ ] **G2..G4** — sequential, gated on G1.

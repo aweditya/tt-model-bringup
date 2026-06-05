@@ -5,12 +5,13 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## POST-WIN QUICK-START (2026-06-05 08:38 PT) — DAY-4 PASSED ✓
+## POST-WIN QUICK-START (2026-06-05 08:57 PT) — DAY-4.5 PASSED ✓
 
-**Where we are**: G1 **day-4 PASSED** at cos = 0.9997 vs numpy oracle.
-Mode=2 and mode=3 both validated end-to-end. Commit `d239875`.
-Full SSM math working:
-`state_out[d, s] = decay * state_in[d, s] + dt_eff * x[d] * B[s]`.
+**Where we are**: G1 **day-4.5 PASSED** — mode=4 ships y math at
+**cos = 0.999998** (essentially bit-perfect). Commit `978f23e`.
+Modes 2/3/4 all green in regression sweep. Full SSM math + y:
+- `state_out[d, s] = decay * state_in[d, s] + dt_eff * x[d] * B[s]`
+- `y[d] = C · state_in^T[d] + D · x[d]`  (mode 5 will swap state_in→state_out)
 
 **🔑 THE 4-INGREDIENT RECIPE** (memory: [[feedback-mm-init-prime-required]]):
 The Blackhole TRISC pipeline hangs at ~4 transpose+matmul+binary iters
@@ -45,20 +46,27 @@ no effect without the short init.
 
 `cb_outer` is bf16 (matches GDN's tensor_format).
 
-**Exact next task**: G1 **day-4.5** — wire mode=4 (D·x via y_partial).
+**Exact next task**: G1 **day-4.6** — mode=5 (production-equivalent y).
 
-`cb_y_partial` already has `C · state_in^T` (from `matmul_reduce_C_state`).
-For mode=4, add `D · x[d]` to get (almost-)full y:
-1. `bcast_mul_tile_scalar(cb_x, cb_D, d, 0, cb_tmp)` — D as broadcast
-   scalar across x[d]'s 32-element vector.
-2. `add_tiles(cb_y_partial, cb_tmp, d, 0, cb_y)` — sum into y.
+Mode=4's y uses `C · state_in^T` (pre-update state); production needs
+`C · state_out^T` (post-update). The delta is `C · outer`. Add a fixup
+phase that accumulates `delta_y[d] = sum_s(C[s] · outer[d, s])` into
+y_partial before the D·x add. Sketch:
 
-Gate: `oracle_y = C·state_out + D·x` cos ≥ 0.999 vs the smoke's y_out.
+1. New helper `add_C_outer_to_y_partial(cb_C, cb_outer, head_dim_tile,
+   ssm_state_tile, cb_y_partial)` — like a matmul reduce against
+   outer products. Could be done as a small matmul (transpose=1) or as
+   per-tile bcast operations.
+2. In mode=5: same Phase 1-3 as mode=4. In Phase 3 (state-update loop)
+   don't pop cb_outer after add_state_scaled_outer — keep it queued
+   for the C·outer reduce. After the state-update loop, do another
+   matmul-reduce-style phase consuming cb_outer + cb_C, accumulating
+   into cb_y_partial. THEN do the D·x add.
+3. Watch cb_outer capacity (currently 2 tiles); may need bigger CB or
+   redesign to consume per-iteration.
 
-Then day-4.6 (full mode=5) adds the `y_partial += C · outer` fixup so
-y reflects the post-update state instead of pre-update.
-
-Then day-5: G0a multi-step harness (8 steps), per-head cos ≥ 0.999.
+Gate: cos ≥ 0.999 vs `oracle_y = C · state_out^T + D · x` (production
+math, no shortcut).
 
 **Then G2-G4**: multi-core (shard 64 heads), batched, server wiring.
 
