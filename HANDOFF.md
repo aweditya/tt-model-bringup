@@ -63,6 +63,13 @@ Run the kernel regression sweep:
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
 **Phase 1 — exact next task**: v0.1.2 L0 Mamba2 wrapper drop-in (task #204).
+v0.1.1.c DONE 2026-06-05 — L5 attention now FULLY ON-DEVICE on (1,4) mesh.
+Single `ttnn.transformer.scaled_dot_product_attention` call handles 16:1
+GQA natively (forked from 27B `server_tp.py:1832` per
+[[reference-ttnn-sdpa-gqa-native]]). All 3 gates PASS (O/M cos=0.9995,
+B cos=1.000000 bit-exact). The NKV>1 hack is decode-only — will fire at
+v0.3+ via the Gemma 4 two-call workaround
+([[reference-gemma4-two-call-paged-decode]]).
 Previously DONE 2026-06-05:
 - v0.0 oracle PASS — `.cache/hf_oracle_nemotron3_nano/` 19 artifacts
 - v0.0+ oracle HARDENED — norm + mixer-out + shared-expert hooks, `--gen N` multi-step

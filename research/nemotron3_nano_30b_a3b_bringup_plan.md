@@ -46,6 +46,27 @@ took. Mirrors `[[feedback-correctness-first]]`: never optimise past
 cos < 0.99, and never scale (batching) past a known-bad correctness
 floor.
 
+### 0.4 Everything on-device, no host-side SDPA (2026-06-05, user)
+
+User direction after v0.1.1.b: "I'd like to do everything on-device
+because it makes things harder to fix later." Research-first round
+that followed confirmed:
+
+- `ttnn.transformer.scaled_dot_product_attention` (non-paged prefill)
+  takes Q[b,nqh,s,dh] + K/V[b,nkv,s,dh] with `nqh ≠ nkv` as a
+  1st-class contract — no caller-side K/V repeat needed
+  ([[reference-ttnn-sdpa-gqa-native]]).
+- 27B already uses this at `server_tp.py:1832`. Single-call fork.
+- The NKV_PER_CHIP>1 contract issue (tt-metal #12330 OPEN) only
+  fires on the DECODE path. Gemma 4's two-call workaround
+  ([[reference-gemma4-two-call-paged-decode]]) is the blessed fix
+  there. We'll fork at v0.3 decode, NOT at v0.1.1 prefill.
+
+**Implication**: every v0.1.x sub-step uses on-device ops only.
+No numpy bridges. The v0.1.1.b host-SDPA implementation is
+preserved as a regression baseline but v0.1.1.c rewrites it
+on-device.
+
 ### 0.3 L5-before-L0 in v0.1.x (2026-06-05)
 
 In Phase 1, bring up **L5 (Attention) BEFORE L0 (Mamba2)** as a
@@ -441,7 +462,8 @@ already uses the production-grade kernel.
 | **v0.0.1** | `experiments/utils/nemotron3_tokenizer_probe.py` (~150 LOC). Active-prompt suffix detected on BOTH thinking branches (6 tokens each: `<|im_start|>assistant\n<think>\n` vs `<|im_start|>assistant\n<think></think>`). EOS list [2, 11] = [`</s>`, `<|im_end|>`]. Multi-turn truncate_history_thinking confirmed (matches Qwen 3.6 / Gemma 4 PC asymmetry). | TokenizersBackend, BOS=1/EOS=11, model_max=262144, vocab=131072, chat_template inlined, both suffix branches resolve correctly | ✅ DONE (commit `f70b6f2`) |
 | **v0.0.2** | `experiments/utils/nemotron3_weights_introspect.py` (~200 LOC). Reads safetensors INDEX only (no tensor materialisation). Result: 6243 keys × shapes audited; **0 missing, 0 shape mismatches, 0 extras**. **Real finding for v0.1.3**: every MoE gate has `e_score_correction_bias` [128] (DeepSeek-V3 load-balance bias) — added to router scores before topk; brief did not flag this. 58.82 GB across 13 shards. Keys by kind: 30 attn + 207 mamba2 + 6003 moe + 3 non-layer. | 0 missing, 0 shape mismatches | ✅ DONE (commit `f70b6f2`) |
 | **v0.1.0** | `experiments/serve/server_nemotron3_nano_ttnn.py` (~250 LOC, forks `server_35b_ttnn.py` helpers) — bootstrap-only scaffold (mesh + embed + final_norm + lm_head). Llama-style RMSNorm (no +1.0). Vocab=131072 (clean /4 split). Validator `experiments/cb/isolate/nemotron3_v010_bootstrap_smoke.py` (~170 LOC). Key finding: HF `logits.npy` is bf16-precision; use numpy fp32 as strict ground truth ([[feedback-hf-logits-npy-is-bf16-imprecise]]). | Bootstrap 5.5s; Gate A embed cos=1.000000; Gate B final_norm cos=0.999905; Gate C1 generation token TT==HF (' Paris'); Gate C2 logits cos vs numpy=0.999970; Gate C3 argmax 5/5 vs numpy | ✅ DONE (commit `010b98e`) |
-| **v0.1.1** 🔄 reordered | **L5 (Attention) — eager (was v0.1.3)**. v0.1.1.a `experiments/serve/server_nemotron3_nano_ttnn.py` adds `upload_attn_layer` + `attn_projections_only` + sparse layer-upload env gate; v0.1.1.b adds `attn_block_eager` (TT pre-norm + qkv + numpy SDPA + TT o_proj + residual). SDPA in numpy fp32 — NKV=2 × NCHIPS=4 doesn't shard; on-device prefill SDPA is a v0.5 perf concern. Simplest attention block we've shipped: GQA repeat_kv (16:1), NO RoPE, NO q/k_norm. | v0.1.1.a 4/4 (H/Q/K/V cos ≥ 0.9999); v0.1.1.b 3/3 (O cos=0.999799, M cos=0.999799, B cos=1.000000) | ✅ DONE (commits `95f6cf7` + `e7f3e59`) |
+| **v0.1.1.a/b** 🔄 reordered | **L5 (Attention) — eager — host-SDPA stages**. v0.1.1.a adds `upload_attn_layer` + `attn_projections_only` + sparse layer-upload env gate; v0.1.1.b adds `attn_block_eager` (TT pre-norm + qkv + numpy SDPA + TT o_proj + residual). GQA 16:1, NO RoPE, NO q/k_norm. | v0.1.1.a 4/4 (H/Q/K/V cos ≥ 0.9999); v0.1.1.b 3/3 (O 0.9998, M 0.9998, B 1.000000) | ✅ DONE (`95f6cf7` + `e7f3e59`) |
+| **v0.1.1.c** | **L5 — fully on-device prefill SDPA** (replaces numpy bridge). Forked from 27B `server_tp.py:1832` per [[reference-ttnn-sdpa-gqa-native]]: single `ttnn.transformer.scaled_dot_product_attention` call handles GQA natively (Q[b,32,5,128] + K/V[b,2,5,128] with `is_causal=True`, scale=1/sqrt(128), B3 HiFi2). reshape+transpose for head reorder; transpose+reshape back for o_proj. Residual add on-device. | Gate O cos=0.999460; Gate M cos=0.999460; Gate B cos=1.000000 (bit-exact post-residual). Slightly lower O/M than v0.1.1.b's numpy fp32 ref (0.999799) — bf16 SDPA precision floor; well above 0.999 gate | ✅ DONE (commit `ee2b76e`) |
 | **v0.1.2** 🔄 reordered | **L0 (Mamba2) — eager via the drop-in `mamba2_decode_step_ttnn` wrapper (was v0.1.1)**. in_proj split → `qwen36_conv1d_decode_owned` (D=6144) + silu → split B/C/x → kernel call (already cos=0.999998 in isolation) → MambaRMSNormGated → out_proj. | per-sub-step cos ≥ 0.999 vs HF L0; ssm + conv state allocation correct | pending |
 | **v0.1.3** | **L1 (MoE) — eager (Pattern A fork)**. Fork `moe_forward_ttnn_pattern_a_batched` from 35B. Deltas: sigmoid router, **per-expert load-balance bias `e_score_correction_bias` added to scores BEFORE group masking + topk** (DeepSeek-V3, surfaced at v0.0.2 introspect), group-restricted topk (n_group=8, topk_group=1), routed_scaling=2.5, relu², shared expert 2× wider. | per-sub-step cos ≥ 0.999; group-topk matches HF indices 100/100 | pending |
 | **v0.2** | All 52 layers (per-layer dispatch via `state.layer_types[L]`) + final_norm + lm_head + argmax | per-layer cos ≥ 0.999 vs HF oracle; argmax matches HF at pos 0 | pending |
