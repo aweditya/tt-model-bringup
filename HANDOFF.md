@@ -64,7 +64,10 @@ Run the kernel regression sweep:
 
 **Phase 1 — exact next task**: v0.2 (full 52-layer forward + argmax).
 v0.1.4 EP COMPLETE 2026-06-05 — 3/3 gates PASS, cosines bit-equivalent
-to v0.1.3.b naive path (commit `1abce07`).
+to v0.1.3.b naive path (commits `1abce07` forward, `13b111e` h_norm
+host-bridge eliminated). Remaining host bridges = router topk-6, combine
+weighted-sum, shared+residual add — same as the 27B/35B production
+precedent. v0.5 perf pass will move them on-device coherently.
 
 **v0.1.4 COMPLETE — what shipped:**
 - `upload_moe_layer_ep` — 128 experts sharded as 32/chip

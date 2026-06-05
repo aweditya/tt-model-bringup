@@ -480,7 +480,7 @@ already uses the production-grade kernel.
 | Stage | Adds | Gate | Status |
 |---|---|---|---|
 | **v0.4** | **Trace capture — fp32-in-trace risk check** ([[35b-dn-h-state-drift-lever]]). Two-phase warmup ([[ttnn-multi-trace-two-phase-warmup]]). Fallback: bf16 ssm + measure drift, ship if drift <3% at 64 tok. | 100 traced steps == 100 eager token-for-token; ≥3× speedup vs eager | pending |
-| **v0.5** | **Single-stream PERF pass** (target ≥30 tok/s traced). Apply known wins: vocab-sharded LM head + on-device argmax (P22 — already proven on 27B/Gemma 4 at +5-8%); HiFi2 expert matmul (35B win); RMSNorm fusion ([[adoption-next-b]]); concatenated Mamba2 in_proj fusion; distributed RMSNorm. Profile-driven (Tracy A/B per win). | ≥30 tok/s single-stream traced. **This is the demo-ready state.** | pending |
+| **v0.5** | **Single-stream PERF pass** (target ≥30 tok/s traced). Apply known wins: vocab-sharded LM head + on-device argmax (P22 — already proven on 27B/Gemma 4 at +5-8%); HiFi2 expert matmul (35B win); RMSNorm fusion ([[adoption-next-b]]); concatenated Mamba2 in_proj fusion; distributed RMSNorm. Profile-driven (Tracy A/B per win). **On-device sweep**: router topk on-device (replace `np.argpartition` with ttnn topk), combine weighted-sum on-device (broadcast `topk_weights_tt × combine_out_tt` + reduce TOP_K), shared+residual on-device (chain `ttnn.add`). | ≥30 tok/s single-stream traced. **This is the demo-ready state.** | pending |
 
 ### Phase 3 — Continuous batching (DEFERRED until v0.5 ships)
 
