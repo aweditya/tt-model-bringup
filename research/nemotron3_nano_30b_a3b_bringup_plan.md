@@ -245,12 +245,23 @@ the per-group broadcast.
       to qb1).
 - [x] **G0a** — isolation harness (multi-step replay + per-head
       cos/MAD + kernel-compare hook via `--kernel-callable`). Commit
-      `4352baf`. PASSES self-consistency (bit-equal across 8 steps)
-      and step-evolution sanity.
-- [ ] **G1..G4** — sequential, gated on prior. **G1 is the next
-      hands-on task**: author the single-core tt-metal SSD kernel.
-      Wire it into the harness via `--kernel-callable` for the
-      pass gate.
+      `4352baf`.
+- [-] **G1** — in progress (task #186, commit `58267c0`):
+  - ✅ Kernel design doc: `research/mm7_g1_mamba2_kernel_design.md`
+    (file map, op signature, CB layout, compute pseudocode, 5-day
+    order of ops)
+  - ✅ Conv1d reuse discovered: `qwen36_conv1d_decode_owned`
+    parametrised at D=6144 IS Mamba2's `conv1d_step`. Zero new conv
+    code.
+  - ✅ Day-1 fork: `experiments/owned_ops/nemotron3_mamba2_decode_owned/`
+    cloned from GDN base, all identifiers renamed (file names,
+    class names, macros). Compute math still GDN — next commit
+    rewrites for SSD math.
+  - [ ] Day-2: reader + writer rewrite for Mamba2 input/output tensors
+  - [ ] Day-3: compute kernel discretization stage (dt_eff, A, decay, dt_B)
+  - [ ] Day-4: compute kernel state update + output reduce
+  - [ ] Day-5: build, debug_fill smoke, oracle compare via G0a harness
+- [ ] **G2..G4** — sequential, gated on G1.
 
 Phase 0 timeline estimate: **3-5 weeks** depending on how many of the
 G-stages hit unexpected snags. Each stage gates the next; do NOT

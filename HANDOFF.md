@@ -46,16 +46,28 @@ parallel), #186 (G1 single-core), #187 (G2 multi-core), #188 (G3 batched),
   fires at v0.0 oracle invocation. Internal self-test sufficient to
   unblock G0a harness development.
 - ✅ G0a isolation harness: `experiments/utils/test_mamba2_decode_isolated.py`
-  (commit `4352baf`). Multi-step replay (8 consecutive decode steps,
-  ssm_state threaded) with per-head cos/MAD compare + assert gates.
-  Self-test PASSES on qb1: self-consistency bit-equal, step evolution
-  finite. Kernel-compare path stubbed via `--kernel-callable
-  <module:fn>` flag — G1 author plugs their ttnn-backed Mamba2 SSD
-  callable there and the gate fires automatically.
-- ⏭ Next: **G1 (#186)** — author the single-core tt-metal SSD kernel.
-  The numpy oracle + harness mean the kernel author can iterate
-  against a fast deterministic ground-truth without spinning up the
-  full forward.
+  (commit `4352baf`). Multi-step replay + per-head cos/MAD gate.
+- ✅ G1 kernel design: `research/mm7_g1_mamba2_kernel_design.md`
+  (commit `642f50d`, 334 lines). File-by-file map qwen36_gdn →
+  nemotron3_mamba2; SPMD work unit (batch, head); CB layout; LLK
+  call pattern; 5-day order of operations.
+- ✅ **Major reuse find**: `qwen36_conv1d_decode_owned` IS Mamba2's
+  `conv1d_step` (4-tap depthwise causal Conv1d + rolling state + SiLU).
+  Parametrise D=6144 and we get Mamba2's pre-SSD conv path for FREE.
+- ✅ G1 day-1: `experiments/owned_ops/nemotron3_mamba2_decode_owned/`
+  forked from `qwen36_gdn_decode_owned/` with all identifiers renamed
+  (commit `58267c0`). Compute math still GDN — SSD rewrite is next.
+- ✅ 3 background audits done — research/audit_{gemma4_opts,qwen36,gdn_kernel}_*.md
+  with 1-paragraph email replies in §6 of each (commits `d5dc1bc`,
+  `b26db66`, `0b672e0`).
+- ✅ Wiki §66: `wiki/66_blackhole_kernel_dataflow_anatomy.md` — pedagogy
+  on the kernel ↔ hardware mapping (Tensix, RISC-V cores, CBs,
+  tiles, SPMD partition, cross-tile comm, DRAM streaming).
+- 🟢 Dead-code audit subagent running in background — proposed
+  archive layout for stale 27B/35B/Gemma 4 probes.
+- ⏭ Next: rewrite the Mamba2 compute kernel for SSD math per
+  `research/mm7_g1_mamba2_kernel_design.md` §6. Then build on qb1 +
+  debug_fill smoke + numpy-oracle compare via G0a harness.
 
 ---
 
