@@ -35,9 +35,19 @@ G0..G4 staging mirrors the 35B `qwen36_gdn_decode_owned` build. Phase 0
 parallel), #186 (G1 single-core), #187 (G2 multi-core), #188 (G3 batched),
 #189 (G4 server wrapper) — each blocks the next.
 
-**Current work (2026-06-04)**: G0 in progress — Mamba architecture
-primer for learning (`wiki/`), then numpy oracle + tt-metal SSM survey.
-User explicitly wants to learn the Mamba math themselves.
+**Current work (2026-06-04 EOD)**:
+- ✅ Mamba primer: `wiki/65_mamba_state_space_models.md` (commit `52ca6ec`)
+- ✅ G0b: qb1 RAM 503/468 GB OK; ttnn has ZERO ssm/mamba/scan ops at
+  module level — building from scratch (commit `9832952`)
+- ✅ G0 numpy oracle: `experiments/utils/mamba2_numpy_oracle.py`
+  written + self-test PASSES on qb1 (commit `98fc43d`). Decay in
+  (0,1], state mutated, bit-equal across seeded runs.
+- ⏸ G0 HF byte-match gate: blocked on Nemotron weight download (~63 GB);
+  fires at v0.0 oracle invocation. Internal self-test sufficient to
+  unblock G0a harness development.
+- ⏭ Next: G0a isolation harness (task #184) — fork from
+  `test_pattern_a_moe_np.py`, generates random fixtures, will later
+  compare ttnn kernel against the numpy oracle's outputs.
 
 ---
 

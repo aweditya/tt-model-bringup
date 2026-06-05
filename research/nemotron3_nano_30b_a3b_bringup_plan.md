@@ -221,13 +221,30 @@ the per-group broadcast.
 
 ### Tasks (Phase 0) — tracked in the project task list
 
-- **Task #183** — G0 numpy oracle + tt-metal SSM survey
+- **Task #183** — G0 numpy oracle + tt-metal SSM survey — **IN PROGRESS**:
+  oracle written (`experiments/utils/mamba2_numpy_oracle.py`, commit
+  `98fc43d`) + self-test ✓ on qb1; tt-metal SSM survey ✓ (no matches,
+  build from scratch confirmed). HF byte-match gate still open
+  (pending Nemotron weight download).
 - **Task #184** — G0a isolation harness (blocked by #183)
-- **Task #185** — G0b qb1 RAM + tokenizer prep (parallel with G0)
+- **Task #185** — G0b qb1 RAM + tt-metal SSM survey — **DONE**:
+  qb1 has 503/468 GB RAM (plenty); ZERO ttnn SSM ops at module level.
 - **Task #186** — G1 single-core (blocked by #184)
 - **Task #187** — G2 multi-core (blocked by #186)
 - **Task #188** — G3 batched (blocked by #187)
 - **Task #189** — G4 server wrapper + Phase 1 unblock (blocked by #188)
+
+### Phase 0 progress (2026-06-04 EOD)
+
+- [x] **G0b** — qb1 RAM + ttnn SSM survey done. No tt-metal Mamba2
+      primitive exists; building from scratch.
+- [-] **G0** — numpy oracle written + internal self-test PASS. HF
+      byte-match gate still open (pending Nemotron weight download
+      to qb1).
+- [ ] **G0a** — isolation harness (next foreground; blocked by HF
+      verification of G0 oracle, but can be developed in parallel
+      using random fixtures from `mamba2_numpy_oracle._make_fixture`).
+- [ ] **G1..G4** — sequential, gated on prior.
 
 Phase 0 timeline estimate: **3-5 weeks** depending on how many of the
 G-stages hit unexpected snags. Each stage gates the next; do NOT
