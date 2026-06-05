@@ -133,8 +133,8 @@ in ~30 sec per probe. Triggers:
 
 - `research/35b_drift_next_session_plan.md` — live plan, read
   §REAL findings.
-- `research/35b_a3b_correctness_plan.md` — historical context, mostly
-  superseded.
+- `archive/superseded_research_2026-06-04/35b_a3b_correctness_plan.md` —
+  historical context, mostly superseded (archived 2026-06-04).
 - `experiments/cb/isolate/gm4_per_layer_drift_pos1.py` — forkable
   bisection pattern.
 - `experiments/cb/dev/cb35_drift_ladder.py` + wrappers — deployed

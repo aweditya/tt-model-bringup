@@ -138,7 +138,7 @@ have it).
 
 | Their issue | Us, status | Where it lives / why |
 |---|---|---|
-| #44943 (profile + signpost) | **PARTIALLY SHIPPED** | `experiments/utils/tracy_profile_one_gemma4_layer.py` (commit `2610ef3`) + analyse pipeline in `research/profiling-quick-reference.md`. Not per-module-signposted yet. |
+| #44943 (profile + signpost) | **PARTIALLY SHIPPED** | `experiments/utils/tracy_profile_one_gemma4_layer.py` (commit `2610ef3`) + analyse pipeline in `archive/superseded_research_2026-06-04/profiling-quick-reference.md`. Not per-module-signposted yet. |
 | #44944 (prefill QKV fuse + per-head norm fuse) | **WORTH ADOPTING** | We don't yet run a traced multi-chunk prefill — chat path uses prefix cache + 1-tok/iter fallback above chunk_size. Their fuse would unblock long-context prefill perf. |
 | #44945 (decode SDPA tune for B=32 + concat_heads→o_proj fuse) | **PARTIALLY SHIPPED** (sliding) + **WORTH ADOPTING** (the fuse) | Sliding SDPA at B=4 traced. concat_heads_decode → o_proj fusion not done; this is a clean kernel-time win. |
 | #44946 (paged KV cache batched layout + block-size sweet-spot) | **SHIPPED** (sliding) + **PLANNED** (global) + **WORTH ADOPTING** (`paged_fused_update_cache`) | We call `paged_update_cache` twice per sliding layer (NKV_PER_CHIP=1 each). Briefing flags `paged_fused_update_cache` as a ~1.6 ms/tok win. |

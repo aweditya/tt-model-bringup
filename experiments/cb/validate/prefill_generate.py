@@ -6,7 +6,7 @@ forward_prefill_chunked_tp (whole-prompt parallel) — then greedily decodes N
 tokens from each prefilled state (same decode path for both, so only the prefill
 differs) and prints both continuations. Chunked prefill is "good enough to ship"
 if its continuation is coherent + sensible (the usable-models bar), even though it
-won't bit-match the bf16-noisy stub (see research/27b_chunked_prefill_plan.md).
+won't bit-match the bf16-noisy stub (see archive/superseded_research_2026-06-04/27b_chunked_prefill_plan.md).
 
 Run on qb1 (from repo root):
   make run PY=experiments/cb/validate/prefill_generate.py

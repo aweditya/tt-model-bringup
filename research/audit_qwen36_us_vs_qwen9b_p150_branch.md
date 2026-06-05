@@ -3,8 +3,8 @@
 Date: 2026-06-04. Scope: read-only comparison. Read first:
 [`HANDOFF.md`](../HANDOFF.md) for our headline perf,
 [`research/27b_prefix_caching_plan.md`](27b_prefix_caching_plan.md) for our PC
-design, [`research/27b_chunked_prefill_prior_art.md`](27b_chunked_prefill_prior_art.md)
-for the upstream chunked-SDPA audit. Their branch:
+design, [`archive/superseded_research_2026-06-04/27b_chunked_prefill_prior_art.md`](../archive/superseded_research_2026-06-04/27b_chunked_prefill_prior_art.md)
+for the upstream chunked-SDPA audit (archived 2026-06-04). Their branch:
 https://github.com/tenstorrent/tt-metal/tree/qwen9b-p150 (branch HEAD
 `14be5b9` as of fetch).
 
@@ -88,7 +88,7 @@ Target: Blackhole P150 single-node, mesh up to 4 chips (`P150x4`).
 | Feature | Us (Qwen3.6-27B + 35B-A3B) | Them (`qwen9b-p150`) |
 |---|---|---|
 | **Primary model(s)** | Qwen3.6-27B dense, Qwen3.6-35B-A3B MoE+GDN, Gemma 4 12B (base+IT). Multi-backend dispatch in `cb_api.BACKENDS` (`experiments/serve/cb_api.py:346`). | Qwen3.5-9B (hybrid), Qwen27B integration landed 2026-06-04 (`e61d05c`) via `HF_MODEL`-driven config. |
-| **MoE** | **Shipped** — 35B-A3B Pattern-A broadcast MoE (B>1 bit-validated; `experiments/serve/server_35b_ttnn.py`, `server_35b_cb.py`; `research/35b_moe_pattern_a_plan.md`). | Not present in this branch's `qwen3_5_9b/` tree. (35B-A3B is dense MoE, 9B is dense GDN.) |
+| **MoE** | **Shipped** — 35B-A3B Pattern-A broadcast MoE (B>1 bit-validated; `experiments/serve/server_35b_ttnn.py`, `server_35b_cb.py`; `archive/superseded_research_2026-06-04/35b_moe_pattern_a_plan.md`). | Not present in this branch's `qwen3_5_9b/` tree. (35B-A3B is dense MoE, 9B is dense GDN.) |
 | **Gated DeltaNet decode kernel** | `ttnn.experimental.qwen36_gdn_decode_owned` — fused owned kernel (`server_tp.py:783`, `server_35b_ttnn.py:598`). Default on for 27B since 2026-05-18; recently un-clobbered for CB (commit `017665e`, `38b15b0`). | **`recurrent_gated_delta_rule_decode_ttnn`** — a different fused op composing "L2 norm + scale + delta step" internally (per `tt/gdn/tp.py` extract). Independent implementation of the same math. |
 | **GDN recurrent state dtype** | bf16 for owned-gdn path; fp32 path exists but routes through broken manual recurrence (`[[feedback-35b-manual-recurrence-path-broken]]`). | bf16 only — `torch.zeros(*shape, dtype=torch.bfloat16)`. |
 | **MAX_POS / max_seq_len** | **8192** (`server_tp.py:53`, bumped from 2048 for L=4000/8000). 35B same. Long-context working at L=7312 (`feedback_qb2_tp_long_context_works.md`). | **131,072** = `MAX_NUM_BLOCKS(2048) × BLOCK_SIZE(64)`. Demo fixtures max at 64k JSON; no 256K-specific code path verified. |
@@ -102,7 +102,7 @@ Target: Blackhole P150 single-node, mesh up to 4 chips (`P150x4`).
 | **Chat template patches** | `preserve_thinking=True` Qwen3.6 jinja kwarg + trailing strip + universal `_active_prompt_suffix` for active-prompt-only suffixes (`openai_endpoint.py:47`). | None in-tree (model doesn't serve chat itself). |
 | **Trace pattern** | Two-phase warmup (compile-all → capture-all), per `[[ttnn-multi-trace-two-phase-warmup]]`. Decode trace + S2 chunked-prefill trace coexist. `trace_region_size=400_000_000` for Gemma 4 48-layer decode. | Chunk-outer prefill trace (capture ONE 2048-token chunk's all-layer forward, replay per chunk to fit "4 GiB ceiling at long context"). Decode trace warmed via `prime_decode_trace`. |
 | **Sliding-window attention** | Gemma 4 only (`server_gemma4_unified_ttnn.py`). Qwen3.6 does not use it. | Not in 9B (no sliding in arch); branch references `cache_position_modulo` for bounded sliding only in upstream tt-metal (`#45193`). |
-| **vLLM integration** | None directly — we built our own CB stack. `research/27b_chunked_prefill_prior_art.md` documents the vLLM-TT plugin design we deliberately did not adopt. | Lightweight model-side hook (`qwen35_vllm.py`); scheduling delegated to vLLM externally. |
+| **vLLM integration** | None directly — we built our own CB stack. `archive/superseded_research_2026-06-04/27b_chunked_prefill_prior_art.md` documents the vLLM-TT plugin design we deliberately did not adopt. | Lightweight model-side hook (`qwen35_vllm.py`); scheduling delegated to vLLM externally. |
 | **35B / MoE bringup** | Production. `server_35b_ttnn.py` 103 KB. | Not on this branch. |
 | **Tokenizer / chat handling** | `apply_chat_template(tokenize=True)` direct path; `_normalise_template_output` handles both list-of-int (Qwen) and dict (Gemma); multi-EOS (`[1, 106, 50]` for Gemma IT). | `HF_MODEL` env-var → `transformers.from_pretrained`; chat template not handled in the model code. |
 | **Multi-turn measured perf** | T0 8.69s wall (cold), T1 5.84s (PC HIT, 5.1× per-tok), T2 5.92s (PC HIT, 8.0× per-tok). HANDOFF.md. | Demo only; no multi-turn perf claim on this branch. |
@@ -175,7 +175,7 @@ should check. Worth asking them directly.
    replay per chunk — likely cuts cold-start TTFT on 1k+ prompts by an
    order of magnitude. The op exists in upstream tt-metal
    (`ttnn.transformer.chunked_scaled_dot_product_attention`, audited
-   in `research/27b_chunked_prefill_prior_art.md`); their branch is
+   in `archive/superseded_research_2026-06-04/27b_chunked_prefill_prior_art.md`); their branch is
    the concrete reference implementation.
 2. **Masked fixed-bucket prefill for short prompts.** A 5-bucket
    {128, 256, 512, 1024, 2048} masked path with state masking is a
@@ -273,6 +273,6 @@ should check. Worth asking them directly.
 - Our side: read `HANDOFF.md`, `experiments/serve/{server_tp.py,
   server_35b_ttnn.py, openai_endpoint.py, cb_engine.py, cb_scheduler.py,
   cb_api.py}`, `research/27b_prefix_caching_plan.md`,
-  `research/27b_chunked_prefill_prior_art.md`. Direct `grep` for
+  `archive/superseded_research_2026-06-04/27b_chunked_prefill_prior_art.md`. Direct `grep` for
   MAX_POS, NUM_BLOCKS, BLOCK_SIZE, chunked_prefill, prefix_cache,
   owned_gdn confirmed file:line citations above.

@@ -61,7 +61,7 @@ NQ_PER_CHIP = NUM_Q_HEADS // NCHIPS
 MOE_INTER_CHIP = MOE_INTER // NCHIPS
 
 # Pattern A MoE: each chip owns 64 experts (full intermediate dim per expert).
-# See research/35b_moe_pattern_a_plan.md.
+# See archive/superseded_research_2026-06-04/35b_moe_pattern_a_plan.md.
 E_LOCAL = NUM_EXPERTS // NCHIPS
 
 VOCAB = 248320
@@ -278,7 +278,7 @@ def upload_moe_layer_pattern_a(sd, mesh):
 
     Differs from `upload_moe_layer` (which gives every chip all 256 experts × 1/4
     intermediate dim). Pattern A enables trace-clean on-device dispatch — the
-    Mixtral/Grok pattern. See research/35b_moe_pattern_a_plan.md.
+    Mixtral/Grok pattern. See archive/superseded_research_2026-06-04/35b_moe_pattern_a_plan.md.
 
     Per-chip output tensors:
       experts_gate_up_local: [E_LOCAL=64, HIDDEN=2048, 2*MOE_INTER=1024] TILE bf16

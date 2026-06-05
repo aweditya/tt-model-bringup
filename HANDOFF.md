@@ -897,7 +897,7 @@ fusion, bf8 expert weights.
 ## Read order when resuming work
 
 1. This file.
-2. [`research/profiling-quick-reference.md`](research/profiling-quick-reference.md) — Tracy + tt-perf-report capture/analyze.
+2. [`archive/superseded_research_2026-06-04/profiling-quick-reference.md`](archive/superseded_research_2026-06-04/profiling-quick-reference.md) — Tracy + tt-perf-report capture/analyze (archived 2026-06-04; still the best concise reference).
 3. [`research/35b_perf_milestones.md`](research/35b_perf_milestones.md) — 35B perf trajectory.
 4. [`research/27b_cb_scope.md`](research/27b_cb_scope.md) — CB design + numbers (CB0–CB4).
 5. [`research/35b_tt_perf_report_findings.md`](research/35b_tt_perf_report_findings.md) — empirical writeup behind 35B advice.

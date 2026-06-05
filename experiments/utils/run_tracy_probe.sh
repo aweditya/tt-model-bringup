@@ -8,7 +8,7 @@
 #   bash experiments/utils/run_tracy_probe.sh \
 #       experiments/utils/tracy_profile_one_moe.py tracy_one_moe
 #
-# Assumes one-time setup already done (see research/profiling-cheatsheet.md):
+# Assumes one-time setup already done (see archive/superseded_research_2026-06-04/profiling-cheatsheet.md):
 #   - pipx install tt-perf-report
 #   - python3 experiments/utils/_patch_tracy_assertion.py
 set -euo pipefail

@@ -1895,7 +1895,7 @@ def forward_prefill_tp_inner(state, prompt_ids, capture_logits=False):
 
     # S1a: opt-in whole-prompt chunked prefill (default OFF → prod path unchanged).
     # Returns production-equivalent last-position logits; functionally validated
-    # (coherent generation). See research/27b_chunked_prefill_plan.md.
+    # (coherent generation). See archive/superseded_research_2026-06-04/27b_chunked_prefill_plan.md.
     if getattr(state, "prefill_chunked", False) and not capture_logits:
         return forward_prefill_chunked_tp(state, prompt_ids)
 

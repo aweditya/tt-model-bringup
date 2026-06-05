@@ -706,9 +706,11 @@ ladder + reuse philosophy:
   bringup).
 
 Other useful references:
-- `research/27b_continuous_batching_plan.md` — CB1/2/3/4 origin design.
-- `research/35b_a3b_correctness_plan.md` — the diagnosis recipe for
-  per-layer drift (will be needed if a v0.x cosine gate fails).
+- `archive/superseded_research_2026-06-04/27b_continuous_batching_plan.md`
+  — CB1/2/3/4 origin design (archived 2026-06-04).
+- `archive/superseded_research_2026-06-04/35b_a3b_correctness_plan.md`
+  — the diagnosis recipe for per-layer drift (archived 2026-06-04;
+  will be needed if a v0.x cosine gate fails).
 - `research/multi_chip_optimizations_menu.md` (+ `v2`) — perf-pass
   candidate list; useful AFTER v0..v0.4 ships.
 

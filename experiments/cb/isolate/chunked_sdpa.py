@@ -2,7 +2,7 @@
 """S2.1 isolation — `ttnn.transformer.chunked_scaled_dot_product_attention`.
 
 The only NEW primitive S2 chunked-prefill needs. Per the prior-art audit
-(research/27b_chunked_prefill_prior_art.md) this op ships in tt-metal today —
+(archive/superseded_research_2026-06-04/27b_chunked_prefill_prior_art.md) this op ships in tt-metal today —
 Llama/Qwen-VL prefill paths use it. This isolation confirms it's available in
 our ttnn build, runs at Qwen3.6-27B per-chip shapes, and is bit-equivalent to
 the decode SDPA replayed C times against the same paged KV (the path we're

@@ -19,7 +19,7 @@ Run (qb1, ttnn env exported, server stopped):
     --output-json .cache/sanity_2026_05_22/cosine_ladder_35b.json \\
     [--n-positions 10]   # smoke; omit for full prompt
 
-Output JSON schema documented in `research/35b_a3b_correctness_plan.md`.
+Output JSON schema documented in `archive/superseded_research_2026-06-04/35b_a3b_correctness_plan.md`.
 """
 import argparse
 import json

@@ -236,7 +236,7 @@ twin, to be called `server_35b_cb.py`):
   - Owned-GDN kernel: 27B's CB uses the manual recurrence because
     `qwen36_gdn_decode_owned` hard-asserts B=1. 35B has the SAME constraint
     (MEMORY.md: "hard-asserts batch=1"). v0 must use the manual DN. Batching
-    the owned kernel is research/maintainability_pass-level work — defer.
+    the owned kernel is archive/superseded_research_2026-06-04/maintainability_pass-level work — defer.
 - `cb_reset_slots(state, slot_ids)` (line 157) — pure math on DN ssm + conv
   cols. Generalizes immediately.
 - `cb_reset_states(state)` (line 146) — same, generalizes.

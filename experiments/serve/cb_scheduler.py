@@ -158,7 +158,7 @@ class Scheduler:
         self.pc_misses = 0
         self.pc_evictions = 0
         # chunked_prefill: alternating PREFILL_ONLY / DECODE_ONLY scheduler pattern
-        # (TT vLLM convention; research/27b_chunked_prefill_prior_art.md). When a
+        # (TT vLLM convention; archive/superseded_research_2026-06-04/27b_chunked_prefill_prior_art.md). When a
         # new request is admitted, the next step runs S1a chunked prefill on the
         # production state + cb_prefill_transplant into the slot — one step
         # regardless of L, instead of L decode steps. Other slots are paused
@@ -570,7 +570,7 @@ class Scheduler:
          - chunked_prefill=True: when any request is waiting AND any slot is
            free, run a PREFILL_ONLY step (S1a chunked prefill + transplant for
            ONE request). Otherwise run a DECODE_ONLY step on the active slots.
-           Matches TT vLLM scheduler (research/27b_chunked_prefill_prior_art.md).
+           Matches TT vLLM scheduler (archive/superseded_research_2026-06-04/27b_chunked_prefill_prior_art.md).
          - chunked_prefill=False: original behaviour — admit into slots and
            advance ALL slots one token per iteration through the decode forward
            (the waiting request's prompt is consumed one tok/iter through the

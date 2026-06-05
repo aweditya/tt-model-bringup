@@ -17,7 +17,7 @@ Replaces the three back-to-back ttnn ops in
 to DRAM between ops, and reduce trace-time kernel count.
 
 Design context: `research/35b_moe_ffn_kernel_scoping.md` (architecture map),
-`research/35b_moe_ffn_kernel_build_plan.md` (G0..G4 stages).
+`archive/superseded_research_2026-06-04/35b_moe_ffn_kernel_build_plan.md` (G0..G4 stages, archived 2026-06-04 after kernel landed).
 
 ## Contract (G1b)
 

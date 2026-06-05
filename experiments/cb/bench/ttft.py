@@ -17,7 +17,7 @@ Reference: time one CB step at B=1 with the existing decode forward, then
 project L × step + 1 step = tok-by-tok TTFT. (Cheap proxy; the real loop is
 identical-cost iteration-over-iteration.)
 
-Gate target (from research/27b_s2_chunked_prefill_milestones.md S2.6): at
+Gate target (from archive/superseded_research_2026-06-04/27b_s2_chunked_prefill_milestones.md S2.6): at
 L=200, chunked path << 200 × decode_step. Report any L where chunked WINS.
 
 Run on qb1:

@@ -1,6 +1,6 @@
 """OpenAI-compatible HTTP API over the CB engine (same process as the model).
 
-P2 of the production server (research/production_server_plan.md). Drops the
+P2 of the production server (archive/superseded_research_2026-06-04/production_server_plan.md). Drops the
 Unix-socket hop the legacy openai_endpoint uses — this module runs in the SAME
 process as the device-owning CBEngine, so a FastAPI request handler submits
 prompts straight to the engine queue and bridges the blocking token stream to

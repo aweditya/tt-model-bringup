@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CB inference engine — device-owning thread + thread-safe submit/cancel/stream.
 
-P0 of the production server (research/production_server_plan.md). Wraps the
+P0 of the production server (archive/superseded_research_2026-06-04/production_server_plan.md). Wraps the
 validated Orca scheduler (cb_scheduler.Scheduler — pure orchestration over the
 CB1/CB2/CB4 device primitives, no new device risk) behind a clean, thread-safe
 API so an async HTTP layer (P2) can drive it without ever touching the mesh:
