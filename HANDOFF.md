@@ -62,9 +62,25 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.2 — full 52-layer forward + final_norm
-+ lm_head + argmax. All three block kinds are now validated end-to-end
-at cos ≥ 0.999:
+**Phase 1 — exact next task**: v0.1.4.G0 — ttnn.all_to_all_dispatch
+spike on (1,4) BH. Decides v0.1.4 path: True EP vs Pattern A fork.
+
+23 MoE × 1.3 GB > 8 GB/chip → either path needs sharding to 32
+experts/chip. Research round (2026-06-05, 2 parallel agents) found:
+- Tenstorrent ships `ttnn.all_to_all_dispatch`, `all_to_all_combine`,
+  `moe_routing_remap`, `moe_expert_token_remap`
+- DeepSeek-V3 in-tree demo at `models/demos/deepseek_v3/tt/moe.py`
+  uses these ops (sigmoid + bias + group topk — Nemotron arch match)
+- BH status: #27859 broken, PR #39380 (Mar 2026) fixed, UNVALIDATED
+  on our (1,4) P150 mesh
+- Pattern A from 35B (`server_35b_ttnn.py:1254`) is known-good but
+  runs ~95% wasted expert compute (each chip runs all 32 of its
+  experts, masks unselected)
+
+G0 spike resolves the ambiguity in ~4 hours. Then v0.1.4 implements
+the chosen path. v0.2-v0.5 unblocked.
+
+All three block kinds validated end-to-end at cos ≥ 0.999:
 - L0 Mamba2 (v0.1.2, commits `587ae06` + `dd7b80d`)
 - L1 MoE (v0.1.3, commits `7ad5681` + `aadecbc`)
 - L5 Attention (v0.1.1, commit `e7f3e59`)
