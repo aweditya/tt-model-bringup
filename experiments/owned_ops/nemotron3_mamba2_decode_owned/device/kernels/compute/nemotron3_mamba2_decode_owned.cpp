@@ -65,6 +65,7 @@
 #include "api/compute/eltwise_unary/softplus.h"
 #include "api/compute/matmul.h"
 #include "api/compute/reconfig_data_format.h"
+#include "api/compute/tile_move_copy.h"
 
 namespace {
 
@@ -121,7 +122,7 @@ FORCE_INLINE void compute_decay(uint32_t cb_A_log, uint32_t cb_decay) {
 
     tile_regs_acquire();
     // A_log → exp → negate → A
-    copy_tile_to_dst_init_short(cb_A_log);
+    copy_tile_init(cb_A_log);
     copy_tile(cb_A_log, 0, 0);
     exp_tile_init();
     exp_tile(0);

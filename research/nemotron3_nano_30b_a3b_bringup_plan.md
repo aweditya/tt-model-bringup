@@ -283,9 +283,25 @@ the per-group broadcast.
     binding registering ttnn.experimental.nemotron3_mamba2_decode_owned.
     Next: install via integrate_into_ttmetal.py → build on qb1 →
     debug_mode=1 smoke (output all 1.0).
-  - [ ] Day-3.9: install + build on qb1; debug_mode=1 smoke; harden
-    any compile errors from header path / API drift.
-  - [ ] Day-4: compute_dt_B + add_outer_input → debug_mode=3 (state correct).
+  - [x] **Day-3.9: SMOKE PASSED bit-exact at debug_mode=1**.
+    Build + install + dispatch + CB pipeline + readback all validated.
+    4 fixes across 3 commits:
+      (a) `ttnn::register_operation` → GDN-pattern `device_operation::launch`
+      (b) unused `constexpr uint32_t TILE` → removed (Werror)
+      (c) missing `#include "api/compute/tile_move_copy.h"` for copy_tile
+      (d) `copy_tile_to_dst_init_short` → `copy_tile_init` (cleaner API)
+      (e) smoke readback: ttnn.to_torch doesn't handle bf16 → typecast(fp32) first
+    Smoke output: `y_out shape=(1,1,64) finite=True min=+1.000 max=+1.000 |y-1.0|=0.0e+00`
+    `state_out shape=(1,1,64,128) finite=True min=+1.000 max=+1.000`
+    JIT cache: 11/13 hits (84.6%). End-to-end runtime ~1 s after cache warm.
+  - [ ] **Day-4 (next): implement debug_mode=3 (state correct).**
+    Add `compute_dt_B(cb_dt_eff, cb_B, cb_dt_B)` helper that broadcasts
+    dt_eff across the [ssm_state] vector tile. Then
+    `add_outer_input(cb_state_scaled, cb_x, cb_dt_B, cb_state_out)` for
+    the outer-product update. Wire `debug_mode=3` in kernel_main: full
+    state update (no output reduce yet).
+  - [ ] Day-4.5: C_state_reduce + D*x skip → debug_mode=5 (full math).
+  - [ ] Day-5: G0a harness compare at cos ≥ 0.999 vs numpy oracle.
   - [ ] Day-4: C_state_reduce + add_skip → debug_mode=4..5 (full math).
   - [ ] Day-5: build, oracle compare via G0a harness; ship.
 - [ ] **G2..G4** — sequential, gated on G1.
