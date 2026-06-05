@@ -587,11 +587,29 @@ def bootstrap(state: State, log=None):
     import os as _os
     upload_layers_csv = _os.environ.get("NEMOTRON3_UPLOAD_LAYERS", "")
     if upload_layers_csv:
-        targets = [int(x) for x in upload_layers_csv.split(",") if x]
-        log(f"[bootstrap] uploading {len(targets)} layer(s): {targets}")
+        if upload_layers_csv.strip().lower() == "all":
+            # v0.3.0 — mirror server_35b_ttnn.py:1818's all-resident pattern.
+            # P150 has 32 GB DRAM/chip; full Nemotron load ≈ 21 GB/chip — fits.
+            targets = list(range(N_LAYERS))
+            log(f"[bootstrap] uploading ALL {N_LAYERS} layers (resident path)")
+        else:
+            targets = [int(x) for x in upload_layers_csv.split(",") if x]
+            log(f"[bootstrap] uploading {len(targets)} layer(s): {targets}")
         # Pre-fill per_layer_tt with None to allow sparse indexing.
         state.per_layer_tt = [None] * N_LAYERS
-        for L in targets:
+        import time as _t
+        _t_start = _t.time()
+        _last_log = _t_start
+        for _idx, L in enumerate(targets):
+            # v0.3.0 observability: heartbeat every ~5s OR every 5 layers
+            _now = _t.time()
+            if _now - _last_log >= 5.0 or _idx % 5 == 0:
+                _pct = 100.0 * _idx / len(targets) if targets else 0.0
+                _elapsed = _now - _t_start
+                _eta = (_elapsed / max(_idx, 1)) * (len(targets) - _idx) if _idx else 0
+                log(f"  [progress] {_idx}/{len(targets)} ({_pct:.0f}%)  "
+                    f"elapsed={_elapsed:.0f}s  eta={_eta:.0f}s")
+                _last_log = _now
             kind = state.layer_types[L]
             if kind == "attention":
                 state.per_layer_tt[L] = upload_attn_layer(state, key_to_shard, L, log)
