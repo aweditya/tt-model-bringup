@@ -62,9 +62,22 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.1.3 — L1 MoE (Pattern A fork + DeepSeek-V3
-e_score_correction_bias). v0.1.2 COMPLETE 2026-06-05 (commits `587ae06` +
-`dd7b80d`): L0 Mamba2 fully on-device, all gates PASS at cos ≥ 0.99990.
+**Phase 1 — exact next task**: v0.2 — full 52-layer forward + final_norm
++ lm_head + argmax. All three block kinds are now validated end-to-end
+at cos ≥ 0.999:
+- L0 Mamba2 (v0.1.2, commits `587ae06` + `dd7b80d`)
+- L1 MoE (v0.1.3, commits `7ad5681` + `aadecbc`)
+- L5 Attention (v0.1.1, commit `e7f3e59`)
+
+v0.2 wires the per-layer dispatch (52 layers — 23 Mamba2 + 23 MoE +
+6 Attention by `state.layer_types[L]`) and adds final_norm + lm_head
++ argmax (already validated at v0.1.0). Memory budget: 23 MoE × ~1.3 GB
+per chip exceeds 8 GB/chip → need Pattern A sharding (35B precedent)
+OR a lazy upload strategy to fit. Most pragmatic for v0.2: upload only
+the LAYERS WE'RE RUNNING (sparse uplink already wired via
+`NEMOTRON3_UPLOAD_LAYERS`); for v0.5 perf pass, do real sharding.
+
+Old next-step (v0.1.3, now COMPLETE): L0 Mamba2 fully on-device, all gates PASS at cos ≥ 0.99990.
 Root-cause that closed it: hardcoded clamp constants (1e-4, 0.1) in BOTH
 the numpy oracle and the kernel; HF Nemotron uses
 `self.time_step_limit = (0.0, inf)` for the actual clamp — the
