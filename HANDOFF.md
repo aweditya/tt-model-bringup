@@ -62,9 +62,12 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.0 HF oracle re-running on qb1
-(tmux `nemotron_oracle`). Once `.cache/hf_oracle_nemotron3_nano/`
-populates, proceed through the gated chain #199 → #211.
+**Phase 1 — exact next task**: v0.0.1 Nemotron tokenizer verification
+(task #200). v0.0 DONE 2026-06-05 — oracle artifacts in
+`.cache/hf_oracle_nemotron3_nano/` (15 npys + 4 new from hardening:
+L0_norm, L0_mamba2_mixer_out, L1_moe_shared_out, L1_moe_mixer_out,
+L5_attn_mixer_out). argmax=6993 ' Paris' ✓. Multi-step `--gen N`
+flag verified for v0.3 validation.
 
 Steps for v0.1.0 (bootstrap, after v0.0 lands):
 1. Fork bootstrap from `experiments/serve/server_35b_ttnn.py` (closest
