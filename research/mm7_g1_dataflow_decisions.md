@@ -254,34 +254,47 @@ Tracy as >5% of per-block time.
 
 ------------------------------------------------------------------------
 
-## D11 — Split `compute_decay` into two helpers due to SFPU dest-reg lifetime
+## D11 — Split `compute_decay` into two helpers due to SFPU dest-reg lifetime (RESOLVED 2026-06-04 G1 day-3.5)
 
-**Decision (G1 day-3)**: implement decay computation as TWO helpers:
-1. `compute_decay(...)` — produces `A = -exp(A_log)` in `cb_decay`.
-2. `finalize_decay_with_dt_eff(...)` — multiplies `cb_decay` by
-   recomputed `dt_eff`, then `exp`s the result. Stubbed at day-3;
-   wired at day-3.5.
+**Decision (final, G1 day-3.5)**: decay computation is TWO helpers
+plus a scratch CB:
+1. `compute_decay(cb_A_log, cb_decay)` — single tile_regs cycle:
+   `copy_tile → exp_tile → negative_tile → pack`. Produces `A = -exp(A_log)`
+   into `cb_decay`. Consumes only `cb_A_log`.
+2. `finalize_decay_with_dt_eff(cb_decay_inout, cb_dt, cb_dt_bias,
+   cb_dt_eff_scratch, ...)` — TWO tile_regs cycles + a scratch CB:
+   - Cycle 1: `dt_eff = clamp(softplus(dt + dt_bias), floor, max)` packed
+     into `cb_dt_eff_scratch`.
+   - Cycle 2: `mul_tiles(cb_decay_inout=A, cb_dt_eff_scratch=dt_eff) →
+     exp_tile → pack` overwrites `cb_decay_inout` with the final
+     `decay = exp(A * dt_eff)`. Uses queue-pop-after-push semantics
+     to atomically replace `A` with `decay`.
+
+The scratch CB is `cb_dt_B` (reused — it's empty at this point in
+the pipeline; the actual `dt_eff * B` product fires at debug_mode=3+
+after cb_dt_B's scratch use here is popped).
 
 **Alternatives considered**:
-- **One monolithic helper**: keep `dt_eff` alive in dest reg across
-  multiple SFPU stages. Blackhole's dest reg is 8 tiles deep; cross-
-  cycle persistence requires careful `tile_regs_*` sequencing.
-- **Recompute `dt_eff` inline twice**: one recompute is cheap (~5
-  cycles) vs adding a CB store/load round-trip (~30 cycles).
+- **Single monolithic helper with dest-reg lifetime**: SFPU primitives
+  operate in-place at a single dest slot. Cross-cycle persistence of
+  scalar values requires intermediate CB pack/unpack. Doable but
+  fragile and ties cycles together — harder to debug stage by stage.
+- **Recompute `dt_eff` inline in compute_decay**: would compute `A`,
+  recompute `dt_eff`, multiply, exp — all in one tile_regs cycle.
+  Saves one CB round-trip but requires multiple `copy_tile_init`
+  reconfig cycles inside one tile_regs (interleaving math op kernels
+  with copy kernels). Complexity not worth ~30 cycles at this stage.
 
-**Rationale**: SFPU primitives consume a single dest tile and produce
-into the same slot. To compute `decay = exp(dt_eff * A)` we need both
-`dt_eff` and `A` in two dest slots simultaneously. The first pass
-fills cb_decay with `A`; the second pass recomputes `dt_eff` (cheap
-since dt + dt_bias scalars are still in their CBs) and multiplies by
-A in-dest, then exps. The recompute is decision-D5-style (one extra
-add + softplus + clamp per block) but keeps each helper as one
-`tile_regs_acquire`/`release` cycle — much easier to debug.
+**Rationale (final)**: two clean single-purpose helpers + a scratch
+CB is the right abstraction. Each helper = one or two tile_regs
+cycles, each with a clear input/output contract. Mirrors GDN's
+`mul_alpha_scalar_tile_indexed` style (one job per helper). The
+queue-pop-after-push pattern for `cb_decay_inout` overwrite is the
+ONLY non-obvious mechanic — it's documented in the helper body.
 
-**Future opportunity**: when LLK exposes dst-to-dst SFPU mul (or we
-write a custom `compute_decay_fused` that stashes `dt_eff` in a
-secondary dest slot via `copy_tile_init` patterns), we collapse both
-helpers into one. Saves ~30 cycles per (batch, head). Minor at v3.
+**Future opportunity**: when LLK exposes dst-to-dst SFPU mul (already
+on the tt-metal roadmap per their CCL kernel evolution), collapse to
+a single helper. Saves ~30 cycles per (batch, head). Minor at v3.
 
 **Revisit trigger**: if Tracy shows >5% time in discretization stage
 at v3 perf pass.

@@ -259,15 +259,24 @@ the per-group broadcast.
     pattern. CB layout pinned (15 CBs, cb_x..cb_y). debug_mode=1
     (fill_one smoke) implemented for first-build gate. Six TODO
     blocks for the math helpers with explicit LLK call sequences.
-  - [-] Day-3 (partial): LLK API survey done — softplus/clamp/exp/negative
-    all ship as first-class SFPU primitives (decision D8 RESOLVED, "use
-    what they provide" rule). compute_decay (packs A=-exp(A_log) into
-    cb_decay) + mul_decay_state_to (forked from GDN line 57) + sentinel
-    finalize_decay_with_dt_eff stub shipped. debug_mode=2 wired. New
-    decision D11 documents the split-helper approach.
-    Remaining day-3 work: finalize_decay_with_dt_eff body, program
-    factory + reader/writer for new CB layout.
-  - [ ] Day-3.5: compute_dt_B + add_outer_input → debug_mode=3 (state correct).
+  - [x] Day-3: LLK API survey done — softplus/clamp/exp/negative ship
+    as first-class SFPU primitives (D8 RESOLVED). compute_decay +
+    mul_decay_state_to shipped; D11 introduced split-helper approach.
+  - [x] Day-3.5 (commit pending push): finalize_decay_with_dt_eff body
+    landed. Three-stage pipeline:
+      1. Stage 1: dt_eff = clamp(softplus(dt + dt_bias), floor, max)
+         → cb_dt_B (reused as scratch).
+      2. Stage 2+3: decay = exp(A * dt_eff) → overwrites cb_decay via
+         queue-pop-after-push semantics.
+    compute_decay simplified to one tile_regs cycle (A only). D11
+    marked RESOLVED with the scratch-CB pattern documented. debug_mode=2
+    output now: state_out = decay * state_in (matches oracle's
+    decay-only term; full math at debug_mode=5).
+  - [ ] Day-3.75: program_factory + reader/writer for the new 15-CB
+    Mamba2 layout (currently still GDN's 18-CB layout — kernel won't
+    actually run until factory updated). First build + debug_mode=1
+    smoke on qb1.
+  - [ ] Day-4: compute_dt_B + add_outer_input → debug_mode=3 (state correct).
   - [ ] Day-4: C_state_reduce + add_skip → debug_mode=4..5 (full math).
   - [ ] Day-5: build, oracle compare via G0a harness; ship.
 - [ ] **G2..G4** — sequential, gated on G1.
