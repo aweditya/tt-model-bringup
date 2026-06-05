@@ -62,7 +62,7 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.3 (multi-step decode + long-context smoke).
+**Phase 1 — exact next tasks**: v0.2.6 (host weight cache, ~30 LOC) then v0.3.
 
 v0.2.5 COMPLETE 2026-06-05 (commit `926b49c`) — `_tt` block variants
 take/return `ttnn.Tensor`, 0 inter-block readbacks. Regression PASS
@@ -70,11 +70,21 @@ take/return `ttnn.Tensor`, 0 inter-block readbacks. Regression PASS
 77.7s — essentially same. The 52 round trips we eliminated were ~10ms
 each (~520ms); drowned by 23 MoE × ~3s = 69s of MoE weight upload from
 disk per forward. **The bottleneck is weight streaming, not tensor
-flow.** For v0.3 multi-step we need to either fit all layers in memory
-(needs vocab-shard + more aggressive sharding — v0.5 territory) OR
-accept ~minute-per-token decode. Realistic v0.3 plan: 8-token chain
-gate uses ~10 min/run; needle-haystack at L=8192 blocked on weight
-residency (trace path or v0.5 fit-all-in-memory).
+flow.**
+
+**v0.2.6 (next, ~30 lines)**: `state.weight_np_cache` dict.
+`load_t(state, key)` checks cache before re-reading safetensors.
+Iter 1 cold = 82s; iter 2+ warm = ~20s (skips 23×~2.5s disk reads).
+4× steady-state speedup makes v0.3 multi-step decode bearable.
+
+**v0.3 (after v0.2.6)**: 8-token chain match HF. KV cache + ssm_state
+in ttnn tensors carried across steps. ~3-4 min/8-token run = doable.
+
+**Deferred**:
+- Pipeline upload/compute (marginal — compute << upload)
+- Memory residency / aggressive sharding (v0.5 perf — too risky now)
+- bf8 weights (user veto — long-context drift unknown)
+- Needle-haystack L=8192 (blocked on v0.4 trace — eager won't scale)
 
 v0.2 COMPLETE 2026-06-05 — full 52-layer streamed forward + final_norm
 + lm_head + argmax matches HF (commit `5ffd183`). TT argmax_last = 6993
