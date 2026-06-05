@@ -433,55 +433,62 @@ FORCE_INLINE void add_state_scaled_outer(
     cb_push_back(cb_state_out, ONE_TILE);
 }
 
-// matmul_reduce_C_state(cb_state_in, cb_C, head_dim_tile, ssm_state_tiles,
+// matmul_reduce_C_state(cb_C, cb_state_in, head_dim_tile, ssm_state_tiles,
 //                       cb_y_partial)
 //
 // Computes (for one head_dim tile):
-//   y_partial[d] = sum_s(state_in[d, s] @ C[s]^T)
+//   y_partial[d][j] = sum_{global s} state_in[d, s][j, k] * C[s][k]
+//                   = (C · state_in^T)[d, j]
 //
-// where state_in[d, s] is fp32 [head_dim × ssm_state] within the tile and
-// C[s] is bf16 row-vector with values in row 0. We use mm_init's
-// `transpose=1` flag so matmul_tiles computes A @ B^T — the LLK reads C
-// with rows-and-cols swapped, turning the row-vector (values in row 0)
-// into the column-vector orientation matmul needs for the inner-product
-// reduce. Accumulating across all `ssm_state_tiles` tiles in dst[0] gives
-// the full C·state reduce; the result lands in col 0 of the output tile
-// (col-vector layout), then packs to cb_y_partial.
+// where state_in[d, s] is fp32 [head_dim × ssm_state] within the tile,
+// j ranges over head_dim_within_tile, and C[s] is bf16 with values in
+// row 0 (the W axis carries the ssm_state index).
 //
-// Output shape: 1 bf16 tile per head_dim_tile (col-vector with
-// `head_dim_within_tile` values along H). Caller iterates head_dim_tile
-// to fill cb_y_partial with head_dim_tiles output tiles.
+// LAYOUT — operand orientation chosen so y_partial lands in ROW-vector
+// form (values in row 0), matching x[d]'s layout. This lets mode=4's
+// `y[d] = y_partial[d] + D * x[d]` use ordinary `add_tiles` on
+// equivalently-shaped tiles, no extra transpose.
+//
+// Math derivation: with mm_init transpose=1, matmul computes A @ B^T:
+//   result[i, j] = sum_k(A[i, k] * B[j, k])
+// Setting A = C (in0), B = state_in (in1, transposed by the flag):
+//   A[i, k] = C[s, k] if i=0 else 0      (C has values only in row 0)
+//   B[j, k] = state_in[d, s][j, k]
+//   result[0, j] = sum_k(C[s, k] * state_in[d, s][j, k])
+// Accumulating across all `ssm_state_tiles` tiles gives the full reduce
+// in row 0 of dst.
 //
 // REUSE: direct fork of
 //   qwen36_gdn_decode_owned/device/kernels/compute/qwen36_gdn_decode_owned.cpp
-//   line 215: `matmul_reduce`. The structural role is identical to GDN's
-//   `pred = k · s_prev` reduce — that early matmul implicitly primes the
-//   LLK matmul engine for the downstream transpose+matmul_outer loop,
-//   matching the canonical GDN pipeline shape (and replacing the bare
-//   mm_init prime workaround that was at the previous version's
-//   day-4 checkpoint). See [[feedback-gdn-vs-mamba2-kernel-delta]].
+//   line 215: `matmul_reduce`. Structurally identical to GDN's
+//   `pred = k · s_prev` reduce — that early matmul implicitly primes
+//   the LLK matmul engine for the downstream transpose+matmul_outer
+//   loop, matching the canonical GDN pipeline shape and dropping the
+//   bare-mm_init prime workaround. See
+//   [[feedback-gdn-vs-mamba2-kernel-delta]] and
+//   [[feedback-mm-init-prime-required]].
 //
 // SDPA-style escape hatch (memory: [[feedback-sdpa-transpose-b-flag-escape-hatch]]):
 // passing `transpose=1` to mm_init folds the row-to-col flip into the
-// matmul itself instead of calling `transpose_wh_tile` on C — no extra
-// CB allocation, no sticky-unpacker-bit risk.
+// matmul itself instead of calling `transpose_wh_tile` on the data —
+// no extra CB allocation, no sticky-unpacker-bit risk.
 FORCE_INLINE void matmul_reduce_C_state(
-    uint32_t cb_state_in,
-    uint32_t cb_C,
+    uint32_t cb_C,                // in0 (bf16, row-vector tile)
+    uint32_t cb_state_in,         // in1 (fp32, full tile) — will be transposed
     uint32_t head_dim_tile,
     uint32_t ssm_state_tiles,
     uint32_t cb_y_partial) {
     constexpr uint32_t TRANSPOSE_B = 1;
-    mm_init(cb_state_in, cb_C, cb_y_partial, TRANSPOSE_B);
+    mm_init(cb_C, cb_state_in, cb_y_partial, TRANSPOSE_B);
 
-    cb_wait_front(cb_state_in, (head_dim_tile + 1) * ssm_state_tiles);
     cb_wait_front(cb_C, ssm_state_tiles);
+    cb_wait_front(cb_state_in, (head_dim_tile + 1) * ssm_state_tiles);
     cb_reserve_back(cb_y_partial, ONE_TILE);
 
     tile_regs_acquire();
     for (uint32_t s = 0; s < ssm_state_tiles; ++s) {
         const uint32_t state_idx = head_dim_tile * ssm_state_tiles + s;
-        matmul_tiles(cb_state_in, cb_C, state_idx, s, 0);
+        matmul_tiles(cb_C, cb_state_in, s, state_idx, 0);
     }
     tile_regs_commit();
     tile_regs_wait();
@@ -491,16 +498,71 @@ FORCE_INLINE void matmul_reduce_C_state(
     cb_push_back(cb_y_partial, ONE_TILE);
 }
 
-// TODO(G1 day-4): add_skip(cb_y_partial, cb_x, cb_D, head_dim_tile, cb_y)
+// mul_D_x_to(cb_x, cb_D, head_dim_tile, cb_D_x_scratch)
 //
-// Implements:
-//   y[d] = y_partial[d] + D * x[d]
+// Computes:
+//   D_x[d] = D * x[d]    (D is scalar broadcast across x[d]'s row-vec)
 //
-// D is scalar; multiplied by x[d] and added to the reduce result.
+// x[d] is a bf16 row-vector tile (values in row 0). D is a bf16 scalar
+// tile (broadcast across all 1024 positions). Result is a row-vector
+// tile (values in row 0 = D * x[d] values).
 //
-// LLK calls expected:
-//   bcast_mul_tile_scalar(cb_x, cb_D, head_dim_tile, 0, ...)
-//   add_tiles(..., cb_y_partial, 0, 0, cb_y)
+// REUSE: same `mul_tiles_bcast_scalar_init_short` pattern as
+// mul_decay_state_to. cb_D_x_scratch will be cb_outer in mode=4
+// (re-used after state-update loop drains it).
+FORCE_INLINE void mul_D_x_to(
+    uint32_t cb_x,
+    uint32_t cb_D,
+    uint32_t head_dim_tile,
+    uint32_t cb_D_x_scratch) {
+    reconfig_data_format(cb_x, cb_D);
+    pack_reconfig_data_format(cb_D_x_scratch);
+    mul_tiles_bcast_scalar_init_short(cb_x, cb_D);
+    cb_wait_front(cb_x, head_dim_tile + 1);
+    cb_wait_front(cb_D, ONE_TILE);
+    cb_reserve_back(cb_D_x_scratch, ONE_TILE);
+
+    tile_regs_acquire();
+    mul_tiles_bcast_scalar(cb_x, cb_D, head_dim_tile, 0, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_D_x_scratch);
+    tile_regs_release();
+
+    cb_push_back(cb_D_x_scratch, ONE_TILE);
+}
+
+// add_y_partial_D_x(cb_y_partial, cb_D_x_scratch, head_dim_tile, cb_y)
+//
+// Computes:
+//   y[d] = y_partial[d] + D_x[d]
+//
+// Both inputs are bf16 row-vector tiles (values in row 0). add_tiles
+// element-wise sum → row 0 = y[d] values.
+//
+// REUSE: same `add_tiles_init` pattern as add_state_scaled_outer
+// (forked from GDN add_state_to_out).
+FORCE_INLINE void add_y_partial_D_x(
+    uint32_t cb_y_partial,
+    uint32_t cb_D_x_scratch,
+    uint32_t head_dim_tile,
+    uint32_t cb_y) {
+    reconfig_data_format(cb_y_partial, cb_D_x_scratch);
+    pack_reconfig_data_format(cb_y);
+    add_tiles_init(cb_y_partial, cb_D_x_scratch);
+    cb_wait_front(cb_y_partial, head_dim_tile + 1);
+    cb_wait_front(cb_D_x_scratch, ONE_TILE);
+    cb_reserve_back(cb_y, ONE_TILE);
+
+    tile_regs_acquire();
+    add_tiles(cb_y_partial, cb_D_x_scratch, head_dim_tile, 0, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_y);
+    tile_regs_release();
+
+    cb_push_back(cb_y, ONE_TILE);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // kernel_main — orchestration.
@@ -712,7 +774,7 @@ void kernel_main() {
             }
 
             for (uint32_t d = 0; d < head_dim_tiles; ++d) {
-                matmul_reduce_C_state(cb_state_in, cb_C, d, ssm_state_tiles, cb_y_partial);
+                matmul_reduce_C_state(cb_C, cb_state_in, d, ssm_state_tiles, cb_y_partial);
             }
 
             for (uint32_t d = 0; d < head_dim_tiles; ++d) {
@@ -740,17 +802,76 @@ void kernel_main() {
             cb_pop_front(cb_z, head_dim_tiles);
             cb_pop_front(cb_y_partial, head_dim_tiles);  // mode=3 doesn't consume
         }
+        else if (debug_mode == 4) {
+            // ── Mode 4: state correct + y_partial = C·state_in^T + D·x ──
+            // Same state-update pipeline as mode=3 (proven), but now consume
+            // cb_y_partial (already produced by matmul_reduce_C_state) and
+            // add D·x to produce the real y. mode=4 differs from production
+            // mode=5 only in that y_partial uses state_in instead of state_out
+            // (a fixup C·outer add at mode=5 corrects this).
+            //
+            // Math:
+            //   state_out = decay * state_in + dt_eff * x ⊗ B   (full)
+            //   y_partial = C · state_in^T                       (from matmul_reduce_C_state)
+            //   y[d]      = y_partial[d] + D · x[d]              (NEW for mode=4)
+            compute_decay(cb_A_log, cb_decay);
+            compute_dt_eff(
+                cb_dt, cb_dt_bias, cb_dt_B,
+                SOFTPLUS_BETA_BITS, SOFTPLUS_BETA_RECIP_BITS,
+                SOFTPLUS_THRESHOLD_BITS,
+                TIME_STEP_FLOOR_BITS, TIME_STEP_MAX_BITS);
+            multiply_decay_by_dt_eff(cb_decay, cb_dt_B);
+            compute_dt_B(cb_dt_B, cb_B, ssm_state_tiles);
+
+            // Phase 1: pre-transpose x (same as mode=3).
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                transpose_x_to_col(cb_x, d, cb_x_col);
+            }
+
+            // Phase 2: matmul_reduce_C_state — primes the matmul engine
+            // AND produces cb_y_partial for the mode=4 y add (consumed below,
+            // NOT drained like mode=3).
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                matmul_reduce_C_state(cb_C, cb_state_in, d, ssm_state_tiles, cb_y_partial);
+            }
+
+            // Phase 3: state-update loop (same as mode=3).
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                for (uint32_t s = 0; s < ssm_state_tiles; ++s) {
+                    const uint32_t tile_idx = d * ssm_state_tiles + s;
+                    matmul_outer_x_dt_B(cb_x_col, cb_dt_B, d, s, cb_outer);
+                    mul_decay_state_to(cb_state_in, cb_decay, tile_idx, cb_state_scaled);
+                    add_state_scaled_outer(cb_state_scaled, cb_outer, tile_idx, cb_state_out);
+                    cb_pop_front(cb_outer, ONE_TILE);
+                }
+            }
+
+            // Phase 4: y[d] = y_partial[d] + D · x[d] (NEW at mode=4).
+            // Reuse cb_outer as the D·x scratch (it's empty after the
+            // state-update loop's per-iter pop).
+            for (uint32_t d = 0; d < head_dim_tiles; ++d) {
+                mul_D_x_to(cb_x, cb_D, d, cb_outer);
+                add_y_partial_D_x(cb_y_partial, cb_outer, d, cb_y);
+                cb_pop_front(cb_outer, ONE_TILE);
+            }
+
+            // Drain. cb_y_partial fully consumed by add_y_partial_D_x.
+            cb_pop_front(cb_x, head_dim_tiles);
+            cb_pop_front(cb_x_col, head_dim_tiles);
+            cb_pop_front(cb_state_in, head_dim_tiles * ssm_state_tiles);
+            cb_pop_front(cb_state_scaled, head_dim_tiles * ssm_state_tiles);
+            cb_pop_front(cb_decay, ONE_TILE);
+            cb_pop_front(cb_dt_B, ssm_state_tiles);
+            cb_pop_front(cb_C, ssm_state_tiles);
+            cb_pop_front(cb_D, ONE_TILE);
+            cb_pop_front(cb_z, head_dim_tiles);
+            cb_pop_front(cb_y_partial, head_dim_tiles);
+        }
         //
-        // TODO(G1 day-4.5): debug_mode == 4
+        // TODO(G1 day-4.6): debug_mode == 5 (production)
         //
-        // Wire add_skip(cb_y_partial, cb_x, cb_D, cb_y) with cb_y_partial == 0.
-        // i.e. y = D * x only (skip C·state reduce).
-        // Gate: y == D·x bit-close.
-        //
-        // TODO(G1 day-4.5+): debug_mode == 0 / 5 (production)
-        //
-        // Wire C_state_reduce(cb_C, cb_state_out, _, cb_y_partial) ahead of
-        // add_skip. Full math live.
+        // Add the y_partial += C · outer fixup so y reflects state_out
+        // instead of state_in. Then mode=5 ≡ production.
         // Gate: G0a harness PASS at cos ≥ 0.999 vs numpy oracle, both 1-step
         //       AND 8-step multi-step replay.
     }
