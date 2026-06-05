@@ -312,13 +312,29 @@ the per-group broadcast.
     - Single-phase loop works (transpose+matmul+mul_decay+add+pop per s)
       once mm_init prime is in place; two-phase split unnecessary.
     Bisect log + canonical patterns documented in commit `b5c93fa`.
-  - [ ] **Day-4.1 (next)**: localize the d=1 hang. Test ONE matmul iter
-    at d=1 with NO fill_one before (step-14 hung but had fill_one before
-    the matmul, which calls `fill_tile_init` and likely un-primes mm).
-    If d=1 alone passes, then the d-loop transition needs an extra
-    init re-prime. If d=1 hangs, deeper LLK debug.
-  - [ ] Day-4.5: C_state_reduce + D*x skip → debug_mode=4 (D·x only).
-  - [ ] Day-4.6: full mode=5 (production math) → cos ≥ 0.999 vs oracle.
+  - [ ] **Day-4.1 (REVISED post-research 2026-06-05)**: STRUCTURAL fix.
+    Research round (3 parallel subagents) surfaced the principled answer:
+    GDN doesn't need a prime because its **math forces** an early
+    `matmul_reduce(k, s_prev) = pred` (delta-rule prediction-error
+    requires reading old state through current key). Mamba2 SSD is
+    linear — no `pred` term, no natural early matmul. Our bare
+    `mm_init` prime workaround papers over a TRISC init-ordering hole.
+    The PRINCIPLED fix is to **restructure mode=3 to compute
+    `y_partial = C · state_in^T` FIRST** (the C·state reduce we need
+    anyway at mode=5), giving us an isolated `matmul_reduce` before
+    the transpose+matmul loop — structurally identical to GDN's
+    pipeline shape. Then state-update loop. Then fixup
+    `y_partial += C · outer`. Pull mode=5's reduce earlier in the
+    pipeline; this collapses day-4.1 + day-4.5 into one cleaner pass.
+    Memory: [[feedback-gdn-vs-mamba2-kernel-delta]].
+  - [ ] **Alternative escape hatch** (memory: [[feedback-sdpa-transpose-b-flag-escape-hatch]]):
+    SDPA folds Kᵀ into matmul's `transpose=1` B-operand flag, never
+    calls `transpose_wh_tile`. Could replace `transpose_x_to_col +
+    matmul_outer_x_dt_B` with a single `matmul_tiles(x, dt_B,
+    transpose=1)` call. Worth a small isolation probe; if it works,
+    drop transpose helper entirely.
+  - [ ] Day-4.5 (folded into day-4.1 above): C_state_reduce ahead of
+    state update. Full math at mode=5.
   - [ ] Day-5: G0a harness compare at cos ≥ 0.999 vs numpy oracle,
     single-step AND 8-step multi-step replay.
 - [ ] **G2..G4** — sequential, gated on G1.

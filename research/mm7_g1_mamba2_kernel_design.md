@@ -294,6 +294,40 @@ ladder progress.
 
 ------------------------------------------------------------------------
 
+## 8.5 Structural finding (added 2026-06-05 post research)
+
+Day-4 implementation surfaced a load-bearing math-structural difference
+between GDN and Mamba2 SSD that the original §6 pseudocode missed:
+
+- GDN's delta-rule math requires `pred = k · s_prev` BEFORE the state
+  update. The kernel runs this as `matmul_reduce(k, s_scaled, ...)` at
+  `qwen36_gdn_decode_owned.cpp:491`, BEFORE the transpose+matmul_outer
+  inner loop. That isolated real matmul implicitly initializes the LLK
+  matmul-unpacker state, so the subsequent loop's `mm_init` calls work
+  cleanly.
+- Mamba2 SSD is linear (no `pred` term), so its first matmul lands
+  INSIDE the transpose+matmul loop. On Blackhole this hangs the TRISC
+  pipeline starting at the second iteration — `transpose_wh_init_short`
+  leaves a sticky unpacker bit (tt-metal #15930, no `transpose_wh_uninit`)
+  that the in-loop `mm_init` doesn't clear sufficiently.
+
+**Two fixes**, both informed by research:
+- **(A) Restructure: pull C·state reduce earlier.** Compute
+  `y_partial = C · state_in^T` as a `matmul_reduce` BEFORE the
+  state-update loop. Structurally matches GDN's pattern, drops the
+  bare-mm_init workaround, makes the kernel's pipeline shape
+  comprehensible. **Recommended.**
+- **(B) Drop `transpose_wh_tile` entirely.** Use matmul's `transpose=1`
+  B-operand flag (per SDPA's pattern) to fold the col-vector transform
+  into the matmul itself. The sticky-bit class of hang disappears.
+  Less code, less init churn.
+
+Memory entries: [[feedback-gdn-vs-mamba2-kernel-delta]],
+[[feedback-sdpa-transpose-b-flag-escape-hatch]],
+[[feedback-mm-init-prime-required]] (the original workaround).
+
+------------------------------------------------------------------------
+
 ## 9. Open questions to resolve during implementation
 
 1. Does `softplus_tile` exist as an LLK primitive, or do we need to

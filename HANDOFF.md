@@ -26,16 +26,43 @@ transition. Source checkpoint at commit `b5c93fa`.
   tt-metal #15930 = no `transpose_wh_uninit`).
 - `cb_outer` is bf16 (matches GDN's tensor_format).
 
-**Exact next task**: G1 **day-4.1** — localize the d=1 hang.
+**Exact next task**: G1 **day-4.1 (REVISED 2026-06-05 post-research)** —
+**structural restructure**, not bisect.
 
-1. Re-test ONE matmul iter at d=1 (tile_index=1) with NO fill_one or
-   any other op between `mm_init` prime and the matmul. Append the
-   sentinel fill_ones for state_out positions 0..3 AFTER the matmul
-   iter (the writer drains in order), not before.
-2. If d=1 passes alone → it's specifically the d-loop transition that
-   hangs. Add re-prime (another `mm_init`) between d-iters.
-3. If d=1 hangs alone → deeper LLK issue with `tile_index=1`. Try
-   `transpose_wh_init` (full, not _short) inside `transpose_x_to_col`.
+The 3 research subagents converged on a principled answer:
+- GDN doesn't need a prime because its **delta-rule math forces**
+  `pred = k · s_prev` (matmul_reduce) BEFORE the state update. Mamba2
+  SSD is linear — no `pred` term — so our `mm_init` prime is a
+  workaround for an init-ordering hole that doesn't exist in GDN.
+- **The fix is to pull mode=5's `y_partial = C · state_in^T` reduce
+  EARLIER in the pipeline**, giving us a real isolated `matmul_reduce`
+  before the transpose+matmul loop. Structurally identical to GDN. This
+  collapses day-4.1 + day-4.5 (mode 3+5) into one cleaner change.
+
+**Plan (Option A from research)**:
+1. Add a `matmul_reduce_C_state(cb_state_in, cb_C, head_dim_tiles, cb_y_partial)`
+   helper. Fork from GDN's `matmul_reduce` (line 215 in GDN compute
+   kernel). Reads cb_state_in (all 8 tiles) reduces against cb_C
+   (4 tiles ssm_state vector) → writes `head_dim_tiles=2` tiles to
+   cb_y_partial.
+2. In mode=3 wire-up: call `matmul_reduce_C_state` BEFORE the state-update
+   loop. Drop the bare `mm_init(cb_x, cb_dt_B, cb_outer)` workaround at
+   line 651 — no longer needed.
+3. Mode=5 will then add the fixup: `y_partial += C · outer` (one extra
+   reduce after each outer-product step), plus the D·x skip.
+
+**Alternative escape hatch**: SDPA folds Kᵀ into matmul's `transpose=1`
+B-operand flag, never uses `transpose_wh_tile`. Could be a one-line
+replacement for our entire `transpose_x_to_col + matmul_outer_x_dt_B`
+pair — see [[feedback-sdpa-transpose-b-flag-escape-hatch]]. Worth a
+small isolation probe.
+
+**Memory entries written this round**:
+- [[feedback-mm-init-prime-required]] — the workaround
+- [[feedback-gdn-vs-mamba2-kernel-delta]] — the structural reason +
+  principled fix
+- [[feedback-sdpa-transpose-b-flag-escape-hatch]] — the alternative
+- [[tt-llk-frozen-in-tt-metal]] — repo state + missing L3 docs
 
 **Current source state**: the kernel at
 `experiments/owned_ops/nemotron3_mamba2_decode_owned/device/kernels/compute/nemotron3_mamba2_decode_owned.cpp`
