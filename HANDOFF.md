@@ -5,6 +5,88 @@ Read top to bottom; everything else is linked.
 
 ---
 
+## POST-COMPACTION QUICK-START (2026-06-04 22:50 PT)
+
+**Where we are**: G1 day-3.9 PASSED. The owned Mamba2 SSD kernel
+scaffolding (compute + reader + writer + program_factory + device_op +
+nanobind) compiles, registers, dispatches, runs end-to-end. Smoke at
+`debug_mode=1` (fill_one path) returns bit-exact `1.0` for both y and
+ssm_state. Commit `0073ef8`.
+
+**Exact next task**: G1 **day-4** — implement `debug_mode=3` math.
+
+1. Edit `experiments/owned_ops/nemotron3_mamba2_decode_owned/device/kernels/compute/nemotron3_mamba2_decode_owned.cpp`
+2. Add helper `compute_dt_B(cb_dt_eff_scratch, cb_B, cb_dt_B)` — broadcast
+   scalar `dt_eff` across the `[ssm_state]` B vector via
+   `mul_tiles_bcast_scalar`. Fork from the existing `mul_decay_state_to`
+   in the same file (line ~277); the LLK call is identical.
+3. Add helper `add_outer_input(cb_state_scaled, cb_x, cb_dt_B,
+   head_dim_tile, ssm_state_tile, cb_state_out)` — implements
+   `state_out[d,s] = state_scaled[d,s] + dt_B[s] * x[d]`. Per-tile
+   outer-product add. Probably ~50 LOC.
+4. Wire `debug_mode=3` branch in `kernel_main`. Pipeline:
+   ```
+   compute_decay → finalize_decay_with_dt_eff (cb_decay = decay)
+   compute_dt_B (cb_dt_B was scratch-storing dt_eff, now overwrite with
+                 dt_eff * B vector)
+   for d in head_dim_tiles:
+       for s in ssm_state_tiles:
+           mul_decay_state_to → cb_state_scaled
+           add_outer_input → cb_state_out
+   fill_one(cb_y)  # mode 3 still sentinel-fills y
+   ```
+5. Deploy to qb1 + rebuild + smoke. The smoke at `debug_mode=3` should
+   produce state_out ≈ `decay*state_in + dt_eff*B*x` (matching the
+   numpy oracle's state-update step, ignoring the output-reduce).
+
+**Validation gate**: fork
+`experiments/cb/isolate/mamba2_kernel_smoke.py` → run with
+`debug_mode=3` instead of `debug_fill=True`. Compare state_out against
+`experiments/utils/mamba2_numpy_oracle.py` via the G0a harness
+(`experiments/utils/test_mamba2_decode_isolated.py --kernel-callable
+<py path>`). Pass: per-head cos ≥ 0.999.
+
+**Setup commands** (verbatim):
+```bash
+# Build kernel after edits:
+bash scripts/deploy.sh experiments/owned_ops/nemotron3_mamba2_decode_owned/
+ssh qb1 'cd ~/tt-xla && python3 experiments/owned_ops/nemotron3_mamba2_decode_owned/integrate_into_ttmetal.py --tt-metal ~/tenstorrent/tt-metal && cd ~/tenstorrent/tt-metal && cmake --build build_Release --target ttnn -j8 2>&1 | tail -8'
+ssh qb1 'cp ~/tenstorrent/tt-metal/build_Release/ttnn/_ttnn.so ~/tenstorrent/tt-metal/ttnn/ttnn/_ttnn.so && cp ~/tenstorrent/tt-metal/build_Release/ttnn/_ttnncpp.so ~/tenstorrent/tt-metal/ttnn/ttnn/_ttnncpp.so'
+
+# Run the smoke (clear JIT cache if you changed the kernel):
+ssh qb1 'rm -rf /home/aditya/.cache/tt-metal-cache/*/kernels/nemotron3_mamba2_decode_owned/ 2>/dev/null; cd ~/tt-xla && TT_METAL_HOME=$HOME/tenstorrent/tt-metal TT_BUILD_DIR=$TT_METAL_HOME/build_Release ARCH_NAME=blackhole PYTHONPATH=$TT_METAL_HOME/ttnn LD_LIBRARY_PATH=$TT_METAL_HOME/ttnn/ttnn:$TT_BUILD_DIR/ttnn:$TT_BUILD_DIR/lib timeout 60 .venv/bin/python -u experiments/cb/isolate/mamba2_kernel_smoke.py'
+```
+
+**Notes for post-compaction me**:
+- If qb1 server is running (`curl http://localhost:8000/health`), it
+  holds the device; stop with `ssh qb1 'cd ~/tt-xla && bash
+  experiments/serve/scripts/serve_cb.sh stop'` before running smoke.
+- LLK API survey result (decision D8 RESOLVED): tt-metal ships
+  `softplus_tile`, `clamp_tile`, `exp_tile`, `negative_tile`,
+  `copy_tile`, `copy_tile_init`, `mul_tiles`, `mul_tiles_bcast_scalar`,
+  `add_tiles`. All in `tt_metal/hw/inc/api/compute/eltwise_unary/*.h`
+  and `bcast.h`, `eltwise_binary.h`, `tile_move_copy.h`. We use them
+  directly — do NOT decompose.
+- Dataflow decisions log:
+  `research/mm7_g1_dataflow_decisions.md` (D1-D11, each labeled with
+  alternatives + future v3 perf-lever rationale).
+- Kernel design doc: `research/mm7_g1_mamba2_kernel_design.md`.
+- Math primer: `wiki/65_mamba_state_space_models.md` §3.
+
+**In-flight background work** (subagents started during this session):
+- **Cleanup subagent**: archiving ~62 dead-code files from
+  `research/repo_archive_audit_2026-06-04.md` into `archive/`. Pilot
+  bucket DONE (commit `f3a4f1f`). The `cb_engine_scaffolding` bucket
+  is mid-execution — staged renames visible in `git status`. Wait for
+  the subagent to finish (it'll commit each bucket separately) before
+  pushing.
+- **Transcript subagent**: DONE. Session transcript at
+  `archive/session_transcript_2026-06-04/session_transcript.md`
+  (15.7 MB, 283k lines). Reusable extractor at
+  `scripts/extract_session_transcript.py`. Commit `82cbb88`.
+
+---
+
 ## NEW HEADLINE (2026-06-04, post-demo): MM7 — Nemotron-3 Nano 30B-A3B
 
 Stanford CS440LX **demo shipped successfully** 2026-06-04 (27B + Gemma 4 12B
