@@ -148,15 +148,17 @@ Nemotron3Mamba2DecodeOwnedProgramFactory::cached_program_t Nemotron3Mamba2Decode
     create_circular_buffer(program, all_cores, CB_Y, head_dim_tiles * 2, bf16_tile_size, bf16_format);
     // G1 day-4: outer-product scratch (decision D11, see kernel header).
     // cb_x_col is one transposed head-dim tile per d-iter (bf16).
-    // cb_outer is one outer-product tile per (d, s) inner-iter (bf16). The
-    // matmul accumulates in fp32 dst (fp32_dest_acc_en=true), then packs
-    // to bf16 — matching GDN's CB_OUTER pattern exactly (qwen36_gdn_decode_owned
-    // program_factory line 105). The precision loss on this single
-    // bf16 round-trip is bounded because the outer-product is the
-    // INPUT-contribution term added on top of the dominant `decay*state`
-    // term; the state itself stays fp32 throughout.
+    // cb_outer is one outer-product tile per (d, s) inner-iter.
+    //
+    // FORMAT FIX (day-5 multi-step): cb_outer is FP32 to match
+    // cb_state_scaled in add_state_scaled_outer / _two. When add_tiles
+    // mixes fp32 + bf16 sources on Blackhole, the bf16 contribution can
+    // be silently dropped — exposed only when state_in=0 makes outer
+    // the sole non-zero term. With both fp32, the math is exact.
+    // (The single-step smoke missed this because random state_in
+    // ~0.3 dominated; outer ~0.0075 looked like roundoff.)
     create_circular_buffer(program, all_cores, CB_X_COL, 2, bf16_tile_size, bf16_format);
-    create_circular_buffer(program, all_cores, CB_OUTER, 2, bf16_tile_size, bf16_format);
+    create_circular_buffer(program, all_cores, CB_OUTER, 2, fp32_tile_size, fp32_format);
     // G1 day-4.6: post-update state buffer for mode=5's C·state_out^T reduce.
     // Same size + format as cb_state_in / cb_state_scaled.
     create_circular_buffer(program, all_cores, CB_STATE_POST_UPDATE,

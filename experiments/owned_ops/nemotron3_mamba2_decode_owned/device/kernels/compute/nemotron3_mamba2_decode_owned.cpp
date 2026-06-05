@@ -371,18 +371,15 @@ FORCE_INLINE void matmul_outer_x_dt_B(
     uint32_t head_dim_tile,    // day-4.2: read cb_x_col at this index (was hardcoded 0)
     uint32_t s_tile_index,
     uint32_t cb_outer) {
-    // day-4.2b: mm_init_short (light re-init) instead of full mm_init —
-    // matches qwen36_gdn_decode (non-owned) production pattern where the
-    // full mm_init lives outside the loop. UNBLOCKS the 8-iter hang.
-    // Caller must issue a full mm_init OR matmul_reduce_C_state (which
-    // calls full mm_init) BEFORE the loop.
-    //
-    // mm_init_short skips llk_pack_hw_configure / llk_pack_dest_init that
-    // full mm_init does, so we need explicit pack_reconfig_data_format
-    // to set up fp32-dst → bf16-cb_outer conversion. Without this, packed
-    // tile bytes are garbage (~1e+38).
-    mm_init_short(cb_x_col, cb_dt_B);
-    pack_reconfig_data_format(cb_outer);
+    // day-5: revert to full mm_init now that the transpose is in a
+    // pre-loop phase (no transpose interleaved with matmul). mm_init_short
+    // (lighter) was the day-4 fix when transpose+matmul shared the inner
+    // loop, but with separation the iter cap doesn't bite. Full mm_init
+    // re-runs llk_pack_hw_configure per call, which is REQUIRED for the
+    // fp32 cb_outer pack to work — otherwise pack hw config drifts from
+    // Phase 2's bf16 cb_y_partial setup and outer values come out wrong
+    // (multi-step step 0 with state_in=0 exposed: state cos ~0).
+    mm_init(cb_x_col, cb_dt_B, cb_outer);
     cb_wait_front(cb_x_col, head_dim_tile + 1);
     cb_wait_front(cb_dt_B, s_tile_index + 1);
     cb_reserve_back(cb_outer, ONE_TILE);
@@ -464,12 +461,16 @@ FORCE_INLINE void add_state_scaled_outer_two(
     add_tiles(cb_state_scaled, cb_outer, tile_index, 0, 0);
     tile_regs_commit();
     tile_regs_wait();
-    pack_tile(0, cb_state_out);
+    // GDN pack order (qwen36_gdn_decode_owned.cpp:389): internal CB FIRST,
+    // writer-bound CB LAST. Reversed order initially gave correct y (which
+    // reads the internal CB via matmul_reduce) but WRONG cb_state_out
+    // writer readback (cos ~0 with state_in=zeros).
     pack_tile(0, cb_state_post_update);
+    pack_tile(0, cb_state_out);
     tile_regs_release();
 
-    cb_push_back(cb_state_out, ONE_TILE);
     cb_push_back(cb_state_post_update, ONE_TILE);
+    cb_push_back(cb_state_out, ONE_TILE);
 }
 
 // matmul_reduce_C_state(cb_C, cb_state_in, head_dim_tile, ssm_state_tiles,
