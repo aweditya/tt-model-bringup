@@ -223,3 +223,11 @@ Append-only. Each entry is timestamped.
   - **Sharded gate_proj matmul** with `program_config.fused_activation`: would make the activation a TRUE LLK fusion (no post-op), getting the full ~2 ms of saving the activation parameter promised but didn't deliver here. Requires sharding pre_ff to L1 (medium scope).
   - **`rotary_embedding_llama_fused_qk`** (round 3's flagged candidate): still the biggest single remaining single-call lever but needs HF→Llama weight permutation. Saves ~6× more ops than round 4 (576 ops/forward).
   - **Distributed RMSNorm (P2)**: 12-15 ms projected, heaviest scope.
+
+### Investigated but skipped: `[up | gate]` concat + `geglu` fusion
+
+- 01:31 — Probe `experiments/cb/isolate/gm4_geglu_probe.py`: tested `matmul(x, concat([up, gate])) → geglu(., dim=-1)` (rank-4 reshape required) vs `mul(matmul_gelu(x, gate), matmul(x, up))`.
+  - cos(baseline, fused) = **0.9999531** — passes the 0.999 gate.
+  - **max|delta| = 0.113** (vs 0.031 for addcmul, 0.0 for matmul-gelu) — significantly more precision loss.
+  - cos(fused, torch_ref) = 0.9999452 vs cos(baseline, torch_ref) = 0.9999877.
+- **Decision**: SKIP. The 0.113 max-delta would compound across 48 layers and risk argmax stability for long contexts. Even though it would save 1 op/layer (48 ops/forward), the precision drop is unacceptable. Recommend a future round investigate WHY ttnn.geglu has higher bf16 noise (likely uses approximate gelu internally despite the docs claiming exact) before re-trying.
