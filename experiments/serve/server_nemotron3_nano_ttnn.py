@@ -2689,27 +2689,23 @@ def moe_block_eager_ep_tt(state: State, h_input_tt, layer_idx: int):
     topk_weights = topk_weights / denom
     topk_weights = topk_weights * np.float32(ROUTED_SCALING)
 
-    # Dispatch input: re-upload sharded on seq dim from h_padded numpy
-    # (need a separate sharded copy; h_norm_tt is replicated). We avoid
-    # the host round-trip by computing a SECOND rms_norm on the sharded
-    # input. h_padded_np is reconstructed from h_input_tt via readback;
-    # this readback is the one remaining inter-block bridge in v0.2.5
-    # — keeps moe_ep self-contained. v0.5 will use ttnn.reshard or
-    # similar to avoid it.
-    h_padded_np = ttnn.to_torch(
-        h_input_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
-    )[:1].float().numpy()
-    if S_padded != S_orig:
-        pad = np.zeros((B, S_padded - S_orig, HIDDEN), dtype=h_padded_np.dtype)
-        h_padded_np = np.concatenate([h_padded_np, pad], axis=1)
-    h_sharded_tt = ttnn.from_torch(
-        torch.from_numpy(h_padded_np.astype(np.float32)).reshape(B, 1, S_padded, HIDDEN),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-        device=state.mesh,
-        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=2),
+    # v0.4.1.e — on-device replicate->shard via reduce_scatter + 1/N scale.
+    # Math: pre-scale each chip's replicated h by 1/N; reduce_scatter sums
+    # the 4 identical copies (= h back at original values) and scatters
+    # along seq so chip i gets [..., i*S_per_chip:(i+1)*S_per_chip, ...].
+    # Validated cos=0.999999 vs the host-bridged ShardTensorToMesh path
+    # in nemotron3_v041e_reduce_scatter_correct_probe.py (used 4D input).
+    # Trace-friendly: no ttnn.to_torch / ttnn.from_torch.
+    # h_norm_tt is 3D [B, S_padded, HIDDEN] TILE bf16; we reshape to 4D
+    # [B, 1, S_padded, HIDDEN] to match the existing dispatch input contract
+    # (was: ShardTensorToMesh(dim=2) on the reshape-to-4D path), then
+    # reduce_scatter on dim=2 (which is the seq dim in 4D).
+    h_norm_scaled_tt = ttnn.multiply(h_norm_tt, 1.0 / NCHIPS)
+    h_norm_scaled_4d = ttnn.reshape(h_norm_scaled_tt, [B, 1, S_padded, HIDDEN])
+    h_norm_sharded_tile = ttnn.reduce_scatter(
+        h_norm_scaled_4d, dim=2, cluster_axis=1,
     )
-    h_norm_sharded_tile = ttnn.rms_norm(h_sharded_tt, weight=w["norm"], epsilon=EPS)
-    ttnn.deallocate(h_sharded_tt)
+    ttnn.deallocate(h_norm_scaled_tt)
     h_norm_sharded_tt = ttnn.to_layout(h_norm_sharded_tile, ttnn.ROW_MAJOR_LAYOUT)
     ttnn.deallocate(h_norm_sharded_tile)
 
