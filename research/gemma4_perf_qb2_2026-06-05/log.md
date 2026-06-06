@@ -696,3 +696,170 @@ This is conclusive. **The TT stack reproduces the IT model's behaviour faithfull
 - **Long-context retrieval on IT + chat-instruction prompt is a SEPARATE open issue** unrelated to perf. Two avenues for the next session:
   1. Drop the trailing "Answer with only the 8-character password" instruction from the needle probe — test whether IT retrieves under just `"What is the magic password?"`. If yes, instruction-echo is the failure mode and we can document it as a known prompt-shape pitfall.
   2. Test chat-templated prompt (the actual production path through `apply_chat_template`) — that's what real users hit, and may behave differently because the template wraps the user turn with `<start_of_turn>user…<end_of_turn>` boundary tokens.
+
+---
+
+## Round 10 (RETRY — DRAM access patterns — Phase 2 plan commit)
+
+### Background
+
+A previous subagent (`a2fda3c7135228003`) was tasked with a Round 10 DRAM-access-pattern dive
+and timed out at the ~7-min mark inside the qb2 "loading weights" bootstrap (~14 min cold).
+Its only durable output was the (uncommitted) isolation probe
+`experiments/cb/isolate/gm4_dram_sharded_mlp_probe.py`. This Round 10 (RETRY) inherits that
+probe + the Round-8 quantitative diagnosis and follows a strict phase-gated time budget
+(Phase 1 research → Phase 2 commit plan → Phase 3 qb2 spike → Phase 4 validate).
+
+### Phase 1 — research findings (no qb2 invoked)
+
+**Working baseline at start of this round**: 47.0 ms/tok traced (Round 9 reverted bfp8 lever
+from Round 8; the env-gates `TT_GM4_MLP_DTYPE=bfp8` / `TT_GM4_LM_HEAD_DTYPE=bfp8` re-enable
+that win without source edits, but DEFAULT remains bf16). Round-7/Round-8 durable diagnosis:
+**PM-BANDWIDTH / PM-COMPUTE = 24.6×** for the full per-forward signposted region, **Matmul =
+99.5% of all PM-BW-bound time, MLP per-chip `[32,3840]×[3840,3840]` triplet = 71% of matmul
+PM-BW** (`reports/round8_matmul_bw_breakdown.txt:7`). DRAM-traffic reduction is the lever
+class; bytes-per-weight-read was halved by Round 8's bfp8 weights for 1.86%. The remaining
+attackable lever is **the DRAM ACCESS PATTERN itself**: change the matmul from
+`INTERLEAVED DRAM` weight loaded by a single-bank cyclic read to `WIDTH_SHARDED DRAM` weight
+loaded in parallel across all P150 DRAM banks via the dedicated
+`MatmulMultiCoreReuseMultiCastDRAMSharded` program config.
+
+### Files reviewed (citations for the lever)
+
+1. **`tt-metal/tests/ttnn/nightly/unit_tests/operations/matmul/test_matmul_dram_sharded.py:50-185`**
+   — the canonical isolation test for the DRAM-sharded matmul on a single device. Key contract:
+   - `num_banks = device.dram_grid_size().x` for Blackhole (verified at `:71-73`; P150 = 8 banks).
+   - Weight memory config: `WIDTH_SHARDED, DRAM`, `shard_shape=[K, N_padded/num_banks]`,
+     `shard_grid` spans the full DRAM-grid CoreRangeSet (`:107-110`).
+   - Activation memory config: `WIDTH_SHARDED, L1`, `shard_shape=[M, in0_block_w*32]`,
+     `shard_grid` is the compute grid `(num_cores, 1)` (`:133-138`).
+   - Program config:
+     `MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(in0_block_w=K/num_cores/32/4,
+     per_core_M=M/32, per_core_N=N/num_cores/32, fused_activation=<optional>)` (`:152-157`).
+   - **Standard precision contract**: `in0=bfloat16, in1=bfloat8_b, out=bfloat16` (`:271-274`),
+     with `pcc_threshold=0.999` (`:233`). Round 9's bfp8 ablation already cleared the
+     correctness gate for `bfp8` weights on Gemma 4 — these two BW reductions COMBINE
+     additively (Round 8 cuts bytes 2×, Round 10 cuts the per-bank serialization).
+2. **`tt-metal/models/demos/llama3_70b_galaxy/tt/llama_mlp.py:58-72`** — production usage
+   inside the Llama 70B Galaxy MLP. Weights are uploaded ONCE at bootstrap with
+   `memory_config=W1W3_RING_MEMCFG` / `W2_RING_MEMCFG` and stay resident on device. The
+   memory config is created by `args.create_dram_sharded_mem_config(args.dim,
+   args.hidden_dim // args.num_devices)`. **Pattern to fork**: one-shot weight upload with
+   the right `memory_config`, then per-forward `matmul(x_l1_sharded, w_dram_sharded,
+   program_config=...)`. No per-call data movement.
+3. **`tt-metal/models/demos/llama3_70b_galaxy/tt/prefetcher_common.py`** — adds an
+   ASYNCHRONOUS DRAM→L1 prefetcher (a "ring" pattern with sub-device semaphores) that hides
+   the DRAM read latency BEHIND prior compute. This is the *next* step beyond just
+   dram-sharding the weight. The infra requires `tt_ccl`, persistent global circular buffers,
+   and sender/receiver core mappings (heavy; previously noted in Round 8's "deprioritised" pile).
+   **For this round we DO NOT touch the prefetcher** — just the per-matmul `MatmulMultiCoreReuse
+   MultiCastDRAMSharded` config + DRAM-sharded weight upload. That's the cheapest step on the
+   ladder and the one isolated by `test_matmul_dram_sharded.py`.
+4. **Existing probe `experiments/cb/isolate/gm4_dram_sharded_mlp_probe.py`** (UNCOMMITTED,
+   written by the previous timed-out subagent) — already implements the WIDTH_SHARDED DRAM
+   weight + L1 width-sharded activation + program config above, at the exact MLP per-chip
+   shape `[32, 3840] × [3840, 3840]` for gate/up/down. Forks the test-matmul_dram_sharded.py
+   block-size math (`:50-184`) and the `create_dram_sharded_mem_config` helper from
+   `tt_transformers/model_config.py`. Helpers (`_dram_weight_mem_cfg`,
+   `_activation_l1_width_sharded`, `_dram_sharded_program_config`) are clean, reusable, and
+   work on a single mesh-replicated tensor (single-device verify in the (1,4) mesh context;
+   ReplicateTensorToMesh + ConcatMeshToTensor with dim=0 reads first-chip slice).
+
+### Lever picked (Phase 2 commit)
+
+**Lever**: WIDTH_SHARDED DRAM weight memory config + `MatmulMultiCoreReuseMultiCastDRAMSharded
+ProgramConfig` for the **MLP triplet** (gate_proj, up_proj, down_proj) on every layer.
+Land behind env gate `TT_GM4_DRAM_PREFETCH=1` (despite the name, the LEVER is dram-sharded
+matmul access — naming reserved for the prefetcher upgrade in a possible Round 11).
+
+### File:line citations justifying the lever
+
+- **The shape is exactly the test's regime**: `test_matmul_dram_sharded.py:280-283` parameterises
+  `(M=32, K=8192, N={1280, 4096, 1024})` and proves the kernel + program config works at
+  `pcc>=0.999` with `bfp8` weights, HiFi2-or-HiFi4, packer_l1_acc on/off. Our shape `(M=32,
+  K=3840, N=3840)` is in the same class (M=32 is the same; K and N are slightly smaller and
+  still TILE-multiples).
+- **K=3840 = 32 (TILE) × 120 and N=3840 = 32 × 8 (banks) × 15 (cols/bank)** — verified at
+  `gm4_dram_sharded_mlp_probe.py:34-37`. N is already aligned to TILE × num_banks; no
+  padding overhead. `in0_block_w = K / num_cores / TILE / 4 = 3840 / 8 / 32 / 4 = 3.75` —
+  rounded down to **3** by the `max(1, ...)` floor (`gm4_dram_sharded_mlp_probe.py:150`).
+  This is a slight wrinkle — the test uses `K=8192` (divisible by 8×32×4), our K=3840 has
+  `K/num_cores/TILE = 15`, which doesn't divide cleanly by 4. We trial `in0_block_w=3` and
+  fall back to `4` if the kernel rejects.
+- **Production-blessed pattern**: `llama_mlp.py:58-72` shows the matmul call site reading
+  `W1W3_RING_MEMCFG` and `W2_RING_MEMCFG` from the model config; the *config* hides whether
+  the weight is DRAM-sharded or DRAM-interleaved. Our fork: upload Gemma 4 MLP weights with
+  the WIDTH_SHARDED DRAM mem_config (one-shot at bootstrap) and call the matmul with the
+  program config. No per-forward layout shuffling.
+
+### Expected % win
+
+Round 8 bfp8 weights gave **-0.87 ms/tok (-1.86%)** by cutting the weight-read bytes in half.
+This Round 10 dram-sharded lever cuts the LATENCY-bound serialization of those reads by
+spreading them across all 8 P150 DRAM banks. The roofline:
+- The matmul PM-BW for MLP triplet is 30.9 ms / forward (post-bfp8: ~15.5 ms; per
+  Round-8 results halving bf16 → bfp8 should approximately halve the BW time).
+- DRAM-sharded reads parallelise across banks; ideal speedup at the matmul level is bounded
+  by **min(num_banks=8, num_cores_reading=8)** = 8×. Realistic gain after subtracting NoC
+  congestion + per-bank-kernel overhead: 2-3× per-matmul.
+- Net per-forward win: 15.5 ms × (1 - 1/2.5) = ~9 ms PM-BW reduction. PM-BW is 24.6× COMPUTE,
+  so this directly reduces wall-clock by ~9 ms / 24.6 ≈ 0.37 ms via the BW-bound model. The
+  bigger gain is amortising the dispatch hop into a parallel one; the test_matmul_dram_sharded.py
+  test claims **2-4× per-matmul speedup** vs default.
+- **Projected total**: -2 to -4 ms/tok traced (4-8% on 47 ms baseline) — squarely in the BIG
+  move category. Lower bound is -1 ms if NoC congestion + 7-core (rounded) sharding leaves
+  significant on-die idle.
+
+### Env gate name
+
+`TT_GM4_DRAM_PREFETCH=1` (per brief, named for the broader access-pattern family; the actual
+lever in Round 10 is the static dram-shard, prefetcher comes later in a possible Round 11).
+
+### Risk + fall-back
+
+- **Risk 1**: the `in0_block_w = K/num_cores/TILE/4 = 3.75` rounding. Fallback ladder:
+  `[3, 5, 15]` (15 = K/num_cores/TILE; the test divides by 4 for sub-block factor — if the
+  kernel rejects 3 we try 15 to see if the sub-block factor is shape-dependent).
+- **Risk 2**: the mesh-distributed contract. The probe is single-device-style (replicated
+  weight, single shard read); production weight upload is sharded across the (1,4) mesh
+  (`ShardTensor2dMesh`) plus replicate-within-row. Need to verify the WIDTH_SHARDED DRAM
+  mem_config is per-chip (it is — the `shard_spec` references a single device's
+  `dram_grid_size`). Each chip will see its [3840, 960] (= per-chip N=3840/4=960) post-mesh
+  shard, and the dram-shard at THAT level uses the 8 banks of that single P150.
+  **Correction**: the round-8 BW breakdown reports `[3840, 3840]` per chip — that's the
+  TENSOR shape post mesh-sharding for the WEIGHT (mesh-sharded along the OUTER dim so each
+  chip holds a slice). We need to re-check the actual per-chip MLP weight shape.
+- **Risk 3**: WIDTH_SHARDED on DRAM requires the weight to be `from_torch` with the right
+  mem config one-shot. The existing `upload_mlp_layer` uses `np_stacked_to_sharded` which
+  goes via `from_torch` → `to_memory_config`. We need to confirm a one-shot upload to
+  WIDTH_SHARDED DRAM (or a `to_memory_config` reshard at upload time) works.
+- **Fallback if probe fails**: scope down to ONE shape first (gate_proj only), or fall
+  back to the prefetcher-less single-bank pattern. Either way we commit the negative finding
+  + the probe diff.
+
+### Phase 3 plan (only after this commit lands)
+
+Run `bash scripts/run_remote_qb2.sh experiments/cb/isolate/gm4_dram_sharded_mlp_probe.py`
+in background via the dev-harness `gm4` flow (skip ~14 min bootstrap by re-using the
+resident harness from prior rounds). Probe gate: `cos(baseline, dram_sharded) >= 0.99999`
+and `max|delta| < 0.5` for all 3 MLP shapes. Verify per-call ms shows the predicted 2-3×
+speedup. If PASS, wire into `server_gemma4_unified_ttnn.py` `upload_mlp_layer` behind the
+env gate `TT_GM4_DRAM_PREFETCH=1`.
+
+### Phase 4 plan
+
+Bit-stable correctness gate: 100/100 token-for-token + max|delta|=0 across 3 runs each,
+baseline vs `TT_GM4_DRAM_PREFETCH=1`. Reuse the `gm4_v04_trace_validate.py` harness.
+
+### Files
+
+- `experiments/cb/isolate/gm4_dram_sharded_mlp_probe.py` — Phase-1 probe (written by previous
+  subagent, committed in this Phase-2 baton; ready to run via `gm4` harness).
+- `research/gemma4_perf_qb2_2026-06-05/log.md` — this section (Round 10 RETRY Phase 2 plan).
+
+### Commit message (Phase 2 baton)
+
+```
+docs(gemma4): Round 10 RETRY Phase 2 — DRAM-sharded MLP weights plan + uncommitted probe
+```
+
