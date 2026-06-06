@@ -65,25 +65,28 @@ Run the kernel regression sweep:
 **Phase 1 — exact next task**: v0.4.0c — eliminate the conv1d host
 roundtrip in `mamba2_block_eager_tt`. Profiling-driven target.
 
-**v0.4.0a + v0.4.0b** (this session): isolation probe pattern validated,
-section profiler localised the bottleneck in 60 seconds.
-- v0.4.0a constants pre-upload: correctness PASS, but only 46ms/step saved
-  (0.3%) — the wrapper isn't the hot spot
-- v0.4.0b section profile: **S2 conv1d block = 637/656 ms = 97%** of
-  mamba2 layer time. The numpy readback (conv_full_tt → numpy) +
-  ttnn.from_torch reupload (conv_causal_np → conv_causal_tt) is the
-  entire bottleneck. SSD wrapper + matmuls + norms combined = 19ms.
+**v0.4.0a + v0.4.0b + v0.4.0c** (this session):
+- v0.4.0a constants pre-upload: correctness PASS, +0.3% perf
+- v0.4.0b section profile: S2 conv1d block = 637ms (97% of layer)
+- v0.4.0c on-device conv path: correctness PASS, **perf UNCHANGED**.
 
-**v0.4.0c plan** (next): Keep conv1d kernel; eliminate the readback+
-reupload around it:
-- replace numpy concat(conv_state, xBC_np) → ttnn.concat on device
-  (need conv_state as ttnn.Tensor too)
-- skip the `ttnn.to_torch(conv_full_tt)` readback + re-upload as TILE
-- keep conv1d kernel call as-is (it's fast)
+**Honest perf finding**: the original S2=637ms was the ttnn.conv1d
+KERNEL time, not the surrounding host bridges. Removing the numpy
+roundtrip (v0.4.0c) is architectural hygiene only — the kernel
+dominates. For a real perf win we need either:
+1. v0.4.0d — speed up the conv1d kernel itself (matmul fold, smaller
+   input shape, or a depthwise-step-mode op if ttnn ships one)
+2. v0.4.1 — trace capture (amortises dispatch overhead across steps;
+   the per-call dispatch cost may be a big chunk of the 637ms even
+   if the kernel proper is fast)
 
-Predicted: 637ms → ~50ms per layer → **2.3s/step eager** (≈7×
-speedup). After v0.4.0c we re-profile to see what becomes the new
-bottleneck for v0.4.0d.
+**Critical methodology lesson reinforced**: the profile localised the
+right block (S2 = 97% of time), but I assumed it was host bridges
+when it was kernel time. **Next time, also measure the kernel call
+ALONE** (without host setup) to know which sub-component dominates.
+
+v0.4.0c is committed (correctness clean, no numpy reorg in decode
+path). v0.4.0d explores conv-kernel alternatives next.
 
 **v0.3.3.b perf data** (5 decode steps, cold + 4 warm):
 - cold step 0:  15.48s
