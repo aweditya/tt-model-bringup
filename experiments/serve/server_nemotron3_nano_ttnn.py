@@ -654,12 +654,26 @@ def bootstrap(state: State, log=None):
     log(f"  final_norm: [{HIDDEN}] replicated bf16 (Llama-style, no +1.0)")
 
     # LM head — separate weight (tie_word_embeddings=False per the brief
-    # and v0.0.2 introspect). Upload as [HIDDEN, VOCAB] for matmul.
+    # and v0.0.2 introspect). v0.5.P1 (2026-06-06): vocab-sharded across
+    # NCHIPS along dim=1 (vocab axis). Forks 27B P22 (server_tp.py:399)
+    # — proven +5-8% on 27B + Gemma 4. Per-chip matmul produces
+    # [B, S, VOCAB_PER_CHIP], all_gather + slice + on-device argmax keeps
+    # the readback at 8 bytes/step instead of [B, S, VOCAB] floats.
     lm_head_w = load_t(key_to_shard, "lm_head.weight")
     assert lm_head_w.shape == (VOCAB, HIDDEN), \
         f"lm_head shape {lm_head_w.shape} != ({VOCAB}, {HIDDEN})"
-    state.lm_head_tt = np_to_replicated(lm_head_w.T, state.mesh)
-    log(f"  lm_head: [{HIDDEN}, {VOCAB}] replicated bf16 (separate from embed)")
+    assert VOCAB % NCHIPS == 0, \
+        f"VOCAB={VOCAB} must be divisible by NCHIPS={NCHIPS}"
+    lm_head_w_T = lm_head_w.T  # [HIDDEN, VOCAB]
+    state.lm_head_tt = ttnn.from_torch(
+        torch.from_numpy(lm_head_w_T.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    state.vocab_size = VOCAB
+    state.vocab_per_chip = VOCAB // NCHIPS
+    log(f"  lm_head: [{HIDDEN}, {VOCAB}] vocab-sharded "
+        f"(per-chip {state.vocab_per_chip}) bf16 (P22 fork)")
 
     # v0.1.1 staged layer upload — controlled by env so the smoke can
     # request just L5 (the attention warmup layer) without paying for
@@ -1028,12 +1042,33 @@ def apply_final_norm_tt(state: State, h_tt):
 
 def apply_lm_head_argmax_tt(state: State, h_tt):
     """Pure-ttnn lm_head + argmax. Takes h_tt [B, S, HIDDEN] TILE bf16,
-    returns (logits_tt, argmax_tt). argmax_tt is uint32 [B, S, 1]."""
-    logits_tt = ttnn.matmul(
+    returns (logits_tt, argmax_tt). argmax_tt is uint32 [B, S, 1].
+
+    v0.5.P1: vocab-sharded lm_head + on-device argmax. Forks 27B P22
+    (server_tp.py:1680-1688). Per-chip matmul produces
+    [B, S, VOCAB_PER_CHIP]; all_gather replicates to [B, S, VOCAB];
+    slice strips padding (if any); untilize for argmax compatibility;
+    on-device argmax → uint32 [B, S, 1] (8-byte readback).
+    `use_multicore=False` on argmax for determinism (cross-core
+    tie-break race documented in research/35b_determinism_2026-06-04.md).
+    """
+    sharded_logits_tt = ttnn.matmul(
         h_tt, state.lm_head_tt, compute_kernel_config=HIFI4,
     )
-    argmax_tt = ttnn.argmax(logits_tt, dim=-1, keepdim=True)
-    return logits_tt, argmax_tt
+    gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+    ttnn.deallocate(sharded_logits_tt)
+    # VOCAB is exact (no padding) for Nemotron-3, but slice is cheap.
+    B, S, _ = gathered_logits_tt.shape
+    sliced_logits_tt = ttnn.slice(
+        gathered_logits_tt, [0, 0, 0], [B, S, state.vocab_size],
+    )
+    ttnn.deallocate(gathered_logits_tt)
+    rm_logits_tt = ttnn.untilize(sliced_logits_tt, use_multicore=True)
+    ttnn.deallocate(sliced_logits_tt)
+    argmax_tt = ttnn.argmax(
+        rm_logits_tt, dim=-1, keepdim=True, use_multicore=False,
+    )
+    return rm_logits_tt, argmax_tt
 
 
 def apply_lm_head_and_argmax(state: State, h_np):
@@ -1041,6 +1076,11 @@ def apply_lm_head_and_argmax(state: State, h_np):
 
     Input: numpy fp32 [B, S, HIDDEN] (or [S, HIDDEN]).
     Returns (logits_np[..., VOCAB], argmax_np[..., int32]).
+
+    v0.5.P1: lm_head_tt is vocab-sharded on dim=1; per-chip matmul
+    produces [B, S, VOCAB_PER_CHIP], we all_gather + readback (all chips
+    identical post-gather). Used by prefill/oracle paths only — decode
+    hot path uses apply_lm_head_argmax_tt.
     """
     squeeze_batch = h_np.ndim == 2
     if squeeze_batch:
@@ -1050,11 +1090,14 @@ def apply_lm_head_and_argmax(state: State, h_np):
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
-    logits_tt = ttnn.matmul(
+    sharded_logits_tt = ttnn.matmul(
         h_tt, state.lm_head_tt, compute_kernel_config=HIFI4,
     )
+    gathered_logits_tt = ttnn.all_gather(sharded_logits_tt, dim=-1)
+    ttnn.deallocate(sharded_logits_tt)
     logits_np = ttnn.to_torch(
-        logits_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        gathered_logits_tt,
+        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
     )[:1].float().numpy()
     if squeeze_batch:
         logits_np = logits_np[0]
