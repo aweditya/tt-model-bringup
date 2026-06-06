@@ -572,6 +572,13 @@ def bootstrap(state, log=None):
     ang_sliding = np.outer(positions, inv_freq_sliding)  # [MAX_KV, HEAD_DIM_SLIDING/2]
     cos_sliding = np.concatenate([np.cos(ang_sliding), np.cos(ang_sliding)], axis=1).astype(np.float32)
     sin_sliding = np.concatenate([np.sin(ang_sliding), np.sin(ang_sliding)], axis=1).astype(np.float32)
+    # Round 5 perf (2026-06-05): pre-bake the rotate_half sign mask into the
+    # sin tables so `_apply_full_rope` can replace its `neg + concat` (2 ops)
+    # with a single `ttnn.roll` (1 op). The sign mask is [-1]*half + [+1]*half;
+    # multiplying it into sin makes `rotated * sin_signed` = `concat([-x2, x1]) * sin`
+    # bit-identical (probe: gm4_roll_rope_probe.py max|delta|=0.0).
+    half_sliding = HEAD_DIM_SLIDING // 2
+    sin_sliding[:, :half_sliding] *= -1.0
     state.cos_sliding_tt = np_to_replicated(cos_sliding, state.mesh,
                                             layout=ttnn.ROW_MAJOR_LAYOUT)
     state.sin_sliding_tt = np_to_replicated(sin_sliding, state.mesh,
@@ -585,11 +592,15 @@ def bootstrap(state, log=None):
     ang_global = np.outer(positions, inv_freq_global)
     cos_global = np.concatenate([np.cos(ang_global), np.cos(ang_global)], axis=1).astype(np.float32)
     sin_global = np.concatenate([np.sin(ang_global), np.sin(ang_global)], axis=1).astype(np.float32)
+    # Round 5 perf: same sign-mask bake as sliding above.
+    half_global = HEAD_DIM_GLOBAL // 2
+    sin_global[:, :half_global] *= -1.0
     state.cos_global_tt = np_to_replicated(cos_global, state.mesh,
                                            layout=ttnn.ROW_MAJOR_LAYOUT)
     state.sin_global_tt = np_to_replicated(sin_global, state.mesh,
                                            layout=ttnn.ROW_MAJOR_LAYOUT)
-    log(f"  RoPE tables: sliding [{cos_sliding.shape}] + global [{cos_global.shape}] (MAX_KV={MAX_KV})")
+    log(f"  RoPE tables: sliding [{cos_sliding.shape}] + global [{cos_global.shape}] "
+        f"(MAX_KV={MAX_KV}, sin half-sign-baked for round-5 roll fusion)")
 
     log(f"[bootstrap] uploading {NUM_LAYERS} layer weights to mesh…")
     t0 = time.time()
@@ -1027,36 +1038,37 @@ def _apply_full_rope(x, cos_tt, sin_tt, n_heads, head_dim):
     At pos 0 cos = 1, sin = 0 → x_rope = x (identity). v0.3.1.0 uses
     this to validate the RoPE plumbing without changing the answer.
     """
-    # x1, x2 are SLICE VIEWS of x — they share storage. Calling
-    # ttnn.deallocate on a view handle frees the underlying buffer and
-    # corrupts x for subsequent ops ([[ttnn-slice-view-decay]]). This was
-    # masked at pos 0 because sin=0 zeroes out the rotated branch and the
-    # final result reduces to x_cos = mul(x, 1) = x, which happens to be
-    # correct even if x is read after dealloc. At pos > 0 cos ≠ 1, sin ≠ 0,
-    # and x_cos reads garbage. Fix: let views die at scope exit; only
-    # dealloc tensors with their own storage (neg_x2, rotated, x_cos,
-    # rotated_sin).
-    # Round-4 perf (2026-06-05): fuse the final `mul(rotated, sin) + add` pair
-    # into a single `addcmul` device op. ttnn.addcmul(a, b, c, value) =
-    # a + value * b * c is a real TernaryOpType::ADDCMUL LLK kernel
-    # (`tt-metal/ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp:244`),
-    # NOT a composite fallback — verified to land on the device kernel for
-    # bf16 TILE inputs with COL_BCAST broadcast. Saves 1 op per call ×
-    # 96 calls/forward = 96 ops/forward (~0.5-1.5 ms/tok traced).
+    # Round 5 perf (2026-06-05): replace the `slice + slice + neg + concat`
+    # chain (2 device ops: neg + concat; slices are views) with a single
+    # `ttnn.roll` that swaps the two halves circularly. The negation that
+    # belongs to the rotate_half is pre-baked into the sin tables at bootstrap
+    # (`sin_sliding[:, :half] *= -1` + same for global) so the math stays
+    # equivalent:
+    #     rotate_half(x) * sin
+    #   = concat([-x2, x1]) * concat([sin_a, sin_a])              (cos1==cos2, sin1==sin2)
+    #   = concat([-x2 * sin_a, x1 * sin_a])
+    #   = concat([x2, x1]) * concat([-sin_a, sin_a])              (factor neg into sin)
+    #   = roll(x, half, dim=-1) * sin_signed
+    # Production: 3 device ops (roll + mul + addcmul) vs prior 4 (neg +
+    # concat + mul + addcmul). Saves 1 op per RoPE call × 96 calls/forward
+    # = 96 ops/forward. Per [[feedback-kernel-vs-dispatch-realization]] the
+    # saved ops are real kernel work (neg = UnaryNg, concat = data-movement
+    # kernel), so the win should realize ~1:1 in trace.
     #
-    # Probe: experiments/cb/isolate/gm4_addcmul_rope_probe.py — cos(baseline,
-    # fused) = 0.99999 for both sliding (head_dim=256, n_heads=4) and global
-    # (head_dim=512, n_heads=8). max|delta| ~0.03 (bf16 round-off).
+    # Probe: experiments/cb/isolate/gm4_roll_rope_probe.py — max|delta| = 0.0
+    # for both sliding (head_dim=256, n_heads=4) and global (head_dim=512,
+    # n_heads=8) — BIT-IDENTICAL on bf16. Bootstrap sign-bake is at
+    # `bootstrap(state, log)` ~line 575 / 590 (sliding + global).
+    #
+    # Round-4 history kept here for reference: the addcmul fusion (4 ops →
+    # final mul+add → 1 op) shipped 2026-06-05; this round-5 attacks the
+    # leading neg+concat. The cos table is UNCHANGED (no sign mask); only sin.
     half = head_dim // 2
-    x1 = ttnn.slice(x, [0, 0], [n_heads, half])
-    x2 = ttnn.slice(x, [0, half], [n_heads, head_dim])
-    neg_x2 = ttnn.neg(x2)
-    rotated = ttnn.concat([neg_x2, x1], dim=-1)
-    ttnn.deallocate(neg_x2)
+    swapped = ttnn.roll(x, shifts=half, dim=-1)
     x_cos = ttnn.mul(x, cos_tt)
-    # Fused: x_rope = x_cos + 1.0 * rotated * sin_tt
-    x_rope = ttnn.addcmul(x_cos, rotated, sin_tt, value=1.0)
-    ttnn.deallocate(x_cos); ttnn.deallocate(rotated)
+    # Fused: x_rope = x_cos + 1.0 * swapped * sin_tt   (sin pre-signed)
+    x_rope = ttnn.addcmul(x_cos, swapped, sin_tt, value=1.0)
+    ttnn.deallocate(x_cos); ttnn.deallocate(swapped)
     return x_rope
 
 

@@ -231,3 +231,81 @@ Append-only. Each entry is timestamped.
   - **max|delta| = 0.113** (vs 0.031 for addcmul, 0.0 for matmul-gelu) — significantly more precision loss.
   - cos(fused, torch_ref) = 0.9999452 vs cos(baseline, torch_ref) = 0.9999877.
 - **Decision**: SKIP. The 0.113 max-delta would compound across 48 layers and risk argmax stability for long contexts. Even though it would save 1 op/layer (48 ops/forward), the precision drop is unacceptable. Recommend a future round investigate WHY ttnn.geglu has higher bf16 noise (likely uses approximate gelu internally despite the docs claiming exact) before re-trying.
+
+---
+
+## Round 5 (subagent — `ttnn.roll` + pre-signed sin tables for `_apply_full_rope`)
+
+### Baseline reconfirm (n=3, qb2, post-round-4 main HEAD `bee4f1e`)
+
+- 01:36 — Baseline run 1: eager **188.6** ms/tok, traced **47.7** ms/tok, 100/100 PASS. Log: `logs/round5/baseline_run1.log`.
+- 01:38 — Baseline run 2: eager **184.1** ms/tok, traced **47.8** ms/tok, 100/100 PASS. Log: `logs/round5/baseline_run2.log`.
+- 01:40 — Baseline run 3: eager **192.3** ms/tok, traced **47.7** ms/tok, 100/100 PASS. Log: `logs/round5/baseline_run3.log`.
+- **Aggregate (n=3)**: eager 188.3 ± 4.2, traced **47.73 ± 0.05 ms/tok (20.95 tok/s)** — slight regression vs round-4 final 47.33 (~0.4 ms, within noise).
+
+### Tracy v2 capture post-round-4
+
+- 01:43 — Tracy v2 captured with all rounds 1-4 applied. CSV: `.cache/perf_logs/tracy_gemma4_v2_round5/reports/2026_06_06_01_43_45/`. DRAM marker buffer overflowed (expected for full forward). Op COUNTS in signposted region (`count_ops_in_csv.py`, divided by 4 mesh for per-forward):
+  - 432 Slice (~9/layer) — view ops, free
+  - 337 LayerNorm (~7/layer, all rms_norms)
+  - 329 Matmul (~7/layer Q/K/V/O + gate/up/down)
+  - 291 BinaryNg (~6/layer; -192 vs round-3 from addcmul + matmul-gelu fusions)
+  - 200 UntilizeWithUnpadding (~4/layer)
+  - 176 ReshapeView, 176 InterleavedToSharded, 165 TilizeWithValPadding
+  - 145 UnaryNg (~3/layer; includes 96 RoPE `neg`)
+  - 136 Concat (~3/layer; includes 96 RoPE `concat`)
+  - 96 Ternary (= 96 addcmuls, all in `_apply_full_rope`)
+  - 88 SdpaDecode, 88 PagedFusedUpdateCache, 97 AllGather, 96 ReduceScatter, 56 Clone
+  - Conclusion: the `_apply_full_rope` body still spends 4 device ops/call (neg + concat + mul + addcmul) × 96 calls = 384 ops/forward. Cumulative 192 ops/forward attackable if we can fuse neg+concat → roll.
+
+### Lever pick — `ttnn.roll` + pre-signed sin tables
+
+- **Lever**: replace `_apply_full_rope`'s `slice + slice + neg + concat` (2 device ops + 2 view slices) with a single `ttnn.roll(x, shifts=half, dim=-1)`. The negation that belonged to `rotate_half([a, b]) = [-b, a]` is pre-baked into the sin tables at bootstrap (`sin[:, :half] *= -1`). Math identity:
+  - `rotate_half(x) * sin = concat([-x2, x1]) * concat([sin_a, sin_a])` (Gemma 4 has sin1==sin2)
+  - `                     = concat([x2, x1]) * concat([-sin_a, sin_a])` (factor neg into sin)
+  - `                     = roll(x, half, dim=-1) * sin_signed`
+- **Why it passes the kernel-vs-dispatch test ([[feedback-kernel-vs-dispatch-realization]])**: `neg` is a UnaryNg kernel; `concat` is a data-movement kernel. Both do real work per call (~tens of μs at our tile sizes). Eliminating them per RoPE × 96 calls/forward = real kernel-time saving.
+- **Predicted delta**: 0.5-1.5 ms/tok traced (matches the round-4 addcmul fusion which saved 96 ops and got 0.83 ms; same op count saving here for a similar kernel mix).
+- **Risk**: low. The sin tables are read-only across the forward and used ONLY by `_apply_full_rope` (verified: `grep sin_sliding_tt|sin_global_tt` → 4 callers, all in `_apply_full_rope`'s call graph). Pre-signing is atomic with the function rewrite — only one code path uses the new tables.
+
+### Isolation probe + production land
+
+- 01:54 — Isolation probe `experiments/cb/isolate/gm4_roll_rope_probe.py` (forks `gm4_addcmul_rope_probe.py`):
+  - Sliding (n_heads=4, head_dim=256): cos(baseline, roll) = **1.0000001**, **max|delta| = 0.000000** (BIT-IDENTICAL).
+  - Global (n_heads=8, head_dim=512): cos(baseline, roll) = **1.0000004**, **max|delta| = 0.000000** (BIT-IDENTICAL).
+  - Torch sanity also PASS — confirms the sign-factor identity is mathematically exact.
+- 01:55 — Wrote roll+pre-sign change to `server_gemma4_unified_ttnn.py`:
+  - Bootstrap (line 575-581 + 590-595): `sin_sliding[:, :half_sliding] *= -1.0` and same for global, BEFORE `np_to_replicated`.
+  - `_apply_full_rope` (line 1041-1071): 4-op chain → 3-op chain (`roll + mul + addcmul`). API gotcha: `ttnn.roll(x, shifts=half, dim=-1)` — `dim` not `dims` (the python bindings reject the kwarg `dims=[-1]`).
+- 01:58 — First run FAILED with TypeError — wrong kwarg `dims=[-1]`. Fixed in one line. Re-deployed.
+- 02:00 — Validator run 1: eager 179.1 ms/tok, traced **47.1** ms/tok, 100/100 PASS. **Token sequence BIT-IDENTICAL to baseline** (first 10: [532, 575, 532, 496, 563, 496, 45518, 107, 100, 45518] — same as round-4 final).
+- 02:02 — Validator run 2: eager 178.9 ms/tok, traced **47.4** ms/tok, 100/100 PASS.
+- 02:04 — Validator run 3: eager 180.0 ms/tok, traced **47.1** ms/tok, 100/100 PASS.
+
+### Final aggregate (n=3 after the fix)
+
+| Metric | Baseline (round 5) | roll-fused | Delta |
+| --- | --- | --- | --- |
+| Eager mean ms/tok | 188.3 (std 4.2) | 179.3 (std 0.6) | **-4.8% (-9.0 ms)** |
+| Traced mean ms/tok | 47.73 (std 0.05) | **47.20 (std 0.17)** | **-1.1% (-0.53 ms)** |
+| Traced tok/s | 20.95 | **21.19** | +1.1% |
+| Token-for-token | 100/100 | 100/100 | clean (bit-identical) |
+
+- Both eager AND traced moved as predicted ([[feedback-kernel-vs-dispatch-realization]]) — neg + concat = real kernel work, so saving them × 96 calls = real trace-time win. The traced gain (0.53 ms) is consistent with the round-4 addcmul fusion's 0.83 ms (which saved fewer ops but with broader kernel work).
+- **Token argmax sequence is byte-identical** to round-4 final — the roll + pre-signed-sin transform is mathematically and bit-wise equivalent (vs round-4's addcmul which had ~0.03 max|delta| from bf16 reorder; this round has 0.0 max|delta|).
+
+### Round 5 final state
+
+- **Landed**: `_apply_full_rope` neg+concat → `ttnn.roll` + pre-signed sin tables. Single commit covers bootstrap sign-bake + `_apply_full_rope` rewrite. Traced delta: **-0.53 ms/tok (-1.1%, 47.20 ms = 21.19 tok/s)**, eager delta: **-4.8% (-9 ms/tok)**. 3×100/100 token-for-token match.
+- **Combined w/ rounds 1-4**: traced **51.4 → 47.20 ms/tok = 1.089× cumulative**; eager **474.1 → 179.3 ms/tok = 2.64× cumulative**. **Below qb1's 47.5 ms reference by ~0.3 ms.**
+- **Probe added**: `experiments/cb/isolate/gm4_roll_rope_probe.py` — bit-identical math probe; reusable pattern for any "neg + concat" → "roll + pre-signed weight" fusion site.
+- **Open next (low-medium risk)**:
+  - **`rotary_embedding_llama_fused_qk`** (still flagged): biggest remaining single lever. Replaces all 3 ops in `_apply_full_rope` (roll + mul + addcmul = 3 ops × 96 calls = 288 ops) with ONE op per Q,K pair (48 calls/forward = 48 ops). Saves ~240 ops/forward. BUT needs HF→Llama weight permutation, HEIGHT_SHARDED inputs on disjoint cores, trans_mat setup — medium-day scope. Reference: `~/tenstorrent/tt-metal/models/demos/llama3_70b_galaxy/tt/llama_attention.py` (decode mode) + `llama_rope.py` (trans_mat construction).
+  - **Sharded gate_proj matmul** with `program_config.fused_activation`: still ~2 ms of potential saving by making `activation="gelu"` a TRUE in-kernel fusion vs the current post-op. Requires sharding `pre_ff` to L1 (medium scope).
+  - **Eliminate `v_raw = ttnn.clone(k_h)` in global attention**: 8 Clones/forward saving but small (<0.1 ms expected). One-line change; left for future bundling with a bigger win.
+  - **Distributed RMSNorm (P2)**: 12-15 ms projected, heaviest scope.
+
+### Investigated but skipped (round 5 only)
+
+- **`alt_complex_rotate90`**: ttnn op that does interleaved rotate `(out_{2i}, out_{2i+1}) = (-in_{2i+1}, in_{2i})`. Different RoPE convention from HF Gemma 4's split-half rotate; would require permuting Q/K projection weights (interleave first half + second half columns). Same scope as `rotary_embedding_llama_fused_qk` but with less head-room (still need a mul + addcmul after).
+- **Eliminate the per-layer `residual_1 = ttnn.clone(h_in)`** (48 Clones/forward): defensive clone added during initial bringup ("L1 hard-FAIL hypothesis: rms_norm + downstream ops may be aliasing h_in"). Static analysis suggests it's safe to remove (rms_norm is pure, no in-place writes to h_in), but the comment flags real bug history. Reverting it risks a hard-to-diagnose regression. SKIP — high blast radius for ~0.3 ms expected gain.
