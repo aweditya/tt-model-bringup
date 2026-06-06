@@ -32,6 +32,17 @@ kernel ALONE confirmed the kernel itself dominates → matmul-fold was the
 right move. **Always isolate the suspect op alone, not just inside the
 chain**. Saved in `[[feedback-profile-first-perf-method]]`.
 
+**TRACE INTEGRATION PARKED 2026-06-05** — blockers 1 + 4 cleared
+(commit `f45a710` — pure-ttnn embed/final_norm/lm_head/argmax); blocker
+#2 (router) has tie-break drift, deferred behind long-context checks;
+**blocker #3 (replicate→shard) has NO ttnn primitive** (verified via
+probes `v041c_reshard_probe` + `v041d_replicated_dispatch_probe` +
+research agent on tt-metal source). Production fix is **dual-resident
+layer outputs** — significant refactor scope. Current 0.26s warm
+step (3.8 tok/s steady, 5.0 peak) usable for long-context correctness
+iteration WITHOUT trace. See `research/nemotron3_trace_plan_2026-06-05.md`
+for full path.
+
 **v0.4.1.a DIAGNOSTIC LANDED (commit `bfb04bb`)** — trace capture probe
 confirms TT_FATAL "Writes are not allowed inside a captured trace" on
 the current decode path. Definitive blocker list:
