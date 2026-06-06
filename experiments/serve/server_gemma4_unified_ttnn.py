@@ -97,6 +97,35 @@ HIFI4 = ttnn.WormholeComputeKernelConfig(
     packer_l1_acc=False,
 )
 
+# Round 7 perf (2026-06-05) — HiFi2 NEGATIVE FINDING (reverted).
+# Profile-driven hypothesis: matmuls were 23.58% of measured kernel time
+# in the post-Round-6 tt-perf-report; HiFi2 was inlined-suggested by the
+# report on every dense matmul site ("HiFi2 may also work, it discards
+# the lowest bit of the activations and has 2x the throughput of HiFi4");
+# Llama 70B Galaxy production ships HiFi2 for Q/K/V/O. Probe
+# `experiments/cb/isolate/gm4_hifi2_matmul_probe.py` confirmed precision
+# is acceptable: cos(HiFi4, HiFi2) 0.9999918-0.9999931, max|delta|
+# 0.015-0.031 on all 5 representative decoder matmul shapes.
+#
+# RESULT (n=3 v04 traced validator, qb2): baseline 46.67 ± 0.05 ms/tok →
+# HiFi2 46.60 ± 0.0 ms/tok = -0.07 ms (-0.15%, within noise). Eager:
+# 183.2 → 183.2 ms/tok (no movement). 3×100/100 PASS.
+#
+# Diagnosis: Gemma 4 12B decode at B=1 is DRAM-bandwidth bound, not
+# math-bound. The matmul reads the full weight tile from DRAM per token
+# (no batching to amortise the BW); the lowest-bit activation precision
+# bit doesn't change the DRAM-read cost. HiFi2's 2x math throughput is
+# wasted when math isn't the bottleneck. The tt-perf-report DRAM% on
+# 32x3840x1024 was 29% (vs peak); for larger reduction-axis matmuls it
+# would be higher but still BW-pinned at B=1. Llama 70B Galaxy ships
+# HiFi2 because at TP=8 the per-chip matmul is smaller and more
+# compute-bound — different regime.
+#
+# Verdict: REVERTED — no perf gain, accepts a (tiny) precision concession
+# for zero benefit, masks the real bottleneck. Documented as a Round 7
+# negative finding in `research/gemma4_perf_qb2_2026-06-05/log.md`.
+# The probe is kept as a future-reference isolation pattern.
+
 
 # ── Upload helpers (reused from 35B per REUSE MANDATE) ─────────────────
 def np_to_replicated(arr, mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):

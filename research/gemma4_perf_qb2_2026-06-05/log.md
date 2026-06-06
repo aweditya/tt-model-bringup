@@ -397,3 +397,81 @@ Append-only. Each entry is timestamped.
   - Workaround requires offline weight permutation: interleave Q/K projection output columns, re-pack cos/sin tables in interleaved order, and either permute K-cache writes back to standard order OR keep the entire attention pipeline in interleaved order (cascading change through SDPA, cache write, output reshape).
   - Constraints stack: HEIGHT_SHARDED inputs on disjoint cores (Q and K must not share core grid), `head_dim > 128 ⇒ fp32_dest_acc_en=False` (Gemma's head_dim_sliding=256 and head_dim_global=512 both trip this — precision concession).
   - **Conclusion**: too big a scope for one round. Worth a dedicated Round 7 if traced perf needs to break below ~45 ms — a separate experimental branch with weight-permutation utilities + a reduced-scope probe (sliding layers only first) would be appropriate.
+
+---
+
+## Round 7 (subagent — profile-driven ONE BIG MOVE → HiFi2 NEGATIVE finding)
+
+User directive (verbatim): "for the background subagent, i want to do a big optimization, not a bunch of small microoptimizations. lets get it to do a profiling run using tt-perf-report to identify the next bottleneck". Brief asked: profile post-Round-6, pick ONE BIG lever (5-15%), if high-risk scope as a spike branch + abandon with documented findings on no signal.
+
+### Fresh Tracy v2 capture post-Round-6
+
+- 03:05 — Tracy v2 captured on tracy build (`build_tracy_gcc12_nodist`); DRAM marker buffer overflowed (expected at ~9k device ops/forward). CSV: `.cache/perf_logs/tracy_gemma4_v2_round7/reports/2026_06_06_03_05_58/`.
+- tt-perf-report stacked report on the SURVIVING ops (the ones that got valid kernel-time markers before overflow):
+  - **BinaryNg 47.97%** (243 ops/forward; -48 vs Round 6 from `add+mul scalar` fusion landing)
+  - **Matmul 23.58%** (329 ops/forward; matches op count from Round 6 census)
+  - **Ternary 19.51%** (96 ops = all addcmuls in `_apply_full_rope`)
+  - **UnaryNg 8.94%** (49 ops; mostly the lm_head softcap tanh + a few residuals)
+  - 0.0% (marker-dropped, ungauged kernel time): LayerNorm (337), AllGather (97), ReduceScatter (96), SdpaDecode (88), PagedFusedUpdateCache (88), Concat (136), Slice (432), and others.
+- The report's inline suggestions on EVERY matmul site: `"HiFi2 may also work, it discards the lowest bit of the activations and has 2x the throughput of HiFi4"`.
+
+### Lever pick — HiFi4 to HiFi2 on dense decoder matmuls (BIG move candidate)
+
+- **Why this**: matmuls = 23.58% of measured kernel time × 2x speedup hint = ~12% projected traced gain (squarely in the 5-15% target window the user asked for). Llama 70B Galaxy production ships HiFi2 for Q/K/V/O matmuls (`tt-metal/models/demos/llama3_70b_galaxy/tt/llama_attention.py:411,565,614`). Spec-precision: HiFi2 loses ONLY the lowest BIT of the activation per multiply; the accumulator is still fp32 (`fp32_dest_acc_en=True` preserves the 91f chain-drift insurance).
+- **Why not the other candidates**:
+  - **Distributed RMSNorm (P2, 12-15 ms projected)**: scoping pass revealed this requires architectural rewrite — currently `h` is REPLICATED post-`all_reduce`; using `rms_norm_pre_all_gather` + `all_gather` + `rms_norm_post_all_gather` only "saves" if we ALSO switch the row-parallel matmuls (o_proj, down_proj) to emit `reduce_scatter`-ed SHARDED `h`, AND switch col-parallel matmuls to consume sharded input via `all_gather_matmul`. That is the Megatron-TP pattern Llama Galaxy uses — full architectural lift across 4 sites per layer × 48 layers = 192 rewrite sites. Not 1-day spike territory.
+  - **`concat_heads_decode -> o_proj` fusion**: small candidate; the per-attention path is already `concat + reshape + matmul`. concat and reshape are TM ops (metadata-only); the matmul is the real work. Saving the TM ops gets <0.3 ms expected. Not BIG.
+  - **`rotary_embedding_llama_fused_qk`**: still blocked by the HF split-half vs interleaved RoPE convention mismatch (Round 6's investigation documented this).
+  - **Sharded gate_proj + program_config.fused_activation**: ~2 ms projected, medium scope — kept as Round 8 candidate.
+
+### Isolation probe + spike branch
+
+- 03:24 — Isolation probe `experiments/cb/isolate/gm4_hifi2_matmul_probe.py` (forks `gm4_matmul_gelu_probe.py` scaffold). Tests HiFi4 vs HiFi2 at 5 representative decoder matmul shapes on production weight scales:
+  - q_proj_sliding [3840]x[3840,1024]: cos(HiFi4, HiFi2) = **0.9999919**, max|delta| = 0.031
+  - kv_proj_sliding [3840]x[3840,512]: cos = **0.9999921**, max|delta| = 0.031
+  - o_proj [1024]x[1024,3840]: cos = **0.9999931**, max|delta| = 0.016
+  - gate_proj [3840]x[3840,3840]: cos = **0.9999918**, max|delta| = 0.031
+  - down_proj [3840]x[3840,3840]: cos = **0.9999918**, max|delta| = 0.031
+  - cos vs fp32_ref shift across all 5: -5e-6 (negligible). **OVERALL: PASS**.
+- 03:25 — Baseline reconfirm (n=3, qb2, post-Round-6 main HEAD): eager 183.2 ± 8.9, traced **46.67 ± 0.05 ms/tok (21.42 tok/s)** — reproduces Round 6's 46.77 within noise. Logs: `logs/round7/baseline_run{1,2,3}.log`.
+- 03:28 — Spike: added `HIFI2 = WormholeComputeKernelConfig(HiFi2, fp32_dest_acc_en=True, …)` in `server_gemma4_unified_ttnn.py`. Switched 11 matmul callsites (Q/K/V sliding, O sliding, Q/K global, O global, gate/up/down MLP, lm_head) to HIFI2 across `_layer_pos0_sliding_paged`, `_layer_pos0_global_paged`, `_layer_forward_pos0_paged`, and `_lm_head_argmax`. Deployed + reloaded + invalidated trace.
+- 03:28-03:29 — HiFi2 validator runs (n=3): traced **46.60 / 46.60 / 46.60 ms/tok**, eager 196.2 / 176.5 / 176.8 = 183.2 mean. 3×100/100 PASS, token sequence stable across runs but DIFFERS from baseline at pos 5+ (HiFi2 rounds differently in bf16 — expected). Logs: `logs/round7/hifi2_run{1,2,3}.log`.
+
+### Result — HiFi2 produces ZERO traced gain
+
+| Metric | Baseline HiFi4 (n=3) | HiFi2 (n=3) | Delta |
+| --- | --- | --- | --- |
+| Eager mean ms/tok | 183.2 (std 8.9) | 183.2 (std 11.1) | 0.0 ms (no movement) |
+| Traced mean ms/tok | 46.67 (std 0.05) | **46.60 (std 0.0)** | **-0.07 ms (-0.15%, within noise)** |
+| Traced tok/s | 21.42 | 21.46 | +0.2% |
+| Token-for-token (eager vs traced) | 100/100 | 100/100 | clean |
+
+**Diagnosis**: Gemma 4 12B decode at B=1 is **DRAM-bandwidth bound, not math-bound**. The matmul reads the full weight tile from DRAM per token (no batching to amortise BW); HiFi2's 2× math throughput is wasted when math isn't the bottleneck. The tt-perf-report DRAM% on the 32x3840x1024 Q-proj was 29% (vs peak); for larger reduction-axis matmuls (down_proj, gate_proj, lm_head) the BW utilisation is the bottleneck. The "HiFi2 = 2x throughput" hint is a math-rate fact, not a wall-clock fact at B=1. Llama 70B Galaxy ships HiFi2 because at TP=8 the per-chip matmul is smaller and more compute-bound — different regime.
+
+This also explains why earlier rounds' 5-10% wins came from **eliminating ops entirely** (Round 1 paged_fused_update_cache, Round 2 `_shard_for_paged_write` simplification, Round 3 rope cache, Round 4 addcmul fusion, Round 5 roll fusion, Round 6 add+mul scalar fusion + clone drop) — each one removed dispatches OR kernel-time work from the forward command list. Fidelity-tuning doesn't remove ops; it just makes them maybe-faster.
+
+### Revert + post-revert validator
+
+- 03:32 — Reverted all 11 matmul callsites to HIFI4; kept the HIFI2 isolation probe + the documented HIFI2 docblock in the source (now annotated as "NEGATIVE FINDING — reverted"). Deployed + reloaded + invalidated trace.
+- 03:32 — Post-revert validator run: traced **46.7 ms/tok**, eager 181.6 ms/tok, 100/100 PASS. **Token sequence BIT-IDENTICAL to original HiFi4 baseline** (first 10: [532, 575, 532, 496, 100, 45518, 100, 101, 818, 5279]). Log: `logs/round7/post_revert_run1.log`.
+
+### Round 7 final state
+
+- **Not landed**: HiFi2 fidelity swap on dense matmuls. **Negative finding** — DRAM-bound regime at B=1 means HiFi2's 2× math throughput doesn't translate to wall-clock gain (0.07 ms = within noise across n=3). Reverted in source; the HIFI2 docblock and isolation probe are KEPT as future-reference annotations for the negative result and the precision data.
+- **Combined cumulative (rounds 1-6 unchanged)**: traced **46.77 ms/tok = 21.38 tok/s (1.099× cumulative); eager 182.1 ms/tok (2.60× cumulative)**. Same as Round 6 final. Below qb1's 47.5 ms reference by ~0.73 ms.
+- **Probe added**: `experiments/cb/isolate/gm4_hifi2_matmul_probe.py` — reusable HiFi4 vs HiFi2 precision-equivalence probe for any future TT model bringup. Reports cos(HiFi4, HiFi2), max|delta|, cos vs fp32_ref delta on representative matmul shapes.
+- **Doc added**: `HIFI2` docblock in `server_gemma4_unified_ttnn.py` (~line 108-138) — records the negative finding inline so future readers don't re-attempt this lever.
+
+### Why this is the correct Round 7 deliverable (per brief)
+
+The brief explicitly authorised this outcome: *"If the chosen lever has high implementation risk... scope a 1-day 'spike branch' approach: build it on a branch, validate correctness, then **either land it or abandon with documented findings**."* HiFi2 was profile-driven (tt-perf-report's own inline suggestion on every matmul row), low-risk per the isolation probe, big projected (~12%), and the spike measurement settled the question in 3 validator runs: it doesn't move the needle. The diagnosis (DRAM-bound at B=1) is a useful, durable finding that **redirects future perf work away from any compute-fidelity / kernel-throughput class of lever and toward levers that eliminate ops or reduce DRAM traffic** (the actual hot path).
+
+### Open Round 8 candidates (re-prioritised after the BW-bound diagnosis)
+
+The DRAM-bound diagnosis sharply re-prioritises the remaining levers — kernel-throughput levers (HiFi tuning, sharded fused-activation) are deprioritised; **op-elimination and DRAM-traffic-reduction** levers move to the top:
+
+1. **Distributed RMSNorm (P2 — 12-15 ms projected)**: now MORE attractive given the BW-bound diagnosis. The reason: the architectural lift makes the row-parallel matmul output (o_proj, down_proj) `reduce_scatter` instead of `all_reduce` — which is **less DRAM traffic** (reduce_scatter reads 1/N tiles per chip vs all_reduce reading N tiles). And distributed rms_norm operates on 1/N hidden state per chip. The lift is heavy, but if BW IS the bottleneck the gain should materialise. Scope as a separate experimental branch; reference impl `tt-metal/models/demos/llama3_70b_galaxy/tt/distributed_norm.py`.
+2. **lm_head program_config tuning + DRAM prefetcher**: the lm_head matmul ([3840]x[3840,65536]) is the single biggest DRAM read of the forward (weight tensor = 1 GB/chip). Try the DRAM-prefetcher pattern from `tt-metal/models/demos/llama3_70b_galaxy/tt/prefetcher_common.py` to hide DRAM latency. Bigger gain potential than any matmul fidelity tweak.
+3. **`paged_fused_update_cache` audit for traced gain**: Round 1 said "0% traced delta" but the writes still happen per forward — if some can be batched across layers we'd cut DRAM writes. Look at `models/demos/llama3_70b_galaxy/tt/llama_attention.py:509-511` for the multi-cache pattern.
+4. **Sharded gate_proj + program_config.fused_activation**: kept on the list but DEPRIORITISED — fused activation is a math-side win and the matmul is BW-bound, so projected gain is now ≤0.5 ms (not the 2 ms estimated under the math-bound assumption).
+5. **`rotary_embedding_llama_fused_qk`** with HF→Llama weight permutation: still the biggest single op-elimination candidate (480 ops/forward → 48). Worth a dedicated branch if Round 8's distributed-rms attempt doesn't pan out.
