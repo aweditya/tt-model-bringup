@@ -506,10 +506,13 @@ class State:
         self.weight_np_cache: dict = {}  # v0.2.6 — keyed by safetensors name
         # v0.3.1.b/c — multi-step decode state. Lazily populated per layer.
         # ssm_state_np[L]: numpy fp32 [B, NH, HD, SS] for Mamba2 layers
+        # conv_state_np[L]: numpy fp32 [B, CONV_KERNEL-1=3, CONV_DIM_M=6144]
+        #   for Mamba2 layers (v0.3.1.c step 3d — conv1d kernel=4 history carry)
         # kv_K_cache_tt[L] / kv_V_cache_tt[L]: list-of-2 ttnn tensors per Attention layer
         #   (Gemma-4-style two-call: one cache per KV head; NKV_PER_CHIP=1)
         # cur_pos: int — position of the next token to be processed
         self.ssm_state_np: list = []
+        self.conv_state_np: list = []
         self.kv_K_cache_tt: list = []
         self.kv_V_cache_tt: list = []
         self.cur_pos: int = 0
@@ -815,10 +818,17 @@ def reset_decode_state(state, B: int = 1, log=print):
     """
     n = len(state.layer_types) if state.layer_types else N_LAYERS
     state.ssm_state_np = [None] * n
+    state.conv_state_np = [None] * n   # v0.3.1.c step 3d
     for L, kind in enumerate(state.layer_types):
         if kind == "mamba2":
             state.ssm_state_np[L] = np.zeros(
                 (B, MAMBA_HEADS, MAMBA_HEAD_DIM, SSM_STATE), dtype=np.float32,
+            )
+            # v0.3.1.c step 3d — conv1d kernel_size=4 needs last 3 positions of
+            # x_BC carried across decode steps. Without this, decode S=1 zero-pads
+            # the conv input → wrong output (per teacher-forced ladder L0 fail).
+            state.conv_state_np[L] = np.zeros(
+                (B, CONV_KERNEL - 1, CONV_DIM_M), dtype=np.float32,
             )
     # Lazy alloc of the paged decode support state (idempotent).
     setup_paged_decode_state(state, log=log)
@@ -1621,28 +1631,104 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     dt_tt  = ttnn.slice(in_proj_tt, [0, 0, D_INNER + CONV_DIM_M], [B, S, D_INNER + CONV_DIM_M + MAMBA_HEADS])
     ttnn.deallocate(in_proj_tt)
 
-    xBC_nhwc = ttnn.to_layout(ttnn.reshape(xBC_tt, [B, 1, S, CONV_DIM_M]),
-                              ttnn.ROW_MAJOR_LAYOUT)
-    conv_full_tt = ttnn.conv1d(
-        input_tensor=xBC_nhwc,
-        weight_tensor=w["conv1d_w"],
-        device=state.mesh,
-        in_channels=CONV_DIM_M, out_channels=CONV_DIM_M,
-        batch_size=B, input_length=S,
-        kernel_size=CONV_KERNEL, stride=1,
-        padding=CONV_KERNEL - 1, dilation=1,
-        groups=CONV_DIM_M,
-        bias_tensor=w["conv1d_b"],
+    # v0.3.1.c step 3d — conv_state carry for decode.
+    # Conv1d kernel_size=4 needs 3 prior positions of x_BC. For prefill
+    # (S>=4), internal padding suffices. For decode (S=1), zero-padding
+    # would lose history → wrong output (teacher-forced ladder L0 fail).
+    # Solution: when persistent conv_state exists, prepend it (3 positions)
+    # to the new x_BC (S positions), run conv1d with padding=0, take last S.
+    # After the call, save the last (kernel-1) positions of the combined
+    # input as the new conv_state.
+    def _rb(t):
+        arr = ttnn.to_torch(
+            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )
+        return arr[:1].float().numpy()
+
+    _conv_state_list = getattr(state, "conv_state_np", None)
+    _persistent_conv = (
+        _conv_state_list
+        and layer_idx < len(_conv_state_list)
+        and _conv_state_list[layer_idx] is not None
     )
-    conv_full_np = ttnn.to_torch(
-        conv_full_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
-    )[:1].float().numpy()
-    ttnn.deallocate(conv_full_tt)
-    if conv_full_np.ndim == 4:
-        conv_full_np = conv_full_np.squeeze(1)
-    if conv_full_np.shape[-1] != CONV_DIM_M:
-        conv_full_np = conv_full_np.transpose(0, 2, 1)
-    conv_causal_np = conv_full_np[:, :S, :]
+
+    if _persistent_conv:
+        # DECODE / state-carrying path. Read xBC as numpy, prepend conv_state.
+        xBC_np_S = _rb(xBC_tt)  # [1, S, CONV_DIM_M]
+        if xBC_np_S.shape[1] != S:
+            # Defensive: readback might come back transposed for some S.
+            if xBC_np_S.shape[-1] == S:
+                xBC_np_S = xBC_np_S.transpose(0, 2, 1)
+        conv_state = _conv_state_list[layer_idx]  # [1, 3, CONV_DIM_M]
+        # Combined input: [1, 3+S, CONV_DIM_M]
+        combined_np = np.concatenate([conv_state, xBC_np_S], axis=1)
+        # Save updated conv_state: last (kernel-1)=3 positions of combined input.
+        _conv_state_list[layer_idx] = combined_np[:, -(CONV_KERNEL - 1):, :].copy()
+        # Run conv1d with no padding. Output length = (3+S) - 4 + 1 = S.
+        combined_tt = ttnn.from_torch(
+            torch.from_numpy(combined_np.astype(np.float32)).reshape(
+                B, 1, CONV_KERNEL - 1 + S, CONV_DIM_M,
+            ),
+            dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        conv_full_tt = ttnn.conv1d(
+            input_tensor=combined_tt,
+            weight_tensor=w["conv1d_w"],
+            device=state.mesh,
+            in_channels=CONV_DIM_M, out_channels=CONV_DIM_M,
+            batch_size=B, input_length=CONV_KERNEL - 1 + S,
+            kernel_size=CONV_KERNEL, stride=1,
+            padding=0,  # history already prepended
+            dilation=1, groups=CONV_DIM_M,
+            bias_tensor=w["conv1d_b"],
+        )
+        ttnn.deallocate(combined_tt)
+        conv_full_np = ttnn.to_torch(
+            conv_full_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )[:1].float().numpy()
+        ttnn.deallocate(conv_full_tt)
+        if conv_full_np.ndim == 4:
+            conv_full_np = conv_full_np.squeeze(1)
+        if conv_full_np.shape[-1] != CONV_DIM_M:
+            conv_full_np = conv_full_np.transpose(0, 2, 1)
+        # conv_full_np is [1, S, CONV_DIM_M] — already the causal output.
+        conv_causal_np = conv_full_np
+    else:
+        # PREFILL or no-state path: existing on-device padded conv1d.
+        xBC_nhwc = ttnn.to_layout(ttnn.reshape(xBC_tt, [B, 1, S, CONV_DIM_M]),
+                                  ttnn.ROW_MAJOR_LAYOUT)
+        conv_full_tt = ttnn.conv1d(
+            input_tensor=xBC_nhwc,
+            weight_tensor=w["conv1d_w"],
+            device=state.mesh,
+            in_channels=CONV_DIM_M, out_channels=CONV_DIM_M,
+            batch_size=B, input_length=S,
+            kernel_size=CONV_KERNEL, stride=1,
+            padding=CONV_KERNEL - 1, dilation=1,
+            groups=CONV_DIM_M,
+            bias_tensor=w["conv1d_b"],
+        )
+        conv_full_np = ttnn.to_torch(
+            conv_full_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )[:1].float().numpy()
+        ttnn.deallocate(conv_full_tt)
+        if conv_full_np.ndim == 4:
+            conv_full_np = conv_full_np.squeeze(1)
+        if conv_full_np.shape[-1] != CONV_DIM_M:
+            conv_full_np = conv_full_np.transpose(0, 2, 1)
+        conv_causal_np = conv_full_np[:, :S, :]
+
+    # If conv_state buffers are active, save the last (kernel-1) positions
+    # of xBC as the new conv_state for the NEXT call. Done lazily here
+    # (after conv) so we don't pay the readback during fresh-prefill probes.
+    if (_conv_state_list is not None
+            and layer_idx < len(_conv_state_list)
+            and not _persistent_conv):
+        # First-time state save (prefill). Read xBC now.
+        if S >= CONV_KERNEL - 1:
+            xBC_np_for_state = _rb(xBC_tt)
+            _conv_state_list[layer_idx] = xBC_np_for_state[:, -(CONV_KERNEL - 1):, :].copy()
 
     conv_causal_tt = ttnn.from_torch(
         torch.from_numpy(conv_causal_np.astype(np.float32)),
@@ -1656,12 +1742,6 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     x_inner_tt = ttnn.slice(silu_out_tt, [0, 0, 0],                  [B, S, D_INNER])
     B_inner_tt = ttnn.slice(silu_out_tt, [0, 0, D_INNER],            [B, S, D_INNER + BC_SIZE])
     C_inner_tt = ttnn.slice(silu_out_tt, [0, 0, D_INNER + BC_SIZE],  [B, S, D_INNER + 2 * BC_SIZE])
-
-    def _rb(t):
-        arr = ttnn.to_torch(
-            t, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
-        )
-        return arr[:1].float().numpy()
 
     x_inner_np = _rb(x_inner_tt)
     z_full_np  = _rb(z_tt)
