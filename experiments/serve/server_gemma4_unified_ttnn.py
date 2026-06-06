@@ -433,24 +433,28 @@ def upload_mlp_layer(layer_sd, mesh):
     down_w = layer_sd["mlp.down_proj.weight"].T  # [INTERMEDIATE, HIDDEN]
     # Round 9 ablation gate: set TT_GM4_MLP_DTYPE=bfp8 to re-enable Round 8.
     mlp_dtype = _resolve_dtype("TT_GM4_MLP_DTYPE", default=ttnn.bfloat16)
-    # Round 10 (2026-06-06) — DRAM-sharded MLP weights. When env-gated, lay out
-    # gate/up/down as WIDTH_SHARDED DRAM (parallel reads across all 8 P150
-    # DRAM banks). Per-chip shape after the leading-axis shard is
-    # [HIDDEN, INTERMEDIATE_PER_CHIP] = [3840, 3840] for all three. We pass
-    # this per-chip shape to `_dram_weight_mem_cfg_mlp` — ttnn's mesh-mapper
-    # treats the leading dim as the chip-shard axis (per
-    # ShardTensorToMesh(dim=0)), so the WIDTH_SHARDED layout applies inside
-    # each chip's slice [3840, 3840].
-    mlp_mem_cfg = None
-    if _dram_sharded_enabled():
-        # All three weights share the same per-chip shape [3840, 3840].
-        mlp_mem_cfg = _dram_weight_mem_cfg_mlp(mesh, K=HIDDEN, N=INTERMEDIATE_PER_CHIP)
+    # Round 10 (2026-06-06) — DRAM-sharded MLP weights. When env-gated,
+    # upload weights with the default INTERLEAVED DRAM mem_config (so the
+    # ShardTensorToMesh(dim=0) sharding + 3D-stacked input contract is
+    # respected), then `to_memory_config` to WIDTH_SHARDED DRAM per-chip.
+    # The per-chip shape after the leading-axis shard is [HIDDEN, IN_PC] =
+    # [3840, 3840] for all three. We pass this per-chip shape to
+    # `_dram_weight_mem_cfg_mlp`. Doing the reshard via `to_memory_config`
+    # (rather than passing memory_config to from_torch) avoids the rank
+    # mismatch between the 3D stacked input and the 2D WIDTH_SHARDED spec.
     w["gate_proj"] = np_stacked_to_sharded(
-        shard_along(gate_w, axis=1), mesh, dtype=mlp_dtype, memory_config=mlp_mem_cfg)
+        shard_along(gate_w, axis=1), mesh, dtype=mlp_dtype)
     w["up_proj"]   = np_stacked_to_sharded(
-        shard_along(up_w,   axis=1), mesh, dtype=mlp_dtype, memory_config=mlp_mem_cfg)
+        shard_along(up_w,   axis=1), mesh, dtype=mlp_dtype)
     w["down_proj"] = np_stacked_to_sharded(
-        shard_along(down_w, axis=0), mesh, dtype=mlp_dtype, memory_config=mlp_mem_cfg)
+        shard_along(down_w, axis=0), mesh, dtype=mlp_dtype)
+    if _dram_sharded_enabled():
+        mlp_mem_cfg = _dram_weight_mem_cfg_mlp(
+            mesh, K=HIDDEN, N=INTERMEDIATE_PER_CHIP)
+        for k in ("gate_proj", "up_proj", "down_proj"):
+            old = w[k]
+            w[k] = ttnn.to_memory_config(old, mlp_mem_cfg)
+            ttnn.deallocate(old)
     return w
 
 
@@ -1678,8 +1682,15 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
             M=TILE, K=HIDDEN, N=INTERMEDIATE_PER_CHIP, num_cores=8)
         prog_up = _dram_sharded_mlp_program_config(
             M=TILE, K=HIDDEN, N=INTERMEDIATE_PER_CHIP, num_cores=8)
+        # N for down_proj is HIDDEN=3840 (NOT HIDDEN_PER_CHIP=960). The
+        # per-chip down weight after `shard_along(axis=0)` is [3840, 3840]
+        # — the HIDDEN dim is fully replicated across chips; the partial
+        # sum gets all_reduce'd downstream. Bug found 2026-06-06 in Round
+        # 10 Phase 4 validator (TT_THROW "Tensor is not allocated" on the
+        # mlp_partial matmul because per_core_N = 960/8/32 = 3.75 floored
+        # to wrong shape).
         prog_down = _dram_sharded_mlp_program_config(
-            M=TILE, K=INTERMEDIATE_PER_CHIP, N=HIDDEN_PER_CHIP, num_cores=8)
+            M=TILE, K=INTERMEDIATE_PER_CHIP, N=HIDDEN, num_cores=8)
 
         pre_ff_sh = ttnn.to_memory_config(pre_ff, x_mem_cfg_gate_up)
         ttnn.deallocate(pre_ff)
