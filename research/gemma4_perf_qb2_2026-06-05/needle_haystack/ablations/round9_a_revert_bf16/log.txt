@@ -1,0 +1,69 @@
+[06:11:12] bootstrapping Gemma 4 12B IT server (~5min on qb2)…
+[06:11:12] [bootstrap] open mesh + fabric…
+[06:11:13]   mesh: MeshDevice(1x4 grid, 4 devices)
+[06:11:13] [bootstrap] variant=it model=google/gemma-4-12B-it — config + tokenizer…
+[06:11:16]   tokenizer: GemmaTokenizer, eos_token='<eos>' id=1, chat_template_installed=True
+[06:11:16]   48 layers; 40 sliding / 8 global
+[06:11:16] [bootstrap] enumerate shards + load top-level weights to mesh…
+[06:11:16]   677 keys total
+[06:11:17]   embed: (262144, 3840)
+[06:11:17]   final_norm: (3840,)
+[06:11:25]   lm_head (tied, vocab-sharded dim=1, per-chip 65536): (3840, 262144)
+[06:11:25]   paged SDPA: MAX_KV=4096, block_size=32, num_blocks=128
+[06:11:30]   KV caches: 48 layers allocated (sliding: 2 caches/layer × 40 layers)
+[06:11:30]   SDPA program/memory/compute configs ready
+[06:11:30]   RoPE tables: sliding [(4096, 256)] + global [(4096, 512)] (MAX_KV=4096, sin half-sign-baked for round-5 roll fusion)
+[06:11:30] [bootstrap] uploading 48 layer weights to mesh…
+[06:11:44]   layer 10/48 uploaded (13.9s)
+[06:11:58]   layer 20/48 uploaded (27.9s)
+[06:12:12]   layer 30/48 uploaded (41.7s)
+[06:12:26]   layer 40/48 uploaded (55.3s)
+[06:12:37]   all layer weights uploaded in 66.5s
+[06:12:37] [bootstrap] ready (v0.1.0 — embed + L0 input_layernorm only).
+[06:12:37] bootstrap in 84.6s
+[06:12:37] capturing decode trace (warmup + capture; first call)…
+[06:12:37] [trace] warmup + capture decode trace…
+[06:12:38] [trace] captured in 1280 ms (id=MeshTraceId(0))
+[06:12:38] trace ready in 1.3s
+[06:12:38] === L=128 frac=0.5 trial=0 needle=N4Y2BWLS (rendered=133 toks) ===
+[06:12:46]   prefill 6.2s (47 ms/tok), decode 1.1s (45 ms/tok)
+[06:12:46]   generated: '8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'
+[06:12:46]   verdict: N
+[06:12:46] === L=128 frac=0.5 trial=1 needle=SRBW4DPD (rendered=132 toks) ===
+[06:12:53]   prefill 6.2s (47 ms/tok), decode 1.1s (45 ms/tok)
+[06:12:53]   generated: '8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'
+[06:12:53]   verdict: N
+[06:12:53] === L=128 frac=0.5 trial=2 needle=9PJDLBTP (rendered=133 toks) ===
+[06:13:00]   prefill 6.2s (47 ms/tok), decode 1.1s (45 ms/tok)
+[06:13:00]   generated: '8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'
+[06:13:00]   verdict: N
+[06:13:00] === L=512 frac=0.5 trial=0 needle=H5MP4TP3 (rendered=509 toks) ===
+[06:13:25]   prefill 24.0s (47 ms/tok), decode 1.1s (46 ms/tok)
+[06:13:25]   generated: '01101010.\n\n\n 01101010\n'
+[06:13:25]   verdict: N
+[06:13:25] === L=512 frac=0.5 trial=1 needle=ZW665VS8 (rendered=510 toks) ===
+[06:13:51]   prefill 24.1s (47 ms/tok), decode 1.1s (46 ms/tok)
+[06:13:51]   generated: '012345678.\n\nAnswer: 012345678.'
+[06:13:51]   verdict: N
+[06:13:51] === L=512 frac=0.5 trial=2 needle=P7Q8ZWWJ (rendered=510 toks) ===
+[06:14:16]   prefill 24.2s (48 ms/tok), decode 1.1s (46 ms/tok)
+[06:14:16]   generated: '01111111.\n\n\n 1\n 2\n 3\n '
+[06:14:16]   verdict: N
+[06:14:16] === L=1024 frac=0.5 trial=0 needle=FWD7SWFY (rendered=1022 toks) ===
+[06:15:06]   prefill 48.9s (48 ms/tok), decode 1.1s (47 ms/tok)
+[06:15:06]   generated: '01234567\n\n01234567\n\n012345'
+[06:15:06]   verdict: N
+[06:15:06] === L=1024 frac=0.5 trial=1 needle=7YQ9M7MW (rendered=1021 toks) ===
+[06:15:56]   prefill 48.8s (48 ms/tok), decode 1.1s (46 ms/tok)
+[06:15:56]   generated: '07YQ9M7M.thought\n07YQ9M7M'
+[06:15:56]   verdict: P
+[06:15:56] === L=1024 frac=0.5 trial=2 needle=BHHGN56G (rendered=1019 toks) ===
+[06:16:46]   prefill 48.5s (48 ms/tok), decode 1.1s (46 ms/tok)
+[06:16:46]   generated: '01101010\n\n_\n\n\n\n\nう\nう\n'
+[06:16:46]   verdict: N
+[06:16:46] === SUMMARY ===
+[06:16:46]   L=128: Y=0 P=0 N=3 / 3
+[06:16:46]   L=512: Y=0 P=0 N=3 / 3
+[06:16:46]   L=1024: Y=0 P=1 N=2 / 3
+[06:16:46] wrote /home/aditya/tt-xla/research/gemma4_perf_qb2_2026-06-05/needle_haystack/round9_a_revert_bf16/results.json
+[06:16:46] done

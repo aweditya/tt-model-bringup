@@ -127,6 +127,30 @@ HIFI4 = ttnn.WormholeComputeKernelConfig(
 # The probe is kept as a future-reference isolation pattern.
 
 
+# Round 9 ablation gate (2026-06-05). The Round 8 bfp8 win regressed
+# long-context needle retrieval. To pin which of MLP-bfp8 or lm_head-bfp8
+# is the culprit, the upload paths for both are routed through these
+# env-driven dtype helpers. Default: bf16 (the Round-9-reverted baseline).
+# Set TT_GM4_MLP_DTYPE=bfp8 and/or TT_GM4_LM_HEAD_DTYPE=bfp8 to re-enable
+# the Round-8 shape on a per-piece basis. See `research/gemma4_perf_qb2_2026-06-05/log.md`
+# §"Round 9" for the ablation results.
+def _resolve_dtype(env_name: str, default=None):
+    """Map env var value → ttnn dtype. Recognised values: 'bf16', 'bfp8'.
+    Returns `default` (caller's default) when unset; otherwise returns the
+    selected dtype. Unknown values raise.
+    """
+    import os as _os
+    v = _os.environ.get(env_name, "").strip().lower()
+    if v == "":
+        return default if default is not None else ttnn.bfloat16
+    if v in ("bf16", "bfloat16"):
+        return ttnn.bfloat16
+    if v in ("bfp8", "bfp8_b", "bfloat8_b"):
+        return ttnn.bfloat8_b
+    raise ValueError(
+        f"{env_name}={v!r} not recognised (expected bf16 or bfp8)")
+
+
 # ── Upload helpers (reused from 35B per REUSE MANDATE) ─────────────────
 def np_to_replicated(arr, mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     return ttnn.from_torch(
@@ -271,29 +295,26 @@ def upload_mlp_layer(layer_sd, mesh):
     - down_proj: [INTERMEDIATE, HIDDEN] = [15360, 3840]
               → shard along INPUT axis (matches column-sharded pattern)
 
-    Round 8 perf (2026-06-05): weights as `bfloat8_b` (block-floating-point
-    8-bit with shared exponent per TILE). Halves the DRAM read per matmul,
-    which is the dominant cost at B=1 (Round 7 diagnosis: DRAM-bandwidth
-    bound, not math bound; Round 8 PM-BW breakdown via
-    `experiments/utils/dram_bw_matmul_breakdown.py` shows MLP `[3840,3840]`
-    triplet = 71% of all matmul PM-BW = 30.9 ms of the 43.5 ms matmul-BW
-    budget per forward).
-
-    Precedent: `server_35b_ttnn.py:320-336` (MoE expert weights, PCC=0.999903
-    vs bf16 reference). Llama 70B Galaxy production MLP also bfp8_b.
-
-    Precision isolation: `experiments/cb/isolate/gm4_bfp8_weights_probe.py`
-    at production shapes shows cos(bf16, bfp8) >= 0.99996 across all 5
-    matmul shapes (gate/up/down/q/o), max|delta| < 0.05, magnitude ratio
-    0.999-1.0002 (no scale shift). v04_trace_validate is the 48-layer gate.
+    Round 8 / Round 9 (2026-06-05) — bfp8 weights REVERTED. Round 8 shipped
+    `dtype=ttnn.bfloat8_b` here for a -1.86% traced perf win (block-fp8 with
+    shared exponent per TILE, halves DRAM read per matmul). The 100/100
+    short-token validator gate PASSed but the long-context needle-haystack
+    diagnostic at L=128/512/1024 collapsed to deterministic template loops
+    (0/3 Y @ L=128 / L=512, 1/3 P @ L=1024 — was 3/3 Y pre-Round-8). Round 9
+    ablation pins the culprit (see research/gemma4_perf_qb2_2026-06-05/log.md
+    "Round 9"); default reverted to bf16 for long-context safety. The
+    bfp8 precedent and probe are kept in
+    `experiments/cb/isolate/gm4_bfp8_weights_probe.py` for future use.
     """
     w = {}
     gate_w = layer_sd["mlp.gate_proj.weight"].T  # [HIDDEN, INTERMEDIATE]
     up_w   = layer_sd["mlp.up_proj.weight"].T
     down_w = layer_sd["mlp.down_proj.weight"].T  # [INTERMEDIATE, HIDDEN]
-    w["gate_proj"] = np_stacked_to_sharded(shard_along(gate_w, axis=1), mesh, dtype=ttnn.bfloat8_b)
-    w["up_proj"]   = np_stacked_to_sharded(shard_along(up_w,   axis=1), mesh, dtype=ttnn.bfloat8_b)
-    w["down_proj"] = np_stacked_to_sharded(shard_along(down_w, axis=0), mesh, dtype=ttnn.bfloat8_b)
+    # Round 9 ablation gate: set TT_GM4_MLP_DTYPE=bfp8 to re-enable Round 8.
+    mlp_dtype = _resolve_dtype("TT_GM4_MLP_DTYPE", default=ttnn.bfloat16)
+    w["gate_proj"] = np_stacked_to_sharded(shard_along(gate_w, axis=1), mesh, dtype=mlp_dtype)
+    w["up_proj"]   = np_stacked_to_sharded(shard_along(up_w,   axis=1), mesh, dtype=mlp_dtype)
+    w["down_proj"] = np_stacked_to_sharded(shard_along(down_w, axis=0), mesh, dtype=mlp_dtype)
     return w
 
 
@@ -453,16 +474,15 @@ def bootstrap(state, log=None):
     VOCAB = int(embed_w_np.shape[0])
     assert VOCAB % NCHIPS == 0, f"VOCAB {VOCAB} not divisible by NCHIPS {NCHIPS}"
     state.vocab_size = VOCAB  # cb_api / scheduler expect this attr
-    # Round 8 perf (2026-06-05): lm_head weights as `bfloat8_b`. After MLP
-    # bfp8 conversion, lm_head is the next-largest PM-bandwidth-bound matmul
-    # (1 op/forward, 8.4% of matmul PM-BW = 3.66 ms — single-largest SHAPE).
-    # Embed lookup is unaffected; embed_tt at line ~431 stays bf16.
-    # Precision probe covered the [3840, 16384] per-chip shape implicitly
-    # via the [3840, 3840] case (same K=3840 reduction; output width is
-    # bigger but per-output-tile error is independent of width).
+    # Round 8 / Round 9 (2026-06-05) — lm_head bfp8 REVERTED. Round 8 shipped
+    # `dtype=ttnn.bfloat8_b` here (-0.4 ms/tok traced incremental). See the
+    # `upload_mlp_layer` docstring above for the long-context regression that
+    # forced the revert; Round 9 ablation pinned the culprit. Default is bf16
+    # for long-context safety; set TT_GM4_LM_HEAD_DTYPE=bfp8 to re-enable.
+    lm_head_dtype = _resolve_dtype("TT_GM4_LM_HEAD_DTYPE", default=ttnn.bfloat16)
     state.lm_head_tt = ttnn.from_torch(
         torch.from_numpy(embed_w_np.T.astype(np.float32)),
-        dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        dtype=lm_head_dtype, layout=ttnn.TILE_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
     )
     log(f"  lm_head (tied, vocab-sharded dim=1, "

@@ -1,0 +1,74 @@
+[
+  {
+    "length": 128,
+    "frac": 0.5,
+    "trial": 0,
+    "needle": "N4Y2BWLS",
+    "prompt_tokens": 133,
+    "max_new": 24,
+    "generated_text": "8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n",
+    "verdict": "N",
+    "prefill_seconds": 23.44084620475769,
+    "decode_seconds": 3.777543783187866
+  },
+  {
+    "length": 128,
+    "frac": 0.5,
+    "trial": 1,
+    "needle": "SRBW4DPD",
+    "prompt_tokens": 132,
+    "max_new": 24,
+    "generated_text": "8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n",
+    "verdict": "N",
+    "prefill_seconds": 23.106011629104614,
+    "decode_seconds": 3.932163715362549
+  },
+  {
+    "length": 128,
+    "frac": 0.5,
+    "trial": 2,
+    "needle": "9PJDLBTP",
+    "prompt_tokens": 133,
+    "max_new": 24,
+    "generated_text": "8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n",
+    "verdict": "N",
+    "prefill_seconds": 22.795669555664062,
+    "decode_seconds": 3.8499839305877686
+  },
+  {
+    "length": 512,
+    "frac": 0.5,
+    "trial": 0,
+    "needle": "H5MP4TP3",
+    "prompt_tokens": 509,
+    "max_new": 24,
+    "generated_text": "01101010.\n\n\n 01101010\n",
+    "verdict": "N",
+    "prefill_seconds": 88.15402340888977,
+    "decode_seconds": 3.9676575660705566
+  },
+  {
+    "length": 512,
+    "frac": 0.5,
+    "trial": 1,
+    "needle": "ZW665VS8",
+    "prompt_tokens": 510,
+    "max_new": 24,
+    "generated_text": "012345678.\n\nAnswer: 012345678.",
+    "verdict": "N",
+    "prefill_seconds": 86.75462055206299,
+    "decode_seconds": 3.8839528560638428
+  },
+  {
+    "length": 512,
+    "frac": 0.5,
+    "trial": 2,
+    "needle": "P7Q8ZWWJ",
+    "prompt_tokens": 510,
+    "max_new": 24,
+    "generated_text": "01111111.\n\n\n 1\n 2\n 3\n ",
+    "verdict": "N",
+    "prefill_seconds": 86.46888709068298,
+    "decode_seconds": 3.861205816268921
+  }
+]

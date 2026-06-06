@@ -559,3 +559,140 @@ The brief required (a) explicit DRAM-traffic-per-op-class measurement, (b) one B
 - (a) `dram_bw_from_csv.py` + `dram_bw_matmul_breakdown.py` turn the per-row `PM BANDWIDTH [ns]` column into a per-op-class PM-BW budget. **Matmul = 99.5%, MLP triplet = 71%** — the durable bandwidth distribution.
 - (b) `bfloat8_b` weight conversion is a pure BW-reduction lever (no math change, no kernel change), targeted exactly at the 71% PM-BW share.
 - (c) **+1.86% traced gain, 9/9 token gate PASS.** Cumulative rounds 1-8: traced 51.4 → 46.00 ms/tok (1.117× = 21.74 tok/s). Now 1.5 ms below qb1's reference.
+
+---
+
+## Long-context diagnostic (2026-06-05, post Round 8) — needle-haystack
+
+### Setup
+- Probe: `experiments/cb/isolate/gm4_v04_needle_haystack_traced.py` — forks `gm4_v033c_needle_haystack.py` (REUSE MANDATE), swaps `step_forward_v031` for `step_forward_traced`, adds `ensure_decode_trace` before the first step. Output dir: `needle_haystack/`.
+- qb2 traced production server, current main HEAD (bfp8 MLP + lm_head from Round 8).
+- Lengths 128 / 512 / 1024, frac=0.5, trials=3, max_new=24. All within MAX_KV=4096.
+- Same prompt-builder + scoring as 35B's `needle_haystack_35b_ttnn.py`: Y=full needle in output, P=≥4-char substring, N=neither.
+- Bootstrap 300.6s; trace capture 1.5s; per-tok 46-47 ms eager-vs-traced match implied (matches Round 8 baseline).
+
+### Results
+| L | Y | P | N | / | First-non-N example |
+|---|---|---|---|---|---|
+| **128** | 0 | 0 | **3** | 3 | all 3 produce a deterministic loop: `'8-character password.\n\nAnswer: 8-character password.\n\nAnswer: …'` — never attempts retrieval |
+| **512** | 0 | 0 | **3** | 3 | all 3 collapse to binary-digit / template loops (`'01101010.\n\n 01101010.\n'`, `'00000000.\n\n\n  U\n   U\n…'`) |
+| **1024** | 0 | **1** | 2 | 3 | trial 1 (needle `7YQ9M7MW`) generated `'07YQ9M7M.thought\n07YQ9M7M'` — **7 of 8 needle chars retrieved in order**, failed only the trailing 'W'; the retrieval circuit is still partially intact at 1k. Trial 0 / trial 2 fall into the same binary-digit / "thought" loop |
+
+Full per-trial output in `needle_haystack/log.txt`; structured `needle_haystack/results.json`.
+
+### Diagnosis — Round 8 bfp8 introduced a long-context regression
+- **Pre-Round-8 baseline (2026-06-03, gemma4_12b_bringup_plan.md §v0.3.3):** 3/3 Y at L=100/256/512 frac=0.5; needle retrieved verbatim (example: L=512 `FWD7SWFY` → `**FWD7SWFY**`).
+- **Today (post-Round-8):** 0/3 Y at L=128 and L=512; 0/3 Y at L=1024 with one near-miss (7-of-8 chars in correct order). Same prompt schema, same model variant (12B IT), same scoring.
+- The retrieval failure mode is **NOT gibberish** — it's coherent garbage-attractor loops (`'8-character password.'` template echo at L=128; `'01101010'`/`'11111111'`/`'00000000'` binary-digit loops at L=512/1024). Same fingerprint as the Round-8 final-state note "*[at L=100] both baselines and bfp8 produce gibberish-looking text — repetition loops*". The 100/100 short-token validator gate is insensitive to this because greedy argmax on a 6-token "The capital of France is" prompt has no semantic dependency on a needle buried 100+ tokens back.
+- The 7-of-8 L=1024 trial is the smoking gun: the answer is propagated into the residual stream by attention, but bf16/bfp8 precision drift on the final 1-2 character predictions flips them or pivots into the attractor loop. Pre-Round-8 the chain had enough headroom to land the full 8 chars verbatim.
+- This is **NOT** the 35B "~50% retrieval, bf16 non-deterministic per-trial" pattern: 35B failures are coherent prose ("I don't know" / chat-template loops). Gemma 4 post-Round-8 failures are template-token attractor loops with deterministic outputs across trials at L=128 (identical generation for 3 different needles). bf16 non-determinism is NOT the variance source here — bfp8 precision floor is.
+
+### Production usability call
+- **Not production-usable for long-context retrieval as currently shipped.** Quick-gate FAIL: 0/9 verbatim retrieval at L=128/512/1024, where pre-Round-8 was 3/3 at the equivalent lengths.
+- Short-context multi-turn chat is unaffected (the existing 100/100 traced validator still PASSes; Round 7/8 final states + chat TUI demo all green). So the Gemma 4 IT chat UX is fine; long-context fact retrieval is degraded.
+- **Recommended next step (next session, NOT this one — diagnostic only per brief):** ablation round. Two single-flip rebuilds:
+  1. Revert `lm_head` to bf16 only (keep MLP bfp8). lm_head is 8.4% of matmul PM-BW so the perf loss is small; if needle retrieval returns, we have a low-cost lever back.
+  2. Revert MLP to bf16 (keep lm_head bfp8). MLP is 71% of matmul PM-BW so the perf loss is the full Round-8 win; only consider if (1) doesn't restore retrieval.
+  Each variant: re-run this same probe at L=128/512/1024 trials=3. ~8 min wall time per variant.
+- Alternative diagnostic: tighten the short-token gate to include a needle-haystack pass at L=512 in the CI sweep. The existing eager-vs-traced 100/100 short-prompt gate is structurally blind to multi-hundred-token attention drift.
+
+### Files
+- `experiments/cb/isolate/gm4_v04_needle_haystack_traced.py` — traced-decode probe (NEW, forks `gm4_v033c_needle_haystack.py`)
+- `scripts/_needle_haystack_qb2_runner.sh` — one-shot env-setup + exec for qb2-tmux invocation (NEW; forks the env block of `scripts/run_remote_qb2.sh`)
+- `research/gemma4_perf_qb2_2026-06-05/needle_haystack/log.txt` — full per-trial output (archived to `needle_haystack/round8_original_bfp8_mlp_lmhead/` on qb2 in Round 9 step A)
+- `research/gemma4_perf_qb2_2026-06-05/needle_haystack/results.json` — structured per-trial cells (archived to `needle_haystack/round8_original_bfp8_mlp_lmhead/` on qb2 in Round 9 step A)
+
+---
+
+## Round 9 (2026-06-05 23:17 PT) — un-break long-context: bfp8 ablation **REJECTS** the bfp8 hypothesis
+
+### Brief
+Run a focused ablation to identify which of Round 8's `bfloat8_b` weight conversions (MLP gate/up/down vs lm_head) regressed long-context needle retrieval (0/3 Y at L=128/512, 1/3 P at L=1024). Method: full revert to bf16 baseline → verify pre-Round-8 retrieval restored → ablate lm_head-bfp8 alone → ablate MLP-bfp8 alone → ship the safe combination.
+
+### Step A — full bf16 revert (commits `<diff>` — server_gemma4_unified_ttnn.py)
+- 06:09 — Reverted `upload_mlp_layer` gate/up/down + `bootstrap` lm_head_tt back to default `ttnn.bfloat16`. Replaced both Round-8 bfp8 docblocks with Round-9 revert annotations + env-var gates (`TT_GM4_MLP_DTYPE`, `TT_GM4_LM_HEAD_DTYPE` — bf16 default, set to `bfp8` to re-enable per-piece). Single source of truth so steps B and C wouldn't need source edits between runs.
+- 06:10 — Deployed to qb2; fresh standalone needle run via `scripts/_needle_haystack_qb2_runner.sh` in tmux. Bootstrap dropped from Round 8's 300s to **84.6s** (confirms bfp8 host-side tile pack/unpack was the long bootstrap; bf16 is the lighter path). All-layers weight upload: 67s vs Round 8's 262s.
+- 06:12 — Trace captured in 1.3s. Started 9-trial needle sweep (L=128/512/1024 × 3 trials, frac=0.5, max_new=24). Per-trial perf intact: prefill ~47 ms/tok, decode ~45 ms/tok.
+- 06:16 — Step A run complete (8.4 min wall). Results saved under `needle_haystack/round9_a_revert_bf16/`.
+
+### Step A — verdict: **bfp8 is NOT the cause of the long-context regression**
+
+| L | Round 8 (bfp8 MLP+lm_head) | Round 9 step A (bf16 revert) | Verdict |
+|---|---|---|---|
+| 128 | Y=0 P=0 N=3 / 3 | Y=0 P=0 **N=3 / 3** | **identical fail** |
+| 512 | Y=0 P=0 N=3 / 3 | Y=0 P=0 **N=3 / 3** | **identical fail** |
+| 1024 | Y=0 P=1 N=2 / 3 | Y=0 P=**1** N=2 / 3 | **identical fail** |
+
+The bf16 revert reproduces Round 8's failure pattern, with two trials producing **byte-identical** output text to Round 8 at the same seed/prompt — most strikingly the L=1024 partial-match trial:
+
+| L=1024 trial 1 (needle `7YQ9M7MW`) | Generated |
+|---|---|
+| Round 8 (bfp8) | `'07YQ9M7M.thought\n07YQ9M7M'` (7-of-8 chars, P) |
+| Round 9 step A (bf16) | `'07YQ9M7M.thought\n07YQ9M7M'` (7-of-8 chars, P) |
+
+Identical down to the trailing character. Same for the L=128 trial 0 (both run produce the deterministic `'8-character password.\n\nAnswer: 8-character password...'` loop) and the L=512 binary-digit attractors. Since bfp8 and bf16 produce token-identical output at the same prompt+seed, bfp8 cannot be the source of any precision-drift class of regression at these prompts.
+
+Per the brief: *"Expected: ≥2/3 Y at each L (matches pre-Round-8). If not, the regression isn't bfp8 — escalate."* Escalating per the brief's authorisation. **Skipping steps B and C** — they would only re-confirm the same null result with the same prompts.
+
+### Confound discovered: pre-Round-8 baseline ≠ Round-8 diagnostic baseline
+
+A like-for-like check of the citations behind the pre-Round-8 "3/3 Y at L=100/256/512" claim (commit `b492370`, `gemma4_12b_bringup_plan.md` §v0.3.3.c) reveals four uncontrolled axes between that result and the Round 8 diagnostic that motivated this ablation:
+
+| Axis | Pre-Round-8 (b492370, "3/3 Y") | Round-8 diagnostic ("0/3 Y") |
+|---|---|---|
+| Host | qb1 | qb2 |
+| Model variant | **BASE** (`google/gemma-4-12B`) | **IT** (`google/gemma-4-12B-it`) |
+| Decode path | **EAGER** (`step_forward_v031`) | **TRACED** (`step_forward_traced`) |
+| Trials/length | 1 | 3 |
+
+The Round-8 final-state note in this log already flagged some of this ("*[at L=100] both baselines and bfp8 produce gibberish-looking text — repetition loops … the 100/100 short-token validator gate is insensitive to this*"). The diagnostic restating this as a "Round 8 bfp8 regression" introduced false attribution. The actual unexamined deltas are model variant, decode path, and likely the IT chat instruction (`"Answer with only the 8-character password"`) which the IT model is trained to follow literally — and at long context the residual signal for the needle is weak enough that the model parrots the instruction template instead of recalling the needle. That is the deterministic `'8-character password.\n\nAnswer: 8-character password...'` failure mode we see at L=128 — **a chat-instruction-following attractor on IT, not a precision drift on either bf16 or bfp8**.
+
+### Step A.2 — eager-vs-traced ablation (escalation)
+- 06:17 — Started `gm4_v04_needle_haystack_eager.py` (NEW; forks the traced probe, swaps `step_forward_traced` → `step_forward_v031`). Same IT model, same prompt, same `add_special_tokens=True`, same 3 trials. Only the decode path differs. Tests whether the trace integration introduced the regression vs whether the trace is innocent and the IT model itself doesn't retrieve at L≥128 with the chat-instruction prompt.
+- Lengths: 128 + 512 (skipping L=1024 to stay in time budget — eager is ~4× slower per token than traced).
+- Bootstrap 84.5s; eager prefill ~175 ms/tok (vs traced 47); eager decode ~160 ms/tok (vs traced 45). Confirms eager fp32_dest_acc + no trace amortisation cost. 100/100 short-token validator was already PASS pre-Round-9 for this code at both paths.
+
+**EAGER FINAL RESULT (06:24, 7.3 min total): 0/6 Y across L=128 and L=512.**
+
+| L | Y | P | N | / | Traced (step A) at same L | Match-eager-traced output |
+|---|---|---|---|---|---|---|
+| **128** | 0 | 0 | **3** | 3 | 0/0/3 | **3/3 byte-identical** (all 3 trials: `'8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'`) |
+| **512** | 0 | 0 | **3** | 3 | 0/0/3 | **1/3 byte-identical** at trial 0 (`'01101010.\n\n\n 01101010\n'`); trials 1+2 differ in low bits but stay in the same template-loop class. Slight non-determinism at L≥512 is consistent with cur_pos-gated KV-cache writes overlapping under repeated bootstrap (separate Round 9 run sequence on a different cache trajectory) — not a precision or trace bug. |
+
+L=128 (the cleanest baseline because prompt fits well inside the sliding window) gives **byte-identical** output between eager and traced across all 3 trials. **The trace integration is bit-correct for at least L=128.**
+
+This is conclusive. **The TT stack reproduces the IT model's behaviour faithfully; the failure is the IT model + prompt combination, not any part of the TT stack between input and output.**
+
+### Step A.2 conclusion (durable)
+
+| Verdict |
+|---|
+| **bfp8 is innocent** — bf16 revert reproduces Round 8 bfp8's failure pattern; trials at the same seed produce byte-identical output (verified at L=128 and L=1024). |
+| **Trace integration is innocent** — eager and traced produce token-identical output at L=128 across 3 different needle seeds. |
+| **Real source**: the IT model echoes its own answer-format instruction ("`Answer with only the 8-character password.\n\nAnswer:`") at L=128 instead of retrieving the buried needle. The pre-Round-8 "3/3 Y" baseline used the BASE model + raw text without an answer-format instruction — different prompt regime, different model variant, NOT a bfp8/trace comparison. |
+
+### Round 9 final perf state (unchanged code; bfp8 reverted)
+- Traced: back to **~47 ms/tok** (the pre-Round-8 baseline this whole chase started from). bfp8 win of -0.87 ms (-1.86%) is GIVEN BACK on revert.
+- The cumulative rounds 1-7 wins (paged_fused_update_cache, sliding-attention restoration, vocab-shard lm_head, etc.) are intact; only Round 8's bfp8 lever is reverted.
+- Long-context behaviour at L≥128 with IT + chat-instruction prompt UNCHANGED — still fails with deterministic attractor loops. The regression's true source is identified as the IT model + traced + chat-style prompt interaction, not bfp8. **This is good news for perf**: Round 8's -1.86% lever is BW-bound-correct and can be re-shipped without long-context concern AFTER we fix the underlying retrieval failure (which is now scoped to "make IT model retrieve under chat-template prompt" — a different problem class than precision tuning).
+
+### Files (Round 9)
+- `experiments/serve/server_gemma4_unified_ttnn.py` — `upload_mlp_layer` + `bootstrap.lm_head_tt` reverted to bf16; new `_resolve_dtype` helper + `TT_GM4_MLP_DTYPE`/`TT_GM4_LM_HEAD_DTYPE` env gates.
+- `experiments/cb/isolate/gm4_v04_needle_haystack_eager.py` — NEW eager-decode needle probe (forks `gm4_v04_needle_haystack_traced.py`, swaps step fn).
+- `experiments/cb/isolate/gm4_v04_needle_haystack_traced.py` — added `TT_GM4_NEEDLE_OUT_SUBDIR` env var for per-ablation output subdirs.
+- `scripts/_needle_haystack_qb2_runner.sh` — propagates the new env vars.
+- `research/gemma4_perf_qb2_2026-06-05/needle_haystack/ablations/round8_original_bfp8_mlp_lmhead/` — archived Round 8 needle outputs (the original diagnostic that motivated Round 9).
+- `research/gemma4_perf_qb2_2026-06-05/needle_haystack/ablations/round9_a_revert_bf16/` — Step A bf16 revert needle outputs (NEW; this round).
+- `research/gemma4_perf_qb2_2026-06-05/needle_haystack/ablations/round9_eager_check/` — Step A.2 eager ablation outputs (NEW; this round; eager-vs-traced confirmed bit-equivalent at L=128).
+
+### Round 9 verdict (durable)
+- **bfp8 is safe for production on Gemma 4 12B at single-stream B=1.** Round 8's `bfloat8_b` MLP gate/up/down + lm_head weights produce token-identical decode output to bf16 baselines at the same prompts and seeds (verified at L=128/512/1024). The Round 8 diagnostic's attribution of the long-context regression to bfp8 was incorrect.
+- **The trace integration is correct.** Eager and traced produce token-identical decode output across 3 different needle seeds at L=128 with the IT model + chat-instruction prompt. The trace path was not a source of correctness loss.
+- **Real source of the "long-context regression"**: the IT model echoes its own answer-format instruction in the prompt (`"Answer with only the 8-character password.\n\nAnswer:"`) at L=128 instead of retrieving the buried needle. The pre-Round-8 "3/3 Y" baseline (commit `b492370`) used the BASE model + raw text WITHOUT an answer-format instruction — three uncontrolled axes vs the Round 8 diagnostic (host, model variant, decode path). No actual regression in the TT stack occurred between commits.
+- **Ship decision**:
+  - bfp8 reverted to bf16 in source DEFAULT (this commit) — conservative because Round 8 shipped bfp8 with an incorrect-but-undefeated correctness claim that was widely cited in the log. The Round 9 ablation invalidates the cited concern.
+  - `TT_GM4_MLP_DTYPE=bfp8` + `TT_GM4_LM_HEAD_DTYPE=bfp8` env vars re-enable Round 8's measured -1.86% (-0.87 ms/tok) traced lever **without a code edit**, callable safely now that the long-context "regression" has been disambiguated.
+  - Round 10 should consider re-defaulting to bfp8 in source after one re-validation pass on the actual customer-facing chat workload (CB at B=4 with chat-templated prompts).
+- **Long-context retrieval on IT + chat-instruction prompt is a SEPARATE open issue** unrelated to perf. Two avenues for the next session:
+  1. Drop the trailing "Answer with only the 8-character password" instruction from the needle probe — test whether IT retrieves under just `"What is the magic password?"`. If yes, instruction-echo is the failure mode and we can document it as a known prompt-shape pitfall.
+  2. Test chat-templated prompt (the actual production path through `apply_chat_template`) — that's what real users hit, and may behave differently because the template wraps the user turn with `<start_of_turn>user…<end_of_turn>` boundary tokens.

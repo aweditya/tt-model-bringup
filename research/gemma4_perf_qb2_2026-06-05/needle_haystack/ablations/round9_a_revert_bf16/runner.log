@@ -1,0 +1,145 @@
+2026-06-06 06:11:08.429 | DEBUG    | ttnn:<module>:79 - Initial ttnn.CONFIG:
+Config{cache_path=/home/aditya/.cache/ttnn,model_cache_path=/home/aditya/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=true,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=false,comparison_mode_should_raise_exception=false,comparison_mode_pcc=0.9999,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
+[transformers] You are using a model of type `gemma4_unified` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[06:11:12] bootstrapping Gemma 4 12B IT server (~5min on qb2)…
+[06:11:12] [bootstrap] open mesh + fabric…
+2026-06-06 06:11:12.857 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-06-06 06:11:12.860 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-06-06 06:11:12.860 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:494)
+2026-06-06 06:11:12.876 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:224)
+2026-06-06 06:11:12.877 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-06-06 06:11:12.880 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-06-06 06:11:12.880 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:494)
+2026-06-06 06:11:12.895 | info     |             UMD | Harvesting masks for Chip 2: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:275)
+2026-06-06 06:11:12.942 | info     |             UMD | Harvesting masks for Chip 0: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:275)
+2026-06-06 06:11:12.946 | info     |             UMD | Harvesting masks for Chip 1: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:275)
+2026-06-06 06:11:12.949 | info     |             UMD | Harvesting masks for Chip 3: Tensix: 0xc0 DRAM: 0x0 ETH: 0x120 PCIe: 0x2 L2CPU: 0x0 (cluster.cpp:275)
+2026-06-06 06:11:12.953 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1, 2, 3}/[1, 2, 3, 0] and remote chip ids {} (cluster.cpp:177)
+2026-06-06 06:11:12.953 | info     |             UMD | IOMMU: disabled (cluster.cpp:157)
+2026-06-06 06:11:12.953 | info     |             UMD | KMD version: 2.8.0 (cluster.cpp:160)
+2026-06-06 06:11:12.956 | info     |             UMD | Starting devices in cluster (cluster.cpp:949)
+2026-06-06 06:11:12.957 | info     |             UMD | Mapped hugepage 0x440000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-06-06 06:11:12.958 | info     |             UMD | Mapped hugepage 0x500000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-06-06 06:11:12.960 | info     |             UMD | Mapped hugepage 0x480000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-06-06 06:11:12.961 | info     |             UMD | Mapped hugepage 0x4c0000000 to NOC address 0x1000000000000000 (silicon_sysmem_manager.cpp:262)
+2026-06-06 06:11:13.714 | DEBUG    | ttnn.device:__init__:150 - Using default dispatch core type for this system: DispatchCoreType.WORKER
+2026-06-06 06:11:13.714 | DEBUG    | ttnn.device:__init__:152 - Using default dispatch core axis for this system: DispatchCoreAxis.COL
+2026-06-06 06:11:13.714 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:332)
+2026-06-06 06:11:13.714 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:394)
+2026-06-06 06:11:13.715 | info     |             UMD | Creating TopologyDiscovery for architecture: blackhole (topology_discovery.cpp:72)
+2026-06-06 06:11:13.716 | info     |             UMD | Established firmware bundle version: 19.6.0 (topology_discovery.cpp:468)
+2026-06-06 06:11:13.716 | info     |             UMD | Firmware bundle version 19.6.0 on the system is newer than the latest fully tested version 19.5.0 for blackhole architecture. Newest features may not be supported. (topology_discovery.cpp:494)
+2026-06-06 06:11:13.724 | info     |          Fabric | TopologyMapper: Logical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1474)
+2026-06-06 06:11:13.724 | info     |          Fabric | 
+=== Logical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-06-06 06:11:13.724 | info     |          Fabric | 
+=== Logical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-06-06 06:11:13.724 | info     |          Fabric | TopologyMapper: Physical Multi-Mesh Adjacency Map: (topology_mapper.cpp:1485)
+2026-06-06 06:11:13.724 | info     |          Fabric | 
+=== Physical Mesh-Level Graph Adjacency Map ===
+Total nodes: 1
+Degree histogram: {0:1}
+ (topology_solver.tpp:91)
+2026-06-06 06:11:13.724 | info     |          Fabric | 
+=== Physical Mesh 0 Internal Graph Adjacency Map ===
+Total nodes: 4
+Degree histogram: {2:4}
+ (topology_solver.tpp:91)
+2026-06-06 06:11:13.724 | info     |          Fabric | Starting multi-mesh mapping: 1 logical mesh(es) to 1 physical mesh(es) (topology_mapper_utils.cpp:1465)
+2026-06-06 06:11:13.724 | info     |          Fabric | Multi-mesh mapping attempt 1/2: Trying inter-mesh mapping (topology_mapper_utils.cpp:1506)
+2026-06-06 06:11:13.724 | info     |          Fabric | Attempt 1: Inter-mesh mapping succeeded, found 1 mesh pair(s) (topology_mapper_utils.cpp:1535)
+2026-06-06 06:11:13.724 | info     |          Fabric | Attempt 1: Mapping 1 mesh pair(s) (topology_mapper_utils.cpp:1547)
+2026-06-06 06:11:13.724 | info     |          Fabric | Attempt 1: Mapping mesh 0 -> 0 (topology_mapper_utils.cpp:1549)
+2026-06-06 06:11:13.724 | info     |          Fabric | Multi-mesh mapping succeeded after 1 attempt(s): 1 mesh pair(s) mapped (topology_mapper_utils.cpp:1682)
+2026-06-06 06:11:13.741 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tenstorrent/tt-metal/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:256)
+2026-06-06 06:11:13.741 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tenstorrent/tt-metal/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:256)
+2026-06-06 06:11:13.741 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tenstorrent/tt-metal/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:256)
+2026-06-06 06:11:13.741 | info     |    BuildKernels | Using pre-compiled firmware from: /home/aditya/tenstorrent/tt-metal/tt_metal/pre-compiled/7480443082328483327/ (build_env_manager.cpp:256)
+2026-06-06 06:11:13.804 | info     |           Metal | Initializing Fabric (fabric_firmware_initializer.cpp:45)
+2026-06-06 06:11:13.838 | info     |           Metal | Fabric initialized on Device 0 (device.cpp:412)
+2026-06-06 06:11:13.843 | info     |           Metal | Fabric initialized on Device 1 (device.cpp:412)
+2026-06-06 06:11:13.844 | info     |           Metal | Fabric initialized on Device 2 (device.cpp:412)
+2026-06-06 06:11:13.845 | info     |           Metal | Fabric initialized on Device 3 (device.cpp:412)
+2026-06-06 06:11:13.845 | info     |           Metal | Fabric initialized on 4 devices (fabric_firmware_initializer.cpp:173)
+2026-06-06 06:11:13.845 | info     |           Metal | Fabric Initialized with config FabricConfig::FABRIC_1D (fabric_firmware_initializer.cpp:48)
+[06:11:13]   mesh: MeshDevice(1x4 grid, 4 devices)
+[06:11:13] [bootstrap] variant=it model=google/gemma-4-12B-it — config + tokenizer…
+[transformers] You are using a model of type `gemma4_unified` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[06:11:16]   tokenizer: GemmaTokenizer, eos_token='<eos>' id=1, chat_template_installed=True
+[06:11:16]   48 layers; 40 sliding / 8 global
+[06:11:16] [bootstrap] enumerate shards + load top-level weights to mesh…
+[06:11:16]   677 keys total
+[06:11:17]   embed: (262144, 3840)
+[06:11:17]   final_norm: (3840,)
+[06:11:25]   lm_head (tied, vocab-sharded dim=1, per-chip 65536): (3840, 262144)
+[06:11:25]   paged SDPA: MAX_KV=4096, block_size=32, num_blocks=128
+[06:11:30]   KV caches: 48 layers allocated (sliding: 2 caches/layer × 40 layers)
+[06:11:30]   SDPA program/memory/compute configs ready
+[06:11:30]   RoPE tables: sliding [(4096, 256)] + global [(4096, 512)] (MAX_KV=4096, sin half-sign-baked for round-5 roll fusion)
+[06:11:30] [bootstrap] uploading 48 layer weights to mesh…
+[06:11:44]   layer 10/48 uploaded (13.9s)
+[06:11:58]   layer 20/48 uploaded (27.9s)
+[06:12:12]   layer 30/48 uploaded (41.7s)
+[06:12:26]   layer 40/48 uploaded (55.3s)
+[06:12:37]   all layer weights uploaded in 66.5s
+[06:12:37] [bootstrap] ready (v0.1.0 — embed + L0 input_layernorm only).
+[06:12:37] bootstrap in 84.6s
+[06:12:37] capturing decode trace (warmup + capture; first call)…
+[06:12:37] [trace] warmup + capture decode trace…
+[06:12:38] [trace] captured in 1280 ms (id=MeshTraceId(0))
+[06:12:38] trace ready in 1.3s
+[06:12:38] === L=128 frac=0.5 trial=0 needle=N4Y2BWLS (rendered=133 toks) ===
+[06:12:46]   prefill 6.2s (47 ms/tok), decode 1.1s (45 ms/tok)
+[06:12:46]   generated: '8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'
+[06:12:46]   verdict: N
+[06:12:46] === L=128 frac=0.5 trial=1 needle=SRBW4DPD (rendered=132 toks) ===
+[06:12:53]   prefill 6.2s (47 ms/tok), decode 1.1s (45 ms/tok)
+[06:12:53]   generated: '8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'
+[06:12:53]   verdict: N
+[06:12:53] === L=128 frac=0.5 trial=2 needle=9PJDLBTP (rendered=133 toks) ===
+[06:13:00]   prefill 6.2s (47 ms/tok), decode 1.1s (45 ms/tok)
+[06:13:00]   generated: '8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'
+[06:13:00]   verdict: N
+[06:13:00] === L=512 frac=0.5 trial=0 needle=H5MP4TP3 (rendered=509 toks) ===
+[06:13:25]   prefill 24.0s (47 ms/tok), decode 1.1s (46 ms/tok)
+[06:13:25]   generated: '01101010.\n\n\n 01101010\n'
+[06:13:25]   verdict: N
+[06:13:25] === L=512 frac=0.5 trial=1 needle=ZW665VS8 (rendered=510 toks) ===
+[06:13:51]   prefill 24.1s (47 ms/tok), decode 1.1s (46 ms/tok)
+[06:13:51]   generated: '012345678.\n\nAnswer: 012345678.'
+[06:13:51]   verdict: N
+[06:13:51] === L=512 frac=0.5 trial=2 needle=P7Q8ZWWJ (rendered=510 toks) ===
+[06:14:16]   prefill 24.2s (48 ms/tok), decode 1.1s (46 ms/tok)
+[06:14:16]   generated: '01111111.\n\n\n 1\n 2\n 3\n '
+[06:14:16]   verdict: N
+[06:14:16] === L=1024 frac=0.5 trial=0 needle=FWD7SWFY (rendered=1022 toks) ===
+[06:15:06]   prefill 48.9s (48 ms/tok), decode 1.1s (47 ms/tok)
+[06:15:06]   generated: '01234567\n\n01234567\n\n012345'
+[06:15:06]   verdict: N
+[06:15:06] === L=1024 frac=0.5 trial=1 needle=7YQ9M7MW (rendered=1021 toks) ===
+[06:15:56]   prefill 48.8s (48 ms/tok), decode 1.1s (46 ms/tok)
+[06:15:56]   generated: '07YQ9M7M.thought\n07YQ9M7M'
+[06:15:56]   verdict: P
+[06:15:56] === L=1024 frac=0.5 trial=2 needle=BHHGN56G (rendered=1019 toks) ===
+[06:16:46]   prefill 48.5s (48 ms/tok), decode 1.1s (46 ms/tok)
+[06:16:46]   generated: '01101010\n\n_\n\n\n\n\nう\nう\n'
+[06:16:46]   verdict: N
+[06:16:46] === SUMMARY ===
+[06:16:46]   L=128: Y=0 P=0 N=3 / 3
+[06:16:46]   L=512: Y=0 P=0 N=3 / 3
+[06:16:46]   L=1024: Y=0 P=1 N=2 / 3
+[06:16:46] wrote /home/aditya/tt-xla/research/gemma4_perf_qb2_2026-06-05/needle_haystack/round9_a_revert_bf16/results.json
+[06:16:46] done
+2026-06-06 06:16:47.272 | info     |    BuildKernels | JIT cache stats: 492/492 hits (100.0%) [492 cached, 372 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:197)
+2026-06-06 06:16:47.272 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-06-06 06:16:47.272 | info     |    BuildKernels | JIT telemetry [dependencies_up_to_date]: count=984, total=834.951ms, min=0.021ms, max=6.573ms, mean=0.849ms (build_cache_telemetry.cpp:238)
+2026-06-06 06:16:47.272 | info     |    BuildKernels | JIT telemetry [JitBuildState::build]: count=492, total=870.755ms, min=0.563ms, max=6.874ms, mean=1.770ms (build_cache_telemetry.cpp:238)
+2026-06-06 06:16:47.272 | info     |    BuildKernels | JIT telemetry [jit_build]: count=159, total=332.134ms, min=0.582ms, max=6.898ms, mean=2.089ms (build_cache_telemetry.cpp:238)
+2026-06-06 06:16:47.302 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:490)
+2026-06-06 06:16:47.302 | info     |             UMD | Closing devices in cluster (cluster.cpp:961)

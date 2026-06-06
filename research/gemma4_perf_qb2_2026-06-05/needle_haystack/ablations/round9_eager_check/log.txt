@@ -1,0 +1,53 @@
+[06:17:22] bootstrapping Gemma 4 12B IT server (~85s)…
+[06:17:22] [bootstrap] open mesh + fabric…
+[06:17:23]   mesh: MeshDevice(1x4 grid, 4 devices)
+[06:17:23] [bootstrap] variant=it model=google/gemma-4-12B-it — config + tokenizer…
+[06:17:26]   tokenizer: GemmaTokenizer, eos_token='<eos>' id=1, chat_template_installed=True
+[06:17:26]   48 layers; 40 sliding / 8 global
+[06:17:26] [bootstrap] enumerate shards + load top-level weights to mesh…
+[06:17:26]   677 keys total
+[06:17:27]   embed: (262144, 3840)
+[06:17:27]   final_norm: (3840,)
+[06:17:34]   lm_head (tied, vocab-sharded dim=1, per-chip 65536): (3840, 262144)
+[06:17:34]   paged SDPA: MAX_KV=4096, block_size=32, num_blocks=128
+[06:17:40]   KV caches: 48 layers allocated (sliding: 2 caches/layer × 40 layers)
+[06:17:40]   SDPA program/memory/compute configs ready
+[06:17:40]   RoPE tables: sliding [(4096, 256)] + global [(4096, 512)] (MAX_KV=4096, sin half-sign-baked for round-5 roll fusion)
+[06:17:40] [bootstrap] uploading 48 layer weights to mesh…
+[06:17:54]   layer 10/48 uploaded (14.0s)
+[06:18:08]   layer 20/48 uploaded (27.9s)
+[06:18:22]   layer 30/48 uploaded (41.6s)
+[06:18:35]   layer 40/48 uploaded (55.1s)
+[06:18:46]   all layer weights uploaded in 66.0s
+[06:18:46] [bootstrap] ready (v0.1.0 — embed + L0 input_layernorm only).
+[06:18:46] bootstrap in 84.5s
+[06:18:46] EAGER path — no trace capture
+[06:18:46] === L=128 frac=0.5 trial=0 needle=N4Y2BWLS (rendered=133 toks) ===
+[06:19:14]   prefill 23.4s (176 ms/tok), decode 3.8s (157 ms/tok)
+[06:19:14]   generated: '8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'
+[06:19:14]   verdict: N
+[06:19:14] === L=128 frac=0.5 trial=1 needle=SRBW4DPD (rendered=132 toks) ===
+[06:19:41]   prefill 23.1s (175 ms/tok), decode 3.9s (164 ms/tok)
+[06:19:41]   generated: '8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'
+[06:19:41]   verdict: N
+[06:19:41] === L=128 frac=0.5 trial=2 needle=9PJDLBTP (rendered=133 toks) ===
+[06:20:07]   prefill 22.8s (171 ms/tok), decode 3.8s (160 ms/tok)
+[06:20:07]   generated: '8-character password.\n\nAnswer: 8-character password.\n\nAnswer: 8-character password.\n\n'
+[06:20:07]   verdict: N
+[06:20:07] === L=512 frac=0.5 trial=0 needle=H5MP4TP3 (rendered=509 toks) ===
+[06:21:39]   prefill 88.2s (173 ms/tok), decode 4.0s (165 ms/tok)
+[06:21:39]   generated: '01101010.\n\n\n 01101010\n'
+[06:21:39]   verdict: N
+[06:21:39] === L=512 frac=0.5 trial=1 needle=ZW665VS8 (rendered=510 toks) ===
+[06:23:10]   prefill 86.8s (170 ms/tok), decode 3.9s (162 ms/tok)
+[06:23:10]   generated: '012345678.\n\nAnswer: 012345678.'
+[06:23:10]   verdict: N
+[06:23:10] === L=512 frac=0.5 trial=2 needle=P7Q8ZWWJ (rendered=510 toks) ===
+[06:24:40]   prefill 86.5s (170 ms/tok), decode 3.9s (161 ms/tok)
+[06:24:40]   generated: '01111111.\n\n\n 1\n 2\n 3\n '
+[06:24:40]   verdict: N
+[06:24:40] === SUMMARY ===
+[06:24:40]   L=128: Y=0 P=0 N=3 / 3
+[06:24:40]   L=512: Y=0 P=0 N=3 / 3
+[06:24:40] wrote /home/aditya/tt-xla/research/gemma4_perf_qb2_2026-06-05/needle_haystack/round9_eager_check/results.json
+[06:24:40] done
