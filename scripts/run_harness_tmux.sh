@@ -27,7 +27,8 @@ esac
 # switches don't need a code edit. Add new vars here as bringups need them.
 PASS_THROUGH_ENV=""
 for var in TT_GEMMA4_VARIANT TT_GEMMA4_MODEL_ID TT_CB_SLOTS TT_CB_TOPK_K \
-           NEMOTRON3_UPLOAD_LAYERS NEMOTRON3_MOE_MODE; do
+           NEMOTRON3_UPLOAD_LAYERS NEMOTRON3_MOE_MODE \
+           NM3_ROUTER_ON_DEVICE NM3_NEEDLE_MAX_NEW; do
   if [ -n "${!var:-}" ]; then
     PASS_THROUGH_ENV="$PASS_THROUGH_ENV $var=${!var}"
   fi

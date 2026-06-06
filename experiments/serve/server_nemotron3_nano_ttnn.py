@@ -21,6 +21,7 @@ uploads ship at v0.1.x). Key deltas vs 35B:
   - tie_word_embeddings=False — separate `lm_head.weight`
 """
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -2670,24 +2671,100 @@ def moe_block_eager_ep_tt(state: State, h_input_tt, layer_idx: int):
     if S_padded != S_orig:
         ttnn.deallocate(h_padded_tt)
 
-    # Router scores → host topk-6 (intra-block bridge, kept for now)
+    # Router scores. Two paths gated on NM3_ROUTER_ON_DEVICE:
+    #   default (host topk): ttnn.to_torch(scores) + np.argpartition
+    #   on-device: ttnn.topk + ttnn.embedding-gather (validated
+    #     cos=0.9997 in nemotron3_v040hb_ondevice_router_probe.py).
+    # We readback results to keep downstream dispatch+combine code
+    # unchanged for this iteration. Eliminating the readback for
+    # trace is a follow-up after the drift-vs-baseline gate passes.
     logits_tt = ttnn.matmul(h_norm_tt, w["gate_w"], compute_kernel_config=HIFI4)
     scores_tt = ttnn.sigmoid(logits_tt)
     ttnn.deallocate(logits_tt)
-    scores_np = ttnn.to_torch(
-        scores_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
-    )[:1].float().numpy()[0]
-    ttnn.deallocate(scores_tt)
-    bias = w["e_score_bias_np"].astype(np.float32)
-    scores_for_choice = scores_np + bias[None, :]
-    topk_indices = np.argpartition(
-        -scores_for_choice, TOP_K_ROUTED, axis=-1
-    )[:, :TOP_K_ROUTED]
-    rows = np.arange(scores_np.shape[0])[:, None]
-    topk_weights = scores_np[rows, topk_indices]
-    denom = topk_weights.sum(axis=-1, keepdims=True) + 1e-20
-    topk_weights = topk_weights / denom
-    topk_weights = topk_weights * np.float32(ROUTED_SCALING)
+    use_ondev_router = os.environ.get("NM3_ROUTER_ON_DEVICE", "0") == "1"
+
+    if use_ondev_router:
+        # Lazy upload bias tensors per layer (first-use; one-time).
+        if "router_bias_tt" not in w:
+            bias_np = w["e_score_bias_np"].astype(np.float32)
+            w["router_bias_tt"] = ttnn.from_torch(
+                torch.from_numpy(np.ascontiguousarray(
+                    bias_np.reshape(1, 1, N_ROUTED_EXPERTS)
+                )),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            )
+            bias_table_np = np.zeros((N_ROUTED_EXPERTS, 32), dtype=np.float32)
+            bias_table_np[:, 0] = bias_np
+            w["router_bias_table_tt"] = ttnn.from_torch(
+                torch.from_numpy(np.ascontiguousarray(bias_table_np)),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            )
+        # scores_tt shape [B, S_padded, N_ROUTED_EXPERTS=128] TILE bf16.
+        scores_biased_tt = ttnn.add(scores_tt, w["router_bias_tt"])
+        top_vals_tt, top_idxs_tt = ttnn.topk(
+            scores_biased_tt, k=TOP_K_ROUTED, dim=-1,
+        )
+        ttnn.deallocate(scores_biased_tt)
+        # ttnn.embedding requires UINT32 indices. ttnn.topk returns UINT16.
+        top_idxs_u32 = ttnn.typecast(top_idxs_tt, ttnn.uint32)
+        # Embedding with rank-3 indices [B, S, K] collapses S; reshape to
+        # 2D [B*S_padded, K] (per the probe's empirical fix).
+        top_idxs_2d = ttnn.reshape(top_idxs_u32, [B * S_padded, TOP_K_ROUTED])
+        ttnn.deallocate(top_idxs_u32)
+        bias_at_idx_full = ttnn.embedding(top_idxs_2d, w["router_bias_table_tt"])
+        ttnn.deallocate(top_idxs_2d)
+        # Embedding output [B*S, K, 32]. Slice col 0 → [B*S, K, 1] → 3D.
+        bias_at_idx = ttnn.slice(
+            bias_at_idx_full, [0, 0, 0],
+            [B * S_padded, TOP_K_ROUTED, 1],
+        )
+        ttnn.deallocate(bias_at_idx_full)
+        bias_at_idx_3d = ttnn.reshape(
+            bias_at_idx, [B, S_padded, TOP_K_ROUTED],
+        )
+        # Unbiased weights = top_vals - bias[idx]; then normalise + scale.
+        weights_tt = ttnn.subtract(top_vals_tt, bias_at_idx_3d)
+        ttnn.deallocate(top_vals_tt)
+        ttnn.deallocate(bias_at_idx_3d)
+        denom_tt = ttnn.sum(weights_tt, dim=-1, keepdim=True)
+        denom_eps = ttnn.add(denom_tt, 1e-20)
+        ttnn.deallocate(denom_tt)
+        weights_norm = ttnn.div(weights_tt, denom_eps)
+        ttnn.deallocate(weights_tt)
+        ttnn.deallocate(denom_eps)
+        weights_scaled = ttnn.multiply(weights_norm, ROUTED_SCALING)
+        ttnn.deallocate(weights_norm)
+        # Readback for downstream (compat with existing dispatch + combine).
+        topk_indices_np = ttnn.to_torch(
+            top_idxs_tt,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )[:1].cpu().numpy().reshape(B * S_padded, TOP_K_ROUTED)
+        topk_weights_np = ttnn.to_torch(
+            weights_scaled,
+            mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )[:1].float().cpu().numpy().reshape(B * S_padded, TOP_K_ROUTED)
+        ttnn.deallocate(top_idxs_tt)
+        ttnn.deallocate(weights_scaled)
+        ttnn.deallocate(scores_tt)
+        topk_indices = topk_indices_np.astype(np.int64)[:S_padded]
+        topk_weights = topk_weights_np.astype(np.float32)[:S_padded]
+    else:
+        scores_np = ttnn.to_torch(
+            scores_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+        )[:1].float().numpy()[0]
+        ttnn.deallocate(scores_tt)
+        bias = w["e_score_bias_np"].astype(np.float32)
+        scores_for_choice = scores_np + bias[None, :]
+        topk_indices = np.argpartition(
+            -scores_for_choice, TOP_K_ROUTED, axis=-1
+        )[:, :TOP_K_ROUTED]
+        rows = np.arange(scores_np.shape[0])[:, None]
+        topk_weights = scores_np[rows, topk_indices]
+        denom = topk_weights.sum(axis=-1, keepdims=True) + 1e-20
+        topk_weights = topk_weights / denom
+        topk_weights = topk_weights * np.float32(ROUTED_SCALING)
 
     # v0.4.1.e — on-device replicate->shard via reduce_scatter + 1/N scale.
     # Math: pre-scale each chip's replicated h by 1/N; reduce_scatter sums
