@@ -232,4 +232,149 @@ def mamba2_decode_step_ttnn(
     return state_logical, y_logical
 
 
-__all__ = ["mamba2_decode_step_ttnn"]
+def prepare_mamba2_constants(dt_bias, A_log, D, *, B: int, num_heads: int, device):
+    """v0.4.0a — pre-upload SSD constants ONCE at bootstrap.
+
+    dt_bias, A_log, D are per-layer scalars that NEVER change across
+    decode calls. The old wrapper pads + uploads them every call (≈3
+    of 9 host-to-device transfers per step). This helper does the
+    padding + upload ONCE; the result is reused by
+    `mamba2_decode_step_ttnn_with_const_tt`.
+
+    Returns dict with `dt_bias_tt`, `A_log_tt`, `D_tt` (ttnn TILE bf16
+    replicated across the mesh if `device` is a MeshDevice).
+    """
+    import ttnn
+    is_mesh = isinstance(device, ttnn.MeshDevice)
+    dt_bias_padded = _pad_scalar_per_head_per_batch(
+        _to_numpy(dt_bias).astype(np.float32), B, num_heads,
+    )
+    A_log_padded = _pad_scalar_per_head_per_batch(
+        _to_numpy(A_log).astype(np.float32), B, num_heads,
+    )
+    D_padded = _pad_scalar_per_head_per_batch(
+        _to_numpy(D).astype(np.float32), B, num_heads,
+    )
+
+    def _up(arr):
+        kwargs = dict(
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device,
+        )
+        if is_mesh:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(device)
+        return ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(arr)), **kwargs,
+        )
+
+    return {
+        "dt_bias_tt": _up(dt_bias_padded),
+        "A_log_tt":   _up(A_log_padded),
+        "D_tt":       _up(D_padded),
+    }
+
+
+def mamba2_decode_step_ttnn_with_const_tt(
+    *,
+    x,
+    z,
+    dt,
+    dt_bias_tt,
+    A_log_tt,
+    D_tt,
+    B_in,
+    C_in,
+    ssm_state,
+    device,
+    debug_mode: int = 5,
+):
+    """v0.4.0a — variant of `mamba2_decode_step_ttnn` accepting
+    pre-uploaded ttnn constants for dt_bias, A_log, D. Eliminates 3
+    of the 9 per-call uploads.
+
+    All OTHER inputs (x, z, dt, B_in, C_in, ssm_state) stay numpy/torch
+    for this stage; v0.4.0b/c land the remaining state + variable
+    on-device handling.
+    """
+    import ttnn
+
+    x_np         = _to_numpy(x).astype(np.float32)
+    z_np         = _to_numpy(z).astype(np.float32)
+    dt_np        = _to_numpy(dt).astype(np.float32)
+    B_in_np      = _to_numpy(B_in).astype(np.float32)
+    C_in_np      = _to_numpy(C_in).astype(np.float32)
+    ssm_state_np = _to_numpy(ssm_state).astype(np.float32)
+
+    B_, num_heads, head_dim = x_np.shape
+    ssm_state_size = B_in_np.shape[-1]
+
+    x_padded   = _pad_per_head_vector(x_np, head_dim)
+    z_padded   = _pad_per_head_vector(z_np, head_dim)
+    dt_padded  = _pad_dt_per_batch_per_head(dt_np)
+    B_padded   = _replicate_per_group_to_per_head(B_in_np, num_heads)
+    C_padded   = _replicate_per_group_to_per_head(C_in_np, num_heads)
+
+    is_mesh = isinstance(device, ttnn.MeshDevice)
+
+    def tt_bf16(arr):
+        kwargs = dict(
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device,
+        )
+        if is_mesh:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(device)
+        return ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(arr)), **kwargs,
+        )
+
+    def tt_fp32(arr):
+        kwargs = dict(
+            dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device,
+        )
+        if is_mesh:
+            kwargs["mesh_mapper"] = ttnn.ReplicateTensorToMesh(device)
+        return ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(arr)), **kwargs,
+        )
+
+    x_tt        = tt_bf16(x_padded)
+    z_tt        = tt_bf16(z_padded)
+    dt_tt       = tt_bf16(dt_padded)
+    B_in_tt     = tt_bf16(B_padded)
+    C_in_tt     = tt_bf16(C_padded)
+    ssm_state_tt = tt_fp32(ssm_state_np)
+
+    state_out_tt, y_out_tt = ttnn.experimental.nemotron3_mamba2_decode_owned(
+        x_tt, z_tt, dt_tt, dt_bias_tt, A_log_tt, D_tt,
+        B_in_tt, C_in_tt, ssm_state_tt,
+        debug_mode=debug_mode,
+    )
+
+    if is_mesh:
+        composer = ttnn.ConcatMeshToTensor(device, dim=0)
+        state_kernel = ttnn.to_torch(state_out_tt, mesh_composer=composer)
+        state_kernel = state_kernel[:B_].cpu().numpy()
+        y_kernel_padded = ttnn.to_torch(
+            ttnn.typecast(y_out_tt, ttnn.float32),
+            mesh_composer=composer)
+        y_kernel_padded = y_kernel_padded[:B_].cpu().numpy()
+    else:
+        state_kernel = ttnn.to_torch(state_out_tt).cpu().numpy()
+        y_kernel_padded = ttnn.to_torch(
+            ttnn.typecast(y_out_tt, ttnn.float32)).cpu().numpy()
+
+    if y_kernel_padded.ndim == 4 and y_kernel_padded.shape[-2] == 32:
+        y_logical = y_kernel_padded[:, :, 0, :head_dim]
+    else:
+        y_logical = y_kernel_padded[:, :, :head_dim].reshape(
+            B_, num_heads, head_dim)
+
+    state_logical = state_kernel[:, :, :head_dim, :ssm_state_size].reshape(
+        B_, num_heads, head_dim, ssm_state_size)
+
+    return state_logical, y_logical
+
+
+__all__ = [
+    "mamba2_decode_step_ttnn",
+    "prepare_mamba2_constants",
+    "mamba2_decode_step_ttnn_with_const_tt",
+]

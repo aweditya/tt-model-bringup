@@ -491,7 +491,12 @@ already uses the production-grade kernel.
 
 | Stage | Adds | Gate | Status |
 |---|---|---|---|
-| **v0.4** | **Trace capture — fp32-in-trace risk check** ([[35b-dn-h-state-drift-lever]]). Two-phase warmup ([[ttnn-multi-trace-two-phase-warmup]]). Fallback: bf16 ssm + measure drift, ship if drift <3% at 64 tok. | 100 traced steps == 100 eager token-for-token; ≥3× speedup vs eager | pending |
+| **v0.4.0a** | **Pre-upload SSD constants** (dt_bias, A_log, D) — 3 of 9 wrapper inputs never change. Isolation probe: `mamba2_decode_step_ttnn_const(...)` accepts ttnn tensors for these, smoke compares output vs original wrapper. | new-wrapper output cos ≥ 0.999 vs original; per-call time drops | pending |
+| **v0.4.0b** | **Keep `ssm_state` as ttnn tensor** — eliminate 1 upload + 1 readback per layer per step. Isolation: N-call recurrence (output matches numpy-state path bit-for-bit at ttnn precision). | final state cos ≥ 0.999 vs numpy-state path | pending |
+| **v0.4.0c** | **On-device padding** for x/z/dt/B/C — replace `_pad_per_head_vector` + `_pad_dt_per_batch_per_head` + `_replicate_per_group_to_per_head` with ttnn pad/repeat ops. Isolation: padded-ttnn bit-equals padded-numpy. | padded tensors bit-equal | pending |
+| **v0.4.0d** | **Direct kernel call from `mamba2_block_eager_tt`** — bypass the wrapper for S=1 decode using pre-uploaded constants + on-device padding. | v0.3.3 chain regression: 6/7 PASS with recovery; per-step time ≤6s | pending |
+| **v0.4.1** | First trace capture of single decode step. | 100 traced steps == 100 eager token-for-token | pending |
+| **v0.4.2** | Two-phase warmup ([[ttnn-multi-trace-two-phase-warmup]]) + prefill+decode capture together. Fallback: bf16 ssm + measure drift, ship if drift <3% at 64 tok ([[35b-dn-h-state-drift-lever]]). | 8-step traced chain == v0.3.3 6/7 baseline | pending |
 | **v0.5** | **Single-stream PERF pass** (target ≥30 tok/s traced). Apply known wins: vocab-sharded LM head + on-device argmax (P22 — already proven on 27B/Gemma 4 at +5-8%); HiFi2 expert matmul (35B win); RMSNorm fusion ([[adoption-next-b]]); concatenated Mamba2 in_proj fusion; distributed RMSNorm. Profile-driven (Tracy A/B per win). **On-device sweep**: router topk on-device (replace `np.argpartition` with ttnn topk), combine weighted-sum on-device (broadcast `topk_weights_tt × combine_out_tt` + reduce TOP_K), shared+residual on-device (chain `ttnn.add`). | ≥30 tok/s single-stream traced. **This is the demo-ready state.** | pending |
 
 ### Phase 3 — Continuous batching (DEFERRED until v0.5 ships)
