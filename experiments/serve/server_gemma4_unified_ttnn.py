@@ -1705,12 +1705,18 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
         ttnn.deallocate(gelu_gate_sh); ttnn.deallocate(up_sh)
         # Reshard mid → WIDTH_SHARDED L1 with K=INTERMEDIATE_PER_CHIP contract
         # for down_proj's in0.
+        # NOTE 2026-06-06: when the source mem_cfg already matches the target
+        # shard spec (as is the case here — gate/up output is [32, 480] per
+        # core on 8 cores, same as `x_mem_cfg_down`), `to_memory_config` may
+        # return the SAME tensor handle. If we deallocate `mid_sh` after,
+        # `mid` becomes unallocated → "Tensor is not allocated" TT_THROW on
+        # the next matmul. Keep `mid_sh` alive by reusing the alias and only
+        # deallocating after the final matmul.
         mid = ttnn.to_memory_config(mid_sh, x_mem_cfg_down)
-        ttnn.deallocate(mid_sh)
         mlp_partial_sh = ttnn.matmul(
             mid, w["down_proj"], program_config=prog_down,
             memory_config=out_mem_cfg, compute_kernel_config=HIFI4)
-        ttnn.deallocate(mid)
+        ttnn.deallocate(mid_sh)  # also covers `mid` (no-op reshard alias)
         # all_reduce expects INTERLEAVED; reshard back.
         mlp_partial = ttnn.sharded_to_interleaved(
             mlp_partial_sh, ttnn.DRAM_MEMORY_CONFIG)
