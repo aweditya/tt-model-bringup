@@ -446,6 +446,27 @@ def upload_mamba2_layer(state, key_to_shard, L: int, log) -> dict:
     # ([out_channels, in_channels/groups=1, kernel_height=1, kernel_width=4]).
     # The op itself is implemented as a 2D conv with H=1.
     conv1d_w_4d = conv1d_w[:, :, None, :]  # [conv_dim, 1, 1, 4]
+    # v0.4.0e — matmul-fold per-position weights for the decode-path conv1d
+    # replacement (345× faster than ttnn.conv1d on [B=1, 1, 4, 6144]).
+    # Split [C, 1, 1, K=4] into 4 broadcast-shaped [1, 1, 1, C] tile tensors,
+    # one per kernel position. Bias also goes on-mesh TILE for the final add.
+    conv1d_w_per_pos_tt = [
+        ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(
+                conv1d_w[:, 0, k].reshape(1, 1, 1, CONV_DIM_M).astype(np.float32)
+            )),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+        for k in range(CONV_KERNEL)
+    ]
+    conv1d_b_tile_tt = ttnn.from_torch(
+        torch.from_numpy(np.ascontiguousarray(
+            conv1d_b.reshape(1, 1, 1, -1).astype(np.float32)
+        )),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
     out = {
         "kind": "mamba2",
         "norm": np_to_replicated(norm_w, state.mesh),
@@ -453,6 +474,7 @@ def upload_mamba2_layer(state, key_to_shard, L: int, log) -> dict:
         "in_proj": np_to_replicated(in_proj_w.T, state.mesh),
         # Conv1d weight + bias uploaded for ttnn.conv1d. Depth-wise:
         # groups=conv_dim makes this a per-channel kernel.
+        # Kept for prefill (non-trivial-S) and legacy probe paths.
         "conv1d_w": ttnn.from_torch(
             torch.from_numpy(conv1d_w_4d.astype(np.float32)),
             dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
@@ -461,6 +483,9 @@ def upload_mamba2_layer(state, key_to_shard, L: int, log) -> dict:
             torch.from_numpy(conv1d_b.reshape(1, 1, 1, -1).astype(np.float32)),
             dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
         ),
+        # v0.4.0e — matmul-fold weights for the decode hot path.
+        "conv1d_w_per_pos_tt": conv1d_w_per_pos_tt,
+        "conv1d_b_tile_tt": conv1d_b_tile_tt,
         # The small per-head ops (Mamba2 step's scalars) plumb at v0.1.2.c.
         "dt_bias_np": dt_bias.copy(),
         "A_log_np": A_log.copy(),
@@ -1685,47 +1710,109 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     )
 
     if _persistent_conv_tt:
-        # v0.4.0c — ALL-ON-DEVICE decode path: no numpy roundtrip.
-        # Layout flow: xBC_tt TILE → ROW_MAJOR → reshape 4D → concat with
-        # conv_state_tt → conv1d → reshape 3D → TILE for silu.
+        # v0.4.0e — MATMUL-FOLD decode path: replaces ttnn.conv1d (656ms)
+        # with 4×mul + 3×add + 1×bias-add (~2ms on probe). Math:
+        #   y[c] = Σ_{k=0..3} w_k[c] * x[k,c] + b[c]
+        # where w_k is the per-position weight pre-uploaded as TILE in
+        # upload_mamba2_layer and x[k] is the k-th of the 4 input positions
+        # (3 from conv_state + S=1 new). Validated bit-equiv to ttnn.conv1d
+        # at cos=0.999994 in nemotron3_v040e_conv1d_matmul_fold_probe.py.
+        # Lazy-upload the matmul-fold weights if the layer dict predates v0.4.0e
+        # ([[harness-state-version-skew]]).
+        if "conv1d_w_per_pos_tt" not in w:
+            # Recover the unsplit weight from `conv1d_w` (host RM bf16
+            # [conv_dim, 1, 1, K=4]) and split into 4 per-position TILE tensors
+            # replicated to mesh.
+            _w_host = ttnn.to_torch(w["conv1d_w"]).float().numpy()
+            # _w_host shape: [CONV_DIM_M, 1, 1, K]
+            w["conv1d_w_per_pos_tt"] = [
+                ttnn.from_torch(
+                    torch.from_numpy(np.ascontiguousarray(
+                        _w_host[:, 0, 0, k].reshape(1, 1, 1, CONV_DIM_M).astype(np.float32)
+                    )),
+                    dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+                )
+                for k in range(CONV_KERNEL)
+            ]
+            _b_host = ttnn.to_torch(w["conv1d_b"]).float().numpy()
+            w["conv1d_b_tile_tt"] = ttnn.from_torch(
+                torch.from_numpy(np.ascontiguousarray(
+                    _b_host.reshape(1, 1, 1, -1).astype(np.float32)
+                )),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            )
         conv_state_tt = _conv_state_tt_list[layer_idx]  # [B, 1, 3, CONV_DIM_M] ROW_MAJOR
         xBC_rm = ttnn.to_layout(xBC_tt, ttnn.ROW_MAJOR_LAYOUT)
         xBC_4d = ttnn.reshape(xBC_rm, [B, 1, S, CONV_DIM_M])
-        # Concat along seq dim → [B, 1, 3+S, CONV_DIM_M]
-        combined_tt = ttnn.concat([conv_state_tt, xBC_4d], dim=2)
+        # Concat along seq dim → [B, 1, 3+S=4, CONV_DIM_M] ROW_MAJOR.
+        combined_rm = ttnn.concat([conv_state_tt, xBC_4d], dim=2)
         ttnn.deallocate(xBC_4d)
-        conv_full_tt = ttnn.conv1d(
-            input_tensor=combined_tt,
-            weight_tensor=w["conv1d_w"],
-            device=state.mesh,
-            in_channels=CONV_DIM_M, out_channels=CONV_DIM_M,
-            batch_size=B, input_length=CONV_KERNEL - 1 + S,
-            kernel_size=CONV_KERNEL, stride=1,
-            padding=0, dilation=1, groups=CONV_DIM_M,
-            bias_tensor=w["conv1d_b"],
-        )
-        # Save new conv_state: last (kernel-1)=3 positions of combined.
-        # Materialise via ttnn.add(slice, zeros) so the slice view survives
-        # combined_tt deallocation ([[ttnn-slice-view-decay]]).
+        # ── Save new conv_state FIRST (still ROW_MAJOR for next iter). ──
+        # Last (kernel-1)=3 positions of combined. Materialise via add-zeros
+        # so the slice view survives combined deallocation ([[ttnn-slice-view-decay]]).
         new_state_view = ttnn.slice(
-            combined_tt,
+            combined_rm,
             [0, 0, S, 0],
             [B, 1, S + CONV_KERNEL - 1, CONV_DIM_M],
         )
         zeros_view = ttnn.zeros_like(new_state_view)
         new_conv_state_tt = ttnn.add(new_state_view, zeros_view)
         ttnn.deallocate(zeros_view)
-        ttnn.deallocate(combined_tt)  # safe — view above is materialised
+        if S == 1:
+            # v0.4.0e MATMUL-FOLD (decode hot path, S=1).
+            # Convert combined to TILE, slice 4 positions, multiply each by
+            # per-position weight, accumulate, add bias.
+            combined_tile = ttnn.to_layout(combined_rm, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(combined_rm)
+            w_per_pos = w["conv1d_w_per_pos_tt"]  # 4 × [1,1,1,CONV_DIM_M] TILE
+            products = []
+            for k in range(CONV_KERNEL):
+                pos_view = ttnn.slice(
+                    combined_tile, [0, 0, k, 0], [B, 1, k + 1, CONV_DIM_M],
+                )
+                products.append(ttnn.mul(pos_view, w_per_pos[k]))
+            ttnn.deallocate(combined_tile)
+            accum = products[0]
+            for k in range(1, CONV_KERNEL):
+                new_accum = ttnn.add(accum, products[k])
+                ttnn.deallocate(accum)
+                ttnn.deallocate(products[k])
+                accum = new_accum
+            fold_out_4d = ttnn.add(accum, w["conv1d_b_tile_tt"])
+            ttnn.deallocate(accum)
+            # fold_out_4d shape: [B, 1, S=1, CONV_DIM_M] TILE.
+            # Reshape to [B, S, CONV_DIM_M] for downstream silu. Materialise
+            # the reshape view via add-zeros so we can dealloc fold_out_4d
+            # cleanly ([[ttnn-slice-view-decay]] reverse direction).
+            reshape_view = ttnn.reshape(fold_out_4d, [B, S, CONV_DIM_M])
+            zeros_view2 = ttnn.zeros_like(reshape_view)
+            conv_causal_tt = ttnn.add(reshape_view, zeros_view2)
+            ttnn.deallocate(zeros_view2)
+            ttnn.deallocate(fold_out_4d)
+        else:
+            # PREFILL-with-state path (S > 1) — use ttnn.conv1d on combined.
+            # Sliding window over S+3 inputs gives S outputs directly.
+            conv_full_tt = ttnn.conv1d(
+                input_tensor=combined_rm,
+                weight_tensor=w["conv1d_w"],
+                device=state.mesh,
+                in_channels=CONV_DIM_M, out_channels=CONV_DIM_M,
+                batch_size=B, input_length=CONV_KERNEL - 1 + S,
+                kernel_size=CONV_KERNEL, stride=1,
+                padding=0, dilation=1, groups=CONV_DIM_M,
+                bias_tensor=w["conv1d_b"],
+            )
+            ttnn.deallocate(combined_rm)
+            # ROW_MAJOR → 3D → TILE for downstream silu.
+            # Materialise via to_layout BEFORE deallocating source.
+            conv_full_3d = ttnn.reshape(conv_full_tt, [B, S, CONV_DIM_M])
+            conv_causal_tt = ttnn.to_layout(conv_full_3d, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(conv_full_tt)
         # Replace the old conv_state (deallocate prev first to avoid leak).
         ttnn.deallocate(conv_state_tt)
         _conv_state_tt_list[layer_idx] = new_conv_state_tt
-        # conv_full_tt shape: [B, 1, S, CONV_DIM_M] in ROW_MAJOR after conv1d.
-        # Reshape to [B, S, CONV_DIM_M] and convert to TILE for downstream silu.
-        # ORDER MATTERS: ttnn.reshape returns a VIEW, so we must materialise via
-        # ttnn.to_layout BEFORE deallocating the source ([[ttnn-slice-view-decay]]).
-        conv_full_3d = ttnn.reshape(conv_full_tt, [B, S, CONV_DIM_M])
-        conv_causal_tt = ttnn.to_layout(conv_full_3d, ttnn.TILE_LAYOUT)
-        ttnn.deallocate(conv_full_tt)  # safe NOW — conv_causal_tt is independent
         # Skip the legacy numpy path entirely — we hand conv_causal_tt to silu.
         conv_causal_np = None  # signal that we already have ttnn
     elif _persistent_conv:
