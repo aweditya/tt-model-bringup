@@ -1,0 +1,29 @@
+signposted region: rows [6429, 17321) = 10892 ops
+
+Total kernel time (signposted, summed across rows): 967237.771 ms
+
+OP CODE                           count    kern_ms  kern_%  drmRows   drmBW%    pmBW_ms   pmCmp_ms  bound
+--------------------------------------------------------------------------------------------------------------
+SliceDeviceOperation               1728      0.000    0.00        0     0.00      0.041      0.764   COMP
+LayerNormDeviceOperation           1348      0.000    0.00        0     0.00      0.001      0.001   COMP
+MatmulDeviceOperation              1316 228074.901   23.58        0     0.00     43.487      0.158     BW
+BinaryNgDeviceOperation             972 463942.573   47.97        0     0.00      0.001      0.001   COMP
+UntilizeWithUnpaddingDeviceOpera    800      0.000    0.00        0     0.00      0.023      0.402   COMP
+ReshapeViewDeviceOperation          704      0.000    0.00        0     0.00      0.001      0.001   COMP
+InterleavedToShardedDeviceOperat    704      0.000    0.00        0     0.00      0.001      0.001   COMP
+TilizeWithValPaddingDeviceOperat    660      0.000    0.00        0     0.00      0.001      0.001   COMP
+ConcatDeviceOperation               544      0.000    0.00        0     0.00      0.014      0.001     BW
+AllGatherDeviceOperation            388      0.000    0.00        0     0.00      0.000      0.000   COMP
+TernaryDeviceOperation              384 188722.129   19.51        0     0.00      0.000      0.000   COMP
+ReduceScatterDeviceOperation        384      0.000    0.00        0     0.00      0.000      0.000   COMP
+PagedFusedUpdateCacheDeviceOpera    352      0.000    0.00        0     0.00      0.000      0.000   COMP
+SdpaDecodeDeviceOperation           352      0.004    0.00        0     0.00      0.000      0.000   COMP
+UnaryNgDeviceOperation              196  86498.163    8.94        0     0.00      0.000      0.000   COMP
+CloneOperation                       32      0.000    0.00        0     0.00      0.002      0.020   COMP
+EmbeddingsDeviceOperation            20      0.000    0.00        0     0.00      0.000      0.000   COMP
+UntilizeDeviceOperation               4      0.000    0.00        0     0.00      0.122      0.425   COMP
+ArgMaxDeviceOperation                 4      0.000    0.00        0     0.00      0.000      0.000   COMP
+
+PM BANDWIDTH total (signposted): 43.695 ms
+PM COMPUTE   total (signposted): 1.776 ms
+PM ratio bw/comp: 24.61x

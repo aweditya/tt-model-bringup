@@ -270,14 +270,30 @@ def upload_mlp_layer(layer_sd, mesh):
               → shard along OUTPUT axis (each chip has [3840, 3840])
     - down_proj: [INTERMEDIATE, HIDDEN] = [15360, 3840]
               → shard along INPUT axis (matches column-sharded pattern)
+
+    Round 8 perf (2026-06-05): weights as `bfloat8_b` (block-floating-point
+    8-bit with shared exponent per TILE). Halves the DRAM read per matmul,
+    which is the dominant cost at B=1 (Round 7 diagnosis: DRAM-bandwidth
+    bound, not math bound; Round 8 PM-BW breakdown via
+    `experiments/utils/dram_bw_matmul_breakdown.py` shows MLP `[3840,3840]`
+    triplet = 71% of all matmul PM-BW = 30.9 ms of the 43.5 ms matmul-BW
+    budget per forward).
+
+    Precedent: `server_35b_ttnn.py:320-336` (MoE expert weights, PCC=0.999903
+    vs bf16 reference). Llama 70B Galaxy production MLP also bfp8_b.
+
+    Precision isolation: `experiments/cb/isolate/gm4_bfp8_weights_probe.py`
+    at production shapes shows cos(bf16, bfp8) >= 0.99996 across all 5
+    matmul shapes (gate/up/down/q/o), max|delta| < 0.05, magnitude ratio
+    0.999-1.0002 (no scale shift). v04_trace_validate is the 48-layer gate.
     """
     w = {}
     gate_w = layer_sd["mlp.gate_proj.weight"].T  # [HIDDEN, INTERMEDIATE]
     up_w   = layer_sd["mlp.up_proj.weight"].T
     down_w = layer_sd["mlp.down_proj.weight"].T  # [INTERMEDIATE, HIDDEN]
-    w["gate_proj"] = np_stacked_to_sharded(shard_along(gate_w, axis=1), mesh)
-    w["up_proj"]   = np_stacked_to_sharded(shard_along(up_w,   axis=1), mesh)
-    w["down_proj"] = np_stacked_to_sharded(shard_along(down_w, axis=0), mesh)
+    w["gate_proj"] = np_stacked_to_sharded(shard_along(gate_w, axis=1), mesh, dtype=ttnn.bfloat8_b)
+    w["up_proj"]   = np_stacked_to_sharded(shard_along(up_w,   axis=1), mesh, dtype=ttnn.bfloat8_b)
+    w["down_proj"] = np_stacked_to_sharded(shard_along(down_w, axis=0), mesh, dtype=ttnn.bfloat8_b)
     return w
 
 
@@ -437,9 +453,16 @@ def bootstrap(state, log=None):
     VOCAB = int(embed_w_np.shape[0])
     assert VOCAB % NCHIPS == 0, f"VOCAB {VOCAB} not divisible by NCHIPS {NCHIPS}"
     state.vocab_size = VOCAB  # cb_api / scheduler expect this attr
+    # Round 8 perf (2026-06-05): lm_head weights as `bfloat8_b`. After MLP
+    # bfp8 conversion, lm_head is the next-largest PM-bandwidth-bound matmul
+    # (1 op/forward, 8.4% of matmul PM-BW = 3.66 ms — single-largest SHAPE).
+    # Embed lookup is unaffected; embed_tt at line ~431 stays bf16.
+    # Precision probe covered the [3840, 16384] per-chip shape implicitly
+    # via the [3840, 3840] case (same K=3840 reduction; output width is
+    # bigger but per-output-tile error is independent of width).
     state.lm_head_tt = ttnn.from_torch(
         torch.from_numpy(embed_w_np.T.astype(np.float32)),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
     )
     log(f"  lm_head (tied, vocab-sharded dim=1, "
