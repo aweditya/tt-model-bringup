@@ -513,6 +513,36 @@ already uses the production-grade kernel.
 | **v0.4.2** | Two-phase warmup ([[ttnn-multi-trace-two-phase-warmup]]) + prefill+decode capture together. Fallback: bf16 ssm + measure drift, ship if drift <3% at 64 tok ([[35b-dn-h-state-drift-lever]]). | 8-step traced chain == v0.3.3 6/7 baseline | pending |
 | **v0.5** | **Single-stream PERF pass** (target ≥30 tok/s traced). Apply known wins: vocab-sharded LM head + on-device argmax (P22 — already proven on 27B/Gemma 4 at +5-8%); HiFi2 expert matmul (35B win); RMSNorm fusion ([[adoption-next-b]]); concatenated Mamba2 in_proj fusion; distributed RMSNorm. Profile-driven (Tracy A/B per win). **On-device sweep**: router topk on-device (replace `np.argpartition` with ttnn topk), combine weighted-sum on-device (broadcast `topk_weights_tt × combine_out_tt` + reduce TOP_K), shared+residual on-device (chain `ttnn.add`). | ≥30 tok/s single-stream traced. **This is the demo-ready state.** | pending |
 | **v0.5.bench** | **RULER long-context benchmark integration** (replacing ad-hoc needle test). NVIDIA RULER is the de facto standard for long-context LLM eval — multi-task (NIAH variants, multi-key, multi-hop, aggregation), 4k→128k context. Forks the lm-evaluation-harness `cb_api.py` driver pattern. Output: directly comparable numbers vs upstream Nemotron / Qwen / Gemma releases. Replaces our IT-template-shape-sensitive ad-hoc needle test that hit the misattribution risk per `[[needle-prompt-shape-not-precision]]`. Also runs against Gemma 4 and 27B to baseline regressions before/after perf rounds. | RULER-NIAH-single + multi-key at L=4k pass rate matches upstream paper-table | pending |
+| **v0.5.P1** | **Vocab-shard lm_head + on-device argmax (commit `693806a`).** Forks 27B P22 (server_tp.py:399 + :1680-1688). Per-chip lm_head matmul produces [B, S, VOCAB_PER_CHIP=32768]; all_gather replicates to [B, S, VOCAB=131072]; on-device argmax → uint32 [B, S, 1] (8-byte readback vs 262 KB pre-shard). Forks 27B P22 pattern proven +5-8% on 27B and Gemma 4. Validation pending harness restart. Target: 260 → 240-245 ms eager warm step. | warm step ≤ 245 ms + 7/7 chain regression preserved | in flight |
+
+## v0.6 — MoE on-device dispatch (trace unlock)
+
+Cross-server audit (2026-06-06, `[[decode-trace-canonical-pattern]]`)
+proved trace+MoE is novel territory in OUR repo (35B is eager-only).
+But MoE+trace upstream research (commit `486436e`) confirmed BOTH
+`gpt_oss` AND `deepseek_v3` demos in tt-metal trace MoE decode
+end-to-end. Solutions, in increasing scope:
+
+1. **DeepSeek-V3 layout-convert (lightest)** — fork `models/demos/
+   deepseek_v3/tt/moe.py:413-418`. On-device topk-indices via
+   `ttnn.to_layout + ttnn.reshape` instead of `to_torch/from_torch`.
+   Eliminates host bridges #2 + #3 from `[[decode-trace-canonical-pattern]]`.
+2. **Sparsity tensor + `ttnn.sparse_matmul`** (gpt_oss
+   `tt/experts/decode.py:73`) — collapses dispatch into one MM kernel.
+3. **Fused kernels** (`ttnn.experimental.all_to_all_dispatch_metadata
+   + moe_gpt + selective_reduce_combine`) — 3 ops, all on-device.
+
+Plus our own **owned-topk-with-stable-flag** (`qwen36_topk_owned`
+shipped, task #241) bridges DeepSeek's `topk_fallback=True` vs
+`False` trade-off — gives us device-topk WITHOUT the SFPSWAP drift,
+which DeepSeek-V3 itself has to choose between.
+
+Trace orchestration to fork: `tt_transformers/tt/generator.py:1147-1245`
+`_capture_decode_trace_text` / `_decode_forward_trace_text` (shared by
+gpt_oss + DeepSeek-V3).
+
+Multi-day architectural effort. Gated on v0.5 eager wins shipping
+first (`[[feedback-27b-path-correctness-perf-batching-server]]`).
 
 ### Phase 3 — Continuous batching (DEFERRED until v0.5 ships)
 
