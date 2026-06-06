@@ -9,9 +9,60 @@ Memory note: `reference_ruler_long_context_benchmark.md`.
 
 ## Status
 
-**Scaffold only — not yet runnable.** Phase 0 = this directory exists +
-points to the design doc + lists the run command shape. Phase 1 wiring (clone
-RULER on qb2, smoke a single NIAH task) is the next-session entry point.
+**Scaffold + RULER cloned on qb2 — smoke BLOCKED by device-lock contention as
+of 2026-06-06.** Phase 0 done (directory exists, design doc, run-command shape
+documented). Phase 1 partial:
+
+- Cloned `NVIDIA/RULER` → `qb2:~/RULER/`, pinned SHA
+  `ab17b7853df4e0a30b78cd5d2b463ac7dff6ee13` (also in `tasks.yaml`).
+- Inspected RULER's `OpenAIClient` (`~/RULER/scripts/pred/client_wrappers.py:188`).
+  It DOES NOT respect `OPENAI_API_BASE` — `OpenAI(api_key=…)` is called with no
+  `base_url`. Needs a ~5-line patch (see "Required RULER patches" below).
+- Server bring-up BLOCKED: qb2 has a long-running `experiments/cb/dev/gm4_dev_harness.py`
+  (PID 1126437 in tmux session `gm4`, started 2026-06-06 15:44) holding the
+  `CHIP_IN_USE_*_PCIe` lock on chips 0..3. Our `serve_cb.sh start` spun on the
+  UMD `robust_mutex.cpp:417 Waiting for lock` and was SIGKILLed cleanly (no
+  fabric corruption — only mesh-init had started). The dev harness is not
+  ours to kill.
+- Also surfaced and fixed: qb2's `~/tt-xla/.venv` was missing `fastapi`,
+  `uvicorn`, `openai`. Installed via
+  `~/.local/bin/uv pip install --python ~/tt-xla/.venv/bin/python "fastapi>=0.115" "uvicorn[standard]>=0.30" openai`.
+  Versions landed: fastapi 0.136.3, uvicorn 0.49.0, openai 2.41.0. Next session
+  does NOT need to redo this. NOTE: qb2's `~/tt-xla` is not a git repo (rsync'd
+  from local), so `uv sync --extra serve` doesn't work — manual `uv pip install`
+  into the venv is the only path until the host is re-bootstrapped.
+
+Next-session entry point:
+
+1. Confirm the gm4 dev harness is no longer needed (check with the user, or
+   that tmux session `gm4` is empty: `ssh qb2 'tmux ls'`).
+2. `ssh qb2 'tmux kill-session -t gm4'` (releases the device).
+3. Verify chip locks clear: `ssh qb2 'ls /tmp/*CHIP_IN_USE* 2>/dev/null'`
+   (lock files come and go; alternatively just retry start).
+4. Start server (uvicorn deps are already installed):
+   `ssh qb2 'cd ~/tt-xla && TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it bash experiments/serve/scripts/serve_cb.sh start'`
+5. Wait ~14 min for bootstrap (`tail -f ~/tt-xla/.cache/server_cb.log`).
+6. Apply the `OpenAIClient` patch (see below), then run smoke.
+
+## Required RULER patches
+
+RULER's `OpenAIClient` (`scripts/pred/client_wrappers.py:188`) needs minimal
+edits to work against our `cb_api.py` HTTP server:
+
+1. `_create_client` does `OpenAI(api_key=…)` with no `base_url`. Add
+   `base_url=os.environ.get("OPENAI_API_BASE")` so `OPENAI_API_BASE=http://localhost:8000/v1`
+   is honoured. (Upstream OpenAI Python SDK also respects this env var
+   automatically — verify behaviour, may already be a no-op fix.)
+2. `model2length` (`client_wrappers.py:194`) is OpenAI/Azure-only. Either:
+   - add a `model_name.lower().startswith(("google/", "qwen/", "nvidia/"))`
+     fallback that returns 131072, OR
+   - read it from `OPENAI_MODEL_MAX_TOKENS` env var.
+3. `_count_tokens` uses tiktoken `cl100k_base` — wrong for Gemma 4 but only
+   used to clamp `tokens_to_generate`. Safe to leave (over-estimate is fine
+   since RULER caps decode at ~150 tokens for NIAH).
+
+Patches will land at `experiments/bench/ruler/patches/0001-openai-base-url.patch`
+and be applied via `git -C ~/RULER apply` in our wrapper script.
 
 ## Architecture (when wired)
 

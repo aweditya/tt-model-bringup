@@ -13,7 +13,7 @@
 
 ruler_upstream:
   repo: "https://github.com/NVIDIA/RULER"
-  sha:  "TBD"   # set in phase 1, see experiments/bench/ruler/README.md
+  sha:  "ab17b7853df4e0a30b78cd5d2b463ac7dff6ee13"   # pinned 2026-06-06 on qb2 ~/RULER
 
 task_sets:
 
