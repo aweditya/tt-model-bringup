@@ -62,25 +62,28 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.4.0 — multi-day SSD wrapper refactor.
+**Phase 1 — exact next task**: v0.4.0c — eliminate the conv1d host
+roundtrip in `mamba2_block_eager_tt`. Profiling-driven target.
 
-**Scope assessment (be honest before starting)**:
-The wrapper at `nemotron3_mamba2_step.py:117-232` does ~9 numpy→ttnn
-uploads + 2 readbacks + numpy padding per S=1 call. To eliminate
-the ~14s/step bridges:
-- v0.4.0a: pre-upload dt_bias / A_log / D as ttnn constants at bootstrap
-  (3 of 9 inputs never change); ~2s/step saved (~30 LOC, ~1-2h)
-- v0.4.0b: keep ssm_state as ttnn tensor (avoid 1 upload + 1 readback
-  per layer per step); ~1s/step saved (~50 LOC, ~2h, careful trace
-  shape contract)
-- v0.4.0c: replace numpy padding with on-device ttnn padding for
-  x/z/dt/B/C; ~3s/step saved (~150 LOC, ~4h, kernel layout work)
-- v0.4.0d: call kernel directly from mamba2_block_eager_tt without
-  wrapper for S=1; ~3s/step saved (~50 LOC, ~2h)
-- v0.4.1: trace capture single decode step (BIGGEST RISK per plan)
-- v0.4.2: two-phase warmup + 100-step accuracy regression vs eager
+**v0.4.0a + v0.4.0b** (this session): isolation probe pattern validated,
+section profiler localised the bottleneck in 60 seconds.
+- v0.4.0a constants pre-upload: correctness PASS, but only 46ms/step saved
+  (0.3%) — the wrapper isn't the hot spot
+- v0.4.0b section profile: **S2 conv1d block = 637/656 ms = 97%** of
+  mamba2 layer time. The numpy readback (conv_full_tt → numpy) +
+  ttnn.from_torch reupload (conv_causal_np → conv_causal_tt) is the
+  entire bottleneck. SSD wrapper + matmuls + norms combined = 19ms.
 
-Total: **1.5–2 days of focused work** to land v0.4.0–v0.4.2.
+**v0.4.0c plan** (next): Keep conv1d kernel; eliminate the readback+
+reupload around it:
+- replace numpy concat(conv_state, xBC_np) → ttnn.concat on device
+  (need conv_state as ttnn.Tensor too)
+- skip the `ttnn.to_torch(conv_full_tt)` readback + re-upload as TILE
+- keep conv1d kernel call as-is (it's fast)
+
+Predicted: 637ms → ~50ms per layer → **2.3s/step eager** (≈7×
+speedup). After v0.4.0c we re-profile to see what becomes the new
+bottleneck for v0.4.0d.
 
 **v0.3.3.b perf data** (5 decode steps, cold + 4 warm):
 - cold step 0:  15.48s
