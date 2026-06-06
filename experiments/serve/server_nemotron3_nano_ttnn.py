@@ -491,9 +491,28 @@ def upload_mamba2_layer(state, key_to_shard, L: int, log) -> dict:
         "A_log_np": A_log.copy(),
         "D_np": D_w.copy(),
         "mixer_norm_w_np": mixer_norm_w.copy(),
+        # v0.4.0g — pre-upload mixer_norm_w as TILE bf16 (mesh replicated)
+        # so the decode hot path doesn't `ttnn.from_torch` it every layer
+        # every step (was ~5 ms × 23 layers per step of pure overhead).
+        "mixer_norm_w_tt": ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(
+                mixer_norm_w.astype(np.float32)
+            )),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        ),
         # out_proj uploaded pre-transposed for matmul [d_inner, HIDDEN].
         "out_proj": np_to_replicated(out_proj_w.T, state.mesh),
     }
+    # v0.4.0g — pre-upload SSD constants (dt_bias, A_log, D) ONCE per layer.
+    # Used by `mamba2_decode_step_ttnn_pure_state` so the hot path doesn't
+    # re-upload them per call. Same pattern as v0.4.0a's prepare_mamba2_constants
+    # but stored per-layer for caller convenience.
+    from nemotron3_mamba2_step import prepare_mamba2_constants
+    const_tt = prepare_mamba2_constants(
+        dt_bias, A_log, D_w, B=1, num_heads=MAMBA_HEADS, device=state.mesh,
+    )
+    out["const_tt"] = const_tt
     log(f"  L{L} (mamba2): norm + in_proj + out_proj uploaded replicated bf16; "
         f"conv1d_w/b uploaded as host bf16 (for ttnn.conv1d at v0.1.2.b); "
         f"dt_bias/A_log/D/mixer_norm held host-side for v0.1.2.c")
@@ -856,13 +875,34 @@ def reset_decode_state(state, B: int = 1, log=print):
                     ttnn.deallocate(t)
                 except Exception:
                     pass
+    # v0.4.0g — same hygiene for the new on-device ssm_state buffer.
+    old_ssm_tt = getattr(state, "ssm_state_tt", None)
+    if old_ssm_tt:
+        for t in old_ssm_tt:
+            if t is not None:
+                try:
+                    ttnn.deallocate(t)
+                except Exception:
+                    pass
     state.ssm_state_np = [None] * n
     state.conv_state_np = [None] * n   # v0.3.1.c step 3d
     state.conv_state_tt = [None] * n   # v0.4.0c (on-device)
+    state.ssm_state_tt = [None] * n    # v0.4.0g (on-device fp32)
     for L, kind in enumerate(state.layer_types):
         if kind == "mamba2":
             state.ssm_state_np[L] = np.zeros(
                 (B, MAMBA_HEADS, MAMBA_HEAD_DIM, SSM_STATE), dtype=np.float32,
+            )
+            # v0.4.0g — on-device fp32 ssm_state, [B, NH, HD, SS] TILE replicated
+            # on mesh. Persists across decode steps; eliminates ~2 MB readback +
+            # upload per layer per step that the legacy numpy path was paying.
+            ssm_zeros = np.zeros(
+                (B, MAMBA_HEADS, MAMBA_HEAD_DIM, SSM_STATE), dtype=np.float32,
+            )
+            state.ssm_state_tt[L] = ttnn.from_torch(
+                torch.from_numpy(ssm_zeros),
+                dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
             )
             # v0.3.1.c step 3d — conv1d kernel_size=4 needs last 3 positions of
             # x_BC carried across decode steps. Kept as numpy for legacy
@@ -1923,49 +1963,100 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     dt_bias = w["dt_bias_np"]
     A_log = w["A_log_np"]
     D_w = w["D_np"]
-    # v0.3.1.b: use persistent ssm_state if state.ssm_state_np[L] is
-    # populated (set by reset_decode_state); else fresh zeros. After the
-    # SSD loop, save the final state back so the next call (decode step)
-    # can pick it up. With no persistent buffer (v0.3.0 / v0.3.1.a
-    # quadratic), the state stays internal as before.
-    # Defensive getattr handles harness state-version skew (live State
-    # objects from before this attr existed — [[harness-state-version-skew]]).
-    _ssm_list = getattr(state, "ssm_state_np", None)
-    if (_ssm_list
-            and layer_idx < len(_ssm_list)
-            and _ssm_list[layer_idx] is not None):
-        ssm_state = _ssm_list[layer_idx].copy()
-        _persistent = True
-    else:
-        ssm_state = np.zeros((B, NH, HD, SS), dtype=np.float32)
-        _persistent = False
-    y_list = []
-    for p in range(S):
-        new_state, y_p = _step_mod.mamba2_decode_step_ttnn(
-            x=x_inner_np[:, p, :, :],
-            z=z_inner_np[:, p, :, :],
-            dt=dt_full_np[:, p, :],
-            dt_bias=dt_bias, A_log=A_log, D=D_w,
-            B_in=B_inner_np[:, p, :, :],
-            C_in=C_inner_np[:, p, :, :],
-            ssm_state=ssm_state,
+    # v0.4.0g — prefer the pure-state path when:
+    #   * the layer has pre-uploaded const_tt (dt_bias/A_log/D on mesh)
+    #   * state.ssm_state_tt[L] exists (on-device fp32 buffer)
+    # Else fall back to the legacy numpy ssm_state path (still correct
+    # for probes that don't bootstrap the new buffers).
+    _ssm_list_tt = getattr(state, "ssm_state_tt", None)
+    _ssm_list_np = getattr(state, "ssm_state_np", None)
+    # v0.4.0g — defensive: only take the pure-state path if the wrapper
+    # module actually exposes it (handles harness reload of server-only
+    # without reloading nemotron3_mamba2_step — [[harness-state-version-skew]]).
+    _has_pure_fn = hasattr(_step_mod, "mamba2_decode_step_ttnn_pure_state")
+    if "const_tt" not in w and S == 1 and _has_pure_fn:
+        w["const_tt"] = _step_mod.prepare_mamba2_constants(
+            dt_bias, A_log, D_w, B=B, num_heads=NH, device=state.mesh,
+        )
+    has_const_tt = "const_tt" in w
+    use_pure_state = (
+        S == 1
+        and _has_pure_fn
+        and has_const_tt
+        and _ssm_list_tt is not None
+        and layer_idx < len(_ssm_list_tt)
+        and _ssm_list_tt[layer_idx] is not None
+    )
+
+    if use_pure_state:
+        # v0.4.0g pure-state hot path. ssm_state never crosses host;
+        # y stays on device; mixer_norm_w is pre-uploaded.
+        # The kernel writes through the state input buffer (35B GDN
+        # pattern at server_35b_ttnn.py:595). Clone via ttnn.add(_, 0.0)
+        # so the persistent buffer survives across the kernel call, then
+        # swap pointers post-call.
+        ssm_state_clone = ttnn.add(_ssm_list_tt[layer_idx], 0.0)
+        new_state_tt, y_out_tt = _step_mod.mamba2_decode_step_ttnn_pure_state(
+            x=x_inner_np[:, 0, :, :],
+            z=z_inner_np[:, 0, :, :],
+            dt=dt_full_np[:, 0, :],
+            dt_bias_tt=w["const_tt"]["dt_bias_tt"],
+            A_log_tt=w["const_tt"]["A_log_tt"],
+            D_tt=w["const_tt"]["D_tt"],
+            B_in=B_inner_np[:, 0, :, :],
+            C_in=C_inner_np[:, 0, :, :],
+            ssm_state_tt=ssm_state_clone,
             device=state.mesh,
             debug_mode=5,
         )
-        ssm_state = new_state
-        y_list.append(y_p)
-    if _persistent:
-        # _ssm_list is the live list; mutate it in place so reload-without-bootstrap
-        # paths see the carry too.
-        _ssm_list[layer_idx] = ssm_state
-    y_post_ssd = np.stack(y_list, axis=1)
-    y_flat = y_post_ssd.reshape(B, S, NH * HD)
+        # ssm_state_clone may BE new_state_tt (in-place write). Don't
+        # touch the clone here. Release the OLD persistent buffer and
+        # promote new_state_tt as the new persistent state.
+        ttnn.deallocate(_ssm_list_tt[layer_idx])
+        _ssm_list_tt[layer_idx] = new_state_tt
+        # Kernel y_out_tt shape: [B, NH, 32, HD] padded (value at row 0).
+        # Slice row 0 → [B, NH, 1, HD] → materialise → reshape [B, S=1, NH*HD].
+        y_row0_view = ttnn.slice(y_out_tt, [0, 0, 0, 0], [B, NH, 1, HD])
+        zeros = ttnn.zeros_like(y_row0_view)
+        y_row0 = ttnn.add(y_row0_view, zeros)
+        ttnn.deallocate(zeros)
+        ttnn.deallocate(y_out_tt)
+        y_tt = ttnn.reshape(y_row0, [B, S, NH * HD])
+    else:
+        # Legacy numpy-state path (prefill S>1 or probes without const_tt).
+        if (_ssm_list_np
+                and layer_idx < len(_ssm_list_np)
+                and _ssm_list_np[layer_idx] is not None):
+            ssm_state = _ssm_list_np[layer_idx].copy()
+            _persistent = True
+        else:
+            ssm_state = np.zeros((B, NH, HD, SS), dtype=np.float32)
+            _persistent = False
+        y_list = []
+        for p in range(S):
+            new_state, y_p = _step_mod.mamba2_decode_step_ttnn(
+                x=x_inner_np[:, p, :, :],
+                z=z_inner_np[:, p, :, :],
+                dt=dt_full_np[:, p, :],
+                dt_bias=dt_bias, A_log=A_log, D=D_w,
+                B_in=B_inner_np[:, p, :, :],
+                C_in=C_inner_np[:, p, :, :],
+                ssm_state=ssm_state,
+                device=state.mesh,
+                debug_mode=5,
+            )
+            ssm_state = new_state
+            y_list.append(y_p)
+        if _persistent:
+            _ssm_list_np[layer_idx] = ssm_state
+        y_post_ssd = np.stack(y_list, axis=1)
+        y_flat = y_post_ssd.reshape(B, S, NH * HD)
+        y_tt = ttnn.from_torch(
+            torch.from_numpy(y_flat.astype(np.float32)),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
 
-    y_tt = ttnn.from_torch(
-        torch.from_numpy(y_flat.astype(np.float32)),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
     group_size = D_INNER // NG
     y_grouped = ttnn.reshape(y_tt, [B, S, NG, group_size])
     sq = ttnn.mul(y_grouped, y_grouped)
@@ -1974,15 +2065,22 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     rsqrt_var = ttnn.rsqrt(var_eps)
     y_normed_g = ttnn.mul(y_grouped, rsqrt_var)
     y_normed = ttnn.reshape(y_normed_g, [B, S, D_INNER])
-    mixer_norm_w_tt = ttnn.from_torch(
-        torch.from_numpy(w["mixer_norm_w_np"].astype(np.float32)),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
+    # v0.4.0g — mixer_norm_w pre-uploaded at upload_mamba2_layer. Defensive
+    # lazy-upload for live harness states that predate this commit
+    # ([[harness-state-version-skew]]).
+    if "mixer_norm_w_tt" not in w:
+        w["mixer_norm_w_tt"] = ttnn.from_torch(
+            torch.from_numpy(np.ascontiguousarray(
+                w["mixer_norm_w_np"].astype(np.float32)
+            )),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+    mixer_norm_w_tt = w["mixer_norm_w_tt"]
     y_weighted = ttnn.mul(y_normed, mixer_norm_w_tt)
     silu_z = ttnn.silu(z_tt)
     norm_out_tt = ttnn.mul(y_weighted, silu_z)
-    ttnn.deallocate(z_tt); ttnn.deallocate(silu_z); ttnn.deallocate(mixer_norm_w_tt)
+    ttnn.deallocate(z_tt); ttnn.deallocate(silu_z)
     ttnn.deallocate(y_tt); ttnn.deallocate(y_weighted); ttnn.deallocate(y_normed)
 
     o_tt = ttnn.matmul(norm_out_tt, w["out_proj"], compute_kernel_config=HIFI4)

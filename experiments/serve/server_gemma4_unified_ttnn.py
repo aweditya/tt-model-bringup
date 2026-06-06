@@ -997,13 +997,17 @@ def _layer_forward_pos0(state, h_in, layer_idx):
     ttnn.deallocate(mlp_partial)
     post_ff = ttnn.rms_norm(mlp_out, weight=w["post_feedforward_layernorm"], epsilon=EPS)
     ttnn.deallocate(mlp_out)
-    h_residual_2 = ttnn.add(h_after_attn, post_ff)
-    ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff)
     # Gemma 4 final per-layer scalar multiplication (HF decoder layer
     # forward:540). Without this, L0 has cos~1 but mad ~18× too big at
     # `layer_scalar=0.054`, and L1+ collapses to near-zero cos.
-    h_out = ttnn.multiply(h_residual_2, w["layer_scalar"])
-    ttnn.deallocate(h_residual_2)
+    # Round 6 perf (2026-06-05): the post-residual scalar multiply is
+    # fused into `ttnn.add` via the `activations` parameter (same fusion
+    # as in `_layer_forward_pos0_paged` below — see comment there for
+    # rationale).
+    _layer_scalar_act = [ttnn.UnaryWithParam(
+        ttnn.UnaryOpType.MUL_UNARY_SFPU, float(w["layer_scalar"]))]
+    h_out = ttnn.add(h_after_attn, post_ff, activations=_layer_scalar_act)
+    ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff)
     return h_out
 
 
@@ -1451,10 +1455,23 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
     ttnn.deallocate(mlp_partial)
     post_ff = ttnn.rms_norm(mlp_out, weight=w["post_feedforward_layernorm"], epsilon=EPS)
     ttnn.deallocate(mlp_out)
-    h_residual_2 = ttnn.add(h_after_attn, post_ff)
+    # Round 6 perf (2026-06-05): fuse the trailing scalar multiply
+    # `h_residual_2 * layer_scalar` into the residual add via the
+    # `activations` parameter on `ttnn.add` (UnaryOpType.MUL_UNARY_SFPU).
+    # The LLK exposes `mul_unary_tile(idst, scalar)` as a post-add SFPU
+    # pass within the same kernel; see tt-metal
+    # `ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp:340`.
+    # Saves 1 op per layer × 48 = 48 ops/forward. Per
+    # [[feedback-kernel-vs-dispatch-realization]] this is real SFPU work
+    # (one less kernel pass over the tile), so the win should realize ~1:1
+    # in trace, similar magnitude to the round-4 matmul-gelu fusion.
+    # Isolation probe: `experiments/cb/isolate/gm4_add_mul_scalar_probe.py` —
+    # cos(baseline, fused) = 0.9999961, max|delta| = 0.000977 (bf16
+    # round-off, expected from same-op-order reordering).
+    _layer_scalar_act = [ttnn.UnaryWithParam(
+        ttnn.UnaryOpType.MUL_UNARY_SFPU, float(w["layer_scalar"]))]
+    h_out = ttnn.add(h_after_attn, post_ff, activations=_layer_scalar_act)
     ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff)
-    h_out = ttnn.multiply(h_residual_2, w["layer_scalar"])
-    ttnn.deallocate(h_residual_2)
     return h_out
 
 
