@@ -38,12 +38,18 @@ as fp32 + bias_fp32` (8/8 match); device does `bf16 + bf16`
 (6/8 match). And **HF itself uses `torch.topk(sorted=False)`** which
 is non-deterministic on CUDA — there is NO "correct" reference.
 
-**Production precedent**: DeepSeek-V3 demo at
-`models/demos/deepseek_v3/tt/moe_gate.py:445-489` ships
-`topk_fallback=True` (host readback + bitonic sort). Comment at
-`moe_gate.py:130`: `"not required in future when we have equivalent
-topk op."` Upstream considers ttnn.topk not-yet-equivalent for MoE
-routing.
+**Production precedent (CORRECTED 2026-06-06)**: DeepSeek-V3 demo's
+source default at `tt/moe_gate.py:126` is `topk_fallback: bool = False`
+— i.e. **DEVICE topk IS the default in production**, not host. The
+host fallback is a TEST path (`tests/test_moe.py:274` pins True for
+correctness validation). The demo accepts the drift because it runs
+with `DEFAULT_SAMPLING_TEMPERATURE` — sampling washes out tie-break
+choices. **OUR** Nemotron chain uses greedy argmax (no temperature)
+for deterministic 7/7 vs HF gate, which exposes the tie-breaks fully
+AND the L=128 needle test with router=ON produces gibberish
+(`': pleeer? pleeer?'` vs baseline `'\nThe user wants to...'`) — so
+even though DeepSeek-V3 ships device-topk, on OUR model + greedy
+argmax, the device path is broken.
 
 **Verdict**: keep `NM3_ROUTER_ON_DEVICE=0` (default). Match
 DeepSeek-V3 production. **Trace blocker #2 is BLOCKED ON UPSTREAM**
