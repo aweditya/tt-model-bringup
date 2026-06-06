@@ -62,9 +62,25 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.4.0 — refactor Mamba2 SSD wrapper
-to keep data on-device across positions (eliminate ~14s/step of host
-bridges). Data-justified by v0.3.3.b perf measurement.
+**Phase 1 — exact next task**: v0.4.0 — multi-day SSD wrapper refactor.
+
+**Scope assessment (be honest before starting)**:
+The wrapper at `nemotron3_mamba2_step.py:117-232` does ~9 numpy→ttnn
+uploads + 2 readbacks + numpy padding per S=1 call. To eliminate
+the ~14s/step bridges:
+- v0.4.0a: pre-upload dt_bias / A_log / D as ttnn constants at bootstrap
+  (3 of 9 inputs never change); ~2s/step saved (~30 LOC, ~1-2h)
+- v0.4.0b: keep ssm_state as ttnn tensor (avoid 1 upload + 1 readback
+  per layer per step); ~1s/step saved (~50 LOC, ~2h, careful trace
+  shape contract)
+- v0.4.0c: replace numpy padding with on-device ttnn padding for
+  x/z/dt/B/C; ~3s/step saved (~150 LOC, ~4h, kernel layout work)
+- v0.4.0d: call kernel directly from mamba2_block_eager_tt without
+  wrapper for S=1; ~3s/step saved (~50 LOC, ~2h)
+- v0.4.1: trace capture single decode step (BIGGEST RISK per plan)
+- v0.4.2: two-phase warmup + 100-step accuracy regression vs eager
+
+Total: **1.5–2 days of focused work** to land v0.4.0–v0.4.2.
 
 **v0.3.3.b perf data** (5 decode steps, cold + 4 warm):
 - cold step 0:  15.48s
