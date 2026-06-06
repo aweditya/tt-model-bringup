@@ -4,6 +4,29 @@ Living document. Companion to `log.md` (per-round implementation history) and
 `reports/round8_matmul_bw_breakdown.txt` (durable PM-BW breakdown that anchors
 prioritisation).
 
+**MANDATORY validation gate stack (every round, no exceptions, no shortcuts)**:
+1. **Token-level**: 100/100 token-for-token vs baseline + `max|delta|=0` across
+   3 runs at the same seed. Catches precision drift.
+2. **Coherence-level**: at least L=128 needle smoke (3 trials) every round
+   that touches dtype OR memory_config OR an op-class — not just the
+   "precision rounds" (11, 15, 18). Reason: Round 9 misattribution taught us
+   that bit-stable token sequences can hide model-behaviour issues (the IT
+   model's instruction-echo loop was masked by 100/100 traced-vs-eager but
+   FAILED on long context). Coherent text is a separate axis from
+   bit-equivalence; check both.
+3. **Diff-from-baseline**: every round commits the generated text for the
+   3 needle prompts in `research/gemma4_perf_qb2_2026-06-05/needle_haystack/round_NN/`
+   so the next round has the exact text to diff against. Drift gate = text
+   changes from coherent reasoning → gibberish (per the Nemotron router
+   v0.4.0h.d finding: router on-device produces `': pleeer? pleeer?'` at
+   L=128 — that's the unacceptable bar).
+4. **Eager-vs-traced spot-check**: if a round changes the op mix, run one
+   eager-mode probe to confirm trace integration didn't introduce
+   bit-divergence (Round 9 step A.2 method).
+
+If any of (1)-(3) regress, revert and document — not "ship and watch".
+Performance gains that come at the cost of incoherent text are not gains.
+
 **Baseline at write time (post-Round-9, qb2)**:
 - Traced **47.0 ms/tok** (21.28 tok/s), 100/100 token-for-token gate.
 - With `TT_GM4_MLP_DTYPE=bfp8 TT_GM4_LM_HEAD_DTYPE=bfp8` env vars: **46.0 ms/tok**
