@@ -1049,6 +1049,88 @@ def attn_block_eager(state: State, h_input_np, layer_idx: int):
     return out
 
 
+def attn_prefill_tt(state: State, h_input_tt, layer_idx: int):
+    """v0.3.1.c step 3 — prefill variant of `attn_block_eager_tt`.
+
+    Same forward math; additionally writes K and V into the paged KV
+    cache via `ttnn.experimental.paged_fill_cache` (Gemma 4 two-call:
+    one fill per KV head, since NKV=2 + NCHIPS=4 → NKV_per_chip=1).
+    Caller is responsible for `setup_paged_decode_state` having been
+    called (which populates state.kv_K_cache_tt[L] = list-of-2).
+
+    After this call: state.cur_pos += S (host-side bookkeeping; the
+    device-side cur_pos_buf is written by attn_decode_step_tt).
+
+    Input:  h_input_tt  ttnn.Tensor  [B, S, HIDDEN]  TILE  replicated
+    Output: block_tt    ttnn.Tensor  [B, S, HIDDEN]  TILE  replicated
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "attention"
+    B, S, _ = h_input_tt.shape
+    NQ = NUM_Q_HEADS
+    NKV = NUM_KV_HEADS
+    HD = HEAD_DIM_ATTN
+
+    h_norm_tt = ttnn.rms_norm(h_input_tt, weight=w["norm"], epsilon=EPS)
+    q_tt = ttnn.matmul(h_norm_tt, w["q_proj"], compute_kernel_config=HIFI4)
+    k_tt = ttnn.matmul(h_norm_tt, w["k_proj"], compute_kernel_config=HIFI4)
+    v_tt = ttnn.matmul(h_norm_tt, w["v_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(h_norm_tt)
+    q4 = ttnn.transpose(ttnn.reshape(q_tt, [B, S, NQ, HD]), 1, 2)
+    k4 = ttnn.transpose(ttnn.reshape(k_tt, [B, S, NKV, HD]), 1, 2)
+    v4 = ttnn.transpose(ttnn.reshape(v_tt, [B, S, NKV, HD]), 1, 2)
+    ttnn.deallocate(q_tt); ttnn.deallocate(k_tt); ttnn.deallocate(v_tt)
+
+    # ── v0.3.1.c — Write K, V to paged cache (two-call Gemma 4 pattern) ──
+    kc_list = getattr(state, "kv_K_cache_tt", None)
+    vc_list = getattr(state, "kv_V_cache_tt", None)
+    page_table_tt = getattr(state, "page_table_tt", None)
+    if (kc_list and vc_list and page_table_tt is not None
+            and layer_idx < len(kc_list)
+            and kc_list[layer_idx] is not None):
+        # k4 shape: [B, NKV=2, S, HD]; slice each KV head separately.
+        for nkv_idx in range(NKV):
+            k_slice = ttnn.slice(
+                k4, [0, nkv_idx, 0, 0], [B, nkv_idx + 1, S, HD])
+            v_slice = ttnn.slice(
+                v4, [0, nkv_idx, 0, 0], [B, nkv_idx + 1, S, HD])
+            try:
+                ttnn.experimental.paged_fill_cache(
+                    kc_list[layer_idx][nkv_idx], k_slice,
+                    page_table_tt, batch_idx=0,
+                )
+                ttnn.experimental.paged_fill_cache(
+                    vc_list[layer_idx][nkv_idx], v_slice,
+                    page_table_tt, batch_idx=0,
+                )
+            except Exception as e:  # noqa: BLE001
+                # Non-fatal for the forward result; the SDPA below uses fresh
+                # k4/v4 directly. Cache integrity only matters for subsequent
+                # decode_step calls. Log + continue.
+                print(f"[warn] paged_fill_cache L{layer_idx} nkv={nkv_idx} "
+                      f"failed: {type(e).__name__}: {e}", flush=True)
+            ttnn.deallocate(k_slice)
+            ttnn.deallocate(v_slice)
+
+    # Regular causal SDPA on fresh K/V (cache write was a side effect).
+    attn_tt = ttnn.transformer.scaled_dot_product_attention(
+        q4, k4, v4,
+        is_causal=True,
+        scale=1.0 / math.sqrt(HD),
+        compute_kernel_config=B3_HIFI2,
+    )
+    ttnn.deallocate(q4); ttnn.deallocate(k4); ttnn.deallocate(v4)
+    attn_tt = ttnn.transpose(attn_tt, 1, 2)
+    attn_tt = ttnn.reshape(attn_tt, [B, S, NQ * HD])
+    o_tt = ttnn.matmul(attn_tt, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_tt)
+    block_tt = ttnn.add(h_input_tt, o_tt)
+    ttnn.deallocate(o_tt)
+    # Advance host-side cur_pos (device cur_pos_buf is updated by decode_step).
+    state.cur_pos = (getattr(state, "cur_pos", 0) or 0) + S
+    return block_tt
+
+
 def attn_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     """v0.2.5 on-device flow — same math as `attn_block_eager` but takes
     and returns `ttnn.Tensor`. No host round-trips for h.
