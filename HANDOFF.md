@@ -32,7 +32,24 @@ kernel ALONE confirmed the kernel itself dominates → matmul-fold was the
 right move. **Always isolate the suspect op alone, not just inside the
 chain**. Saved in `[[feedback-profile-first-perf-method]]`.
 
-**v0.4.0g.a LANDED (commit `36ec27c`)** — pure-state Mamba2 SSD wrapper:
+**v0.4.0g COMPLETE (commits `36ec27c` + `9cfcb11`)** — fully pure-ttnn Mamba2 decode path:
+
+```
+total step (warm):     15.5s -> 0.66s -> 0.43s -> 0.33s        (52× cumulative)
+mamba2 per-layer:      16.5 ms -> 9.1 ms -> 4.3 ms             (74% drop from v0.4.0e)
+correctness:           6/7 PASS -> 7/7 PASS (fp32 device state fixed step-3 drift)
+moe per-layer:         10.5 ms -> 8.2 ms (consistent across .a/.b)
+tok/s (eager warm):    0.064 -> 1.5 -> 2.5 -> 3.3
+```
+
+**v0.4.0g.b** — three on-device pad helpers in `nemotron3_mamba2_step.py`
+(`_pad_per_head_vector_tt`, `_pad_dt_tt`, `_replicate_per_group_to_per_head_tt`)
+validated cos=0.999999 vs numpy in `nemotron3_v040gb_ondevice_pads_probe.py`.
+New `mamba2_decode_step_ttnn_pure_tt` variant accepts the small inputs as
+ttnn.Tensors at logical shapes — pads on-device via reshape + permute +
+repeat + pad. Reuses 35B + 27B + Gemma 4 patterns.
+
+**v0.4.0g.a** — pure-state Mamba2 SSD wrapper:
 - New `mamba2_decode_step_ttnn_pure_state` accepts ssm_state as
   ttnn.Tensor, returns (state_out_tt, y_out_tt) as ttnn.Tensors. No
   device→numpy→device for the big tensors.
