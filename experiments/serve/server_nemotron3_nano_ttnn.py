@@ -513,6 +513,11 @@ class State:
         # cur_pos: int — position of the next token to be processed
         self.ssm_state_np: list = []
         self.conv_state_np: list = []
+        # v0.4.0c: on-device conv_state to eliminate the numpy roundtrip
+        # around ttnn.conv1d (which was 97% of mamba2 layer time per the
+        # v0.4.0b section profile). Shape per layer: [B, 1, 3, CONV_DIM_M=6144]
+        # bf16 ROW_MAJOR (compatible with ttnn.conv1d input).
+        self.conv_state_tt: list = []
         self.kv_K_cache_tt: list = []
         self.kv_V_cache_tt: list = []
         self.cur_pos: int = 0
@@ -817,18 +822,36 @@ def reset_decode_state(state, B: int = 1, log=print):
     cur_pos: 0; cur_pos_buf reset via copy_host_to_device_tensor.
     """
     n = len(state.layer_types) if state.layer_types else N_LAYERS
+    # Deallocate any old conv_state_tt before re-allocating.
+    old_conv_tt = getattr(state, "conv_state_tt", None)
+    if old_conv_tt:
+        for t in old_conv_tt:
+            if t is not None:
+                try:
+                    ttnn.deallocate(t)
+                except Exception:
+                    pass
     state.ssm_state_np = [None] * n
     state.conv_state_np = [None] * n   # v0.3.1.c step 3d
+    state.conv_state_tt = [None] * n   # v0.4.0c (on-device)
     for L, kind in enumerate(state.layer_types):
         if kind == "mamba2":
             state.ssm_state_np[L] = np.zeros(
                 (B, MAMBA_HEADS, MAMBA_HEAD_DIM, SSM_STATE), dtype=np.float32,
             )
             # v0.3.1.c step 3d — conv1d kernel_size=4 needs last 3 positions of
-            # x_BC carried across decode steps. Without this, decode S=1 zero-pads
-            # the conv input → wrong output (per teacher-forced ladder L0 fail).
+            # x_BC carried across decode steps. Kept as numpy for legacy
+            # paths (v0.3.x) but v0.4.0c uses conv_state_tt for the decode hot path.
             state.conv_state_np[L] = np.zeros(
                 (B, CONV_KERNEL - 1, CONV_DIM_M), dtype=np.float32,
+            )
+            # v0.4.0c: on-device conv_state. Upload zeros as
+            # [B, 1, 3, CONV_DIM_M] ROW_MAJOR bf16 (matches conv1d input layout).
+            zeros = np.zeros((B, 1, CONV_KERNEL - 1, CONV_DIM_M), dtype=np.float32)
+            state.conv_state_tt[L] = ttnn.from_torch(
+                torch.from_numpy(zeros),
+                dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
             )
     # Lazy alloc of the paged decode support state (idempotent).
     setup_paged_decode_state(state, log=log)
@@ -1652,19 +1675,69 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
         and _conv_state_list[layer_idx] is not None
     )
 
-    if _persistent_conv:
-        # DECODE / state-carrying path. Read xBC as numpy, prepend conv_state.
-        xBC_np_S = _rb(xBC_tt)  # [1, S, CONV_DIM_M]
+    # v0.4.0c: prefer on-device conv_state_tt path; fall back to numpy
+    # path for legacy probes that only set conv_state_np.
+    _conv_state_tt_list = getattr(state, "conv_state_tt", None)
+    _persistent_conv_tt = (
+        _conv_state_tt_list
+        and layer_idx < len(_conv_state_tt_list)
+        and _conv_state_tt_list[layer_idx] is not None
+    )
+
+    if _persistent_conv_tt:
+        # v0.4.0c — ALL-ON-DEVICE decode path: no numpy roundtrip.
+        # Layout flow: xBC_tt TILE → ROW_MAJOR → reshape 4D → concat with
+        # conv_state_tt → conv1d → reshape 3D → TILE for silu.
+        conv_state_tt = _conv_state_tt_list[layer_idx]  # [B, 1, 3, CONV_DIM_M] ROW_MAJOR
+        xBC_rm = ttnn.to_layout(xBC_tt, ttnn.ROW_MAJOR_LAYOUT)
+        xBC_4d = ttnn.reshape(xBC_rm, [B, 1, S, CONV_DIM_M])
+        # Concat along seq dim → [B, 1, 3+S, CONV_DIM_M]
+        combined_tt = ttnn.concat([conv_state_tt, xBC_4d], dim=2)
+        ttnn.deallocate(xBC_4d)
+        conv_full_tt = ttnn.conv1d(
+            input_tensor=combined_tt,
+            weight_tensor=w["conv1d_w"],
+            device=state.mesh,
+            in_channels=CONV_DIM_M, out_channels=CONV_DIM_M,
+            batch_size=B, input_length=CONV_KERNEL - 1 + S,
+            kernel_size=CONV_KERNEL, stride=1,
+            padding=0, dilation=1, groups=CONV_DIM_M,
+            bias_tensor=w["conv1d_b"],
+        )
+        # Save new conv_state: last (kernel-1)=3 positions of combined.
+        # Materialise via ttnn.add(slice, zeros) so the slice view survives
+        # combined_tt deallocation ([[ttnn-slice-view-decay]]).
+        new_state_view = ttnn.slice(
+            combined_tt,
+            [0, 0, S, 0],
+            [B, 1, S + CONV_KERNEL - 1, CONV_DIM_M],
+        )
+        zeros_view = ttnn.zeros_like(new_state_view)
+        new_conv_state_tt = ttnn.add(new_state_view, zeros_view)
+        ttnn.deallocate(zeros_view)
+        ttnn.deallocate(combined_tt)  # safe — view above is materialised
+        # Replace the old conv_state (deallocate prev first to avoid leak).
+        ttnn.deallocate(conv_state_tt)
+        _conv_state_tt_list[layer_idx] = new_conv_state_tt
+        # conv_full_tt shape: [B, 1, S, CONV_DIM_M] in ROW_MAJOR after conv1d.
+        # Reshape to [B, S, CONV_DIM_M] and convert to TILE for downstream silu.
+        # ORDER MATTERS: ttnn.reshape returns a VIEW, so we must materialise via
+        # ttnn.to_layout BEFORE deallocating the source ([[ttnn-slice-view-decay]]).
+        conv_full_3d = ttnn.reshape(conv_full_tt, [B, S, CONV_DIM_M])
+        conv_causal_tt = ttnn.to_layout(conv_full_3d, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(conv_full_tt)  # safe NOW — conv_causal_tt is independent
+        # Skip the legacy numpy path entirely — we hand conv_causal_tt to silu.
+        conv_causal_np = None  # signal that we already have ttnn
+    elif _persistent_conv:
+        # LEGACY v0.3.1.d numpy-state decode path (still used by probes
+        # that don't set conv_state_tt). Kept for backward compat.
+        xBC_np_S = _rb(xBC_tt)
         if xBC_np_S.shape[1] != S:
-            # Defensive: readback might come back transposed for some S.
             if xBC_np_S.shape[-1] == S:
                 xBC_np_S = xBC_np_S.transpose(0, 2, 1)
-        conv_state = _conv_state_list[layer_idx]  # [1, 3, CONV_DIM_M]
-        # Combined input: [1, 3+S, CONV_DIM_M]
+        conv_state = _conv_state_list[layer_idx]
         combined_np = np.concatenate([conv_state, xBC_np_S], axis=1)
-        # Save updated conv_state: last (kernel-1)=3 positions of combined input.
         _conv_state_list[layer_idx] = combined_np[:, -(CONV_KERNEL - 1):, :].copy()
-        # Run conv1d with no padding. Output length = (3+S) - 4 + 1 = S.
         combined_tt = ttnn.from_torch(
             torch.from_numpy(combined_np.astype(np.float32)).reshape(
                 B, 1, CONV_KERNEL - 1 + S, CONV_DIM_M,
@@ -1679,8 +1752,7 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
             in_channels=CONV_DIM_M, out_channels=CONV_DIM_M,
             batch_size=B, input_length=CONV_KERNEL - 1 + S,
             kernel_size=CONV_KERNEL, stride=1,
-            padding=0,  # history already prepended
-            dilation=1, groups=CONV_DIM_M,
+            padding=0, dilation=1, groups=CONV_DIM_M,
             bias_tensor=w["conv1d_b"],
         )
         ttnn.deallocate(combined_tt)
@@ -1692,7 +1764,6 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
             conv_full_np = conv_full_np.squeeze(1)
         if conv_full_np.shape[-1] != CONV_DIM_M:
             conv_full_np = conv_full_np.transpose(0, 2, 1)
-        # conv_full_np is [1, S, CONV_DIM_M] — already the causal output.
         conv_causal_np = conv_full_np
     else:
         # PREFILL or no-state path: existing on-device padded conv1d.
@@ -1730,11 +1801,15 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
             xBC_np_for_state = _rb(xBC_tt)
             _conv_state_list[layer_idx] = xBC_np_for_state[:, -(CONV_KERNEL - 1):, :].copy()
 
-    conv_causal_tt = ttnn.from_torch(
-        torch.from_numpy(conv_causal_np.astype(np.float32)),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
-        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-    )
+    # v0.4.0c: in the on-device decode path we already have conv_causal_tt;
+    # skip the numpy re-upload. Legacy paths still go through numpy.
+    if conv_causal_np is not None:
+        conv_causal_tt = ttnn.from_torch(
+            torch.from_numpy(conv_causal_np.astype(np.float32)),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+        )
+    # else: conv_causal_tt was set in the on-device branch above.
     silu_out_tt = ttnn.silu(conv_causal_tt)
     ttnn.deallocate(conv_causal_tt)
 
