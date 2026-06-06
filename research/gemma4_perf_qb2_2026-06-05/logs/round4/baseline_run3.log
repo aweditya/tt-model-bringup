@@ -1,0 +1,18 @@
+[harness] running v04_trace_validate
+[00:57:51] using pre-bootstrapped state from harness
+[00:57:51] running 100 EAGER steps (teacher-forced pos 0..5, free-run after)…
+[00:58:10]   eager done in 18.8s (188.3 ms/tok)
+[00:58:10]   eager first 10: [532, 514, 532, 496, 100, 236743, 45518, 100, 101, 818]
+[00:58:10]   eager last  10: [1018, 237221, 50429, 21719, 1018, 142253, 1018, 237221, 50429, 21719]
+[00:58:10] capturing decode trace…
+[00:58:10]   trace capture took 0.0s
+[00:58:10] running 100 TRACED steps (same prompt)…
+[00:58:15]   traced done in 4.8s (48.3 ms/tok)
+[00:58:15]   traced first 10: [532, 514, 532, 496, 100, 236743, 45518, 100, 101, 818]
+[00:58:15]   traced last  10: [1018, 237221, 50429, 21719, 1018, 142253, 1018, 237221, 50429, 21719]
+[00:58:15] ==============================================================================
+[00:58:15] v0.4 traced vs eager token-for-token match: 100/100
+[00:58:15] ==============================================================================
+[00:58:15] VERDICT: PASS
+[harness] v04_trace_validate exited rc=0
+[harness] v04_trace_validate exited rc=0

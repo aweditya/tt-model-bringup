@@ -149,3 +149,58 @@ Append-only. Each entry is timestamped.
   - Distributed RMSNorm (P2): biggest projected single win (12-15 ms) but heaviest scope.
 - **Probe added**: `experiments/cb/isolate/gm4_invalidate_trace.py` — needed for any future inner-forward edit + harness reload + v04-validator workflow.
 
+---
+
+## Round 4 (subagent — kernel-time chase, addcmul fusion)
+
+### Baseline reconfirm (n=3, qb2, post-round-3 main HEAD)
+
+- 00:57 — Baseline run 1: eager **196.0** ms/tok, traced **48.1** ms/tok, 100/100 PASS. Log: `logs/round4/baseline_run1.log`.
+- 00:57 — Baseline run 2: eager **198.5** ms/tok, traced **48.3** ms/tok, 100/100 PASS. Log: `logs/round4/baseline_run2.log`.
+- 00:58 — Baseline run 3: eager **188.3** ms/tok, traced **48.3** ms/tok, 100/100 PASS. Log: `logs/round4/baseline_run3.log`.
+- **Aggregate (n=3)**: eager 194.3 ± 4.4, traced **48.23 ± 0.09 ms/tok (20.73 tok/s)** — matches round 3's 47.97 within noise (slight ~0.3 ms regression).
+
+### Tracy v2 capture post-round-3
+
+- 01:01 — Tracy v2 ran on tracy build (`build_tracy_gcc12_nodist`); DRAM-marker overflow zeroed per-op kernel times again (expected — single forward = ~3.8k device ops × per-core multiplier > 12k buffer). Op COUNTS in the signposted region survived. Added permanent helper: `experiments/utils/count_ops_in_csv.py`. CSV: `.cache/perf_logs/tracy_gemma4_v2_round4/reports/2026_06_06_01_01_32/`.
+- Per-forward op counts (divided by 4 for mesh-device duplication):
+  - 483 BinaryNg (~10/layer)
+  - 432 Slice (~9/layer)
+  - 337 LayerNorm (~7/layer = 7 rms_norms × 48)
+  - 329 Matmul (~7/layer, matches Q/K/V/O + gate/up/down)
+  - 200 UntilizeWithUnpadding (~4/layer)
+- Lever pick: **fuse the final `mul(rotated, sin) + add(x_cos, …)` in `_apply_full_rope` into a single `ttnn.addcmul` device dispatch.** Round 3 had marked addcmul/mac as "REJECTED — composite fallback"; verified at `tt-metal/ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp:244-302` that `addcmul` is in fact a real `TernaryOpType::ADDCMUL` LLK kernel (with COL_BCAST broadcast support on bf16) — the composite fallback `_addcmul` only triggers for unsupported broadcasts or bf8 inputs, neither of which applies here. Per-forward savings: 1 op × 96 calls = 96 ops (mostly kernel-time, expected ~0.5-1.5 ms traced per [[feedback-kernel-vs-dispatch-realization]]).
+
+### Isolation probe + production land
+
+- 01:15 — Isolation probe `experiments/cb/isolate/gm4_addcmul_rope_probe.py` (forks the round-2 `gm4_shard_for_paged_write_v2.py` pattern):
+  - Sliding (n_heads=4, head_dim=256): cos(baseline, fused) = **0.9999983**, max|delta| = 0.031 (bf16 round-off, expected).
+  - Global (n_heads=8, head_dim=512): cos(baseline, fused) = **0.9999992**, max|delta| = 0.016.
+  - Both pass the 0.99999 gate. **addcmul produces same result as mul+add within bf16 noise.**
+- 01:16 — `_apply_full_rope` simplified in `server_gemma4_unified_ttnn.py:1011-1057`: replaced the trailing `ttnn.mul(rotated, sin_tt) + ttnn.add(x_cos, rotated_sin)` (2 ops, 1 intermediate alloc) with `ttnn.addcmul(x_cos, rotated, sin_tt, value=1.0)` (1 op). Deployed to qb2 + reloaded + invalidated trace.
+- 01:16 — Validator run 1: eager 187.9 ms/tok, traced **47.3** ms/tok, 100/100 PASS. Log: `logs/round4/addcmul_rope_run1.log`.
+- 01:17 — Validator run 2: eager 184.5 ms/tok, traced **47.3** ms/tok, 100/100 PASS.
+- 01:17 — Validator run 3: eager 180.3 ms/tok, traced **47.6** ms/tok, 100/100 PASS.
+
+### Final aggregate (n=3 after the fix)
+
+| Metric | Baseline (round 4) | addcmul-fused | Delta |
+| --- | --- | --- | --- |
+| Eager mean ms/tok | 194.3 (std 4.4) | 184.2 (std 3.1) | **-5.2% (-10.1 ms)** |
+| Traced mean ms/tok | 48.23 (std 0.09) | **47.40 (std 0.14)** | **-1.7% (-0.83 ms)** |
+| Traced tok/s | 20.73 | **21.10** | +1.8% |
+| Token-for-token | 100/100 | 100/100 | clean |
+
+- Both eager AND traced moved as predicted ([[feedback-kernel-vs-dispatch-realization]]): the addcmul kernel does real work (one fused mul+add) and replaces TWO BinaryNg dispatches (each a kernel program), so the saving lands in kernel time, not just dispatch. Op count check post-fix: BinaryNg should drop from ~483 to ~387 per forward.
+- Argmax sequence DIFFERS from baseline ([532, 575, ...] vs [532, 514, ...]) because the addcmul kernel rounds differently from mul+add in bf16. This is EXPECTED — round 2's `_shard_for_paged_write` simplification and round 3's RoPE cache also flipped some downstream argmaxes. The 100/100 eager-vs-traced gate enforces that both paths produce the SAME tokens, which it does.
+
+### Round 4 final state
+
+- **Landed**: `_apply_full_rope` 7-op chain → 6-op chain via `ttnn.addcmul`. Traced delta: **-0.83 ms/tok (-1.7%, 47.40 ms = 21.10 tok/s)**, eager delta: **-5.2% (-10.1 ms/tok)**. 3×100/100 token match.
+- **Combined w/ rounds 1-3**: traced **51.4 → 47.40 ms/tok = 1.084× cumulative**; eager **474.1 → 184.2 ms/tok = 2.57× cumulative**. Below qb1's 47.5 ms reference.
+- **Probe added**: `experiments/cb/isolate/gm4_addcmul_rope_probe.py` — pattern reusable for any future "mul + add" fusion site (e.g., MoE router projection + bias, FFN gate × up + residual).
+- **Helper added**: `experiments/utils/count_ops_in_csv.py` — op-count aggregator for overflow-degraded Tracy CSVs (the standard regime for Gemma 4 full forwards).
+- **Open next (low-medium risk)**:
+  - **Investigate other mul+add sites**: lm_head softcap (`mul(sharded, 1/SOFTCAP) → tanh → mul(., SOFTCAP)`) might benefit from a folded scalar; layer_scalar multiply at end-of-layer could fold with the prior add. These are tiny (1 op/layer or 1 op/forward) but cumulative.
+  - **`rotary_embedding_llama_fused_qk`** (round 3's flagged candidate): still the biggest single remaining single-call lever but needs HF→Llama weight permutation. Saves ~6× more ops than round 4 (576 ops/forward).
+  - **Distributed RMSNorm (P2)**: 12-15 ms projected, heaviest scope.

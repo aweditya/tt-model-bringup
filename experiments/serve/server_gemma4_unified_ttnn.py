@@ -1034,6 +1034,17 @@ def _apply_full_rope(x, cos_tt, sin_tt, n_heads, head_dim):
     # and x_cos reads garbage. Fix: let views die at scope exit; only
     # dealloc tensors with their own storage (neg_x2, rotated, x_cos,
     # rotated_sin).
+    # Round-4 perf (2026-06-05): fuse the final `mul(rotated, sin) + add` pair
+    # into a single `addcmul` device op. ttnn.addcmul(a, b, c, value) =
+    # a + value * b * c is a real TernaryOpType::ADDCMUL LLK kernel
+    # (`tt-metal/ttnn/cpp/ttnn/operations/eltwise/ternary/ternary.cpp:244`),
+    # NOT a composite fallback — verified to land on the device kernel for
+    # bf16 TILE inputs with COL_BCAST broadcast. Saves 1 op per call ×
+    # 96 calls/forward = 96 ops/forward (~0.5-1.5 ms/tok traced).
+    #
+    # Probe: experiments/cb/isolate/gm4_addcmul_rope_probe.py — cos(baseline,
+    # fused) = 0.99999 for both sliding (head_dim=256, n_heads=4) and global
+    # (head_dim=512, n_heads=8). max|delta| ~0.03 (bf16 round-off).
     half = head_dim // 2
     x1 = ttnn.slice(x, [0, 0], [n_heads, half])
     x2 = ttnn.slice(x, [0, half], [n_heads, head_dim])
@@ -1041,10 +1052,9 @@ def _apply_full_rope(x, cos_tt, sin_tt, n_heads, head_dim):
     rotated = ttnn.concat([neg_x2, x1], dim=-1)
     ttnn.deallocate(neg_x2)
     x_cos = ttnn.mul(x, cos_tt)
-    rotated_sin = ttnn.mul(rotated, sin_tt)
-    ttnn.deallocate(rotated)
-    x_rope = ttnn.add(x_cos, rotated_sin)
-    ttnn.deallocate(x_cos); ttnn.deallocate(rotated_sin)
+    # Fused: x_rope = x_cos + 1.0 * rotated * sin_tt
+    x_rope = ttnn.addcmul(x_cos, rotated, sin_tt, value=1.0)
+    ttnn.deallocate(x_cos); ttnn.deallocate(rotated)
     return x_rope
 
 
