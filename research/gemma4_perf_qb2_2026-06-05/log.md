@@ -141,7 +141,7 @@ Append-only. Each entry is timestamped.
 
 ### Round 3 final state
 
-- **Landed**: per-forward RoPE cache. Traced delta: **-1.30 ms/tok (-2.65%, 47.97 ms = 20.85 tok/s)**, eager delta: **-9.1% (-19 ms/tok)**. 3×100/100 token match.
+- **Landed**: per-forward RoPE cache. Commit `a4060de` (a multi-agent commit that lumped this work with a Nemotron MM7 v0.3.3.b smoke probe — the gm4 perf hunk is on disk under `experiments/serve/server_gemma4_unified_ttnn.py` + `experiments/cb/isolate/gm4_invalidate_trace.py`). Traced delta: **-1.30 ms/tok (-2.65%, 47.97 ms = 20.85 tok/s)**, eager delta: **-9.1% (-19 ms/tok)**. 3×100/100 token match.
 - **Combined w/ rounds 1-2**: traced 51.4 → 47.97 ms/tok = **1.072× cumulative**; eager 474.1 → 188.7 ms/tok = **2.51× cumulative**.
 - **Open next (low-medium risk)**:
   - `concat_heads_decode → o_proj` fusion (still untried — round 2's roadmap item).
