@@ -976,6 +976,65 @@ def apply_final_norm(state: State, h_np):
     return out_np
 
 
+# ── v0.4.1.b — pure-ttnn variants for trace-friendly decode ──────────
+# These accept ttnn.Tensor in and return ttnn.Tensor out (no numpy).
+# Caller updates `state.tok_buf` host-side BEFORE the captured region;
+# inside the trace, the forward reads from tok_buf via ttnn.embedding
+# and returns argmax_tt on device.
+
+def ensure_tok_buf(state: State):
+    """Lazily allocate `state.tok_buf` (uint32 [1, 1] device tensor).
+
+    Host updates via `update_tok_buf(state, token_id)` OUTSIDE any
+    captured trace; the captured forward reads through this buffer.
+    """
+    if getattr(state, "tok_buf", None) is not None:
+        return
+    state.tok_buf = ttnn.from_torch(
+        torch.zeros((1, 1), dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+
+
+def update_tok_buf(state: State, token_id: int):
+    """Host-side: write a new token id into `state.tok_buf`. Call OUTSIDE
+    the captured trace; the captured region reads through the buffer."""
+    ensure_tok_buf(state)
+    tok_host = ttnn.from_torch(
+        torch.tensor([[int(token_id)]], dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT,
+    )
+    ttnn.copy_host_to_device_tensor(tok_host, state.tok_buf)
+
+
+def embed_lookup_tt(state: State):
+    """Pure-ttnn embed lookup. Reads from `state.tok_buf` (must be
+    updated host-side before the call). Returns ttnn.Tensor [1, 1, HIDDEN]
+    TILE bf16 replicated on the mesh.
+    """
+    ensure_tok_buf(state)
+    return ttnn.embedding(
+        state.tok_buf, state.embed_tt, layout=ttnn.TILE_LAYOUT,
+    )
+
+
+def apply_final_norm_tt(state: State, h_tt):
+    """Pure-ttnn final RMS norm. Takes h_tt [B, S, HIDDEN] TILE bf16,
+    returns h_norm_tt at the same shape. No deallocate of input."""
+    return ttnn.rms_norm(h_tt, weight=state.final_norm_tt, epsilon=EPS)
+
+
+def apply_lm_head_argmax_tt(state: State, h_tt):
+    """Pure-ttnn lm_head + argmax. Takes h_tt [B, S, HIDDEN] TILE bf16,
+    returns (logits_tt, argmax_tt). argmax_tt is uint32 [B, S, 1]."""
+    logits_tt = ttnn.matmul(
+        h_tt, state.lm_head_tt, compute_kernel_config=HIFI4,
+    )
+    argmax_tt = ttnn.argmax(logits_tt, dim=-1, keepdim=True)
+    return logits_tt, argmax_tt
+
+
 def apply_lm_head_and_argmax(state: State, h_np):
     """Run lm_head matmul + argmax over vocab.
 

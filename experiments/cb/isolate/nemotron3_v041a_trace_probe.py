@@ -205,27 +205,27 @@ def main(state=None) -> int:
         state.cur_pos += 1
     log(f"  post-warmup pre-trace prev_token={traced_token}")
 
-    # ── 3) CAPTURE TRACE ─────────────────────────────────────────────
-    log("CAPTURE TRACE of one decode step…")
-    log("  NOTE: the existing decode forward has host bridges. We expect")
-    log("        one of: (A) ttnn TT_FATAL during capture; (B) trace OK")
-    log("        but replay tokens drift; (C) all match.")
+    # ── 3) CAPTURE TRACE — using v0.4.1.b pure-ttnn variants ─────────
+    # embed via state.tok_buf (host-updated BEFORE capture); forward
+    # returns argmax_tt on device (read back AFTER execute_trace).
+    log("CAPTURE TRACE of one decode step (v0.4.1.b pure-ttnn path)…")
+    log("  embed_lookup_tt + 52-layer fwd + apply_final_norm_tt + apply_lm_head_argmax_tt")
+    log("  tok_buf is the only host-write surface, OUTSIDE the capture.")
+    # Pre-warm tok_buf with current token (host write before capture).
+    srv.update_tok_buf(state, traced_token)
     try:
         trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
-        # Decode forward — this is what we want to trace.
-        h_np_dec = srv.embed_lookup(
-            state, np.asarray([[traced_token]], dtype=np.int64),
-        )
-        h_tt_in = ttnn.from_torch(
-            torch.from_numpy(h_np_dec.astype(np.float32)),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-        )
+        h_tt_in = srv.embed_lookup_tt(state)
         h_tt_out = _forward_layers(
             state, h_tt_in, srv, ttnn, attn_fn_name="attn_decode_step_tt",
         )
-        # KEEP h_tt_out as the traced output tensor handle; do NOT deallocate.
-        state.traced_h_tt = h_tt_out
+        h_norm_tt = srv.apply_final_norm_tt(state, h_tt_out)
+        ttnn.deallocate(h_tt_out)
+        logits_tt, argmax_tt = srv.apply_lm_head_argmax_tt(state, h_norm_tt)
+        ttnn.deallocate(h_norm_tt)
+        ttnn.deallocate(logits_tt)
+        # KEEP argmax_tt as the captured output handle.
+        state.traced_argmax_tt = argmax_tt
         ttnn.end_trace_capture(state.mesh, trace_id, cq_id=0)
         log(f"  ✓ trace captured (id={trace_id})")
     except Exception as e:
@@ -233,30 +233,31 @@ def main(state=None) -> int:
         log("  → outcome A: ttnn objects to a host op inside the captured")
         log("    region. Backtrace identifies the offender:")
         traceback.print_exc()
+        try:
+            ttnn.end_trace_capture(state.mesh, trace_id, cq_id=0)
+        except Exception:
+            pass
         return 1
 
     # ── 4) REPLAY N TIMES + COMPARE TO EAGER ─────────────────────────
     log(f"REPLAY trace {N_TRACED_STEPS} times…")
     traced_tokens = []
-    cur_pos_at_trace = state.cur_pos
+    cur_token = traced_token
     try:
         for s in range(N_TRACED_STEPS):
-            # NOTE: we'd normally update tok_buf/cur_pos_buf here. But the
-            # current path takes tok via ttnn.from_torch INSIDE the
-            # captured region. The replay will re-run that captured
-            # from_torch with whatever data was there at capture time —
-            # which is `traced_token` from capture. Wrong but informative.
+            # Host-update tok_buf BEFORE execute_trace (cur_pos_buf is
+            # already updated inside the captured attn_decode_step_tt path).
+            srv.update_tok_buf(state, cur_token)
             ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=True)
-            # Readback the traced output tensor to get argmax.
-            h_np_traced = ttnn.to_torch(
-                state.traced_h_tt,
+            # Readback the captured argmax_tt output.
+            argmax_torch = ttnn.to_torch(
+                state.traced_argmax_tt,
                 mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
-            )[:1].float().numpy()
-            h_final = srv.apply_final_norm(state, h_np_traced)
-            _, argmax_np = srv.apply_lm_head_and_argmax(state, h_final)
-            tok = int(argmax_np.flatten()[-1])
+            )
+            tok = int(argmax_torch[0].flatten()[-1])
             traced_tokens.append(tok)
             state.cur_pos += 1
+            cur_token = tok
             log(f"  traced step {s}  TT={tok}  "
                 f"eager={eager_baseline[s]}  "
                 f"{'PASS' if tok == eager_baseline[s] else 'FAIL'}")

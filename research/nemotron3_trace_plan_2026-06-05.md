@@ -4,8 +4,13 @@
 
 ## TL;DR
 
-Current state: matmul-fold landed (commit `425acad`); warm decode at
-**0.6-0.7s/step ≈ 1.4-1.6 tok/s**. Conv1d is no longer the bottleneck.
+Current state (post v0.4.0h.a): warm decode at **0.26s/step ≈ 3.8 tok/s
+warm / 5.0 steady-state** (~60× cumulative since v0.4.0d baseline).
+n-step chain 7/7 PASS. Mamba2 is fully pure-ttnn. MoE combine on-device.
+
+**v0.4.1.a diagnostic probe (commit `bfb04bb`)** confirms the trace
+system hard-rejects host bridges with TT_FATAL "Writes are not allowed
+inside a captured trace". Definitive blocker list captured (below).
 
 Goal: trace capture (`v0.4.1`) to compress per-step dispatch on the
 remaining ~14 ops × 23 mamba2 layers + similar for MoE + attn = ~1000
@@ -46,7 +51,22 @@ boundary, replay loop.
 ✅ Mamba2 conv1d replaced by matmul-fold (v0.4.0e — eliminates the
    `groups=6144` conv1d kernel's heavy program-factory setup cost)
 
-## The REAL trace blocker (must fix BEFORE v0.4.1)
+## Definitive trace-blocker list (audited via v0.4.1.a probe 2026-06-05)
+
+In strict elimination order (each unblocks more of the decode path):
+
+| # | Op | Location | Trace fix |
+|---|---|---|---|
+| 1 | `ttnn.from_torch(ids)` for embed | `embed_lookup` server.py:893-907 | Pre-allocate `tok_buf` (uint32 [1,1] device). Host writes via `ttnn.copy_host_to_device_tensor` OUTSIDE trace. Forward reads buffer → `ttnn.embedding` → ttnn.Tensor. Forks 27B `update_input_buffers` at `server_tp.py:2058-2079`. |
+| 2 | `ttnn.to_torch(scores_tt)` + host argpartition + `ttnn.from_torch(topk_indices)` | `moe_block_eager_ep_tt` server.py:2618, 2658 | On-device router via `ttnn.topk` + `ttnn.embedding`-as-gather. Probe at `nemotron3_v040hb_ondevice_router_probe.py` shows cos=0.9997 but 6/8 tie-breaking mismatch — risky without long-context check. Defer until trace lets us iterate fast. |
+| 3 | `ttnn.to_torch(h_input_tt)` + `ttnn.from_torch(sharded)` | `moe_block_eager_ep_tt` server.py:2640-2651 | Replicate→shard primitive missing in ttnn. Options: (a) build the sharded h at upload time (allocate parallel sharded `h_norm` buffer + update via `copy_host_to_device_tensor` once per step); (b) use `ttnn.experimental.reshard` if it exists; (c) refactor to do the FIRST rms_norm on sharded input. Investigate first. |
+| 4 | `ttnn.to_torch(h_final_tt)` + `apply_final_norm`/`apply_lm_head_and_argmax` numpy | server.py:920-960 | EITHER make pure-ttnn (logits/argmax stay on device) OR leave OUTSIDE the captured trace (27B's `forward_token_tp_inner` returns `traced_argmax_tt` on device; host-side readback happens AFTER `execute_trace`). 27B path is simpler. |
+
+**Strategy**: tackle in order. Each item, validate via the v0.4.1.a
+probe (which will progress further before hitting the next blocker).
+When all four are clear, v0.4.1.b multi-trace + correctness gate.
+
+## The OLD trace blocker (was eliminated by v0.4.0g)
 
 **The Mamba2 SSD wrapper takes/returns NUMPY arrays.**
 

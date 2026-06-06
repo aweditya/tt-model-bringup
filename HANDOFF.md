@@ -32,6 +32,24 @@ kernel ALONE confirmed the kernel itself dominates → matmul-fold was the
 right move. **Always isolate the suspect op alone, not just inside the
 chain**. Saved in `[[feedback-profile-first-perf-method]]`.
 
+**v0.4.1.a DIAGNOSTIC LANDED (commit `bfb04bb`)** — trace capture probe
+confirms TT_FATAL "Writes are not allowed inside a captured trace" on
+the current decode path. Definitive blocker list:
+
+1. `embed_lookup` `ttnn.from_torch(ids)` → fix via pre-allocated tok_buf
+2. MoE `ttnn.to_torch(scores)` + topk indices upload → on-device router
+   (probe at `nemotron3_v040hb_ondevice_router_probe.py` has tie-break
+   drift; park behind correctness flag)
+3. MoE `ttnn.to_torch(h_input_tt)` for sharded re-upload → needs
+   replicate→shard primitive (investigate `ttnn.experimental.reshard`)
+4. `apply_final_norm` + `apply_lm_head_and_argmax` numpy → either pure-tt
+   or leave outside the captured trace (27B's pattern: return
+   `argmax_tt` on device, readback after `execute_trace`)
+
+Full plan + elimination order at `research/nemotron3_trace_plan_2026-06-05.md`.
+Strategy: tackle in order; re-run v0.4.1.a probe after each — it'll
+progress further before hitting the next blocker.
+
 **v0.4.0h.a SHIPPED (commit `fe502e3`)** — on-device MoE combine weighted-sum.
 Replaces the largest data-movement readback in MoE
 (combine_out_tt → numpy → routed_np → re-upload = 516 KB × 23 layers = 12 MB/step).
