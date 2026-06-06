@@ -5,7 +5,33 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## LATEST (2026-06-06) — **router on-device attempted, FAILED; research running**
+## LATEST (2026-06-06 PM) — **owned-topk path identified as highest-ROI trace unlock**
+
+**Decision (2026-06-06, user)**: pursue owned-kernel topk that flips the LLK
+stable-sort flag (PR #31989 LLK-level change shipped; `ttnn.topk` doesn't
+expose it). Forks the existing `qwen36_gdn_decode_owned` /
+`qwen36_decay_gate_decode_owned` owned-op pattern (already in qb1+qb2
+builds per `[[reference-remote-host]]`). Effort: ~1-2 days. Unlocks trace
+blocker #2 → projected 0.26s eager → ~100-130 ms traced (8-10 tok/s,
+~2.5-3× based on 27B/35B trace ratios). See bringup plan v0.4.0h.e row.
+
+**Caveat**: `ttnn.topk` device-op hard-asserts bf16/bfp8 input
+(`topk_device_operation.cpp:147-149`). Stable-sort fixes order-determinism
+but bf16 numerical ties remain unrecoverable. If 7/7 chain regression
+fails after the stable flag lands, follow-up `qwen36_topk_owned_fp32` that
+promotes input to fp32 before the descent.
+
+**Companion — RULER long-context benchmark (v0.5.bench)**. NVIDIA RULER is
+the standard long-context LLM eval (multi-task NIAH variants, multi-key,
+multi-hop, aggregation, 4k→128k). Replacing the ad-hoc needle test that
+hit the IT-template-shape misattribution per
+`[[needle-prompt-shape-not-precision]]` across Gemma 4, 35B, and
+Nemotron-3. Output directly comparable to upstream paper-table numbers.
+Will baseline 27B + Gemma 4 + Nemotron-3 before/after perf rounds.
+
+---
+
+## PRIOR (2026-06-06 AM) — **router on-device attempted, FAILED; research complete**
 
 **State**: Nemotron-3 stable at 0.26s warm step / 3.8 tok/s, 7/7 chain PASS,
 3 of 4 trace blockers cleared (#1 embed, #3 reshard via `reduce_scatter`,
