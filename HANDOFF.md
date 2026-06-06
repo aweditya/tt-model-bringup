@@ -5,6 +5,62 @@ Read top to bottom; everything else is linked.
 
 ---
 
+## LATEST (2026-06-06) — **router on-device attempted, FAILED; research running**
+
+**State**: Nemotron-3 stable at 0.26s warm step / 3.8 tok/s, 7/7 chain PASS,
+3 of 4 trace blockers cleared (#1 embed, #3 reshard via `reduce_scatter`,
+#4 final_norm/lm_head/argmax). Default branch is fully working — no
+regression.
+
+**Router on-device (commit `29234f5`)** — `ttnn.topk + ttnn.embedding`-gather
+behind `NM3_ROUTER_ON_DEVICE=1`. Default OFF preserves 7/7 chain. With
+env ON: **0/7 chain FAIL** from decode step 0 — every token wrong.
+
+The probe's `cos=0.9997 / 6/8 expert sets match` looked benign but
+compounds across 23 MoE layers/forward into immediate argmax
+divergence. **Conclusion**: `ttnn.topk` tie-breaking differs from
+`numpy.argpartition` in ways imperceptible at single-layer cos but
+lethal at full-network scale. Env-gate caught it BEFORE shipping
+(faster signal than the planned text-diff vs needle baseline).
+
+**Research finding (2026-06-06 commit `12f101b`)** — agent
+`ace43f189ee5fc05c` traced the root cause: it's NOT a `ttnn.topk` bug.
+HW SFPSWAP comparison is asymmetric/unstable (tt-metal#20625). PR
+#31989 added a stable-sort flag at the LLK level but `ttnn.topk` does
+NOT expose it; bug #33492 on `ttnn.sort(stable=True)` still open.
+`ttnn.topk` hard-asserts bf16 input — no fp32 promotion. On our
+seed-99 distribution, 6/8 rows have EXACT bf16-quantized ties at the
+K-th rank. Compounded over 23 MoE layers → >99% chains diverge.
+
+The host vs device 7/7 vs 0/7 gap isn't a topk bug at all — it's
+precision asymmetry in the ADD: host does `sigmoid(bf16) → readback
+as fp32 + bias_fp32` (8/8 match); device does `bf16 + bf16`
+(6/8 match). And **HF itself uses `torch.topk(sorted=False)`** which
+is non-deterministic on CUDA — there is NO "correct" reference.
+
+**Production precedent**: DeepSeek-V3 demo at
+`models/demos/deepseek_v3/tt/moe_gate.py:445-489` ships
+`topk_fallback=True` (host readback + bitonic sort). Comment at
+`moe_gate.py:130`: `"not required in future when we have equivalent
+topk op."` Upstream considers ttnn.topk not-yet-equivalent for MoE
+routing.
+
+**Verdict**: keep `NM3_ROUTER_ON_DEVICE=0` (default). Match
+DeepSeek-V3 production. **Trace blocker #2 is BLOCKED ON UPSTREAM**
+until tt-metal ships a deterministic on-device topk. Eager path
+stays at 0.26s warm step (~60× since v0.4.0d baseline).
+
+Next gates: v0.5 single-stream perf (vocab-shard lm_head, RMSNorm
+fusion, HiFi2) on the eager path, then v1 continuous batching.
+
+**Gemma 4 Round 10 DRAM access patterns (in flight, qb2)** — agent
+`a2fda3c7135228003` investigating Llama 70B prefetcher, DRAM-sharded
+matmul configs, cross-layer async weight prefetch. The Round 8
+diagnosis (BW/COMPUTE = 24.6×) makes any DRAM-traffic reduction the
+right next lever.
+
+---
+
 ## POST-WIN QUICK-START (2026-06-05 18:50 PT) — **v0.4.0e MATMUL-FOLD LANDED** ✓
 
 **Headline**: Replaced ttnn.conv1d in the Mamba2 decode hot path with a
