@@ -86,3 +86,10 @@ Append-only. Each entry is timestamped.
 - Post-fix logs: `logs/shard_v2_v04_run{1,2,3}.log`
 - **Both eager AND traced moved** — unlike round 1's paged_fused_update_cache where only eager moved. The 4 dispatches per `_shard_for_paged_write` × 176 calls × ~17 μs / dispatch ≈ ~12 ms / forward of pure dispatch tax is now gone; that's what the eager delta reflects. The traced delta (~1.7 ms) is the kernel-time portion (Untilize + Tilize work that the kernel was actually doing — caught by Tracy v2 at 28 ms / forward but the simplification only removes a piece of that, since the FUSED-UPDATE kernel itself still untilizes a single tile per head inside).
 
+### Round 2 final state
+
+- **Landed**: `_shard_for_paged_write` simplified to 2-op reshard. Commit `b153c10`. **Traced delta: -3.3% (-1.7 ms/tok, 49.57 ms = 20.17 tok/s)**, **eager delta: -5.9% (-13 ms/tok)**. 3×100/100 token match.
+- **Combined with round 1** (`de0384a` paged_fused_update_cache): the qb1 reference of 47.5 ms/tok traced is still ~2 ms faster than qb2's 49.6 ms — possible thermals / build delta. Eager went from 474.1 (round 1 baseline) → 208.8 ms/tok (this round) = **2.27× cumulative eager speedup**.
+- **NOT landed (risk/scope vs time budget)**: distributed RMSNorm (P2, +12-15 ms/tok projected); fused-rotary-embedding (`ttnn.experimental.rotary_embedding_llama_fused_qk` is available on qb2, would replace `_apply_full_rope`'s 7-op chain at 96 calls/forward = ~3-5 ms/forward kernel-time but needs sharded-input + transformation_mats setup).
+- **Open next** (low-medium risk): `concat_heads_decode → o_proj` fusion (tt-metal #44945, ~1 hr, +5-10% on attn). Can fork either the Llama-Galaxy demo or the in-tree gemma4 demo.
+
