@@ -194,13 +194,32 @@ Append-only. Each entry is timestamped.
 - Both eager AND traced moved as predicted ([[feedback-kernel-vs-dispatch-realization]]): the addcmul kernel does real work (one fused mul+add) and replaces TWO BinaryNg dispatches (each a kernel program), so the saving lands in kernel time, not just dispatch. Op count check post-fix: BinaryNg should drop from ~483 to ~387 per forward.
 - Argmax sequence DIFFERS from baseline ([532, 575, ...] vs [532, 514, ...]) because the addcmul kernel rounds differently from mul+add in bf16. This is EXPECTED — round 2's `_shard_for_paged_write` simplification and round 3's RoPE cache also flipped some downstream argmaxes. The 100/100 eager-vs-traced gate enforces that both paths produce the SAME tokens, which it does.
 
+### Stacked: matmul `activation="gelu"` fusion on gate_proj
+
+- 01:21 — Discovery: ttnn.matmul accepts `activation="gelu"` (`tt-metal/ttnn/cpp/ttnn/operations/eltwise/unary/common/unary_op_utils.cpp:833` shows the `"gelu"` string maps to UnaryOpType::GELU with fast_and_approximate=false — exactly matches our `ttnn.gelu(fast_and_approximate_mode=False)`). The comment at server_gemma4_unified_ttnn.py:777-780 ("fused-activation path uses APPROXIMATE kernel — DO NOT use") was referring to a DIFFERENT fused path (ttnn.mul with [UnaryOpType.GELU]), NOT the matmul `activation` parameter.
+- 01:22 — Isolation probe `experiments/cb/isolate/gm4_matmul_gelu_probe.py`: cos(baseline, fused) = **1.0000005**, max|delta| = **0.000000** (bit-identical). Confirms `activation="gelu"` runs the exact GELU.
+- 01:23 — Production: replaced `gate = matmul(...); gelu_gate = gelu(gate)` with `gelu_gate = matmul(..., activation="gelu")` in BOTH `_layer_forward_pos0` (line 974, legacy v0.2.0) and `_layer_forward_pos0_paged` (line 1419, v0.4 trace). Per forward: 48 gelu dispatches eliminated (1/layer).
+- Validator runs (n=3): traced **47.33 ms/tok** (47.3/47.3/47.4), eager 190.4 ms/tok (193.7/188.6/189.0). 3×100/100 token match. Token sequence byte-identical to addcmul-only stage → fusion is exact GELU as expected.
+- **Delta vs addcmul-only**: traced -0.07 ms (47.40 → 47.33 — within noise). Eager +6.2 ms (within noise). The matmul appears to be interleaved (non-sharded) for gate_proj at qb2, so the activation parameter likely runs as a post-op rather than a true fusion into the writeback. Op count goes down (48/forward) but kernel-time saving is small because the gelu was already cheap.
+- **Final round-4 aggregate (addcmul + matmul-gelu, n=3)**:
+  | Metric | Baseline (round 4) | addcmul + matmul-gelu | Delta |
+  | --- | --- | --- | --- |
+  | Eager mean ms/tok | 194.3 (std 4.4) | 190.4 (std 2.3) | **-2.0% (-3.9 ms)** |
+  | Traced mean ms/tok | 48.23 (std 0.09) | **47.33 (std 0.05)** | **-1.9% (-0.90 ms)** |
+  | Traced tok/s | 20.73 | **21.13** | +1.9% |
+  | Token-for-token | 100/100 | 100/100 | clean |
+- Probe added: `experiments/cb/isolate/gm4_matmul_gelu_probe.py`.
+
 ### Round 4 final state
 
-- **Landed**: `_apply_full_rope` 7-op chain → 6-op chain via `ttnn.addcmul`. Traced delta: **-0.83 ms/tok (-1.7%, 47.40 ms = 21.10 tok/s)**, eager delta: **-5.2% (-10.1 ms/tok)**. 3×100/100 token match.
-- **Combined w/ rounds 1-3**: traced **51.4 → 47.40 ms/tok = 1.084× cumulative**; eager **474.1 → 184.2 ms/tok = 2.57× cumulative**. Below qb1's 47.5 ms reference.
-- **Probe added**: `experiments/cb/isolate/gm4_addcmul_rope_probe.py` — pattern reusable for any future "mul + add" fusion site (e.g., MoE router projection + bias, FFN gate × up + residual).
+- **Landed (commit 1)**: `_apply_full_rope` mul+add → addcmul. Traced -0.83 ms/tok.
+- **Landed (commit 2)**: matmul `activation="gelu"` fusion on `gate_proj`. Traced -0.07 ms/tok (within noise but ships a cleaner code path).
+- **Combined w/ rounds 1-3**: traced **51.4 → 47.33 ms/tok = 1.086× cumulative**; eager **474.1 → 190.4 ms/tok = 2.49× cumulative**. Below qb1's 47.5 ms reference by ~0.2 ms.
+- **Probes added**:
+  - `experiments/cb/isolate/gm4_addcmul_rope_probe.py` — reusable pattern for mul+add fusion sites.
+  - `experiments/cb/isolate/gm4_matmul_gelu_probe.py` — reusable pattern for matmul+activation fusion.
 - **Helper added**: `experiments/utils/count_ops_in_csv.py` — op-count aggregator for overflow-degraded Tracy CSVs (the standard regime for Gemma 4 full forwards).
 - **Open next (low-medium risk)**:
-  - **Investigate other mul+add sites**: lm_head softcap (`mul(sharded, 1/SOFTCAP) → tanh → mul(., SOFTCAP)`) might benefit from a folded scalar; layer_scalar multiply at end-of-layer could fold with the prior add. These are tiny (1 op/layer or 1 op/forward) but cumulative.
+  - **Sharded gate_proj matmul** with `program_config.fused_activation`: would make the activation a TRUE LLK fusion (no post-op), getting the full ~2 ms of saving the activation parameter promised but didn't deliver here. Requires sharding pre_ff to L1 (medium scope).
   - **`rotary_embedding_llama_fused_qk`** (round 3's flagged candidate): still the biggest single remaining single-call lever but needs HF→Llama weight permutation. Saves ~6× more ops than round 4 (576 ops/forward).
   - **Distributed RMSNorm (P2)**: 12-15 ms projected, heaviest scope.

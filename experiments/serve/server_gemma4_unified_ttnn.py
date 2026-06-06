@@ -971,11 +971,13 @@ def _layer_forward_pos0(state, h_in, layer_idx):
     h_after_attn = ttnn.add(residual_1, post_attn)
     ttnn.deallocate(residual_1); ttnn.deallocate(post_attn)
     pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"], epsilon=EPS)
-    gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4)
+    # Round-4 perf (2026-06-05): fuse gelu into gate_proj matmul; see the
+    # round-4 note in `_layer_forward_pos0_paged` below for details + probe
+    # reference.
+    gelu_gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4,
+                            activation="gelu")
     up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
     ttnn.deallocate(pre_ff)
-    gelu_gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
-    ttnn.deallocate(gate)
     mid = ttnn.mul(gelu_gate, up)
     ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
     mlp_partial = ttnn.matmul(mid, w["down_proj"], compute_kernel_config=HIFI4)
@@ -1416,11 +1418,19 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
     h_after_attn = ttnn.add(residual_1, post_attn)
     ttnn.deallocate(residual_1); ttnn.deallocate(post_attn)
     pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"], epsilon=EPS)
-    gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4)
+    # Round-4 perf (2026-06-05): fuse gelu into gate_proj matmul via the
+    # `activation="gelu"` fused-activation parameter. Per tt-metal
+    # unary_op_utils.cpp:833 the string "gelu" maps to
+    # UnaryOpType::GELU with fast_and_approximate=false — exactly matches
+    # our prior `ttnn.gelu(gate, fast_and_approximate_mode=False)`. Saves
+    # 1 op per layer × 48 = 48 ops/forward (fully kernel-time: the SFPU
+    # GELU runs inside the matmul out-block writeback, no extra pass).
+    # Isolation probe: `experiments/cb/isolate/gm4_matmul_gelu_probe.py` —
+    # max|delta| = 0.0 vs separate matmul + gelu (bit-identical).
+    gelu_gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4,
+                            activation="gelu")
     up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
     ttnn.deallocate(pre_ff)
-    gelu_gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
-    ttnn.deallocate(gate)
     mid = ttnn.mul(gelu_gate, up)
     ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
     mlp_partial = ttnn.matmul(mid, w["down_proj"], compute_kernel_config=HIFI4)
