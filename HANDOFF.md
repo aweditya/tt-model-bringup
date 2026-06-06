@@ -5,7 +5,40 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## POST-WIN QUICK-START (2026-06-05 12:00 PT) — **Phase 0 DONE, Phase 1 LIVE** ✓
+## POST-WIN QUICK-START (2026-06-05 18:50 PT) — **v0.4.0e MATMUL-FOLD LANDED** ✓
+
+**Headline**: Replaced ttnn.conv1d in the Mamba2 decode hot path with a
+4×mul + 3×add + 1×bias-add fold. **Per-step time: 15.5s → 0.6-0.7s warm
+(~22× full-step speedup)**. Correctness preserved: n-step chain 6/7 PASS,
+same single bf16 argmax flip at step 3 as pre-fold baseline (no regression).
+
+- **probe** `experiments/cb/isolate/nemotron3_v040e_conv1d_matmul_fold_probe.py`
+  ttnn.conv1d warm 656.5 ms → matmul-fold warm **1.9 ms** (345× kernel-only)
+  correctness cos = 0.999994 vs ttnn.conv1d (mad 2.5e-5)
+- **integration commit `425acad`** (server_nemotron3_nano_ttnn.py)
+  `mamba2_block_eager_tt`: gated on S==1; prefill keeps ttnn.conv1d
+  `upload_mamba2_layer`: 4 per-position TILE weights + bias TILE on mesh
+  defensive lazy upload for live-harness state-version skew
+- **n-step regression** (chain of 8 after prefill):
+  prefill TT=6993 HF=6993 PASS ✓ (16.5s, still ttnn.conv1d)
+  TT chain [1063,6993,1063,5498,1063,6993,1063] = HF except single
+  bf16 flip at step 3 — identical to v0.3.3 baseline.
+  warm step time **0.6-0.7s** ≈ 1.4-1.6 tok/s (up from 0.064)
+
+**Methodology lesson reinforced**: profile (v0.4.0b) localised the right
+block (97% conv1d), but I assumed it was host bridges → wrong call to
+on-device flow (v0.4.0c saved 0 ms). v0.4.0d isolation probe of the
+kernel ALONE confirmed the kernel itself dominates → matmul-fold was the
+right move. **Always isolate the suspect op alone, not just inside the
+chain**. Saved in `[[feedback-profile-first-perf-method]]`.
+
+**Next perf lever**: warm 0.7s step is no longer conv1d-bound. Profile the
+new step to localise the next bottleneck (likely SSD-scan numpy roundtrip
+or MoE host-side topk). Target ≥30 tok/s still ~20× away.
+
+---
+
+## PRIOR QUICK-START (2026-06-05 12:00 PT) — **Phase 0 DONE, Phase 1 LIVE** ✓
 
 **Where we are**: Phase 0 (owned Mamba2 SSD decode kernel G0..G4)
 COMPLETE 2026-06-05. The drop-in `mamba2_decode_step_ttnn(...)` wrapper
