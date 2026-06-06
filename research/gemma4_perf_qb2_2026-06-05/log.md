@@ -310,3 +310,90 @@ Append-only. Each entry is timestamped.
 - **`alt_complex_rotate90`**: ttnn op that does interleaved rotate `(out_{2i}, out_{2i+1}) = (-in_{2i+1}, in_{2i})`. Different RoPE convention from HF Gemma 4's split-half rotate; would require permuting Q/K projection weights (interleave first half + second half columns). Same scope as `rotary_embedding_llama_fused_qk` but with less head-room (still need a mul + addcmul after).
 - **Eliminate the per-layer `residual_1 = ttnn.clone(h_in)`** (48 Clones/forward): defensive clone added during initial bringup ("L1 hard-FAIL hypothesis: rms_norm + downstream ops may be aliasing h_in"). Static analysis suggests it's safe to remove (rms_norm is pure, no in-place writes to h_in), but the comment flags real bug history. Reverting it risks a hard-to-diagnose regression. SKIP — high blast radius for ~0.3 ms expected gain.
 - **Eliminate the global-attention `v_raw = ttnn.clone(k_h)`** (8 Clones/forward): tested with n=4 traced runs after deploying. Token-for-token PASS (bit-identical), but traced mean was 47.38 vs roll-only 47.20 — measurable noise, no positive signal. REVERTED. Clone is cheap enough (single tile) that the dispatch + kernel cost was already negligible; saving 8/forward doesn't move the needle past noise. Logs: `logs/round5/vraw_run{1,2,3,4}.log`.
+
+---
+
+## Round 6 (subagent — `add(a, b) * scalar` fusion + drop defensive residual_1 clone)
+
+### Baseline reconfirm (n=3, qb2, post-round-5 main HEAD)
+
+- 02:24 — Baseline run 1: eager **179.8** ms/tok, traced **47.1** ms/tok, 100/100 PASS. Log: `logs/round6/baseline_run1.log` (note: re-used original session output path; subsequent baseline runs saved to logs/round6/).
+- 02:26 — Baseline run 2: eager **178.6** ms/tok, traced **47.4** ms/tok, 100/100 PASS. Log: `logs/round6/baseline_run2.log`.
+- 02:28 — Baseline run 3: eager **183.9** ms/tok, traced **47.4** ms/tok, 100/100 PASS. Log: `logs/round6/baseline_run3.log`.
+- **Aggregate (n=3)**: eager 180.8 ± 2.4, traced **47.30 ± 0.15 ms/tok (21.14 tok/s)** — round-5 final of 47.20 reproduces within noise.
+
+### Tracy v2 capture post-round-5
+
+- 02:31 — Tracy v2 ran on tracy build (`build_tracy_gcc12_nodist`). DRAM marker buffer overflowed (expected for full forward); kernel times for most ops zeroed. Surviving ops with valid timestamps showed relative proportions:
+  - BinaryNg 47.06% (291 ops/forward)
+  - Matmul 21.01% (329 ops/forward)
+  - Ternary 15.97% (96 ops = all addcmuls in `_apply_full_rope`)
+  - Clone 8.40% (56 ops = 48 residual_1 + 8 v_raw)
+  - UnaryNg 7.56% (49 ops)
+- CSV: `.cache/perf_logs/tracy_gemma4_round6_b/reports/2026_06_06_02_32_00/`.
+- Conclusion: BinaryNg dominates the surviving-ops mix, with **Clone surprisingly large at 8.4%** even after Round 5 declined to attack it ("high blast radius for ~0.3 ms gain"). The 48 `residual_1` clones per forward are the bigger lever (the 8 `v_raw` clones already tested negative in Round 5).
+- Note: rotary_embedding_llama_fused_qk (the brief's flagged candidate) was investigated but skipped — see "Investigated but skipped" below.
+
+### Lever pick — bundled `add+mul_unary` SFPU fusion + defensive `residual_1` clone removal
+
+- **Lever A — `add + mul scalar` SFPU fusion (per `_layer_forward_pos0_paged`)**:
+  - Current at `server_gemma4_unified_ttnn.py:1454-1456`:
+    ```
+    h_residual_2 = ttnn.add(h_after_attn, post_ff)           # BinaryNg
+    h_out = ttnn.multiply(h_residual_2, w["layer_scalar"])   # BinaryNg
+    ```
+  - Proposed: fuse the trailing scalar multiply via `activations=[UnaryWithParam(MUL_UNARY_SFPU, layer_scalar)]` on the add. LLK exposes `mul_unary_tile(idst, scalar)` as a post-add SFPU pass within the same kernel (tt-metal `unary_op_utils.cpp:340`). Saves 1 op per layer × 48 = 48 ops/forward.
+  - Forks pattern from Round 4's `activation="gelu"` on matmul (different op family but same fusion concept: post-op SFPU runs in the writeback).
+- **Lever B — drop `residual_1 = ttnn.clone(h_in)`**:
+  - Current at `server_gemma4_unified_ttnn.py:1411`: defensive clone before rms_norm.
+  - Static analysis: `ttnn.rms_norm` is functional — input untouched, output is a fresh tensor. Caller `forward_token_gm4_inner` keeps h_in alive throughout `_layer_forward_pos0_paged` (deallocates only after return). So `h_after_attn = ttnn.add(h_in, post_attn)` is safe — same bytes as `add(clone(h_in), post_attn)`.
+  - The clone was added during v0.1 bringup under an "L0 PASS, L1 hard-FAIL" aliasing hypothesis, which the per-layer ladder later attributed to `q_norm`'s missing zero-centered `+1` ([[feedback-qwen36-qnorm-knorm-zero-centered]]) — NOT to any rms_norm/add aliasing. Round 5 deliberately skipped this for "high blast radius" but the architectural review here suggests it's safe.
+  - Saves 1 op per layer × 48 = 48 ops/forward (`Clone` device dispatch is real kernel work: copies tile data with no transform).
+- **Why bundled**: Both target the layer body, both eliminate exactly 48 ops/forward each. The probe is cheap (single-device, no full bootstrap) for lever A; lever B is validated by the v04 trace validator's 100/100 token-for-token check after deploy.
+
+### Isolation probe + production land
+
+- 02:38 — **Isolation probe** `experiments/cb/isolate/gm4_add_mul_scalar_probe.py`:
+  - Single-device, [1, 960] bf16 random tensors, scalar=0.054 (Gemma 4 12B L0 `layer_scalar`).
+  - cos(baseline, fused) = **0.9999961**, max|delta| = **0.000977** (bf16 round-off, expected).
+  - cos(fused, torch_ref) = **0.9999974** vs cos(baseline, torch_ref) = 0.9999972 — fused slightly MORE accurate.
+  - VERDICT: PASS (cos >= 0.99999, max|delta| < 0.05). Log: `logs/round6/probe_add_mul_scalar.log` (stdout captured by run).
+- 02:40 — **Lever A LANDED** in `server_gemma4_unified_ttnn.py:1454-1473` (paged path) + `:1000-1007` (legacy v0.2 path). Deployed.
+- 02:41 — Validator run (Lever A only, n=3): eager 426.8/182.8/178.9 ms/tok (run 1 includes JIT compile, ignore), traced **47.2 ms/tok** (46.8/47.4/47.4). 3×100/100 PASS. **Token sequence differs from baseline** at position 4 onward (bf16 SFPU-reorder rounds slightly differently) — same flip pattern as Round 4 addcmul. Logs: `logs/round6/add_mul_scalar_run{1,2,3}.log`.
+- 02:48 — **Lever B LANDED** — dropped `residual_1 = ttnn.clone(h_in)` in both paged and legacy paths. Used `h_in` directly as the residual operand in the trailing add. Deployed.
+- 02:49 — Validator runs (Lever A + B, n=3): traced **46.6 / 47.1 / 46.6 ms/tok**, eager 190.2 / 174.6 / 181.6. 3×100/100 PASS. Token sequence BIT-IDENTICAL across all 3 runs and matches the Lever-A-only sequence (clone removal is mathematically equivalent — same bytes flow through). Logs: `logs/round6/clone_drop_run{1,2,3}.log`.
+
+### Final aggregate (n=3 after the bundled fix)
+
+| Metric | Baseline (round 6) | A+B fused | Delta |
+| --- | --- | --- | --- |
+| Eager mean ms/tok | 180.8 (std 2.4) | 182.1 (std 6.4) | +0.7% (within noise) |
+| Traced mean ms/tok | 47.30 (std 0.15) | **46.77 (std 0.24)** | **-1.1% (-0.53 ms)** |
+| Traced tok/s | 21.14 | **21.38** | +1.1% |
+| Token-for-token | 100/100 | 100/100 | clean (bit-stable across 3 runs) |
+
+- Traced delta matches the predicted realisation (per [[feedback-kernel-vs-dispatch-realization]]): 48 (clones) + 48 (separated multiplies) = 96 ops/forward saved. Round-3's rope-cache fusion saved ~96 ops also and netted -1.30 ms; today's -0.53 ms is the smaller fraction because clones are CHEAPER per-op than embeddings+tilizes (a clone is one tile-copy, an embedding+tilize is multi-pass). The proportion lines up.
+- Eager moved by ~0.0 ms (within noise) — both Lever A (fused activation = 1 LLK pass instead of 2 dispatches) and Lever B (clone removed = 1 fewer dispatch) should have shaved eager-time, but the eager noise floor here is ±3-6 ms/tok so we can't claim a delta.
+
+### Round 6 final state
+
+- **Landed**:
+  - `add + mul scalar` → `add(..., activations=[MUL_UNARY_SFPU, layer_scalar])` fusion in both `_layer_forward_pos0_paged` (paged trace path) and `_layer_forward_pos0` (legacy path).
+  - Defensive `residual_1 = ttnn.clone(h_in)` dropped in both paths.
+  - Single commit. Traced delta: **-0.53 ms/tok (-1.1%, 46.77 ms = 21.38 tok/s)**, eager delta: within noise. 3×100/100 token match, bit-stable across runs.
+- **Combined w/ rounds 1-5**: traced **51.4 → 46.77 ms/tok = 1.099× cumulative**; eager **474.1 → 182.1 ms/tok = 2.60× cumulative**. **Below qb1's 47.5 ms reference by 0.73 ms.**
+- **Probe added**: `experiments/cb/isolate/gm4_add_mul_scalar_probe.py` — bit-stable bf16 fusion probe; reusable pattern for any `add(a, b) → unary(.)` site (just swap the UnaryOpType + scalar).
+- **Open next (low-medium risk)**:
+  - **`rotary_embedding_llama_fused_qk`**: still the biggest single-call lever (collapses 4-5 ops × 96 calls = 480 ops/forward into 1 op × 48 = 48 ops/forward), but the convention mismatch makes it heavy. Gemma 4 uses HF split-half RoPE; the fused kernel only supports interleaved-half RoPE via a 32×32 `trans_mat` (tile-granularity rotate, can't represent the 256-wide swap-half operation). To use it we'd need to permute Q/K projection weights AND K-cache layout AND cos/sin tables to interleaved layout offline at bootstrap — multi-hour scope with regression risk.
+  - **Sharded gate_proj matmul with `program_config.fused_activation`**: makes Round 4's `activation="gelu"` a TRUE in-kernel fusion (vs the post-op it is now). Requires sharding `pre_ff` to L1 — medium scope.
+  - **Distributed RMSNorm (P2)**: 12-15 ms projected, heaviest scope.
+  - **Audit BinaryNg residue**: 291/forward at 47% of surviving kernel time. The MLP `mid = ttnn.mul(gelu_gate, up)` is one site that COULD potentially fuse into the `down_proj` matmul as an `in0_activation` style pre-op — needs API check.
+
+### Investigated but skipped
+
+- **`rotary_embedding_llama_fused_qk`** (Round 6 brief's flagged candidate): kernel inspection at `tt-metal/ttnn/cpp/ttnn/operations/experimental/transformer/rotary_embedding_llama_fused_qk/device/rotary_embedding_llama_fused_qk_device_operation.cpp:99-120` confirmed:
+  - `trans_mat` is 32×32 tile-granularity — implements interleaved (`(out_{2i}, out_{2i+1}) = (-in_{2i+1}, in_{2i})`) rotate ONLY.
+  - Cannot represent HF Gemma 4's split-half rotate (`rotate_half([a, b]) = [-b, a]`) which is head_dim-wide.
+  - Workaround requires offline weight permutation: interleave Q/K projection output columns, re-pack cos/sin tables in interleaved order, and either permute K-cache writes back to standard order OR keep the entire attention pipeline in interleaved order (cascading change through SDPA, cache write, output reshape).
+  - Constraints stack: HEIGHT_SHARDED inputs on disjoint cores (Q and K must not share core grid), `head_dim > 128 ⇒ fp32_dest_acc_en=False` (Gemma's head_dim_sliding=256 and head_dim_global=512 both trip this — precision concession).
+  - **Conclusion**: too big a scope for one round. Worth a dedicated Round 7 if traced perf needs to break below ~45 ms — a separate experimental branch with weight-permutation utilities + a reduced-scope probe (sliding layers only first) would be appropriate.
