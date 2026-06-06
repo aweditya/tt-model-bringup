@@ -33,6 +33,16 @@ for var in TT_GEMMA4_VARIANT TT_GEMMA4_MODEL_ID TT_CB_SLOTS TT_CB_TOPK_K \
   fi
 done
 
+# qb1 ships `build_Release`; qb2 ships `build` (different cmake preset). Allow
+# the caller to override; default per-host so callers don't have to remember.
+# (See research/gemma4_perf_qb2_2026-06-05/log.md §"qb2 tt-metal builds".)
+if [ -z "${TT_BUILD_NAME:-}" ]; then
+  case "$HOST" in
+    qb2) TT_BUILD_NAME="build";;
+    *)   TT_BUILD_NAME="build_Release";;
+  esac
+fi
+
 ssh "$HOST" bash <<REMOTE
 set -e
 pgrep -f $HARNESS_PATH | xargs -r kill -9 2>/dev/null || true
@@ -47,7 +57,7 @@ cd ~/tt-xla
 tmux new-session -d -s $MODEL \\
   "cd ~/tt-xla && \\
    export TT_METAL_HOME=\\\$HOME/tenstorrent/tt-metal && \\
-   export TT_BUILD_DIR=\\\$TT_METAL_HOME/build_Release && \\
+   export TT_BUILD_DIR=\\\$TT_METAL_HOME/$TT_BUILD_NAME && \\
    export ARCH_NAME=blackhole && \\
    export PYTHONPATH=\\\$TT_METAL_HOME/ttnn && \\
    export LD_LIBRARY_PATH=\\\$TT_METAL_HOME/ttnn/ttnn:\\\$TT_BUILD_DIR/ttnn:\\\$TT_BUILD_DIR/lib && \\
