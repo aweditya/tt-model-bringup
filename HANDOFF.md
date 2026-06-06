@@ -62,11 +62,31 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.4 trace capture **scope-sized by
-v0.3.3.b perf data** (running now). v0.4 is the BIGGEST RISK per plan
-(fp32-in-trace, 35B precedent for hangs); want to know if warm-eager
-is already demo-tractable BEFORE committing days to the trace refactor.
-Constant-time decode pipeline is fully validated by v0.3.3 chain.
+**Phase 1 — exact next task**: v0.4.0 — refactor Mamba2 SSD wrapper
+to keep data on-device across positions (eliminate ~14s/step of host
+bridges). Data-justified by v0.3.3.b perf measurement.
+
+**v0.3.3.b perf data** (5 decode steps, cold + 4 warm):
+- cold step 0:  15.48s
+- warm mean:    15.469s (essentially identical to cold)
+- JIT overhead: 0.01s
+- **The 15.5s is real host-bridge cost, not JIT compile.**
+- Tok/s: 0.065 (about 470× too slow for 30 tok/s target)
+- Breakdown: 23 Mamba2 layers × ~12 host roundtrips/layer/step
+  ≈ 14s/step in SSD wrapper bridges. MoE host topk + combine sum +
+  residual ≈ 1.5s.
+
+**v0.4 path**:
+1. v0.4.0 — refactor `nemotron3_mamba2_step.py` G4 wrapper to take
+   ttnn.Tensor in and return ttnn.Tensor out (eliminate the per-step
+   numpy bridges). State (ssm_state, conv_state) moves to ttnn tensors.
+2. v0.4.1 — first trace capture of single decode step.
+3. v0.4.2 — two-phase warmup ([[ttnn-multi-trace-two-phase-warmup]]) +
+   100-step accuracy regression vs eager.
+
+Realistic v0.4 outcome (per plan): 3× speedup vs eager → ~5s/step
+traced eager → still slow but unblocks v0.5 perf passes that get us
+to 30 tok/s.
 
 **v0.3.3 DONE 2026-06-05** (commit `a617a76`): N-step decode chain
 6/7 PASS with recovery — identical bf16 drift pattern to v0.3.1.a
