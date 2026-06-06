@@ -32,16 +32,23 @@ kernel ALONE confirmed the kernel itself dominates → matmul-fold was the
 right move. **Always isolate the suspect op alone, not just inside the
 chain**. Saved in `[[feedback-profile-first-perf-method]]`.
 
-**Next perf lever**: warm 0.7s step is no longer conv1d-bound. Profile the
-new step (#225 v0.4.0f layer-kind profile) to localise the next
-bottleneck. Tracing plan written: [`research/nemotron3_trace_plan_2026-06-05.md`](research/nemotron3_trace_plan_2026-06-05.md).
-Real blocker for v0.4.1 trace: **Mamba2 SSD wrapper still does
-device→numpy→device per layer per step** (task #223 v0.4.0g
-re-opened). Once that + #226 (MoE host-paths on-device) land, v0.4.1
-single-step trace + multi-trace two-phase warmup become straightforward
-forks of 27B/35B/Gemma 4 traced decode. Target ≥30 tok/s still ~20×
-away — trace gets ~2-3× of that, the rest is v0.5 (vocab-shard
-lm_head + RMSNorm fusion + on-device topk).
+**Next perf lever**: warm 0.7s step is no longer conv1d-bound.
+**v0.4.0f profile (commit pending) confirms**:
+```
+total step:  660 ms  (warm, n=4)
+  mamba2  23 layers ×  16.5 ms = 379.5 ms  (57%)  ← #223 v0.4.0g target
+  moe     23 layers ×  10.5 ms = 240.5 ms  (36%)  ← #226 v0.4.0h target
+  attention 6 layers ×  2.1 ms =  12.8 ms  ( 2%)
+  embed+lm_head+sample:          27.2 ms  ( 4%)
+```
+57% sits in the Mamba2 SSD wrapper. Trace plan called this — eliminating
+the device→numpy→device per layer per step (#223 v0.4.0g) drops mamba2
+to ~2-3 ms/layer (just kernel) → step time ~340 ms ≈ 3 tok/s eager,
+or ~150 ms ≈ 6-7 tok/s after #226. THEN v0.4.1 trace × ~2× → 12-15
+tok/s. v0.5 (vocab-shard + RMSNorm fusion + on-device topk) → 30 tok/s
+demo target.
+
+Tracing plan written: [`research/nemotron3_trace_plan_2026-06-05.md`](research/nemotron3_trace_plan_2026-06-05.md).
 
 ---
 
