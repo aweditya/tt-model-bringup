@@ -32,21 +32,39 @@ kernel ALONE confirmed the kernel itself dominates → matmul-fold was the
 right move. **Always isolate the suspect op alone, not just inside the
 chain**. Saved in `[[feedback-profile-first-perf-method]]`.
 
-**Next perf lever**: warm 0.7s step is no longer conv1d-bound.
-**v0.4.0f profile (commit pending) confirms**:
+**v0.4.0g.a LANDED (commit `36ec27c`)** — pure-state Mamba2 SSD wrapper:
+- New `mamba2_decode_step_ttnn_pure_state` accepts ssm_state as
+  ttnn.Tensor, returns (state_out_tt, y_out_tt) as ttnn.Tensors. No
+  device→numpy→device for the big tensors.
+- `mixer_norm_w_tt` + SSD constants pre-uploaded at upload time.
+- `state.ssm_state_tt[L]` lives across decode steps (fp32 on mesh).
+- 35B GDN clone pattern (`ttnn.add(state, 0.0)`) used at the kernel
+  boundary because the kernel writes through the state input buffer.
+
+**Perf**: 660 ms → **427 ms warm step** (-35%). Mamba2 per-layer:
+16.5 ms → 9.1 ms (-45%). **Correctness IMPROVED**: 7/7 PASS (was 6/7)
+— fp32 on-device state eliminated the bf16-roundtrip drift at step 3.
+Cumulative since v0.4.0d baseline: 15.5s → 0.4s = **~39×**.
+
+**New profile breakdown (v0.4.0g.a)**:
 ```
-total step:  660 ms  (warm, n=4)
-  mamba2  23 layers ×  16.5 ms = 379.5 ms  (57%)  ← #223 v0.4.0g target
-  moe     23 layers ×  10.5 ms = 240.5 ms  (36%)  ← #226 v0.4.0h target
-  attention 6 layers ×  2.1 ms =  12.8 ms  ( 2%)
-  embed+lm_head+sample:          27.2 ms  ( 4%)
+total step:  427 ms  (warm)
+  mamba2  23 layers ×  9.1 ms = 209.3 ms  (49%)  ← v0.4.0g.b next
+  moe     23 layers ×  8.2 ms = 188.3 ms  (44%)  ← #226 v0.4.0h
+  attention 6 layers ×  1.8 ms = 11.0 ms  ( 3%)
+  embed+lm_head+sample:         18.4 ms  ( 4%)
 ```
-57% sits in the Mamba2 SSD wrapper. Trace plan called this — eliminating
-the device→numpy→device per layer per step (#223 v0.4.0g) drops mamba2
-to ~2-3 ms/layer (just kernel) → step time ~340 ms ≈ 3 tok/s eager,
-or ~150 ms ≈ 6-7 tok/s after #226. THEN v0.4.1 trace × ~2× → 12-15
-tok/s. v0.5 (vocab-shard + RMSNorm fusion + on-device topk) → 30 tok/s
-demo target.
+
+**Next**: v0.4.0g.b — kill the remaining mamba2 per-layer ~7 ms of
+input padding by moving x/z/B/C/dt onto device-side permute+pad+repeat
+(eliminates `_pad_per_head_vector`, `_pad_dt_per_batch_per_head`,
+`_replicate_per_group_to_per_head`). Expected mamba2 drop to ~3 ms/layer
+≈ 69 ms → step ~290 ms ≈ 3.5 tok/s.
+
+Then v0.4.0h (MoE host paths → on-device), then v0.4.1 trace (multi-
+trace two-phase warmup, fp32 ssm risk per 35B precedent). Target
+≥30 tok/s reached via v0.5 (vocab-shard + RMSNorm fusion + on-device
+topk).
 
 Tracing plan written: [`research/nemotron3_trace_plan_2026-06-05.md`](research/nemotron3_trace_plan_2026-06-05.md).
 
