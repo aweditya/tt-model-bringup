@@ -62,8 +62,18 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.3.1.c step 3 (attn_prefill_tt + attn_decode_step_tt
-forward variants) → first true single-token decode step.
+**Phase 1 — exact next task**: v0.3.1.c step 3c (correctness debug of decode_step).
+
+**v0.3.1.c step 3b PLUMBING DONE 2026-06-05** (commit `abe079b`):
+attn_decode_step_tt + _shard_for_paged_write + _set_cur_pos_buf added,
+two-call Gemma 4 pattern. Smoke runs end-to-end without crash. Prefill
+argmax = HF = 6993 ✓. Decode argmax = 1911 ≠ HF 1063 ✗. Plumbing works
+(no TT_FATAL, valid token, constant-time decode possible) but math is
+off. Need to isolate root cause: paged_fill_cache→paged_update_cache
+hybrid cache state, GQA-split semantics, or Mamba2 ssm_state carry
+between prefill and decode. v0.3.1.a's 7/8 (with O(n²) re-forward) is
+the working multi-step correctness baseline; v0.3.1.c just needs to
+match it for constant-time perf.
 
 **v0.3.1.b DONE 2026-06-05** (commit `5ca94b8`): Mamba2 ssm_state lazy plumbing +
 defensive `getattr` for harness state-version skew. Regression PASS
