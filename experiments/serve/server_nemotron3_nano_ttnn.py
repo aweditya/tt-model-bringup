@@ -1289,8 +1289,13 @@ def attn_prefill_tt(state: State, h_input_tt, layer_idx: int):
     return block_tt
 
 
-def _set_cur_pos_buf(state, pos: int):
+def update_cur_pos_buf(state, pos: int):
     """Write `pos` into state.cur_pos_buf via copy_host_to_device_tensor.
+
+    MUST be called OUTSIDE trace capture (host-side from_torch is a write
+    that TT_FATALs inside captured region). Mirrors the 35B
+    `update_input_buffers` pattern at server_35b_ttnn.py:1527.
+
     NEVER realloc the buffer ([[ttnn-list-rebinding-leaks]])."""
     pos_host = ttnn.from_torch(
         torch.tensor([pos], dtype=torch.int32),
@@ -1339,8 +1344,10 @@ def attn_decode_step_tt(state: State, h_input_tt, layer_idx: int):
     HD = HEAD_DIM_ATTN
     Q_HALF = NQ // NKV  # 16 — GQA group size, also Q heads per SDPA call
 
-    # Sync cur_pos_buf to host-side cur_pos (the new-token position).
-    _set_cur_pos_buf(state, int(state.cur_pos))
+    # NOTE: cur_pos_buf MUST be updated by caller via update_cur_pos_buf
+    # BEFORE invoking this function. The host write was previously inline
+    # but moved out for trace-capture compatibility (forks 35B's
+    # update_input_buffers pattern).
 
     # Norm + Q/K/V projection (S=1).
     h_norm_tt = ttnn.rms_norm(h_input_tt, weight=w["norm"], epsilon=EPS)

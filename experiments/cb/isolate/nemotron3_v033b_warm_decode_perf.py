@@ -113,6 +113,7 @@ def main(state=None) -> int:
         step_times = []
         for step in range(N_STEPS):
             t0 = time.time()
+            srv.update_cur_pos_buf(state, int(state.cur_pos))
             h_np_dec = srv.embed_lookup(
                 state, np.asarray([[prev_token]], dtype=np.int64),
             )

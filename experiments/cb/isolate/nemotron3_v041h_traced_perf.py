@@ -116,6 +116,9 @@ def main(state=None) -> int:
     warm_token = prev_token
     for w in range(N_WARMUP_STEPS):
         t_w = time.time()
+        # update cur_pos_buf BEFORE attn_decode_step_tt (host write moved
+        # out of the function for trace compatibility — fork of 35B pattern)
+        srv.update_cur_pos_buf(state, int(state.cur_pos))
         h_np_dec = srv.embed_lookup(
             state, np.asarray([[warm_token]], dtype=np.int64),
         )
@@ -138,7 +141,9 @@ def main(state=None) -> int:
 
     # ── CAPTURE TRACE ────────────────────────────────────────────────
     log("CAPTURE TRACE of one decode step (pure-ttnn path)…")
+    # Both host buffers updated OUTSIDE capture; trace reads them.
     srv.update_tok_buf(state, warm_token)
+    srv.update_cur_pos_buf(state, int(state.cur_pos))
     t_cap = time.time()
     try:
         trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
@@ -171,6 +176,7 @@ def main(state=None) -> int:
     try:
         for s in range(N_TRACED_STEPS):
             srv.update_tok_buf(state, cur_token)
+            srv.update_cur_pos_buf(state, int(state.cur_pos))
             t_s = time.time()
             ttnn.execute_trace(state.mesh, trace_id, cq_id=0, blocking=True)
             argmax_torch = ttnn.to_torch(

@@ -129,6 +129,9 @@ def main(state=None) -> int:
     # ── WARMUP DECODE (1 throw-away step to trigger JIT) ──────────────
     log("WARMUP step (JIT cold)…")
     t0 = time.time()
+    # cur_pos_buf now caller-updated (moved out of attn_decode_step_tt
+    # for trace compatibility).
+    srv.update_cur_pos_buf(state, int(state.cur_pos))
     h_tt = _embed_to_tt(np.asarray([[prev_tok]], dtype=np.int64))
     dummy_ms = [0.0] * N_LAYERS
     h_tt = _forward_layers_timed(
@@ -145,6 +148,7 @@ def main(state=None) -> int:
     step_times = []
     for s in range(N_WARM_STEPS):
         t0 = time.time()
+        srv.update_cur_pos_buf(state, int(state.cur_pos))
         h_tt = _embed_to_tt(np.asarray([[prev_tok]], dtype=np.int64))
         h_tt = _forward_layers_timed(
             state, h_tt, srv, ttnn,

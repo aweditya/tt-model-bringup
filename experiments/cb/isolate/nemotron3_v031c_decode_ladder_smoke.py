@@ -132,6 +132,9 @@ def main(state=None) -> int:
             t0 = time.time()
             try:
                 if kind == "attention":
+                    # cur_pos_buf now caller-updated (was inline in
+                    # attn_decode_step_tt; moved out for trace compat).
+                    srv.update_cur_pos_buf(state, int(state.cur_pos))
                     h_out_tt = srv.attn_decode_step_tt(state, h_in_tt, L)
                 elif kind == "mamba2":
                     h_out_tt = srv.mamba2_block_eager_tt(state, h_in_tt, L)

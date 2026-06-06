@@ -121,11 +121,13 @@ def main(state=None) -> int:
         # ── DECODE STEP ────────────────────────────────────────────
         # The position of the new token is exactly len(prompt_ids) — that's
         # where attn_decode_step_tt writes K/V (slot 5). Update state.cur_pos
-        # (host-side); device cur_pos_buf is updated inside attn_decode_step_tt.
+        # (host-side) AND cur_pos_buf (device); both are caller-managed now
+        # (was inline in attn_decode_step_tt; moved out for trace compat).
         # NOTE: state.cur_pos was bumped by attn_prefill_tt to 30 (5 × 6 attn
         # layers), but for paged-cache semantics we need it = 5 (the position
         # to write the new token at). Override here.
         state.cur_pos = int(len(prompt_ids))
+        srv.update_cur_pos_buf(state, int(state.cur_pos))
         log(f"DECODE: new-token position = {state.cur_pos}; "
             f"input token = {prefill_argmax}")
         t0 = time.time()

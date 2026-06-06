@@ -140,6 +140,9 @@ def main(state=None) -> int:
                 break
             hf_expected = int(full_ids[target_pos])
             t0 = time.time()
+            # cur_pos_buf is now caller-updated (moved out of attn_decode_step_tt
+            # for trace compatibility — see commit history around 2026-06-06).
+            srv.update_cur_pos_buf(state, int(state.cur_pos))
             # Embed prev_token
             h_np_dec = srv.embed_lookup(
                 state, np.asarray([[prev_token]], dtype=np.int64),
