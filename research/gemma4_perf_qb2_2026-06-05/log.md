@@ -93,3 +93,59 @@ Append-only. Each entry is timestamped.
 - **NOT landed (risk/scope vs time budget)**: distributed RMSNorm (P2, +12-15 ms/tok projected); fused-rotary-embedding (`ttnn.experimental.rotary_embedding_llama_fused_qk` is available on qb2, would replace `_apply_full_rope`'s 7-op chain at 96 calls/forward = ~3-5 ms/forward kernel-time but needs sharded-input + transformation_mats setup).
 - **Open next** (low-medium risk): `concat_heads_decode → o_proj` fusion (tt-metal #44945, ~1 hr, +5-10% on attn). Can fork either the Llama-Galaxy demo or the in-tree gemma4 demo.
 
+---
+
+## Round 3 (subagent — kernel-time chase on what remains)
+
+### Baseline reconfirm (n=3, qb2, post-round-2 main HEAD)
+
+- 00:39 — Baseline run 1: eager **209.3** ms/tok, traced **49.4** ms/tok, 100/100 PASS. Log: `logs/round3/baseline_run1.log`.
+- 00:40 — Baseline run 2: eager **206.0** ms/tok, traced **49.0** ms/tok, 100/100 PASS. Log: `logs/round3/baseline_run2.log`.
+- 00:40 — Baseline run 3: eager **207.3** ms/tok, traced **49.4** ms/tok, 100/100 PASS. Log: `logs/round3/baseline_run3.log`.
+- **Aggregate (n=3)**: eager 207.5 ± 1.7, traced **49.3 ± 0.2 ms/tok (20.30 tok/s)** — matches round 2's 49.57 within noise.
+
+### Lever pick — per-forward RoPE-table caching
+
+- **Lever**: hoist `_lookup_rope` out of the per-layer hot path; compute (cos_sliding, sin_sliding) and (cos_global, sin_global) ONCE at top of `step_forward_v03`, reuse across all 40 sliding + 8 global layers.
+- **Why now**: round 1's Tracy v2 measured **Tilize 19.3 ms + TilizeWithValPadding 8.5 ms = 28 ms/forward** (>50% of the 51 ms traced budget). Round 2's `_shard_for_paged_write` cleanup removed ~176 Tilize ops/forward (cache-write path). The next biggest Tilize source by inspection is `_lookup_rope`: 48 layers × 2 to_layout(TILE) = **96 Tilize ops/forward** on the cos/sin embedding output. Plus 96 embedding ops + 96 reshape ops on a per-layer hot path. The cos/sin rows are IDENTICAL across all layers within a forward (same `state.rot_idxs_buf` for the whole step) — recomputing 48× is pure waste.
+- **Why this passes the kernel-vs-dispatch test ([[feedback-kernel-vs-dispatch-realization]])**: each Tilize is real kernel work on the device (~60 μs/op measured by Tracy v2). Eliminating 47/48 of these per forward removes ~47 × 60 μs × 2 = ~5.6 ms of kernel-time / forward. That's 50-100% realization in trace, not the 5-10% dispatch-fusion bucket.
+- **Mechanism**: add a `_compute_rope_for_forward(state)` helper at start of `step_forward_v03`; pass a `(cos_sliding, sin_sliding, cos_global, sin_global)` tuple through `_layer_forward_pos0_paged` to `_layer_pos0_sliding_paged` / `_layer_pos0_global_paged`; remove per-layer `_lookup_rope` + `deallocate(cos_tt, sin_tt)`; deallocate the 4 cached tensors at end of `step_forward_v03`.
+- **Risk**: low. RoPE tables are read-only across the layer loop; lifetime is one forward. The math is identical (same `rot_idxs_buf` → same cos/sin → same x_rope). Only behavioural risk is mishandling lifetime (early dealloc → garbage downstream — like [[ttnn-slice-view-decay]]).
+- **Predicted delta**: 4-7 ms/tok traced (8-14% on 49 ms). Eager: similar absolute but smaller % since eager is dispatch-dominated.
+- **Gate**: 100/100 token-for-token + n=3 traced runs.
+
+### Implementation + measurements
+
+- 00:45 — Edited `server_gemma4_unified_ttnn.py`:
+  - Added `_compute_rope_for_forward(state)` + `_release_rope_for_forward(rope_cache)` helpers after `_lookup_rope` (line 1066+).
+  - Added `rope=None` kwarg to `_layer_pos0_sliding_paged` (line 1145) and `_layer_pos0_global_paged` (line 1283); when provided, skip per-layer `_lookup_rope` and use the supplied (cos, sin); only deallocate when `owned_rope=True`.
+  - Added `rope_cache=None` kwarg to `_layer_forward_pos0_paged` (line 1372) that picks (cos_sliding, sin_sliding) for sliding layers and (cos_global, sin_global) for global.
+  - Wired `_compute_rope_for_forward` → loop → `_release_rope_for_forward` into BOTH `step_forward_v03` (eager path) and `forward_token_gm4_inner` (trace-captured path).
+- 00:45 — Wrote `experiments/cb/isolate/gm4_invalidate_trace.py` — clears `state.trace_id` so dev-harness reloads pick up the new captured trace. Without this the v04 validator measures the STALE captured trace and the traced delta looks like 0.
+- 00:45 — Deployed + reloaded module + invalidated trace.
+- 00:46 — Run 1 (fresh trace re-capture): eager **185.5** ms/tok, traced **48.2** ms/tok, 100/100 PASS. Log: `logs/round3/rope_cache_run1.log`.
+- 00:47 — Run 2: eager **183.1** ms/tok, traced **47.8** ms/tok, 100/100 PASS. Log: `logs/round3/rope_cache_run2.log`.
+- 00:47 — Run 3: eager **197.4** ms/tok, traced **47.9** ms/tok, 100/100 PASS. Log: `logs/round3/rope_cache_run3.log`.
+
+### Final aggregate (n=3 after the fix)
+
+| Metric | Baseline (round 3) | rope_cache | Delta |
+| --- | --- | --- | --- |
+| Eager mean ms/tok | 207.5 (std 1.7) | 188.7 (std 7.7) | **-9.1% (-19 ms)** |
+| Traced mean ms/tok | 49.27 (std 0.23) | 47.97 (std 0.21) | **-2.65% (-1.30 ms)** |
+| Traced tok/s | 20.30 | 20.85 | **+2.7%** |
+| Token-for-token | 100/100 | 100/100 | clean |
+
+- Both eager AND traced moved, as predicted by [[feedback-kernel-vs-dispatch-realization]] — the cos/sin tables are real kernel work (embedding + tilize + reshape), so the saved 47/48 ops/forward translate ~1:1 into trace time.
+- Round-3 traced 47.97 ms/tok = qb1's 47.5 ms/tok reference within noise. Caught up to qb1.
+
+### Round 3 final state
+
+- **Landed**: per-forward RoPE cache. Traced delta: **-1.30 ms/tok (-2.65%, 47.97 ms = 20.85 tok/s)**, eager delta: **-9.1% (-19 ms/tok)**. 3×100/100 token match.
+- **Combined w/ rounds 1-2**: traced 51.4 → 47.97 ms/tok = **1.072× cumulative**; eager 474.1 → 188.7 ms/tok = **2.51× cumulative**.
+- **Open next (low-medium risk)**:
+  - `concat_heads_decode → o_proj` fusion (still untried — round 2's roadmap item).
+  - Audit remaining Tilize sources: post-round-3 should be ~204 Tilize ops/forward (was ~316). Re-run Tracy v2 to find the next.
+  - Distributed RMSNorm (P2): biggest projected single win (12-15 ms) but heaviest scope.
+- **Probe added**: `experiments/cb/isolate/gm4_invalidate_trace.py` — needed for any future inner-forward edit + harness reload + v04-validator workflow.
+

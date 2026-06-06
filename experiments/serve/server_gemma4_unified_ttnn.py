@@ -1063,6 +1063,42 @@ def _lookup_rope(state, cos_table_tt, sin_table_tt, head_dim):
     return cos_tt, sin_tt
 
 
+def _compute_rope_for_forward(state):
+    """Round 3 perf (2026-06-05): hoist `_lookup_rope` out of the per-layer
+    hot path. The cos/sin rows are identical across ALL 48 layers within one
+    forward (same `state.rot_idxs_buf`); recomputing them per layer is pure
+    waste. Returns a 4-tuple ``(cos_sliding, sin_sliding, cos_global,
+    sin_global)`` consumed by the attention sub-layers. Caller MUST deallocate
+    via ``_release_rope_for_forward`` at end of forward.
+
+    Per-forward savings: 47 redundant sliding lookups + 7 redundant global =
+    54 hoisted lookups × 4 ops (embedding+to_layout+reshape per cos/sin) ≈
+    216 dispatches/forward + 108 fewer Tilize device-ops (~60 μs each per
+    round-1 Tracy v2 → ~6.5 ms/forward kernel time). Per
+    [[feedback-kernel-vs-dispatch-realization]] this is a kernel-time win
+    expected to realize ~1:1 in trace.
+
+    Forks: NONE — caching identical results across a loop is a generic
+    optimization. The pattern is the same one used in
+    `models/demos/llama3_70b_galaxy/tt/llama_attention.py` where rot_mats
+    are constructed once per decode step in the model wrapper, not per layer.
+    """
+    cos_s, sin_s = _lookup_rope(state, state.cos_sliding_tt,
+                                state.sin_sliding_tt, HEAD_DIM_SLIDING)
+    cos_g, sin_g = _lookup_rope(state, state.cos_global_tt,
+                                state.sin_global_tt, HEAD_DIM_GLOBAL)
+    return (cos_s, sin_s, cos_g, sin_g)
+
+
+def _release_rope_for_forward(rope_cache):
+    """Tear down the 4 cached cos/sin tensors from `_compute_rope_for_forward`.
+    Call at end of forward; the tensors are tile-layout L1 ([[ttnn-list-
+    rebinding-leaks]] anti-pattern requires explicit dealloc, not GC).
+    """
+    for t in rope_cache:
+        ttnn.deallocate(t)
+
+
 def _shard_for_paged_write(t_2d, state, n_kv_heads, head_dim, mem_cfg, dbg=False):
     """Reshard a [n_kv_heads, head_dim] TILE-layout tensor for paged_update_cache.
 
@@ -1106,7 +1142,7 @@ def _shard_for_paged_write(t_2d, state, n_kv_heads, head_dim, mem_cfg, dbg=False
     return out
 
 
-def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None):
+def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None, rope=None):
     """v0.3.0.1 sliding-attention via TWO paged SDPA calls (one per KV head).
 
     Each call uses NKV_PER_CHIP=1 effective — matches 35B's clean contract.
@@ -1118,6 +1154,12 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None):
     readbacks (q_proj_out, k_proj_out, v_proj_out, q_norm_out, k_norm_out,
     v_norm_out, q_rope_out, k_rope_out, mixer_out). Used by
     gm4_v031_L0_subops_pos1.py to bisect sub-ops at pos 0 vs pos 1.
+
+    rope (optional tuple): ``(cos_sliding, sin_sliding)`` from
+    ``_compute_rope_for_forward`` — when provided, skip the per-layer
+    embedding+tile lookup (round-3 perf). Pre-existing callers (probes /
+    sub-op captures) can still call without `rope` and get the legacy
+    per-layer path.
     """
     layer_caches = state.kv_caches_tt[layer_idx]  # list of 2 (kc, vc) tuples
 
@@ -1154,13 +1196,22 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None):
     # is identity — this validates the plumbing without changing the
     # answer. v0.3.1.1 will advance rot_idxs_buf per step for non-trivial
     # rotation at pos > 0.
-    cos_tt, sin_tt = _lookup_rope(state, state.cos_sliding_tt,
-                                  state.sin_sliding_tt, HEAD_DIM_SLIDING)
+    # Round-3 perf: prefer the forward-scoped rope cache when available;
+    # the per-layer lookup is wasteful (same cos/sin across all 48 layers
+    # within a single forward — see _compute_rope_for_forward).
+    if rope is not None:
+        cos_tt, sin_tt = rope
+        owned_rope = False
+    else:
+        cos_tt, sin_tt = _lookup_rope(state, state.cos_sliding_tt,
+                                      state.sin_sliding_tt, HEAD_DIM_SLIDING)
+        owned_rope = True
     q_n = _apply_full_rope(q_n_pre, cos_tt, sin_tt, NQ_PER_CHIP, HEAD_DIM_SLIDING)
     ttnn.deallocate(q_n_pre)
     k_n = _apply_full_rope(k_n_pre, cos_tt, sin_tt, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
     ttnn.deallocate(k_n_pre)
-    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+    if owned_rope:
+        ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
 
     # Two SDPA passes — one per (cache, KV-head, Q-half) trio.
     attn_outs = []
@@ -1229,11 +1280,15 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None):
     return out
 
 
-def _layer_pos0_global_paged(state, h_norm, w, layer_idx):
+def _layer_pos0_global_paged(state, h_norm, w, layer_idx, rope=None):
     """v0.3.1 global-attention via paged SDPA. NKV=1 (replicated across
     chips), head_dim=512, p-RoPE (rotate first 128 of 512 inline via the
     global cos/sin tables), attention_k_eq_v=True (V aliases K post-norm).
     Single SDPA call (no GQA split — NKV=1 already matches kernel contract).
+
+    rope (optional tuple): ``(cos_global, sin_global)`` from
+    ``_compute_rope_for_forward`` — when provided, skip the per-layer
+    embedding+tile lookup (round-3 perf).
     """
     layer_caches = state.kv_caches_tt[layer_idx]  # [(kc, vc)] — single-entry list
     kc, vc = layer_caches[0]
@@ -1260,13 +1315,20 @@ def _layer_pos0_global_paged(state, h_norm, w, layer_idx):
     # p-RoPE applied to Q and K (NOT V). The global cos/sin tables encode
     # the partial-RoPE structure inline (last 384 dims have inv_freq=0 so
     # cos=1, sin=0 acts as identity).
-    cos_tt, sin_tt = _lookup_rope(state, state.cos_global_tt,
-                                  state.sin_global_tt, HEAD_DIM_GLOBAL)
+    # Round-3 perf: per-forward rope cache (see _compute_rope_for_forward).
+    if rope is not None:
+        cos_tt, sin_tt = rope
+        owned_rope = False
+    else:
+        cos_tt, sin_tt = _lookup_rope(state, state.cos_global_tt,
+                                      state.sin_global_tt, HEAD_DIM_GLOBAL)
+        owned_rope = True
     q_n = _apply_full_rope(q_n_pre, cos_tt, sin_tt, NQ_PER_CHIP, HEAD_DIM_GLOBAL)
     ttnn.deallocate(q_n_pre)
     k_n = _apply_full_rope(k_n_pre, cos_tt, sin_tt, NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL)
     ttnn.deallocate(k_n_pre)
-    ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+    if owned_rope:
+        ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
 
     # Write K_rope, V to cache (NKV=1). Fused K+V dispatch — same op as
     # the sliding path above. Forks tt-metal `llama_attention.py:509-511`.
@@ -1307,10 +1369,15 @@ def _layer_pos0_global_paged(state, h_norm, w, layer_idx):
     return out
 
 
-def _layer_forward_pos0_paged(state, h_in, layer_idx):
+def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
     """v0.3.1 layer forward — uses paged SDPA on BOTH sliding and global
     layers. Sliding has 2 caches (per-KV-head, NKV=1 each); global has 1
-    cache (NKV=1 replicated)."""
+    cache (NKV=1 replicated).
+
+    rope_cache (optional 4-tuple from `_compute_rope_for_forward`):
+    ``(cos_sliding, sin_sliding, cos_global, sin_global)`` — when present,
+    the per-layer ``_lookup_rope`` call is skipped (round-3 perf).
+    """
     w = state.per_layer_tt[layer_idx]
     lt = state.layer_types[layer_idx]
     residual_1 = ttnn.clone(h_in)
@@ -1325,12 +1392,14 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx):
         if skip_sliding:
             mixer = ttnn.mul(h_norm, 0.0)
         else:
-            mixer = _layer_pos0_sliding_paged(state, h_norm, w, layer_idx)
+            rope = (rope_cache[0], rope_cache[1]) if rope_cache is not None else None
+            mixer = _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, rope=rope)
     else:
         if skip_global:
             mixer = ttnn.mul(h_norm, 0.0)
         else:
-            mixer = _layer_pos0_global_paged(state, h_norm, w, layer_idx)
+            rope = (rope_cache[2], rope_cache[3]) if rope_cache is not None else None
+            mixer = _layer_pos0_global_paged(state, h_norm, w, layer_idx, rope=rope)
     ttnn.deallocate(h_norm)
     post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
     ttnn.deallocate(mixer)
@@ -1413,12 +1482,20 @@ def step_forward_v03(state, tok_id, capture=None):
     h = ttnn.multiply(ttnn.to_layout(embed, ttnn.TILE_LAYOUT), EMBED_SCALE)
     ttnn.deallocate(embed)
 
+    # Round-3 perf: compute RoPE cos/sin tables ONCE per forward (sliding +
+    # global), reuse across all 48 layers. See _compute_rope_for_forward —
+    # eliminates 47/48 sliding lookups + 7/8 global lookups (~6.5 ms kernel
+    # time / forward per round-1 Tracy v2). Lifetime is exactly one forward.
+    rope_cache = _compute_rope_for_forward(state)
+
     for L in range(NUM_LAYERS):
-        h_new = _layer_forward_pos0_paged(state, h, L)
+        h_new = _layer_forward_pos0_paged(state, h, L, rope_cache=rope_cache)
         ttnn.deallocate(h)
         h = h_new
         if capture is not None and capture.get("per_layer", False):
             capture.setdefault("layer_h", {})[L] = _readback_replicated(h, state.mesh)
+
+    _release_rope_for_forward(rope_cache)
 
     final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
     ttnn.deallocate(h)
@@ -1531,10 +1608,17 @@ def forward_token_gm4_inner(state):
     embed = ttnn.embedding(state.tok_buf, state.embed_tt)
     h = ttnn.multiply(ttnn.to_layout(embed, ttnn.TILE_LAYOUT), EMBED_SCALE)
     ttnn.deallocate(embed)
+    # Round-3 perf: per-forward rope cache hoisted out of the per-layer
+    # hot path (see _compute_rope_for_forward; ~6.5 ms / forward of removed
+    # kernel time per round-1 Tracy v2). MUST appear inside this function
+    # so it's captured into the trace command list — the rope_cache
+    # tensors are produced + consumed within one traced forward.
+    rope_cache = _compute_rope_for_forward(state)
     for L in range(NUM_LAYERS):
-        h_new = _layer_forward_pos0_paged(state, h, L)
+        h_new = _layer_forward_pos0_paged(state, h, L, rope_cache=rope_cache)
         ttnn.deallocate(h)
         h = h_new
+    _release_rope_for_forward(rope_cache)
     final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
     ttnn.deallocate(h)
     argmax_tt, _ = _lm_head_argmax(state, final, capture_logits=False)

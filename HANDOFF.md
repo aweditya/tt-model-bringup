@@ -62,9 +62,11 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.4 trace capture. Constant-time
-decode is fully validated; trace will turn the 15s/step JIT-cold path
-into ~ms/step warm.
+**Phase 1 — exact next task**: v0.4 trace capture **scope-sized by
+v0.3.3.b perf data** (running now). v0.4 is the BIGGEST RISK per plan
+(fp32-in-trace, 35B precedent for hangs); want to know if warm-eager
+is already demo-tractable BEFORE committing days to the trace refactor.
+Constant-time decode pipeline is fully validated by v0.3.3 chain.
 
 **v0.3.3 DONE 2026-06-05** (commit `a617a76`): N-step decode chain
 6/7 PASS with recovery — identical bf16 drift pattern to v0.3.1.a
