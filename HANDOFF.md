@@ -53,11 +53,32 @@ stays at 0.26s warm step (~60× since v0.4.0d baseline).
 Next gates: v0.5 single-stream perf (vocab-shard lm_head, RMSNorm
 fusion, HiFi2) on the eager path, then v1 continuous batching.
 
-**Gemma 4 Round 10 DRAM access patterns (in flight, qb2)** — agent
-`a2fda3c7135228003` investigating Llama 70B prefetcher, DRAM-sharded
-matmul configs, cross-layer async weight prefetch. The Round 8
-diagnosis (BW/COMPUTE = 24.6×) makes any DRAM-traffic reduction the
-right next lever.
+**Gemma 4 Round 10 DRAM-sharded MLP (2026-06-06, qb2)** — Phase 1-3
+committed (`738a057` plan + `bbc072b` probe PASS cos=0.9999937).
+Phase 4 production integration shipped env-gated `TT_GM4_DRAM_PREFETCH=1`
+(commits `7762d7b` + `b0364db` + `980135b` reshard-alias fix). qb2
+validation BLOCKED on upload-side mesh-sharder — `ShardTensorToMesh(dim=0)`
++ WIDTH_SHARDED DRAM mem_cfg not a clean composition. **Next session
+entry**: fork `tt-metal/models/demos/llama3_70b_galaxy/tt/llama_mlp.py:65-70`'s
+`ShardTensor2dMesh(dims=...)` 2D-mesh-sharder pattern. Default branch
+fully working — no regression at 47.0 ms/tok.
+
+**Nemotron router long-context coherence test (in flight)** — open
+question after v0.4.0h.c research: 0/7 chain is bit-divergence vs
+non-deterministic `numpy.argpartition` (HF itself uses
+`torch.topk(sorted=False)` — no "correct" reference). At LONG
+context, does router-on-device produce COHERENT text (acceptable
+drift) or GIBBERISH (heinous)? Re-running v041f needle baseline with
+`NM3_ROUTER_ON_DEVICE=1` (commit pending). Outcome decides whether
+trace blocker #2 is "blocked on upstream" or "drift acceptable, ship
+with text-diff gate".
+
+**Tiling/sharding roadmap (Gemma 4)** — agent's landscape doc at
+`research/gemma4_perf_qb2_2026-06-05/tiling_sharding_plan.md` (commit
+`738a057`) maps ~24 levers across 10 families with file:line
+precedents. Rounds 10-17 stack projects 47 → 37 ms/tok (~21%);
+Rounds 18-20 multi-session experimental branches (bfp4, distributed
+RMSNorm, DRAM prefetcher).
 
 ---
 
