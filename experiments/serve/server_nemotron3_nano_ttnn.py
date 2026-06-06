@@ -1945,19 +1945,9 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     B_inner_tt = ttnn.slice(silu_out_tt, [0, 0, D_INNER],            [B, S, D_INNER + BC_SIZE])
     C_inner_tt = ttnn.slice(silu_out_tt, [0, 0, D_INNER + BC_SIZE],  [B, S, D_INNER + 2 * BC_SIZE])
 
-    x_inner_np = _rb(x_inner_tt)
-    z_full_np  = _rb(z_tt)
-    B_inner_np = _rb(B_inner_tt)
-    C_inner_np = _rb(C_inner_tt)
-    dt_full_np = _rb(dt_tt)
-    ttnn.deallocate(x_inner_tt); ttnn.deallocate(B_inner_tt)
-    ttnn.deallocate(C_inner_tt); ttnn.deallocate(silu_out_tt)
-    ttnn.deallocate(dt_tt)
-
-    x_inner_np = x_inner_np.reshape(B, S, NH, HD)
-    z_inner_np = z_full_np.reshape(B, S, NH, HD)
-    B_inner_np = B_inner_np.reshape(B, S, NG, SS)
-    C_inner_np = C_inner_np.reshape(B, S, NG, SS)
+    # v0.4.0g.b — defer the deallocate of silu_out_tt + numpy readback to
+    # AFTER we know which path we'll take. Pure-tt-tt path keeps the
+    # tt tensors alive; legacy paths read them back.
 
     import nemotron3_mamba2_step as _step_mod
     dt_bias = w["dt_bias_np"]
@@ -1973,28 +1963,79 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     # v0.4.0g — defensive: only take the pure-state path if the wrapper
     # module actually exposes it (handles harness reload of server-only
     # without reloading nemotron3_mamba2_step — [[harness-state-version-skew]]).
-    _has_pure_fn = hasattr(_step_mod, "mamba2_decode_step_ttnn_pure_state")
-    if "const_tt" not in w and S == 1 and _has_pure_fn:
+    _has_pure_state = hasattr(_step_mod, "mamba2_decode_step_ttnn_pure_state")
+    _has_pure_tt = hasattr(_step_mod, "mamba2_decode_step_ttnn_pure_tt")
+    if "const_tt" not in w and S == 1 and _has_pure_state:
         w["const_tt"] = _step_mod.prepare_mamba2_constants(
             dt_bias, A_log, D_w, B=B, num_heads=NH, device=state.mesh,
         )
     has_const_tt = "const_tt" in w
-    use_pure_state = (
+    use_pure_tt = (
         S == 1
-        and _has_pure_fn
+        and _has_pure_tt
+        and has_const_tt
+        and _ssm_list_tt is not None
+        and layer_idx < len(_ssm_list_tt)
+        and _ssm_list_tt[layer_idx] is not None
+    )
+    use_pure_state = (
+        not use_pure_tt
+        and S == 1
+        and _has_pure_state
         and has_const_tt
         and _ssm_list_tt is not None
         and layer_idx < len(_ssm_list_tt)
         and _ssm_list_tt[layer_idx] is not None
     )
 
-    if use_pure_state:
-        # v0.4.0g pure-state hot path. ssm_state never crosses host;
-        # y stays on device; mixer_norm_w is pre-uploaded.
-        # The kernel writes through the state input buffer (35B GDN
-        # pattern at server_35b_ttnn.py:595). Clone via ttnn.add(_, 0.0)
-        # so the persistent buffer survives across the kernel call, then
-        # swap pointers post-call.
+    if use_pure_tt:
+        # v0.4.0g.b FULLY PURE TT path — no numpy roundtrip at all.
+        # Inputs flow ttnn.Tensor → on-device pad → kernel → ttnn.Tensor.
+        # Same clone-state pattern as pure_state (kernel writes through
+        # the input state buffer).
+        ssm_state_clone = ttnn.add(_ssm_list_tt[layer_idx], 0.0)
+        new_state_tt, y_out_tt = _step_mod.mamba2_decode_step_ttnn_pure_tt(
+            x_tt=x_inner_tt, z_tt=z_tt, dt_tt=dt_tt,
+            B_in_tt=B_inner_tt, C_in_tt=C_inner_tt,
+            dt_bias_tt=w["const_tt"]["dt_bias_tt"],
+            A_log_tt=w["const_tt"]["A_log_tt"],
+            D_tt=w["const_tt"]["D_tt"],
+            ssm_state_tt=ssm_state_clone,
+            device=state.mesh,
+            B=B, NH=NH, HD=HD, NG=NG, SS=SS,
+            debug_mode=5,
+        )
+        ttnn.deallocate(x_inner_tt)
+        ttnn.deallocate(B_inner_tt)
+        ttnn.deallocate(C_inner_tt)
+        ttnn.deallocate(dt_tt)
+        ttnn.deallocate(silu_out_tt)
+        # State promotion (same as pure_state path).
+        ttnn.deallocate(_ssm_list_tt[layer_idx])
+        _ssm_list_tt[layer_idx] = new_state_tt
+        # Kernel y_out_tt: [B, NH, 32, HD] padded. Slice row 0, materialise, reshape.
+        y_row0_view = ttnn.slice(y_out_tt, [0, 0, 0, 0], [B, NH, 1, HD])
+        zeros = ttnn.zeros_like(y_row0_view)
+        y_row0 = ttnn.add(y_row0_view, zeros)
+        ttnn.deallocate(zeros)
+        ttnn.deallocate(y_out_tt)
+        y_tt = ttnn.reshape(y_row0, [B, S, NH * HD])
+    elif use_pure_state:
+        # v0.4.0g.a pure-state hot path. ssm_state on device + y on device,
+        # but small inputs still readback + numpy-pad. Kept as fallback in
+        # case v0.4.0g.b regresses.
+        x_inner_np = _rb(x_inner_tt)
+        z_full_np = _rb(z_tt)
+        B_inner_np = _rb(B_inner_tt)
+        C_inner_np = _rb(C_inner_tt)
+        dt_full_np = _rb(dt_tt)
+        ttnn.deallocate(x_inner_tt); ttnn.deallocate(B_inner_tt)
+        ttnn.deallocate(C_inner_tt); ttnn.deallocate(silu_out_tt)
+        ttnn.deallocate(dt_tt)
+        x_inner_np = x_inner_np.reshape(B, S, NH, HD)
+        z_inner_np = z_full_np.reshape(B, S, NH, HD)
+        B_inner_np = B_inner_np.reshape(B, S, NG, SS)
+        C_inner_np = C_inner_np.reshape(B, S, NG, SS)
         ssm_state_clone = ttnn.add(_ssm_list_tt[layer_idx], 0.0)
         new_state_tt, y_out_tt = _step_mod.mamba2_decode_step_ttnn_pure_state(
             x=x_inner_np[:, 0, :, :],
@@ -2009,13 +2050,8 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
             device=state.mesh,
             debug_mode=5,
         )
-        # ssm_state_clone may BE new_state_tt (in-place write). Don't
-        # touch the clone here. Release the OLD persistent buffer and
-        # promote new_state_tt as the new persistent state.
         ttnn.deallocate(_ssm_list_tt[layer_idx])
         _ssm_list_tt[layer_idx] = new_state_tt
-        # Kernel y_out_tt shape: [B, NH, 32, HD] padded (value at row 0).
-        # Slice row 0 → [B, NH, 1, HD] → materialise → reshape [B, S=1, NH*HD].
         y_row0_view = ttnn.slice(y_out_tt, [0, 0, 0, 0], [B, NH, 1, HD])
         zeros = ttnn.zeros_like(y_row0_view)
         y_row0 = ttnn.add(y_row0_view, zeros)
@@ -2024,6 +2060,18 @@ def mamba2_block_eager_tt(state: State, h_input_tt, layer_idx: int):
         y_tt = ttnn.reshape(y_row0, [B, S, NH * HD])
     else:
         # Legacy numpy-state path (prefill S>1 or probes without const_tt).
+        x_inner_np = _rb(x_inner_tt)
+        z_full_np = _rb(z_tt)
+        B_inner_np = _rb(B_inner_tt)
+        C_inner_np = _rb(C_inner_tt)
+        dt_full_np = _rb(dt_tt)
+        ttnn.deallocate(x_inner_tt); ttnn.deallocate(B_inner_tt)
+        ttnn.deallocate(C_inner_tt); ttnn.deallocate(silu_out_tt)
+        ttnn.deallocate(dt_tt)
+        x_inner_np = x_inner_np.reshape(B, S, NH, HD)
+        z_inner_np = z_full_np.reshape(B, S, NH, HD)
+        B_inner_np = B_inner_np.reshape(B, S, NG, SS)
+        C_inner_np = C_inner_np.reshape(B, S, NG, SS)
         if (_ssm_list_np
                 and layer_idx < len(_ssm_list_np)
                 and _ssm_list_np[layer_idx] is not None):

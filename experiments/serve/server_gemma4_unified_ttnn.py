@@ -970,7 +970,9 @@ def _layer_forward_pos0(state, h_in, layer_idx):
     """
     w = state.per_layer_tt[layer_idx]
     lt = state.layer_types[layer_idx]
-    residual_1 = ttnn.clone(h_in)
+    # Round 6 perf (2026-06-05): see comment in `_layer_forward_pos0_paged`
+    # below for why the defensive `residual_1 = ttnn.clone(h_in)` is now
+    # gone (rms_norm is functional, h_in is safe to reuse as residual).
     h_norm = ttnn.rms_norm(h_in, weight=w["input_layernorm"], epsilon=EPS)
     if lt == "sliding_attention":
         mixer = _layer_pos0_sliding(state, h_norm, w)
@@ -979,8 +981,8 @@ def _layer_forward_pos0(state, h_in, layer_idx):
     ttnn.deallocate(h_norm)
     post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
     ttnn.deallocate(mixer)
-    h_after_attn = ttnn.add(residual_1, post_attn)
-    ttnn.deallocate(residual_1); ttnn.deallocate(post_attn)
+    h_after_attn = ttnn.add(h_in, post_attn)
+    ttnn.deallocate(post_attn)
     pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"], epsilon=EPS)
     # Round-4 perf (2026-06-05): fuse gelu into gate_proj matmul; see the
     # round-4 note in `_layer_forward_pos0_paged` below for details + probe
@@ -1408,7 +1410,18 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
     """
     w = state.per_layer_tt[layer_idx]
     lt = state.layer_types[layer_idx]
-    residual_1 = ttnn.clone(h_in)
+    # Round 6 perf (2026-06-05): drop the defensive `residual_1 = ttnn.clone(h_in)`.
+    # `ttnn.rms_norm` returns a NEW tensor (`h_norm`) without mutating its
+    # input (verified by static analysis of
+    # tt-metal `ttnn/cpp/ttnn/operations/normalization/rmsnorm/` — the kernel
+    # writes to a fresh output buffer). Subsequent ops in the layer body
+    # (mixer, post_attn) never alias h_in either. So `h_in` itself is safe
+    # to use as the residual operand in the trailing add. Saves 1 op per
+    # layer × 48 layers = 48 clones/forward (~0.3-0.5 ms expected).
+    # The clone was added during v0.1 bringup ("L0 PASS, L1 hard-FAIL")
+    # under a now-disproved aliasing hypothesis; the real L0/L1 bug at
+    # the time was elsewhere (q_norm zero-centered offset, see
+    # [[feedback-qwen36-qnorm-knorm-zero-centered]]).
     h_norm = ttnn.rms_norm(h_in, weight=w["input_layernorm"], epsilon=EPS)
     # DEBUG: GM4_SKIP_SLIDING=1 / GM4_SKIP_GLOBAL=1 short-circuit one
     # attention type to a zero-mixer (residual passes through). Used to
@@ -1431,8 +1444,8 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
     ttnn.deallocate(h_norm)
     post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
     ttnn.deallocate(mixer)
-    h_after_attn = ttnn.add(residual_1, post_attn)
-    ttnn.deallocate(residual_1); ttnn.deallocate(post_attn)
+    h_after_attn = ttnn.add(h_in, post_attn)
+    ttnn.deallocate(post_attn)
     pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"], epsilon=EPS)
     # Round-4 perf (2026-06-05): fuse gelu into gate_proj matmul via the
     # `activation="gelu"` fused-activation parameter. Per tt-metal

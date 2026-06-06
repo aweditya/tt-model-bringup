@@ -83,3 +83,32 @@ Degree histogram: {2:4}
 [02:39:44]   RoPE tables: sliding [(4096, 256)] + global [(4096, 512)] (MAX_KV=4096, sin half-sign-baked for round-5 roll fusion)
 [02:39:44] [bootstrap] uploading 48 layer weights to mesh…
 [02:39:58]   layer 10/48 uploaded (13.9s)
+[02:40:12]   layer 20/48 uploaded (27.9s)
+[02:40:26]   layer 30/48 uploaded (41.9s)
+[02:40:40]   layer 40/48 uploaded (55.6s)
+[02:40:51]   all layer weights uploaded in 66.9s
+[02:40:51] [bootstrap] ready (v0.1.0 — embed + L0 input_layernorm only).
+[02:40:51] bootstrap took 85.1s
+[02:40:51] running 100 EAGER steps (teacher-forced pos 0..5, free-run after)…
+[02:41:34]   eager done in 42.7s (426.8 ms/tok)
+[02:41:34]   eager first 10: [532, 575, 532, 496, 100, 45518, 100, 101, 818, 5279]
+[02:41:34]   eager last  10: [1018, 45518, 107, 101, 818, 5279, 529, 7001, 563, 5213]
+[02:41:34] capturing decode trace…
+[02:41:34] [trace] warmup + capture decode trace…
+[02:41:34] [trace] captured in 654 ms (id=MeshTraceId(0))
+[02:41:34]   trace capture took 0.7s
+[02:41:34] running 100 TRACED steps (same prompt)…
+[02:41:39]   traced done in 4.7s (46.8 ms/tok)
+[02:41:39]   traced first 10: [532, 575, 532, 496, 100, 45518, 100, 101, 818, 5279]
+[02:41:39]   traced last  10: [1018, 45518, 107, 101, 818, 5279, 529, 7001, 563, 5213]
+[02:41:39] ==============================================================================
+[02:41:39] v0.4 traced vs eager token-for-token match: 100/100
+[02:41:39] ==============================================================================
+[02:41:39] VERDICT: PASS
+2026-06-06 02:41:40.721 | info     |    BuildKernels | JIT cache stats: 363/492 hits (73.8%) [363 cached, 374 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:197)
+2026-06-06 02:41:40.721 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-06-06 02:41:40.721 | info     |    BuildKernels | JIT telemetry [dependencies_up_to_date]: count=726, total=582.686ms, min=0.021ms, max=6.588ms, mean=0.803ms (build_cache_telemetry.cpp:238)
+2026-06-06 02:41:40.721 | info     |    BuildKernels | JIT telemetry [JitBuildState::build]: count=492, total=66319.258ms, min=0.547ms, max=616.129ms, mean=134.795ms (build_cache_telemetry.cpp:238)
+2026-06-06 02:41:40.721 | info     |    BuildKernels | JIT telemetry [jit_build]: count=159, total=286.418ms, min=0.566ms, max=6.977ms, mean=1.801ms (build_cache_telemetry.cpp:238)
+2026-06-06 02:41:40.751 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:490)
+2026-06-06 02:41:40.751 | info     |             UMD | Closing devices in cluster (cluster.cpp:961)

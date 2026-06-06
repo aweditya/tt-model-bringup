@@ -454,9 +454,82 @@ def mamba2_decode_step_ttnn_pure_state(
     return state_out_tt, y_out_tt
 
 
+# ── v0.4.0g.b — on-device pad equivalents ─────────────────────────────
+# Validated cos=0.999999 vs numpy in
+# `experiments/cb/isolate/nemotron3_v040gb_ondevice_pads_probe.py`.
+
+def _pad_per_head_vector_tt(x_tt, *, B, NH, HD, ttnn):
+    """[B, 1, NH*HD] TILE bf16 → [B, NH, 32, HD] TILE bf16 (value at row 0)."""
+    x_4d = ttnn.reshape(x_tt, [B, 1, NH, HD])
+    x_perm = ttnn.permute(x_4d, (0, 2, 1, 3))
+    return ttnn.pad(x_perm, [(0, 0), (0, 0), (0, 31), (0, 0)], value=0.0)
+
+
+def _pad_dt_tt(dt_tt, *, B, NH, ttnn):
+    """[B, 1, NH] TILE bf16 → [B, NH, 32, 32] TILE bf16 (value at [0,0])."""
+    dt_4d = ttnn.reshape(dt_tt, [B, NH, 1, 1])
+    return ttnn.pad(dt_4d, [(0, 0), (0, 0), (0, 31), (0, 31)], value=0.0)
+
+
+def _replicate_per_group_to_per_head_tt(bc_tt, *, B, NH, NG, SS, ttnn):
+    """[B, 1, NG*SS] TILE bf16 → [B, NH, 32, SS] TILE bf16
+    (each group broadcast to NH/NG consecutive heads, value at row 0)."""
+    heads_per_group = NH // NG
+    bc_4d = ttnn.reshape(bc_tt, [B, 1, NG, SS])
+    bc_perm = ttnn.permute(bc_4d, (0, 2, 1, 3))   # [B, NG, 1, SS]
+    bc_5d = ttnn.reshape(bc_perm, [B, NG, 1, 1, SS])
+    bc_rep5 = ttnn.repeat(bc_5d, ttnn.Shape([1, 1, heads_per_group, 1, 1]))
+    bc_4d_nh = ttnn.reshape(bc_rep5, [B, NH, 1, SS])
+    return ttnn.pad(bc_4d_nh, [(0, 0), (0, 0), (0, 31), (0, 0)], value=0.0)
+
+
+def mamba2_decode_step_ttnn_pure_tt(
+    *,
+    x_tt, z_tt, dt_tt, B_in_tt, C_in_tt,    # ttnn.Tensors at LOGICAL shapes:
+                                            #   x_tt, z_tt:        [B, 1, NH*HD]
+                                            #   dt_tt:             [B, 1, NH]
+                                            #   B_in_tt, C_in_tt:  [B, 1, NG*SS]
+    dt_bias_tt, A_log_tt, D_tt,             # pre-uploaded padded constants
+    ssm_state_tt,                           # ttnn.Tensor fp32 [B, NH, HD, SS]
+    device,
+    B, NH, HD, NG, SS,
+    debug_mode: int = 5,
+):
+    """v0.4.0g.b — fully ttnn.Tensor in/out. Eliminates all numpy roundtrip
+    in the Mamba2 decode hot path. Padding happens entirely on-device via
+    `_pad_per_head_vector_tt`, `_pad_dt_tt`, `_replicate_per_group_to_per_head_tt`.
+
+    Returns (state_out_tt, y_out_tt). Caller deallocates them.
+    """
+    import ttnn
+
+    x_padded   = _pad_per_head_vector_tt(x_tt, B=B, NH=NH, HD=HD, ttnn=ttnn)
+    z_padded   = _pad_per_head_vector_tt(z_tt, B=B, NH=NH, HD=HD, ttnn=ttnn)
+    dt_padded  = _pad_dt_tt(dt_tt, B=B, NH=NH, ttnn=ttnn)
+    B_padded   = _replicate_per_group_to_per_head_tt(
+        B_in_tt, B=B, NH=NH, NG=NG, SS=SS, ttnn=ttnn,
+    )
+    C_padded   = _replicate_per_group_to_per_head_tt(
+        C_in_tt, B=B, NH=NH, NG=NG, SS=SS, ttnn=ttnn,
+    )
+
+    state_out_tt, y_out_tt = ttnn.experimental.nemotron3_mamba2_decode_owned(
+        x_padded, z_padded, dt_padded, dt_bias_tt, A_log_tt, D_tt,
+        B_padded, C_padded, ssm_state_tt,
+        debug_mode=debug_mode,
+    )
+    ttnn.deallocate(x_padded)
+    ttnn.deallocate(z_padded)
+    ttnn.deallocate(dt_padded)
+    ttnn.deallocate(B_padded)
+    ttnn.deallocate(C_padded)
+    return state_out_tt, y_out_tt
+
+
 __all__ = [
     "mamba2_decode_step_ttnn",
     "prepare_mamba2_constants",
     "mamba2_decode_step_ttnn_with_const_tt",
     "mamba2_decode_step_ttnn_pure_state",
+    "mamba2_decode_step_ttnn_pure_tt",
 ]
