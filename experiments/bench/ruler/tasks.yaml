@@ -1,0 +1,71 @@
+# RULER task-set definitions for v0.5 acceptance + full bench sweep.
+#
+# Stays in lock-step with `_runner.py:TASK_SETS` (both list the same tasks +
+# lengths + sample counts; if you change one, change the other).
+#
+# Upstream task definitions live in NVIDIA/RULER `scripts/synthetic.yaml`;
+# we don't redefine them here, just select + size the cuts we want.
+#
+# Why v0.5_accept is 3 tasks not 13: budget. Gemma 4 12B at ~50 ms/tok on
+# qb2 → 50 samples × ~150 tokens-out × 3 tasks × 4 lengths ≈ 90 device-min
+# + prefill. Full sweep (v0_5_bench_full) ~24h, reserved for end-of-perf-
+# round runs (see `feedback_perf_workflow.md`).
+
+ruler_upstream:
+  repo: "https://github.com/NVIDIA/RULER"
+  sha:  "TBD"   # set in phase 1, see experiments/bench/ruler/README.md
+
+task_sets:
+
+  v0_5_accept_smoke:
+    purpose: "single-task end-to-end pipeline smoke. ~3 min wall."
+    tasks:    ["niah_single_1"]
+    lengths:  [4096]
+    samples:  10
+    accept:
+      # smoke = any score is a pass; we just want the JSON to land
+      niah_single_1@4096: ">= 0.0"
+
+  v0_5_accept:
+    purpose: "perf-round + post-bring-up correctness gate. ~3h wall on Gemma 4 12B."
+    tasks:    ["niah_single_1", "niah_multikey_2", "vt"]
+    lengths:  [4096, 8192, 16384, 32768]
+    samples:  50
+    accept:
+      # floors from research/ruler_gemma4_integration_plan.md "Pass/fail"
+      niah_single_1@4096:    ">= 0.85"
+      niah_multikey_2@16384: ">= 0.50"
+      vt@8192:               ">= 0.30"
+      # sanity: no task at any length should hit zero
+      _all_:                 "> 0.0"
+
+  v0_5_bench_full:
+    purpose: "full upstream sweep, paper-table-comparable. ~24h. End-of-round only."
+    tasks:
+      - niah_single_1
+      - niah_single_2
+      - niah_single_3
+      - niah_multikey_1
+      - niah_multikey_2
+      - niah_multikey_3
+      - niah_multivalue
+      - niah_multiquery
+      - vt
+      - cwe
+      - fwe
+      - qa_1
+      - qa_2
+    lengths:  [4096, 8192, 16384, 32768, 65536, 131072]
+    samples:  500
+    accept:
+      # No fixed accept gate at full sweep. Reported as a table; compare to
+      # upstream (Llama-3.1-8B-Instruct / Mistral-Nemo-12B class) anchors in
+      # the design doc.
+
+backends:
+  # Maps our TT_BACKEND env to the OpenAI `model` field the server reports
+  # via /v1/models. Must match experiments/serve/cb_api.py:BACKENDS.
+  gemma4_12b:     "google/gemma-4-12b-it"
+  "27b":          "Qwen/Qwen3.6-27B"
+  "35b":          "Qwen/Qwen3.6-35B-A3B"
+  nemotron3_nano: "nvidia/Nemotron-3-Nano-30B-A3B"
