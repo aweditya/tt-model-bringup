@@ -52,3 +52,37 @@ Append-only. Each entry is timestamped.
 - **Open next**: eliminate redundant TM ops in `_shard_for_paged_write` (5-op chain per K/V staging; ~800 dispatches/forward). Could fold the row-major→pad→tile→to_memory_config into the upstream matmul output spec. Estimated savings: 0.5-2 ms/tok traced.
 - **Open further out**: distributed RMSNorm via `ttnn.rms_norm_pre_all_gather` + `all_gather` + `ttnn.rms_norm_post_all_gather` (or the all-in-one `ttnn.fused_rms_minimal`). All three ops are available in qb2's ttnn build. Requires sharding `h` from REPLICATED → 1/4 width on each chip. Major surgery.
 
+---
+
+## Round 2 (subagent, picks up where round 1 left off)
+
+### Plan + lever pick — `_shard_for_paged_write` simplification
+
+- 00:11 — **Baseline re-confirm run 1** with main HEAD on qb2: eager **231.9 ms/tok**, traced **50.9 ms/tok**, 100/100 PASS. Matches round 1's mean (eager 224.7, traced 51.13) within noise. Log: `logs/baseline_round2_run1.log`.
+- **Lever picked**: `_shard_for_paged_write` 5-op chain → minimal `to_memory_config`-only reshard.
+  - **Why now**: round 1's Tracy v2 measured Tilize + TilizeWithValPadding = 28 ms / forward (>50% of traced budget). `_shard_for_paged_write` fires 176×/forward (88 K + 88 V across 40 sliding + 8 global decoder layers); each invocation calls `to_layout(ROW_MAJOR)` → `reshape` → `pad` → `to_layout(TILE)` → `to_memory_config`. The post-RoPE input is ALREADY tile-layout, and slicing `[1, head_dim]` from a TILE-padded `[NKV, head_dim]` tensor gives byte-identical layout to the post-pad+tile `[1, 1, BLOCK_SIZE=32, head_dim]` (tile-pad rows 1..31 = zeros either way; kernel only writes row 0). So untile→pad→tile is pure overhead.
+  - **Mechanism**: replace `_shard_for_paged_write` chain with a single `to_memory_config` reshard from the post-slice tile-layout `[1, head_dim]` to the L1-sharded `[BLOCK_SIZE, head_dim]` memory config — bytes match, only metadata changes.
+  - **Predicted delta**: tighter (kernel-time, not just dispatch tax). Eager: maybe -30 to -80 ms / tok (4 dispatches × 176 calls × ~100 μs each). Traced: should land 1-5 ms / tok if the Untilize+Tilize ops are kernel work (round 1's Tracy v2 said 19.3 ms Tilize + 8.5 ms TilizeWithValPadding kernel time / forward).
+  - **Risk**: medium. Kernel `paged_fused_update_cache` validates `input.padded_shape[1] == 1` (B), `input.padded_shape[-1] == cache.padded_shape[-1]`, input.is_sharded, shard.shape[1] == padded_shape[-1]. Need to confirm a `[1, head_dim]` tile-layout (padded to `[32, head_dim]`) reshape-viewed as `[1, 1, 32, head_dim]` satisfies these. If reshape's volume check fails, fall back to `ttnn.view` (no volume check). If even THAT fails, fall back to a one-call `_shard_for_paged_write_v2` that does just `to_memory_config` and validate that the padded_shape automatically becomes `[1, 1, 32, head_dim]` after the reshard.
+  - **Gate**: 100/100 token-for-token + n=3 traced runs.
+
+### Probe + production land
+
+- 00:17 — **Isolation probe PASS**: `experiments/cb/isolate/gm4_shard_for_paged_write_v2.py` runs single-device, fakes `paged_fused_update_cache` with N_KV=1, HEAD_DIM=256 (sliding shape). Both variants land K, V at the correct cache slot at cos = 0.999999. **Cross-variant max|delta| = 0.0** (K and V) — the simplified variant is bit-identical to the old chain. Confirms the post-RoPE tile-layout `[1, head_dim]` (padded to `[32, head_dim]`) reshape-viewed as `[1, n_kv_heads, 1, head_dim]` carries the same bytes after `to_memory_config`. Log: `logs/probe_shard_v2.log`.
+- 00:20 — **Production `_shard_for_paged_write` simplified** (`server_gemma4_unified_ttnn.py:1066-1106`). 5-op chain → 2-op (reshape + to_memory_config). Deployed to qb2. **Validator run 1**: eager 199.8 ms/tok, traced 49.7 ms/tok, 100/100 PASS.
+- 00:22 — Validator run 2: eager 211.7, traced 49.5, 100/100 PASS.
+- 00:24 — Validator run 3: eager 214.9, traced 49.5, 100/100 PASS.
+
+### Final aggregate (n=3 after the fix)
+
+| Metric | Baseline (round 2) | Simplified | Delta |
+| --- | --- | --- | --- |
+| Eager mean ms/tok | 221.8 (std 8.8) | 208.8 (std 6.5) | **-5.9% (-13 ms)** |
+| Traced mean ms/tok | 51.27 (std 0.32) | 49.57 (std 0.09) | **-3.3% (-1.7 ms)** |
+| Traced tok/s | 19.50 | 20.17 | **+3.4%** |
+| Token-for-token | 100/100 | 100/100 | clean |
+
+- Baseline logs: `logs/baseline_round2_run{1,2,3}.log`
+- Post-fix logs: `logs/shard_v2_v04_run{1,2,3}.log`
+- **Both eager AND traced moved** — unlike round 1's paged_fused_update_cache where only eager moved. The 4 dispatches per `_shard_for_paged_write` × 176 calls × ~17 μs / dispatch ≈ ~12 ms / forward of pure dispatch tax is now gone; that's what the eager delta reflects. The traced delta (~1.7 ms) is the kernel-time portion (Untilize + Tilize work that the kernel was actually doing — caught by Tracy v2 at 28 ms / forward but the simplification only removes a piece of that, since the FUSED-UPDATE kernel itself still untilizes a single tile per head inside).
+

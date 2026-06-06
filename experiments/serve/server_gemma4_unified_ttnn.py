@@ -1064,25 +1064,45 @@ def _lookup_rope(state, cos_table_tt, sin_table_tt, head_dim):
 
 
 def _shard_for_paged_write(t_2d, state, n_kv_heads, head_dim, mem_cfg, dbg=False):
-    """Reshape + pad a [n_kv_heads, head_dim] per-chip tensor for paged_update_cache.
+    """Reshard a [n_kv_heads, head_dim] TILE-layout tensor for paged_update_cache.
 
     Output: HEIGHT_SHARDED L1 [1, n_kv_heads, BLOCK_SIZE, head_dim] per chip.
+
+    Round 2 simplification (2026-06-05): the prior 5-op chain
+    (to_layout(RM) → reshape → pad → to_layout(TILE) → to_memory_config)
+    was pure overhead. The post-RoPE input is already TILE-layout and
+    tile-padded along seq to TILE_HEIGHT=32 = sdpa_block_size; its byte
+    layout matches the L1-sharded [1, n_kv_heads, BLOCK_SIZE, head_dim]
+    target verbatim (tile-pad rows beyond logical n_kv_heads carry zeros
+    either way; the fused-update kernel writes only row 0 per
+    paged_tiled_fused_update_cache_program_factory.cpp:61-64). So one
+    metadata reshape + one to_memory_config reshard suffices.
+
+    Validated bit-equivalent to the old chain at
+    experiments/cb/isolate/gm4_shard_for_paged_write_v2.py (probe_shard_v2.log,
+    K and V cross-variant max|delta| = 0.0). Kernel-time win comes from
+    eliminating ~352 dispatches/forward (4 ops × 176 calls) of which
+    Untilize + Tilize round-trips dominate per round-1 Tracy v2 capture
+    (Tilize 19.3 ms + TilizeWithValPadding 8.5 ms = 28 ms / forward, >50%
+    of traced budget at 51 ms).
+
+    Forks `models/demos/llama3_70b_galaxy/tt/llama_attention.py:509-514`
+    where K, V also enter paged_fused_update_cache as already-tile-layout
+    L1-sharded tensors fresh out of `rotary_embedding_llama_fused_qk` —
+    no intermediate untile/repad/retile.
     """
-    if dbg: print(f"  [shard dbg] t_2d shape={list(t_2d.shape)}", flush=True)
-    t_rm = ttnn.to_layout(t_2d, ttnn.ROW_MAJOR_LAYOUT)
-    if dbg: print(f"  [shard dbg] t_rm shape={list(t_rm.shape)}", flush=True)
-    t4d = ttnn.reshape(t_rm, [1, n_kv_heads, 1, head_dim])
-    if dbg: print(f"  [shard dbg] t4d shape={list(t4d.shape)}", flush=True)
-    ttnn.deallocate(t_rm)
-    t_pad = ttnn.pad(t4d, [[0, 0], [0, 0], [0, state.sdpa_block_size - 1], [0, 0]],
-                     value=0.0)
-    if dbg: print(f"  [shard dbg] t_pad shape={list(t_pad.shape)}", flush=True)
-    ttnn.deallocate(t4d)
-    t_tile = ttnn.to_layout(t_pad, ttnn.TILE_LAYOUT)
-    if dbg: print(f"  [shard dbg] t_tile shape={list(t_tile.shape)}", flush=True)
-    ttnn.deallocate(t_pad)
-    out = ttnn.to_memory_config(t_tile, mem_cfg)
-    if dbg: print(f"  [shard dbg] to_memory_config OK shape={list(out.shape)}", flush=True)
+    if dbg: print(f"  [shard dbg] t_2d shape={list(t_2d.shape)} "
+                  f"padded={list(t_2d.padded_shape)}", flush=True)
+    # Logical [n_kv_heads, head_dim] → [1, n_kv_heads, 1, head_dim]. Volumes
+    # match (n_kv_heads*head_dim = 1*n_kv_heads*1*head_dim) so ttnn.reshape
+    # accepts. The underlying TILE-padded buffer (32-row pad) is untouched.
+    t_4d = ttnn.reshape(t_2d, [1, n_kv_heads, 1, head_dim])
+    if dbg: print(f"  [shard dbg] t_4d shape={list(t_4d.shape)} "
+                  f"padded={list(t_4d.padded_shape)}", flush=True)
+    out = ttnn.to_memory_config(t_4d, mem_cfg)
+    if dbg: print(f"  [shard dbg] out shape={list(out.shape)} "
+                  f"padded={list(out.padded_shape)}", flush=True)
+    ttnn.deallocate(t_4d)
     return out
 
 
