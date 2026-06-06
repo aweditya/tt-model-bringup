@@ -62,18 +62,48 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.3.1.c step 3c (correctness debug of decode_step).
+**Phase 1 — exact next task**: v0.3.3 multi-step decode N>1 (chain
+several decode steps to confirm state-carry across calls works) → then
+v0.4 trace.
+
+**v0.3.1 COMPLETE 2026-06-05** (commit `8ff3c57`): end-to-end
+constant-time single-token decode pipeline PASSES.
+- PREFILL: 5-token forward, argmax = HF = 6993 ✓
+- DECODE: 1 step (S=1) with carried ssm_state + conv_state + paged
+  KV cache, argmax = HF = 1063 ✓
+- Per-step: ~15s cold JIT compile; subsequent warm/traced decode = ms
+- All state carry mechanisms working (ssm_state, conv_state, KV cache)
+- All decode primitives validated (paged_update_cache, paged_sdpa_decode,
+  two-call Gemma-4-style GQA pattern)
+
+The teacher-forced per-layer ladder was DECISIVE here — without it
+I would have spent hours chasing the wrong attention paged decode
+bug. Always run the ladder when correctness fails by a non-drift
+amount.
+
+**v0.3.1.c step 3d DONE 2026-06-05** (commit `8ff3c57`): Mamba2 conv_state
+carry. Teacher-forced per-layer ladder went from mamba2 **14/9** to
+**23/0 PASS** (every Mamba2 layer cos≥0.99 at decode_pos=5). Bug
+diagnosis: conv1d kernel=4 needs 3 prior x_BC positions; we carried
+ssm_state but not conv_state → decode zero-padded conv input → wrong
+output. Fix: lazy `state.conv_state_np[L]` buffer prepended to x_BC
+for decode S=1, last 3 of combined input saved as new state.
+
+Remaining ladder failure: L51 (moe) cos=0.58 mad=6.4 — **identical to
+the pre-existing hot spot** we saw in v0.2.b's 52-layer argmax-pass
+forward (51/52 ≥0.99 with L51 at cos=0.586). final_norm recovers via
+RMS rescaling; doesn't break argmax. Not a decode bug.
 
 **v0.3.1.c step 3b PLUMBING DONE 2026-06-05** (commit `abe079b`):
 attn_decode_step_tt + _shard_for_paged_write + _set_cur_pos_buf added,
-two-call Gemma 4 pattern. Smoke runs end-to-end without crash. Prefill
-argmax = HF = 6993 ✓. Decode argmax = 1911 ≠ HF 1063 ✗. Plumbing works
-(no TT_FATAL, valid token, constant-time decode possible) but math is
-off. Need to isolate root cause: paged_fill_cache→paged_update_cache
-hybrid cache state, GQA-split semantics, or Mamba2 ssm_state carry
-between prefill and decode. v0.3.1.a's 7/8 (with O(n²) re-forward) is
-the working multi-step correctness baseline; v0.3.1.c just needs to
-match it for constant-time perf.
+two-call Gemma 4 pattern. Plumbing was always correct (teacher-forced
+ladder showed attention 6/6 PASS); the actual bug was in mamba2 conv
+state carry, not attention.
+
+**Gemma 4 perf rounds 1+2 COMPLETE on qb2**:
+- Round 1: paged_fused_update_cache → eager 2.11×, traced flat (`de0384a`)
+- Round 2: `_shard_for_paged_write` 5-op → 2-op → traced **51.27 → 49.57 ms/tok** (-3.3%, real outside noise) (`b153c10`)
+- Round 3 IN FLIGHT — agent `ac71cc6da27157872` chasing concat_heads_decode→o_proj fusion or rotary_embedding_llama_fused_qk
 
 **v0.3.1.b DONE 2026-06-05** (commit `5ca94b8`): Mamba2 ssm_state lazy plumbing +
 defensive `getattr` for harness state-version skew. Regression PASS
