@@ -210,11 +210,38 @@ plumbing is sound — correctness validation is the next session's work.
   because shared exponents quantise the score further. Document at probe
   time if seen.
 
+## Build status (2026-06-06)
+
+- Integration dry-run PASSED — all four `insert_before_once` anchors in
+  the CMake / nanobind patch sites resolved cleanly.
+- `python3 integrate_into_ttmetal.py` ran for real — files copied to
+  `~/tenstorrent/tt-metal/ttnn/cpp/ttnn/operations/experimental/transformer/qwen36_topk_owned/`.
+- `cmake --build build_Release --target ttnn -j8` completed CLEAN
+  (16/16 ninja steps, no errors). Per-target compiles for the four
+  qwen36_topk_owned `.cpp` files all succeeded, and the wrapper file
+  rolled into a unity object cleanly. Build log archived at
+  `.cache/qb1/build_logs/cmake_qwen36_topk_owned_build.log`.
+- `_ttnn.so` (13.9 MB) + `_ttnncpp.so` (33.7 MB) refreshed in
+  `~/tenstorrent/tt-metal/build_Release/ttnn/` and copied into the
+  source-package `~/tenstorrent/tt-metal/ttnn/ttnn/`.
+- Python visibility smoke (one-liner, on qb1):
+  `hasattr(ttnn.experimental, 'qwen36_topk_owned') == True`.
+
+The plumbing layer is verified. Next session's first action is the
+correctness probe.
+
 ## Next-session entry points
 
-1. If cmake build PASSED this session: `experiments/cb/isolate/qwen36_topk_owned_probe.py`
-   on qb1 to verify 8/8 + determinism against numpy.argpartition.
-2. If cmake build FAILED this session: error logged in this doc + next
-   session reads the log + iterates on the per-file fork.
-3. Router integration is downstream of (1) — `server_nemotron3_ttnn.py`
-   moe_router_topk swap, then 7/7 decode chain re-run.
+1. `experiments/cb/isolate/qwen36_topk_owned_probe.py` on qb1 to verify
+   8/8 vs bf16-aware numpy reference + 10/10 determinism. Pass gate
+   defined in the probe's docstring.
+2. If the probe PASSES: integrate into the Nemotron-3 router
+   (`experiments/serve/server_nemotron3_nano_ttnn.py`) — swap the
+   `ttnn.topk` call at the routed-experts moe_router_topk site for
+   `ttnn.experimental.qwen36_topk_owned`. Re-run 7/7 decode chain via
+   the existing harness validator.
+3. If the probe FAILS: read which LLK call site was missed. Most likely
+   suspects in order: (a) `bitonic_topk_step_N` branch deeper in the
+   merge specialisation may need its own propagation check, (b) the
+   `topk_local.cpp` / `topk_final.cpp` paths (multi-core PF) don't
+   include the common-funcs header — verify the include chain.

@@ -1,0 +1,18 @@
+[0/2] Re-checking globbed directories...
+[1/16] Generating RPC stub for /home/aditya/tenstorrent/tt-metal/tt_metal/impl/debug/inspector/rpc.capnp
+Cannot generate stub file for Inspector. If you need python autocomplete/static analysis, install with: pip install pycapnp
+[2/16] Building CXX object ttnn/CMakeFiles/ttnn.dir/Unity/unity_15_cxx.cxx.o
+[3/16] Building CXX object ttnn/cpp/ttnn/operations/experimental/transformer/CMakeFiles/ttnn_op_experimental_transformer.dir/Unity/unity_6_cxx.cxx.o
+[4/16] Building CXX object ttnn/cpp/ttnn/operations/experimental/transformer/CMakeFiles/ttnn_op_experimental_transformer.dir/Unity/unity_8_cxx.cxx.o
+[5/16] Building CXX object ttnn/cpp/ttnn/operations/experimental/transformer/CMakeFiles/ttnn_op_experimental_transformer.dir/qwen36_topk_owned/device/qwen36_topk_owned_single_core_program_factory.cpp.o
+[6/16] Building CXX object ttnn/cpp/ttnn/operations/experimental/transformer/CMakeFiles/ttnn_op_experimental_transformer.dir/Unity/unity_7_cxx.cxx.o
+[7/16] Building CXX object ttnn/cpp/ttnn/operations/experimental/transformer/CMakeFiles/ttnn_op_experimental_transformer.dir/qwen36_topk_owned/device/qwen36_topk_owned_multi_core_program_factory.cpp.o
+[8/16] Building CXX object ttnn/cpp/ttnn/operations/experimental/transformer/CMakeFiles/ttnn_op_experimental_transformer.dir/Unity/unity_10_cxx.cxx.o
+[9/16] Building CXX object ttnn/cpp/ttnn/operations/experimental/transformer/CMakeFiles/ttnn_op_experimental_transformer.dir/Unity/unity_9_cxx.cxx.o
+[10/16] Building CXX object ttnn/CMakeFiles/ttnn.dir/Unity/unity_10_cxx.cxx.o
+[11/16] Building CXX object ttnn/cpp/ttnn/operations/experimental/transformer/CMakeFiles/ttnn_op_experimental_transformer.dir/qwen36_topk_owned/device/qwen36_topk_owned_utils.cpp.o
+[12/16] Building CXX object ttnn/cpp/ttnn/operations/experimental/transformer/CMakeFiles/ttnn_op_experimental_transformer.dir/qwen36_topk_owned/device/qwen36_topk_owned_device_operation.cpp.o
+[13/16] Linking CXX shared library ttnn/_ttnncpp.so
+[14/16] Building CXX object ttnn/CMakeFiles/ttnn.dir/Unity/unity_18_cxx.cxx.o
+[15/16] Building CXX object ttnn/CMakeFiles/ttnn.dir/Unity/unity_29_cxx.cxx.o
+[16/16] Linking CXX shared library ttnn/_ttnn.so
