@@ -32,6 +32,32 @@ kernel ALONE confirmed the kernel itself dominates → matmul-fold was the
 right move. **Always isolate the suspect op alone, not just inside the
 chain**. Saved in `[[feedback-profile-first-perf-method]]`.
 
+**v0.4.1.e RESOLVED blocker #3 (commit `a65af53`)** — user's intuition
+was right: `ttnn.reduce_scatter` does work for replicate→shard. My
+prior v0.4.1.c probe failed because of a wrong kwarg
+(`math_op=ttnn.ReduceType.Sum` — not in the API). Real signature is
+`ttnn.reduce_scatter(input_tensor, dim, *, cluster_axis=...)` with
+no `math_op` (op is hardcoded sum-reduce). Fix:
+```python
+h_scaled = ttnn.multiply(h_repl, 1.0 / NCHIPS)
+h_shard  = ttnn.reduce_scatter(h_scaled, dim=2, cluster_axis=1)
+```
+Validated cos=0.999999 in `v041e_reduce_scatter_correct_probe`,
+integrated into `moe_block_eager_ep_tt`, n-step chain 7/7 PASS,
+0.2s warm step retained (no perf regression).
+
+**TRACE STATUS: 3 of 4 blockers cleared.** Only blocker #2 remains
+(MoE router host topk: scores readback + topk_indices upload).
+On-device router probe (v0.4.0h.b) shows cos=0.9997 but 6/8
+tie-break mismatch — precision-reducing change that could affect
+long-context retrieval. **Gemma 4 Round 8 learning (2026-06-05)**:
+bfp8 weights passed 100/100 short-token gate but BROKE long-context
+needle retrieval (0/3 at L=128, partial at L=1024 — was 3/3 pre-bfp8).
+Precision changes need long-context validation BEFORE landing.
+
+Path forward: gate the on-device router behind a long-context test.
+Current 0.26s warm step (~3.8 tok/s steady) usable for that validation.
+
 **TRACE INTEGRATION PARKED 2026-06-05** — blockers 1 + 4 cleared
 (commit `f45a710` — pure-ttnn embed/final_norm/lm_head/argmax); blocker
 #2 (router) has tie-break drift, deferred behind long-context checks;
