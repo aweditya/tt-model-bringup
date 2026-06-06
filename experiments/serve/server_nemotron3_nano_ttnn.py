@@ -1131,6 +1131,131 @@ def attn_prefill_tt(state: State, h_input_tt, layer_idx: int):
     return block_tt
 
 
+def _set_cur_pos_buf(state, pos: int):
+    """Write `pos` into state.cur_pos_buf via copy_host_to_device_tensor.
+    NEVER realloc the buffer ([[ttnn-list-rebinding-leaks]])."""
+    pos_host = ttnn.from_torch(
+        torch.tensor([pos], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+    )
+    ttnn.copy_host_to_device_tensor(pos_host, state.cur_pos_buf)
+
+
+def _shard_for_paged_write(state, k_2d_per_chip):
+    """Stage a [1, HEAD_DIM] per-chip tensor into HEIGHT_SHARDED L1
+    [1, 1, BLOCK_SIZE, HEAD_DIM] for paged_update_cache. Forks
+    server_35b_ttnn.py:846-851 verbatim."""
+    t4d = ttnn.reshape(k_2d_per_chip, [1, 1, 1, HEAD_DIM_ATTN])
+    t_pad = ttnn.pad(
+        t4d, [[0, 0], [0, 0], [0, SDPA_BLOCK_SIZE - 1], [0, 0]],
+        value=0.0,
+    )
+    return ttnn.to_memory_config(t_pad, state.paged_write_mem_cfg)
+
+
+def attn_decode_step_tt(state: State, h_input_tt, layer_idx: int):
+    """v0.3.1.c step 3b — S=1 decode using paged KV caches.
+
+    Two-call Gemma 4 pattern (one SDPA call per KV head). With Q
+    REPLICATED across the mesh (no TP), per-chip Q has all NQ=32
+    heads; we slice Q into halves of NQ/NKV=16 heads each so each
+    SDPA call has the correct GQA group size:
+      • Call 0: Q[0:16] + cache_0 (KV head 0)
+      • Call 1: Q[16:32] + cache_1 (KV head 1)
+      • Concat attn outputs along head axis → [1, NQ*HD] per chip
+
+    State requirements (must be set BEFORE this call):
+      • setup_paged_decode_state ran → cur_pos_buf, page_table_tt,
+        paged_write_mem_cfg, paged_sdpa_progcfg, sdpa_compute_kernel_config
+      • state.kv_K_cache_tt[L] / state.kv_V_cache_tt[L] populated by prefill
+      • state.cur_pos = position of the new token (updated AFTER this call)
+
+    Returns block_tt (replicated, TILE).
+    """
+    w = state.per_layer_tt[layer_idx]
+    assert w is not None and w["kind"] == "attention"
+    B, S, _ = h_input_tt.shape
+    assert B == 1 and S == 1, f"decode_step requires B=1 S=1; got B={B} S={S}"
+    NQ = NUM_Q_HEADS
+    NKV = NUM_KV_HEADS
+    HD = HEAD_DIM_ATTN
+    Q_HALF = NQ // NKV  # 16 — GQA group size, also Q heads per SDPA call
+
+    # Sync cur_pos_buf to host-side cur_pos (the new-token position).
+    _set_cur_pos_buf(state, int(state.cur_pos))
+
+    # Norm + Q/K/V projection (S=1).
+    h_norm_tt = ttnn.rms_norm(h_input_tt, weight=w["norm"], epsilon=EPS)
+    q_tt = ttnn.matmul(h_norm_tt, w["q_proj"], compute_kernel_config=HIFI4)
+    k_tt = ttnn.matmul(h_norm_tt, w["k_proj"], compute_kernel_config=HIFI4)
+    v_tt = ttnn.matmul(h_norm_tt, w["v_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(h_norm_tt)
+    # Reshape to per-head [NH, HD]
+    q_heads = ttnn.reshape(q_tt, [NQ, HD])
+    k_heads = ttnn.reshape(k_tt, [NKV, HD])
+    v_heads = ttnn.reshape(v_tt, [NKV, HD])
+    ttnn.deallocate(q_tt); ttnn.deallocate(k_tt); ttnn.deallocate(v_tt)
+
+    kc_list = state.kv_K_cache_tt[layer_idx]
+    vc_list = state.kv_V_cache_tt[layer_idx]
+
+    # Two SDPA calls — one per (cache, KV-head, Q-half) trio.
+    attn_outs = []
+    for kv_idx in range(NKV):
+        # Slice K, V to this KV head → [1, HD] (view of k_heads/v_heads).
+        k_i = ttnn.slice(k_heads, [kv_idx, 0], [kv_idx + 1, HD])
+        v_i = ttnn.slice(v_heads, [kv_idx, 0], [kv_idx + 1, HD])
+        # Stage for paged_update_cache (HEIGHT_SHARDED L1).
+        k_sharded = _shard_for_paged_write(state, k_i)
+        v_sharded = _shard_for_paged_write(state, v_i)
+        ttnn.experimental.paged_update_cache(
+            kc_list[kv_idx], k_sharded,
+            update_idxs_tensor=state.cur_pos_buf,
+            page_table=state.page_table_tt,
+        )
+        ttnn.experimental.paged_update_cache(
+            vc_list[kv_idx], v_sharded,
+            update_idxs_tensor=state.cur_pos_buf,
+            page_table=state.page_table_tt,
+        )
+        ttnn.deallocate(k_sharded); ttnn.deallocate(v_sharded)
+
+        # Slice Q to this KV head's group [kv_idx*Q_HALF : (kv_idx+1)*Q_HALF].
+        q_half = ttnn.slice(
+            q_heads,
+            [kv_idx * Q_HALF, 0],
+            [(kv_idx + 1) * Q_HALF, HD],
+        )
+        q_for_sdpa = ttnn.reshape(q_half, [1, 1, Q_HALF, HD])
+        attn_i = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+            q_for_sdpa, kc_list[kv_idx], vc_list[kv_idx],
+            cur_pos_tensor=state.cur_pos_buf,
+            page_table_tensor=state.page_table_tt,
+            scale=1.0 / math.sqrt(HD),
+            program_config=state.paged_sdpa_progcfg,
+            compute_kernel_config=state.sdpa_compute_kernel_config,
+        )
+        attn_outs.append(attn_i)
+    ttnn.deallocate(q_heads); ttnn.deallocate(k_heads); ttnn.deallocate(v_heads)
+
+    # Concat attn halves along Q-head axis (dim 2). attn_i: [1, 1, Q_HALF, HD]
+    attn_concat = ttnn.concat(attn_outs, dim=2)
+    for a in attn_outs:
+        ttnn.deallocate(a)
+    # [1, 1, NQ, HD] → [B=1, S=1, NQ*HD]
+    attn_flat = ttnn.reshape(attn_concat, [B, S, NQ * HD])
+    ttnn.deallocate(attn_concat)
+
+    # o_proj + residual
+    o_tt = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    block_tt = ttnn.add(h_input_tt, o_tt)
+    ttnn.deallocate(o_tt)
+    # NOTE: state.cur_pos is NOT advanced here — caller does so after
+    # the full decode step (so multiple attn layers see the same cur_pos).
+    return block_tt
+
+
 def attn_block_eager_tt(state: State, h_input_tt, layer_idx: int):
     """v0.2.5 on-device flow — same math as `attn_block_eager` but takes
     and returns `ttnn.Tensor`. No host round-trips for h.
