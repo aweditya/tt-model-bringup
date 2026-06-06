@@ -57,8 +57,11 @@ def cos_and_mad(a, b):
 
 
 def main(state=None) -> int:
+    import importlib
     import ttnn
     import nemotron3_mamba2_step as step_mod
+    # Harness caches the module; force-reload to pick up v0.4.0a additions.
+    step_mod = importlib.reload(step_mod)
 
     # Reuse harness mesh if available, else open one.
     own_mesh = state is None
