@@ -80,6 +80,11 @@ NCHIPS = 4
 MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 MAX_KV = 8192  # bumped vs 35B's 4096; Nemotron is a longer-context model
 
+# v0.3.1.c paged decode constants (mirrors server_35b_ttnn.py:1881-1882).
+SDPA_BLOCK_SIZE = 32
+SDPA_NUM_BLOCKS = MAX_KV // SDPA_BLOCK_SIZE  # 256 at MAX_KV=8192
+SDPA_TILE_HEIGHT = 32
+
 # HIFI4 + fp32_dest_acc=True is the right matmul default for all paths
 # OTHER than SDPA decode — matches 35B `server_35b_ttnn.py` HIFI4. The
 # bf16-noise floor without fp32_dest_acc accumulates through reductions
@@ -703,12 +708,110 @@ def deallocate_layer(state, L: int):
     state.per_layer_tt[L] = None
 
 
-def reset_decode_state(state, B: int = 1):
-    """Initialize/clear the multi-step decode state buffers (v0.3.1.b).
+def setup_paged_decode_state(state, log=print):
+    """v0.3.1.c — allocate the SDPA paged-decode support state ONCE.
+
+    Forks `server_35b_ttnn.py:1875-1924` verbatim with shape constants
+    tailored to Nemotron-3 Nano. Idempotent: skips if already allocated
+    (e.g., across decode_state resets that keep the buffers warm).
+
+    Allocates on state:
+      cur_pos_buf                int32 [1] device ROW_MAJOR replicated
+      page_table_tt              int32 [1, NUM_BLOCKS] ROW_MAJOR replicated identity
+      paged_write_mem_cfg        HEIGHT_SHARDED L1
+      paged_sdpa_progcfg         SDPAProgramConfig(CoreCoord(4,4), 0, 0, exp_approx=False)
+      sdpa_compute_kernel_config B3 recipe (HiFi2 + math_approx=False + fp32_dest_acc=False)
+      kv_K_cache_tt[L]           list-of-2 ttnn caches per Attention layer (Gemma 4 two-call)
+      kv_V_cache_tt[L]           same
+
+    Per-cache shape: [NUM_BLOCKS=256, NCHIPS=4, BLOCK_SIZE=32, HEAD_DIM=128]
+    bf16 TILE sharded dim=1. Per-chip view: [256, 1, 32, 128] (NKV_PER_CHIP=1).
+    """
+    # Defensive against harness state-version skew (live State objects
+    # may pre-date these attrs — [[harness-state-version-skew]]).
+    if getattr(state, "cur_pos_buf", None) is not None:
+        return  # already allocated
+    # Helpers
+    state.cur_pos_buf = ttnn.from_torch(
+        torch.zeros((1,), dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    page_table_np = np.arange(SDPA_NUM_BLOCKS, dtype=np.int32).reshape(1, SDPA_NUM_BLOCKS)
+    state.page_table_tt = ttnn.from_torch(
+        torch.from_numpy(page_table_np),
+        device=state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    compute_grid = state.mesh.compute_with_storage_grid_size()
+    shard_grid = ttnn.num_cores_to_corerangeset(1, compute_grid, row_wise=True)
+    shard_spec = ttnn.ShardSpec(
+        shard_grid, [SDPA_TILE_HEIGHT, HEAD_DIM_ATTN],
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    state.paged_write_mem_cfg = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, shard_spec,
+    )
+    state.paged_sdpa_progcfg = ttnn.SDPAProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(4, 4),
+        q_chunk_size=0,
+        k_chunk_size=0,
+        exp_approx_mode=False,
+    )
+    state.sdpa_compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=False,
+        packer_l1_acc=False,
+    )
+    log(f"  SDPA paged plumbing: NUM_BLOCKS={SDPA_NUM_BLOCKS}, "
+        f"BLOCK_SIZE={SDPA_BLOCK_SIZE}, MAX_KV={MAX_KV}")
+
+    # Per-layer KV caches (one pair per attention layer, with Gemma 4 two-call
+    # contract — TWO caches per layer since NUM_KV_HEADS=2 + NCHIPS=4 forces
+    # NKV_PER_CHIP=1 [[paged-update-cache-nkv-per-chip]]).
+    n = len(state.layer_types) if state.layer_types else N_LAYERS
+    # Defensive: live State objects from before these attrs existed may
+    # not have them ([[harness-state-version-skew]]).
+    if not getattr(state, "kv_K_cache_tt", None):
+        state.kv_K_cache_tt = [None] * n
+        state.kv_V_cache_tt = [None] * n
+    cache_shape = (SDPA_NUM_BLOCKS, NCHIPS, SDPA_BLOCK_SIZE, HEAD_DIM_ATTN)
+    n_attn = 0
+    for L, kind in enumerate(state.layer_types):
+        if kind != "attention":
+            continue
+        # Two caches (one per KV head) → Gemma-4 two-call decode pattern.
+        kc_pair = []
+        vc_pair = []
+        for _ in range(NUM_KV_HEADS):
+            zeros_np = np.zeros(cache_shape, dtype=np.float32)
+            kc = ttnn.from_torch(
+                torch.from_numpy(zeros_np),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+                mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+            )
+            vc = ttnn.from_torch(
+                torch.from_numpy(zeros_np),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+                mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+            )
+            kc_pair.append(kc)
+            vc_pair.append(vc)
+        state.kv_K_cache_tt[L] = kc_pair
+        state.kv_V_cache_tt[L] = vc_pair
+        n_attn += 1
+    log(f"  per-layer KV caches: {n_attn} attn layers × {NUM_KV_HEADS} "
+        f"caches × (K,V); shape per cache = {cache_shape}")
+
+
+def reset_decode_state(state, B: int = 1, log=print):
+    """Initialize/clear the multi-step decode state buffers (v0.3.1.b/c).
 
     Mamba2 ssm_state: zero numpy buffers, [B, NH=64, HD=64, SS=128] fp32
-    Attention KV cache: cleared (real allocation lands in v0.3.1.c)
-    cur_pos: 0
+    Attention KV cache: allocated via setup_paged_decode_state on first call;
+                        subsequent calls zero in place (kept warm).
+    cur_pos: 0; cur_pos_buf reset via copy_host_to_device_tensor.
     """
     n = len(state.layer_types) if state.layer_types else N_LAYERS
     state.ssm_state_np = [None] * n
@@ -717,10 +820,14 @@ def reset_decode_state(state, B: int = 1):
             state.ssm_state_np[L] = np.zeros(
                 (B, MAMBA_HEADS, MAMBA_HEAD_DIM, SSM_STATE), dtype=np.float32,
             )
-    # Attention KV cache plumbing lands in v0.3.1.c (paged_update_cache +
-    # paged_sdpa_decode). For v0.3.1.b just clear the slots.
-    state.kv_K_cache_tt = [None] * n
-    state.kv_V_cache_tt = [None] * n
+    # Lazy alloc of the paged decode support state (idempotent).
+    setup_paged_decode_state(state, log=log)
+    # Zero the cur_pos_buf to start.
+    pos_host = ttnn.from_torch(
+        torch.zeros((1,), dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+    )
+    ttnn.copy_host_to_device_tensor(pos_host, state.cur_pos_buf)
     state.cur_pos = 0
 
 

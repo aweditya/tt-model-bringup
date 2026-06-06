@@ -62,17 +62,40 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.3.1.b (proper KV cache + ssm_state
-on device → constant-time per-step decode).
+**Phase 1 — exact next task**: v0.3.1.c step 3 (attn_prefill_tt + attn_decode_step_tt
+forward variants) → first true single-token decode step.
+
+**v0.3.1.b DONE 2026-06-05** (commit `5ca94b8`): Mamba2 ssm_state lazy plumbing +
+defensive `getattr` for harness state-version skew. Regression PASS
+(argmax = HF = 6993).
+
+**v0.3.1.c step 1 DONE 2026-06-05** (commit `f4743c6`): 5 paged-decode
+State slots + constants (SDPA_BLOCK_SIZE=32, SDPA_NUM_BLOCKS=256 at MAX_KV=8192).
+**v0.3.1.c step 2 in progress**: `setup_paged_decode_state(state)` helper +
+per-layer KV cache allocation (Gemma 4 two-call: TWO caches per layer since
+NUM_KV_HEADS=2 + NCHIPS=4 forces NKV_PER_CHIP=1; per-cache shape
+[256, 4, 32, 128] bf16 TILE sharded dim=1). All forks 35B `:1875-1924`.
+Verification via `nemotron3_v031c_setup_smoke.py` checking all 5
+support buffers + per-layer KV caches allocated. Step 3 next:
+attn_prefill_tt (paged_fill_cache + non-paged causal SDPA) +
+attn_decode_step_tt (paged_update_cache + paged_sdpa_decode).
 
 **v0.3.1.a DONE 2026-06-05** (commit `b93d552`): 7/8 quadratic multi-step
 PASS with recovery. TT exactly matched HF's `Paris, Paris, Paris,` loop
 for 4 consecutive steps; single bf16 argmax flip at step 4 (TT=5498 vs
 HF=6993), then RECOVERED — TT independently locked back onto the loop
 pattern at steps 5,6,7. Model is semantically correct; drift is bf16
-matmul chain noise (not state mgmt, not kernel). v0.3.1.b won't fix
+matmul chain noise (not state mgmt, not kernel). v0.3.1.b/c won't fix
 the drift but enables constant-time decode (per-step ~ms vs current
 17-28s/step from re-running 52 layers on growing prefix).
+
+**qb2 — Gemma 4 perf agent COMPLETED 2026-06-05**:
+- paged_fused_update_cache landed (commit `de0384a`): **2.11× eager**
+  (474 → 225 ms/tok). Traced 51.4 → 51.1 ms/tok (flat, within noise).
+- qb2 sandbox set up (`scripts/run_remote_qb2.sh`).
+- Next levers identified: distributed RMSNorm (+12-15 ms/tok projected).
+- All work in `research/gemma4_perf_qb2_2026-06-05/`. Zero overlap
+  with Nemotron foreground.
 
 **v0.3.0 DONE 2026-06-05** (commit `42d303d`): switched from streaming to
 all-layers-resident. P150 has 32 GB/chip (verified `ttnn/core/operation.cpp:33`),
