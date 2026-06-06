@@ -32,6 +32,31 @@ kernel ALONE confirmed the kernel itself dominates → matmul-fold was the
 right move. **Always isolate the suspect op alone, not just inside the
 chain**. Saved in `[[feedback-profile-first-perf-method]]`.
 
+**v0.4.0h.a SHIPPED (commit `fe502e3`)** — on-device MoE combine weighted-sum.
+Replaces the largest data-movement readback in MoE
+(combine_out_tt → numpy → routed_np → re-upload = 516 KB × 23 layers = 12 MB/step).
+
+  combine_out_tt → ttnn.all_gather(dim=2) → ttnn.mul(broadcast) →
+  ttnn.sum(dim=0) → ttnn.slice(S_orig). Reuses ttnn.all_gather at
+  server_tp.py:1681 + sum pattern at server_35b_ttnn.py:1278.
+
+PROFILE (post-h.a):
+```
+total step (warm):     15.5s → 0.66s → 0.43s → 0.33s → 0.26s    (60× cumulative)
+moe per-layer:         10.5 → 8.2 → 8.2 → 5.8 ms                (-45% vs .e)
+mamba2 per-layer:      16.5 → 9.1 → 4.3 → 4.2 ms                (-74% vs .e)
+tok/s (eager warm):    0.064 → 1.5 → 2.5 → 3.0 → 3.8 / 5.0 steady
+```
+
+7/7 chain regression PASS throughout. **fp32 device state in v0.4.0g
+fixed step-3 bf16 drift** that the legacy path had — correctness
+IMPROVED through the perf work.
+
+Remaining MoE numpy roundtrips (v0.4.0h.b): scores readback for
+host topk; h_input readback for sharded re-upload (needs
+replicate→shard primitive that ttnn doesn't ship cleanly); topk
+indices upload. These are trace blockers — must land before v0.4.1.
+
 **v0.4.0g COMPLETE (commits `36ec27c` + `9cfcb11`)** — fully pure-ttnn Mamba2 decode path:
 
 ```
