@@ -21,6 +21,28 @@ but bf16 numerical ties remain unrecoverable. If 7/7 chain regression
 fails after the stable flag lands, follow-up `qwen36_topk_owned_fp32` that
 promotes input to fp32 before the descent.
 
+**Empirical trace-blocker finding (2026-06-06 PM, probe `d081398`)** —
+v0.4.1.h attempted traced run with `NM3_ROUTER_ON_DEVICE=1`. **Trace
+capture FAILED**: `TT_FATAL fd_mesh_command_queue.cpp:581: !trace_id_
+.has_value(): Writes are not supported during trace capture`. Root
+cause: `attn_decode_step_tt` at `server_nemotron3_nano_ttnn.py:1342-
+1343` calls `_set_cur_pos_buf → ttnn.copy_host_to_device_tensor`,
+which is a host write — fires 6× per decode step (one per attention
+layer) inside the captured region.
+
+This is a **5th host write the 2026-06-05 audit missed** (v0.4.1.a
+probe ran with router=OFF, hit host topk first, never got past it).
+Fix: move `cur_pos_buf` update OUT of `attn_decode_step_tt`, call it
+once before each `execute_trace` from the caller (same pattern as
+`update_tok_buf`). Server-side refactor, orthogonal to the owned-topk
+kernel work — needed regardless of which topk variant we ship.
+
+So the actual trace-blocker count is **2 remaining**: (a) router host
+topk (owned-topk kernel #241 in flight), (b) `cur_pos_buf` host write
+(server refactor, ~1 hour). Once both land, we measure traced ms/tok.
+
+---
+
 **Companion — RULER long-context benchmark (v0.5.bench)**. NVIDIA RULER is
 the standard long-context LLM eval (multi-task NIAH variants, multi-key,
 multi-hop, aggregation, 4k→128k). Replacing the ad-hoc needle test that
