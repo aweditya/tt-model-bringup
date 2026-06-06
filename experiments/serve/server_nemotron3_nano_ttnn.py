@@ -2695,28 +2695,48 @@ def moe_block_eager_ep_tt(state: State, h_input_tt, layer_idx: int):
     )
     ttnn.deallocate(expert_out_combine); ttnn.deallocate(dispatch_meta_tt)
 
-    # Readback combine → host weighted-sum across TOP_K (intra-block bridge)
-    combine_np = ttnn.to_torch(
-        combine_out_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=2),
-    ).float().numpy()
+    # v0.4.0h.a — on-device combine weighted-sum. Eliminates the largest
+    # numpy roundtrip in MoE (combine_out_tt readback + routed re-upload,
+    # ~516 KB per layer × 23 layers = ~12 MB/step saved). topk_weights
+    # are still computed host-side (small data; v0.4.0h.b will move them
+    # too if it's on the critical path). Reuses ttnn.all_gather pattern
+    # from server_tp.py:1681 and the broadcast-mul + ttnn.sum pattern
+    # from server_35b_ttnn.py:1278.
+    # Step 1: gather combine_out across the mesh seq-shard → fully
+    #         replicated [TOP_K, B, S_padded, HIDDEN].
+    combine_full_tt = ttnn.all_gather(combine_out_tt, dim=2)
     ttnn.deallocate(combine_out_tt)
-    if combine_np.ndim == 5:
-        combine_np = combine_np[0]
-    if combine_np.shape[0] != TOP_K_ROUTED and combine_np.ndim == 4:
-        combine_np = combine_np.squeeze(0)
-    w_bc = topk_weights.T[:, None, :, None]
-    routed_per_topk = combine_np.astype(np.float32) * w_bc.astype(np.float32)
-    routed_np = routed_per_topk.sum(axis=0)  # [B, S_padded, HIDDEN]
-    if routed_np.ndim == 2:
-        routed_np = routed_np[None]
-    routed_np = routed_np[:, :S_orig, :]  # slice padding
-
-    # Upload routed back to device (TILE replicated) → add to shared + residual
-    routed_tt = ttnn.from_torch(
-        torch.from_numpy(routed_np.astype(np.float32)),
+    # Ensure rank-4 [TOP_K, B, S_padded, HIDDEN]. all_to_all_combine
+    # output has TOP_K in dim 0 — squeeze any spurious leading dim.
+    if len(combine_full_tt.shape) == 5:
+        combine_full_tt = ttnn.reshape(
+            combine_full_tt,
+            [TOP_K_ROUTED, B, S_padded, HIDDEN],
+        )
+    # Step 2: upload topk_weights as [TOP_K, B, S_padded, 1] for broadcast.
+    # Permute from [S_padded, TOP_K] → [TOP_K, S_padded] → reshape to
+    # [TOP_K, B, S_padded, 1]. Cheap upload (TOP_K×S_padded floats).
+    topk_weights_kbs1 = topk_weights.T.reshape(
+        TOP_K_ROUTED, B, S_padded, 1,
+    ).astype(np.float32)
+    topk_weights_tt = ttnn.from_torch(
+        torch.from_numpy(np.ascontiguousarray(topk_weights_kbs1)),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
+    # Step 3: broadcast multiply across HIDDEN.
+    weighted_tt = ttnn.mul(combine_full_tt, topk_weights_tt)
+    ttnn.deallocate(combine_full_tt)
+    ttnn.deallocate(topk_weights_tt)
+    # Step 4: sum over TOP_K dim → [B, S_padded, HIDDEN].
+    routed_padded_tt = ttnn.sum(weighted_tt, dim=0)
+    ttnn.deallocate(weighted_tt)
+    # Step 5: slice off the pad rows if any.
+    if S_padded != S_orig:
+        routed_tt = ttnn.slice(routed_padded_tt, [0, 0, 0], [B, S_orig, HIDDEN])
+        ttnn.deallocate(routed_padded_tt)
+    else:
+        routed_tt = routed_padded_tt
 
     # Shared expert (replicated on padded h_norm)
     sh_up_out = ttnn.matmul(h_norm_tt, w["shared_up"], compute_kernel_config=HIFI4)
