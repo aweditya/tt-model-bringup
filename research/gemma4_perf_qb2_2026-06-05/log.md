@@ -1005,3 +1005,92 @@ foundation for Round 8's bfp8 win).
   (Round 9 default; +1.5 ms ahead of qb1 reference of 47.5 ms; with
   `TT_GM4_MLP_DTYPE=bfp8` env var enabled, 46.0 ms/tok available).
 
+
+---
+
+## Round 10 RETRY Phase 4 — DRAM-sharded MLP production wire-up — BLOCKED on upload contract
+
+### Status
+
+Phase 4 integration **landed in source under env-gate `TT_GM4_DRAM_PREFETCH=1`**
+(commits `7762d7b`, `b0364db`) and **passed AST + module import** but **failed
+at first eager step** on qb2 with TT_FATAL "Tensor is not allocated" on the
+gate_proj matmul.
+
+### Tried (and failed)
+
+**Attempt A — pass `memory_config=WIDTH_SHARDED DRAM` to `ttnn.from_torch`**:
+the 3D-stacked input shape `[NCHIPS=4, K=3840, N=3840]` from
+`np.stack(per_chip_list, axis=0)` doesn't satisfy the 2D mem_cfg's
+`shard_spec=[K, padded_N/num_banks]` contract before mesh-sharding lays
+down per-chip buffers. Per-chip tensors come back as dead handles
+("Tensor is not allocated" on the first read in matmul validate).
+
+**Attempt B — upload with default INTERLEAVED DRAM, then `to_memory_config`
+to WIDTH_SHARDED DRAM per-chip after `ShardTensorToMesh(dim=0)`**: same
+crash. `to_memory_config` against a mesh-sharded tensor whose per-chip
+view is [3840, 3840] doesn't produce a valid per-chip WIDTH_SHARDED L1
+buffer either; ttnn's mesh adapter doesn't handle the post-mesh reshard
+to WIDTH_SHARDED DRAM as a clean primitive on this build.
+
+### Root-cause hypothesis (next session entry point)
+
+Llama 70B Galaxy uses **`ShardTensor2dMesh(dims=(-1, -2), mesh_shape=...)`**
+(2D mesh-sharder) for its DRAM-sharded weights — NOT the 1D
+`ShardTensorToMesh(dim=0)` that 35B/Gemma 4 currently use. The 2D sharder
+treats the input as a 2D weight and shards along TWO axes (one for inter-chip
+TP, one inside the chip across DRAM banks). The 1D sharder pre-stacks
+NCHIPS×... which doesn't compose with the WIDTH_SHARDED DRAM 2D shard_spec.
+
+Reference: `tt-metal/models/demos/llama3_70b_galaxy/tt/llama_mlp.py:65-70`:
+```python
+as_sharded_tensor = lambda name, type, dim: ttnn.as_tensor(
+    torch_weight(name[:2]).unsqueeze(0).unsqueeze(0),
+    dtype=type, device=self.mesh_device,
+    mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, dims=dim,
+                                       mesh_shape=args.cluster_shape),
+    layout=ttnn.TILE_LAYOUT,
+    memory_config=w2_mem_config if "w2" in name else w1_w3_mem_config,
+    ...)
+```
+`dim` is a tuple `(w1_dim=(-1, -2)` for FFN1/3, `w2_dim=(-2, -1)` for FFN2).
+The `cluster_shape` is `(8, 4)` on TG/Galaxy; for our (1, 4) qb2 P150 mesh
+we'd need `cluster_shape=(1, 4)` and `dims=(None, -1)` or similar.
+
+### Action for next session (clean Phase 4 retry)
+
+1. Refactor `np_stacked_to_sharded` (or add a sibling `np_to_2d_mesh_sharded`)
+   to use `ShardTensor2dMesh(dims=(None, -1), mesh_shape=(1, NCHIPS))` for
+   the OUT-axis-sharded gate/up weights; `dims=(-1, None)` for the IN-axis
+   sharded down_proj. Forks `llama_mlp.py:65-70`.
+2. Pass `memory_config=mlp_mem_cfg` directly to `ttnn.as_tensor` /
+   `ttnn.from_torch` (the 2D sharder produces the right per-chip view for
+   the 2D WIDTH_SHARDED DRAM mem_cfg).
+3. Re-run `gm4_round10_dram_mlp_revalidate` trigger. The probe scaffolding
+   is in place; only the upload helper needs to change.
+
+### What is durable from this round
+
+- **The landscape map**: `tiling_sharding_plan.md` (commit `738a057`) — full
+  Rounds 10-20 queue + per-lever fitness / gain / cost / risk / precedent
+  table. Anchors all future work.
+- **The integration scaffold**: `server_gemma4_unified_ttnn.py` Round-10
+  helpers (`_dram_weight_mem_cfg_mlp`, `_activation_l1_width_sharded`,
+  `_dram_sharded_mlp_program_config*`) — copy-paste from
+  `gm4_dram_sharded_mlp_probe.py`. Forward-side wiring is correct (the
+  paged MLP block reshards `pre_ff`/`mid` to WIDTH_SHARDED L1 and calls
+  the dedicated program_config). Only the **upload-side mesh-sharder**
+  needs the 2D-sharder fix.
+- **The probe**: `gm4_round10_dram_mlp_revalidate.py` — re-uploads all 48
+  MLP layers under env-gate, invalidates trace, runs eager+traced 100-step
+  validator in one trigger (~3 min wall time). Reusable across attempts.
+- **Negative finding for the 1D mesh-sharder path**: confirms
+  `ShardTensorToMesh(dim=0)` + WIDTH_SHARDED DRAM (either at from_torch
+  time or via post-shard `to_memory_config`) does not work on qb2's
+  current ttnn build. Saves the next session ~1 hour of bad attempts.
+
+### Cumulative Gemma 4 perf state UNCHANGED at 47.0 ms/tok traced
+
+Default `TT_GM4_DRAM_PREFETCH` is unset → all Round-1..9 levers active,
+Round 8 bfp8 lever available via `TT_GM4_MLP_DTYPE=bfp8` / `TT_GM4_LM_HEAD_DTYPE=bfp8`.
+
