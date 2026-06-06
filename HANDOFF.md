@@ -62,13 +62,18 @@ Run the kernel regression sweep:
   Not a Phase 1 blocker — B=1 + full 64 heads (G2) is correct, and the
   CB engine drives per-slot at the server layer (same as 27B/35B).
 
-**Phase 1 — exact next task**: v0.4 trace capture (once v0.3.3 N-step
-chain confirms state carries cleanly across N>1 decode steps).
+**Phase 1 — exact next task**: v0.4 trace capture. Constant-time
+decode is fully validated; trace will turn the 15s/step JIT-cold path
+into ~ms/step warm.
 
-**v0.3.3 IN PROGRESS**: `nemotron3_v033_nstep_chain_smoke.py` runs
-prefill once, then loops 8 decode steps with state carry. Gate: ≥7/8
-token-for-token match (mirrors v0.3.1.a's bf16 drift floor). Probe
-attached to nm3 dev harness.
+**v0.3.3 DONE 2026-06-05** (commit `a617a76`): N-step decode chain
+6/7 PASS with recovery — identical bf16 drift pattern to v0.3.1.a
+quadratic (single flip at step 5, recovered at step 6). cur_pos
+advances 5→11. Constant-time state-carried decode fully validated.
+
+  TT chain: [1063, 6993, 1063, 6993, 1063, 5498, 1063]
+  HF chain: [1063, 6993, 1063, 6993, 1063, 6993, 1063]
+                                          ↑ single bf16 flip
 
 **v0.3.1 COMPLETE 2026-06-05** (commit `8ff3c57`): end-to-end
 constant-time single-token decode pipeline PASSES.
