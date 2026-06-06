@@ -5,7 +5,54 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## LATEST (2026-06-06 PM) — **owned-topk path identified as highest-ROI trace unlock**
+## LATEST (2026-06-06 evening) — **v0.5 eager perf pass started; trace deferred to v0.6**
+
+After cross-server audit (commit `47bd16e`) revealed **no MoE model in our
+project is currently traced** (35B is also eager-only), strategic pivot:
+ship eager perf wins NOW, MoE-on-device dispatch as v0.6 architectural
+effort gated on upstream MoE+trace research (task #245 agent in flight).
+
+**v0.5.P1 vocab-shard lm_head landed (commit `693806a`)**. Forks 27B P22
+(server_tp.py:399 + :1680-1688): vocab-sharded lm_head along dim=1 +
+all_gather + on-device argmax. Per-step readback drops from full-vocab
+(131072 × 2 bytes = 262 KB) to 8 bytes. Expected +5-8% per 27B/Gemma 4
+precedent → 260 ms eager target ~240-245 ms. Validation pending harness
+restart on qb1.
+
+**MoE+trace upstream research LANDED (commit `486436e`)** —
+research/moe_trace_precedents.md (462 lines). **Both `gpt_oss` and
+`deepseek_v3` demos in tt-metal trace MoE decode end-to-end.** Smoking
+gun at `gpt_oss/tt/experts_throughput/fused_decode.py:80-83`: "Format
+conversion ... All done on-device (no host round-trip), following the
+DeepSeek pattern (moe.py:393-395). **This enables trace capture.**"
+
+Three concrete solutions for our 4-bridge MoE trap:
+1. Sparsity tensor + `ttnn.sparse_matmul`
+2. **On-device topk-indices layout-convert** (DeepSeek-V3 `tt/moe.py:413-418`)
+   — `ttnn.to_layout + ttnn.reshape` instead of `to_torch/from_torch`
+3. Fused kernels (`all_to_all_dispatch_metadata + moe_gpt + selective_reduce_combine`)
+
+Key trade-off they make: DeepSeek-V3 ships `topk_fallback=True` for the
+SAME SFPSWAP drift bug we hit, AND trace mode forces `topk_fallback=False`.
+**There's no "both" config**. They pick: device-topk + trace + sampling,
+OR host-topk + eager + greedy. Our owned-topk-with-stable-flag fork
+bridges this gap.
+
+**Implication for v0.6**: scope is now clear — fork
+`_capture_decode_trace_text` from `tt_transformers/tt/generator.py:
+1147-1245` + DeepSeek-V3's `moe.py:413-418` on-device layout-convert.
+Multi-day effort but no novel invention required.
+
+**In flight (background agents)**:
+- **RULER NIAH-single smoke** (#242) — running on qb2 against Gemma 4 12B
+  IT after server start; first paper-table-comparable long-context number
+- **Owned-topk kernel** (#241, commits `310fe82`/`2621e2c`/`e33221b`) —
+  scaffold complete, cmake clean, `ttnn.experimental.qwen36_topk_owned`
+  exposed. Probe + 7/7 chain validation pending.
+
+---
+
+## PRIOR (2026-06-06 PM) — **owned-topk path identified as highest-ROI trace unlock**
 
 **Decision (2026-06-06, user)**: pursue owned-kernel topk that flips the LLK
 stable-sort flag (PR #31989 LLK-level change shipped; `ttnn.topk` doesn't
