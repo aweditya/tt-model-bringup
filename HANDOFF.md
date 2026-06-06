@@ -21,6 +21,33 @@ but bf16 numerical ties remain unrecoverable. If 7/7 chain regression
 fails after the stable flag lands, follow-up `qwen36_topk_owned_fp32` that
 promotes input to fp32 before the descent.
 
+**Cross-server trace audit (2026-06-06 PM)** — Explore agent mapped
+canonical decode-trace patterns across 27B, Gemma 4, 35B. **Key finding:
+NO MoE model in our project is currently traced.** 35B has MoE; it's
+eager-only (no `begin_trace_capture` in `server_35b_ttnn.py`). 27B has
+trace; no MoE. Gemma 4 has trace infra; no MoE.
+
+**Trace + MoE is uncharted territory in our codebase.** The audit
+identified the MoE trap: even with router on-device, the standard
+MoE block has 4+ host bridges that all need eliminating:
+1. Pad-zeros for seq padding (FIXED 2026-06-06 via state cache)
+2. Topk indices readback (`ttnn.to_torch`) after on-device router
+3. Topk indices re-upload (`ttnn.from_torch`) into `all_to_all_dispatch`
+4. Topk weights re-upload (`ttnn.from_torch`) into combine broadcast
+
+Eliminating 2-4 requires threading topk_idxs/weights as ON-DEVICE
+tensors through dispatch + expert FFN + combine — novel architectural
+work, not iterative fixes. See
+`[[decode-trace-canonical-pattern]]` memory for the full audit.
+
+**Strategic implication**: pure-eager perf wins (vocab-shard lm_head
++5-8% proven, RMSNorm fusion, HiFi2 expert matmul) are higher ROI than
+chasing MoE trace. Owned-topk kernel (committed `e33221b` by background
+agent) is correct architectural prep, but trace unblock requires
+on-device dispatch as a SEPARATE v0.6 effort.
+
+---
+
 **Empirical trace-blocker finding (2026-06-06 PM, probe `d081398`)** —
 v0.4.1.h attempted traced run with `NM3_ROUTER_ON_DEVICE=1`. **Trace
 capture FAILED**: `TT_FATAL fd_mesh_command_queue.cpp:581: !trace_id_

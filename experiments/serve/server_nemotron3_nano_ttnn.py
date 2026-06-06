@@ -2662,15 +2662,21 @@ def moe_block_eager_ep_tt(state: State, h_input_tt, layer_idx: int):
     S_padded = ((S_orig + NCHIPS - 1) // NCHIPS) * NCHIPS
     S_per_chip = S_padded // NCHIPS
 
-    # Pad h on device when needed (concat zeros tile-rows).
+    # Pad h on device when needed (concat zeros tile-rows). Pad tensor is
+    # CACHED on state to avoid a `ttnn.from_torch` host write each call —
+    # the latter TT_FATALs inside trace capture. Lazy-allocate on first
+    # use; eager warmup populates it BEFORE trace capture begins.
     if S_padded != S_orig:
-        pad_tt = ttnn.from_torch(
-            torch.zeros((B, S_padded - S_orig, HIDDEN), dtype=torch.float32),
-            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
-        )
-        h_padded_tt = ttnn.concat([h_input_tt, pad_tt], dim=1)
-        ttnn.deallocate(pad_tt)
+        pad_shape = (B, S_padded - S_orig, HIDDEN)
+        cached = getattr(state, "moe_decode_pad_zeros_tt", None)
+        if cached is None or tuple(cached.shape) != pad_shape:
+            state.moe_decode_pad_zeros_tt = ttnn.from_torch(
+                torch.zeros(pad_shape, dtype=torch.float32),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+            )
+        h_padded_tt = ttnn.concat([h_input_tt, state.moe_decode_pad_zeros_tt], dim=1)
+        # NO deallocate — pad is the cached singleton owned by state.
     else:
         h_padded_tt = h_input_tt  # alias; do NOT deallocate
 
