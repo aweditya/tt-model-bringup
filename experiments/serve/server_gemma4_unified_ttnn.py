@@ -160,19 +160,140 @@ def np_to_replicated(arr, mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     )
 
 
-def np_stacked_to_sharded(per_chip_list, mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
+def np_stacked_to_sharded(per_chip_list, mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                          memory_config=None):
     """Stack a list of NCHIPS numpy arrays as the leading axis; shard along it.
 
     Uses `ShardTensorToMesh(dim=0)` (1D sharder) — matches 35B's
     `np_stacked_to_sharded` (`server_35b_ttnn.py:96`). The 2D variant
     `ShardTensor2dMesh` keeps the leading 4-dim on each chip's tensor
     which breaks downstream matmul (`a=1 vs b=4` shape mismatch).
+
+    Round 10 (2026-06-06) — add `memory_config` kwarg so callers can land
+    the weight as WIDTH_SHARDED DRAM (Round 10 Phase 4 lever). Forwards
+    to `ttnn.from_torch(..., memory_config=...)` when provided. Default
+    behaviour (memory_config=None) preserves the pre-Round-10 contract:
+    the runtime picks the default INTERLEAVED-DRAM memory config.
     """
     stacked = np.stack(per_chip_list, axis=0).astype(np.float32)
-    return ttnn.from_torch(
-        torch.from_numpy(stacked),
+    kwargs = dict(
         dtype=dtype, layout=layout, device=mesh,
         mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
+    )
+    if memory_config is not None:
+        kwargs["memory_config"] = memory_config
+    return ttnn.from_torch(torch.from_numpy(stacked), **kwargs)
+
+
+# ── Round 10 — DRAM-sharded MLP helpers ─────────────────────────────────
+# Forks `experiments/cb/isolate/gm4_dram_sharded_mlp_probe.py:82-156`
+# (helpers `_dram_weight_mem_cfg`, `_activation_l1_width_sharded`,
+# `_dram_sharded_program_config`). Probe PASSED on all 3 MLP per-chip
+# shapes (cos = 0.9999937, marginally MORE accurate vs fp32). This is the
+# production wire-up for Round 10 Phase 4. Gated behind env var
+# TT_GM4_DRAM_PREFETCH (set to "1" to enable). See landscape map at
+# `research/gemma4_perf_qb2_2026-06-05/tiling_sharding_plan.md` §A1.
+
+TILE = 32
+
+
+def _dram_sharded_enabled():
+    """Module-level env-gate cache. Read once at first call to avoid the
+    per-forward syscall."""
+    import os as _os
+    return _os.environ.get("TT_GM4_DRAM_PREFETCH", "").strip() == "1"
+
+
+def _dram_weight_mem_cfg_mlp(mesh, K, N):
+    """WIDTH_SHARDED DRAM memory config for a per-chip [K, N] MLP weight.
+
+    Forks `gm4_dram_sharded_mlp_probe.py:_dram_weight_mem_cfg` (which
+    itself forks `tt-metal/models/demos/llama3_70b_galaxy/tt/model_config.py:
+    2312-2320 create_dram_sharded_mem_config`).
+
+    For the Gemma 4 per-chip MLP triplet (K=3840, N=3840) on Blackhole
+    P150 (`dram_grid_size = (8, 1)`): N already aligned to TILE × num_banks
+    (= 32 × 8 = 256), so no padding.
+    """
+    dram_grid_size = mesh.dram_grid_size()
+    num_banks = dram_grid_size.x
+    assert dram_grid_size.y == 1, f"dram_grid_size.y must be 1; got {dram_grid_size.y}"
+    padded_N = int(math.ceil(N / (TILE * num_banks)) * (TILE * num_banks))
+    dram_grid = ttnn.CoreRangeSet({
+        ttnn.CoreRange(
+            ttnn.CoreCoord(0, 0),
+            ttnn.CoreCoord(dram_grid_size.x - 1, dram_grid_size.y - 1),
+        )
+    })
+    shard_spec = ttnn.ShardSpec(
+        dram_grid,
+        (K, padded_N // num_banks),
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    return ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.DRAM,
+        shard_spec,
+    )
+
+
+def _activation_l1_width_sharded(mesh, M, K, num_cores=8):
+    """L1 WIDTH_SHARDED activation memory config for DRAM-sharded matmul in0.
+
+    Forks `gm4_dram_sharded_mlp_probe.py:_activation_l1_width_sharded`
+    + `tt-metal/.../test_matmul_dram_sharded.py:135-142`.
+    """
+    in0_block_w = K // num_cores // TILE
+    in0_shard_grid = ttnn.CoreRangeSet({
+        ttnn.CoreRange(
+            ttnn.CoreCoord(0, 0),
+            ttnn.CoreCoord(num_cores - 1, 0),
+        )
+    })
+    in0_shard_spec = ttnn.ShardSpec(
+        in0_shard_grid,
+        [M, in0_block_w * TILE],
+        ttnn.ShardOrientation.ROW_MAJOR,
+    )
+    return ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+        ttnn.BufferType.L1,
+        in0_shard_spec,
+    )
+
+
+def _dram_sharded_mlp_program_config(M, K, N, num_cores=8):
+    """Matmul program config for DRAM-sharded MLP weight.
+
+    Forks `gm4_dram_sharded_mlp_probe.py:_dram_sharded_program_config`
+    + `tt-metal/.../test_matmul_dram_sharded.py:140-145`.
+
+    Note (probe finding): in0_block_w = K/num_cores/TILE/4 = 15/4 = 3.75
+    floored to 3 by max(1, ...). If the kernel rejects 3 we fall back to
+    5 or 15 by reading the assertion message.
+    """
+    in0_block_w_unscaled = K // num_cores // TILE
+    in0_block_w = max(1, in0_block_w_unscaled // 4)
+    return ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+        in0_block_w=in0_block_w,
+        per_core_M=M // TILE,
+        per_core_N=N // num_cores // TILE,
+        fused_activation=None,
+    )
+
+
+def _dram_sharded_mlp_program_config_with_gelu(M, K, N, num_cores=8):
+    """Same as `_dram_sharded_mlp_program_config` but with fused GELU activation
+    (the Round-4 lever, ported into the DRAM-sharded matmul). Used on gate_proj
+    only.
+    """
+    in0_block_w_unscaled = K // num_cores // TILE
+    in0_block_w = max(1, in0_block_w_unscaled // 4)
+    return ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+        in0_block_w=in0_block_w,
+        per_core_M=M // TILE,
+        per_core_N=N // num_cores // TILE,
+        fused_activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.GELU, False),
     )
 
 
@@ -312,9 +433,24 @@ def upload_mlp_layer(layer_sd, mesh):
     down_w = layer_sd["mlp.down_proj.weight"].T  # [INTERMEDIATE, HIDDEN]
     # Round 9 ablation gate: set TT_GM4_MLP_DTYPE=bfp8 to re-enable Round 8.
     mlp_dtype = _resolve_dtype("TT_GM4_MLP_DTYPE", default=ttnn.bfloat16)
-    w["gate_proj"] = np_stacked_to_sharded(shard_along(gate_w, axis=1), mesh, dtype=mlp_dtype)
-    w["up_proj"]   = np_stacked_to_sharded(shard_along(up_w,   axis=1), mesh, dtype=mlp_dtype)
-    w["down_proj"] = np_stacked_to_sharded(shard_along(down_w, axis=0), mesh, dtype=mlp_dtype)
+    # Round 10 (2026-06-06) — DRAM-sharded MLP weights. When env-gated, lay out
+    # gate/up/down as WIDTH_SHARDED DRAM (parallel reads across all 8 P150
+    # DRAM banks). Per-chip shape after the leading-axis shard is
+    # [HIDDEN, INTERMEDIATE_PER_CHIP] = [3840, 3840] for all three. We pass
+    # this per-chip shape to `_dram_weight_mem_cfg_mlp` — ttnn's mesh-mapper
+    # treats the leading dim as the chip-shard axis (per
+    # ShardTensorToMesh(dim=0)), so the WIDTH_SHARDED layout applies inside
+    # each chip's slice [3840, 3840].
+    mlp_mem_cfg = None
+    if _dram_sharded_enabled():
+        # All three weights share the same per-chip shape [3840, 3840].
+        mlp_mem_cfg = _dram_weight_mem_cfg_mlp(mesh, K=HIDDEN, N=INTERMEDIATE_PER_CHIP)
+    w["gate_proj"] = np_stacked_to_sharded(
+        shard_along(gate_w, axis=1), mesh, dtype=mlp_dtype, memory_config=mlp_mem_cfg)
+    w["up_proj"]   = np_stacked_to_sharded(
+        shard_along(up_w,   axis=1), mesh, dtype=mlp_dtype, memory_config=mlp_mem_cfg)
+    w["down_proj"] = np_stacked_to_sharded(
+        shard_along(down_w, axis=0), mesh, dtype=mlp_dtype, memory_config=mlp_mem_cfg)
     return w
 
 
@@ -1519,23 +1655,73 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
     h_after_attn = ttnn.add(h_in, post_attn)
     ttnn.deallocate(post_attn)
     pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"], epsilon=EPS)
-    # Round-4 perf (2026-06-05): fuse gelu into gate_proj matmul via the
-    # `activation="gelu"` fused-activation parameter. Per tt-metal
-    # unary_op_utils.cpp:833 the string "gelu" maps to
-    # UnaryOpType::GELU with fast_and_approximate=false — exactly matches
-    # our prior `ttnn.gelu(gate, fast_and_approximate_mode=False)`. Saves
-    # 1 op per layer × 48 = 48 ops/forward (fully kernel-time: the SFPU
-    # GELU runs inside the matmul out-block writeback, no extra pass).
-    # Isolation probe: `experiments/cb/isolate/gm4_matmul_gelu_probe.py` —
-    # max|delta| = 0.0 vs separate matmul + gelu (bit-identical).
-    gelu_gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4,
-                            activation="gelu")
-    up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
-    ttnn.deallocate(pre_ff)
-    mid = ttnn.mul(gelu_gate, up)
-    ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
-    mlp_partial = ttnn.matmul(mid, w["down_proj"], compute_kernel_config=HIFI4)
-    ttnn.deallocate(mid)
+    # Round 10 (2026-06-06) — DRAM-sharded MLP matmul path. Gated on
+    # TT_GM4_DRAM_PREFETCH=1. Reshards `pre_ff` (and `mid` for down_proj) to
+    # WIDTH_SHARDED L1 to match the DRAM-sharded matmul's in0 contract; passes
+    # the dedicated `MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig`.
+    # Output stays WIDTH_SHARDED L1 between the three matmuls; reshard to
+    # interleaved before `all_reduce`. Probe `gm4_dram_sharded_mlp_probe.py`
+    # PASSED cos=0.9999937 vs default (3/3 MLP shapes, marginally MORE
+    # accurate vs fp32). Fork rationale + landscape: see
+    # `research/gemma4_perf_qb2_2026-06-05/tiling_sharding_plan.md` §A1.
+    if _dram_sharded_enabled():
+        # Per-chip in0 shape for gate/up: [M=32, K=HIDDEN=3840]; for down:
+        # [M=32, K=INTERMEDIATE_PER_CHIP=3840] (same K by coincidence of
+        # Gemma 4 INTERMEDIATE/NCHIPS == HIDDEN).
+        x_mem_cfg_gate_up = _activation_l1_width_sharded(
+            state.mesh, M=TILE, K=HIDDEN, num_cores=8)
+        x_mem_cfg_down = _activation_l1_width_sharded(
+            state.mesh, M=TILE, K=INTERMEDIATE_PER_CHIP, num_cores=8)
+        out_mem_cfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1)
+        prog_gate = _dram_sharded_mlp_program_config_with_gelu(
+            M=TILE, K=HIDDEN, N=INTERMEDIATE_PER_CHIP, num_cores=8)
+        prog_up = _dram_sharded_mlp_program_config(
+            M=TILE, K=HIDDEN, N=INTERMEDIATE_PER_CHIP, num_cores=8)
+        prog_down = _dram_sharded_mlp_program_config(
+            M=TILE, K=INTERMEDIATE_PER_CHIP, N=HIDDEN_PER_CHIP, num_cores=8)
+
+        pre_ff_sh = ttnn.to_memory_config(pre_ff, x_mem_cfg_gate_up)
+        ttnn.deallocate(pre_ff)
+        gelu_gate_sh = ttnn.matmul(
+            pre_ff_sh, w["gate_proj"], program_config=prog_gate,
+            memory_config=out_mem_cfg, compute_kernel_config=HIFI4)
+        up_sh = ttnn.matmul(
+            pre_ff_sh, w["up_proj"], program_config=prog_up,
+            memory_config=out_mem_cfg, compute_kernel_config=HIFI4)
+        ttnn.deallocate(pre_ff_sh)
+        mid_sh = ttnn.mul(gelu_gate_sh, up_sh)
+        ttnn.deallocate(gelu_gate_sh); ttnn.deallocate(up_sh)
+        # Reshard mid → WIDTH_SHARDED L1 with K=INTERMEDIATE_PER_CHIP contract
+        # for down_proj's in0.
+        mid = ttnn.to_memory_config(mid_sh, x_mem_cfg_down)
+        ttnn.deallocate(mid_sh)
+        mlp_partial_sh = ttnn.matmul(
+            mid, w["down_proj"], program_config=prog_down,
+            memory_config=out_mem_cfg, compute_kernel_config=HIFI4)
+        ttnn.deallocate(mid)
+        # all_reduce expects INTERLEAVED; reshard back.
+        mlp_partial = ttnn.sharded_to_interleaved(
+            mlp_partial_sh, ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(mlp_partial_sh)
+    else:
+        # Round-4 perf (2026-06-05): fuse gelu into gate_proj matmul via the
+        # `activation="gelu"` fused-activation parameter. Per tt-metal
+        # unary_op_utils.cpp:833 the string "gelu" maps to
+        # UnaryOpType::GELU with fast_and_approximate=false — exactly matches
+        # our prior `ttnn.gelu(gate, fast_and_approximate_mode=False)`. Saves
+        # 1 op per layer × 48 = 48 ops/forward (fully kernel-time: the SFPU
+        # GELU runs inside the matmul out-block writeback, no extra pass).
+        # Isolation probe: `experiments/cb/isolate/gm4_matmul_gelu_probe.py` —
+        # max|delta| = 0.0 vs separate matmul + gelu (bit-identical).
+        gelu_gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4,
+                                activation="gelu")
+        up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
+        ttnn.deallocate(pre_ff)
+        mid = ttnn.mul(gelu_gate, up)
+        ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
+        mlp_partial = ttnn.matmul(mid, w["down_proj"], compute_kernel_config=HIFI4)
+        ttnn.deallocate(mid)
     mlp_out = all_reduce_tt(mlp_partial, state.mesh)
     ttnn.deallocate(mlp_partial)
     post_ff = ttnn.rms_norm(mlp_out, weight=w["post_feedforward_layernorm"], epsilon=EPS)
