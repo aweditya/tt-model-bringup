@@ -33,8 +33,15 @@ right move. **Always isolate the suspect op alone, not just inside the
 chain**. Saved in `[[feedback-profile-first-perf-method]]`.
 
 **Next perf lever**: warm 0.7s step is no longer conv1d-bound. Profile the
-new step to localise the next bottleneck (likely SSD-scan numpy roundtrip
-or MoE host-side topk). Target ≥30 tok/s still ~20× away.
+new step (#225 v0.4.0f layer-kind profile) to localise the next
+bottleneck. Tracing plan written: [`research/nemotron3_trace_plan_2026-06-05.md`](research/nemotron3_trace_plan_2026-06-05.md).
+Real blocker for v0.4.1 trace: **Mamba2 SSD wrapper still does
+device→numpy→device per layer per step** (task #223 v0.4.0g
+re-opened). Once that + #226 (MoE host-paths on-device) land, v0.4.1
+single-step trace + multi-trace two-phase warmup become straightforward
+forks of 27B/35B/Gemma 4 traced decode. Target ≥30 tok/s still ~20×
+away — trace gets ~2-3× of that, the rest is v0.5 (vocab-shard
+lm_head + RMSNorm fusion + on-device topk).
 
 ---
 
