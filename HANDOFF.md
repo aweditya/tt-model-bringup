@@ -5,7 +5,23 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## LATEST (2026-06-07) — **v0.5.P1 SHIPPED + v0.5.bench RULER-NIAH on Nemotron-3 next**
+## LATEST (2026-06-07 PM) — **Gemma 4 spec-dec plan ready for review (`8a982d5`)**
+
+User asked to plan + reconvene before building. Plan-of-action lands at
+`research/gemma4_mtp_plan_of_action.md` — 5 phases (0–4) over 8 days,
+forks DeepSeek-V3 trace orchestration + Leviathan Algorithm 1. Target
+α ≥ 0.7, speedup ≥ 1.5× decode tok/s.
+
+**3 open decisions before kickoff** (see § Reconvene checkpoint):
+1. Run Phase 0.A 4 h feasibility code-read on `Gemma4AssistantForCausalLM`
+   (centroid embedding architecture — could be (a) lookup-table → ok,
+   (b) learned VQ → 1 day extra, or (c) not in transformers → HARD STOP)?
+2. Port determinism A+B+D from 35B to Gemma 4 12B (~2 h, free win for ~5% α)?
+3. Host: pause Gemma 4 perf on qb2 to free device, or build drafter on qb1?
+
+---
+
+## PRIOR (2026-06-07) — **v0.5.P1 SHIPPED + v0.5.bench RULER-NIAH on Nemotron-3 next**
 
 **Pivot 2026-06-07 (user)**: skipped P2 RMSNorm fusion after profile showed
 modest ROI (~5-10 ms eager via dispatch reduction; no general rms_norm+
