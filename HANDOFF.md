@@ -5,7 +5,32 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## LATEST (2026-06-06 evening) — **v0.5 eager perf pass started; trace deferred to v0.6**
+## LATEST (2026-06-07) — **v0.5.P1 SHIPPED + v0.5.bench RULER-NIAH on Nemotron-3 next**
+
+**Pivot 2026-06-07 (user)**: skipped P2 RMSNorm fusion after profile showed
+modest ROI (~5-10 ms eager via dispatch reduction; no general rms_norm+
+matmul fusion in ttnn). MoE is the bigger lever (52% of step) but HiFi2
+deferred. Pivot to v0.5.bench — long-context stability validation before
+chasing more perf rounds.
+
+**Prefill reality**: Nemotron-3 prefill ~770 ms/token (mamba2 SSD path
+runs per-position eager); RULER NIAH at L=4k infeasible (~53 min/sample).
+Running smaller NIAH ladder at L=128/512/1024 instead — ~1 hour wall for
+first numbers vs upstream Mistral-Nemo-12B (~95% @ 4k) and
+Llama-3.1-8B-Instruct (~95% @ 4k) as size-class anchors.
+
+**Profile breakdown (252 ms step from v040f)**:
+
+| Block | layers | ms | per-layer | share |
+|---|---|---|---|---|
+| MoE | 23 | 131.2 | 5.7 | **52%** |
+| Mamba2 | 23 | 93.8 | 4.1 | **37%** |
+| Attn | 6 | 9.8 | 1.6 | 4% |
+| Embed+LM+sample | — | 16.9 | — | 7% |
+
+---
+
+## PRIOR (2026-06-06 evening) — **v0.5 eager perf pass started; trace deferred to v0.6**
 
 After cross-server audit (commit `47bd16e`) revealed **no MoE model in our
 project is currently traced** (35B is also eager-only), strategic pivot:
