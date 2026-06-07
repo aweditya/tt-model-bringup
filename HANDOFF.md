@@ -12,12 +12,21 @@ project is currently traced** (35B is also eager-only), strategic pivot:
 ship eager perf wins NOW, MoE-on-device dispatch as v0.6 architectural
 effort gated on upstream MoE+trace research (task #245 agent in flight).
 
-**v0.5.P1 vocab-shard lm_head landed (commit `693806a`)**. Forks 27B P22
-(server_tp.py:399 + :1680-1688): vocab-sharded lm_head along dim=1 +
-all_gather + on-device argmax. Per-step readback drops from full-vocab
-(131072 × 2 bytes = 262 KB) to 8 bytes. Expected +5-8% per 27B/Gemma 4
-precedent → 260 ms eager target ~240-245 ms. Validation pending harness
-restart on qb1.
+**v0.5.P1 vocab-shard lm_head landed + measured (commit `693806a`)**.
+Forks 27B P22 (server_tp.py:399 + :1680-1688). Measured 2026-06-07 on
+fresh qb1 harness bootstrap:
+
+| | pre-shard | post-shard | delta |
+|---|---|---|---|
+| mean ms/tok | 260.0 | **203.1** | **-21.9%** |
+| median | n/a | 201.4 | — |
+| p95 | n/a | 214.3 | — |
+| tok/s | 3.85 | **4.92** | +28% |
+
+30-step measurement, prefill argmax=6993 PASS, chain matches v0.3.3
+baseline (1063/6993 alternating). **Bigger than 27B P22 +5-8% because
+Nemotron-3's smaller HIDDEN (2688 vs 4096) makes lm_head a larger
+fraction of step time.** Per-step saving ~57 ms.
 
 **MoE+trace upstream research LANDED (commit `486436e`)** —
 research/moe_trace_precedents.md (462 lines). **Both `gpt_oss` and
