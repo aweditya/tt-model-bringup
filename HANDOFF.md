@@ -52,9 +52,19 @@ trigger IT-conversational evasion in any IT model. Long-context decode
 - Bootstrap 28s cold / 9.9s warm
 - Key arch findings: drafter has NO k_proj/v_proj (cross-attention from target's KV); L3 full attn head_dim=512 vs L0-2 sliding head_dim=256 (dual-head_dim); `tie_word_embeddings` honored
 
-**Phase 1 v0.2 in flight**: 4-layer forward with shared_kv_states injection,
-post_projection, lm_head. Build agent on qb2. Targets cos≥0.999 + 4/5
-argmax match vs HF on the 5 oracle prompts.
+**Phase 1 v0.2 STRUCTURALLY COMPLETE, qb2 toolchain regression** (commits
+`ed4753f` v0.2 server + 5-prompt smoke + `7b1cdc4` rms_norm isolation):
+- 4-layer forward + cross-K/V attention + post_projection + lm_head all
+  shipped (+280 LOC to drafter server)
+- **HARD STOP on qb2**: `TT_THROW: Failed to generate binaries for
+  layernorm — trisc1 SFPI copysgn<vInt,vInt> returns vSMag, expected
+  vInt`. Every `ttnn.rms_norm` call fails. v0.1 path (embed+matmul+
+  all_reduce only) still PASS on the broken build.
+- Isolation confirms qb2-only: 4/4 rms_norm shapes FAIL on qb2, all PASS
+  on qb1. Memory entry `[[qb2-layernorm-trisc1-broken-2026-06-07]]`
+- **Pivoting v0.2 validation to qb1** (nm3 harness killed to free
+  device; oracle artifacts rsync qb2→local→qb1; v0.2 sources deployed
+  to qb1). Forward smoke in flight on qb1 now.
 
 ---
 
