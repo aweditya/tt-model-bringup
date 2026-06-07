@@ -245,6 +245,8 @@ class State:
         # head_dim helpers for v_norm (ones, no scale) — sliding only here.
         self.ones_head_dim_sliding = None
         self.ones_head_dim_full = None
+        # SDPA compute kernel config (HiFi4 + fp32_dest_acc).
+        self.sdpa_compute_kernel_config = None
         # Misc
         self.vocab_size = None
 
@@ -302,6 +304,11 @@ def bootstrap(state, log=None):
         np.ones(HEAD_DIM_SLIDING, dtype=np.float32), state.mesh)
     state.ones_head_dim_full = np_to_replicated(
         np.ones(HEAD_DIM_FULL, dtype=np.float32), state.mesh)
+
+    # SDPA compute kernel config — HiFi4 + fp32_dest_acc (matches target's
+    # `sdpa_compute_kernel_config` setup at server_gemma4_unified_ttnn.py
+    # bootstrap).
+    state.sdpa_compute_kernel_config = HIFI4
 
     # ── Embed: replicated, ROW_MAJOR (ttnn.embedding requires it) ──
     # Tied to lm_head. Drafter prefix is `model.` (NOT `model.language_model.`).
@@ -451,6 +458,320 @@ def pre_projection_tt(state, inputs_embeds_np):
     out_np = _readback_replicated(y_tt, state.mesh).reshape(B, L, HIDDEN)
     ttnn.deallocate(y_tt)
     return out_np
+
+
+# ── v0.2: cross-attention helpers + drafter layer forward ──────────────
+#
+# Drafter v0.2 design (cross-attention to target's KV per HF
+# Gemma4UnifiedAssistantForCausalLM, modeling_gemma4_unified_assistant.py +
+# Gemma4TextAttention.is_kv_shared_layer branch in modeling_gemma4.py:
+# 1252-1262):
+#
+# 1. h_in is REPLICATED [1, 1, HIDDEN=1024] across the mesh.
+# 2. h_norm = rms_norm(h_in, input_layernorm_weight).
+# 3. q = h_norm @ q_proj_sharded → per chip [1, 1, NQ_PER_CHIP*head_dim].
+#    Reshape to [NQ_PER_CHIP, head_dim].
+# 4. q_norm via ttnn.rms_norm with `weight=q_norm` (Gemma 4 Llama-style — NO
+#    +1.0 offset; see target's _layer_pos0_sliding_paged at unified server
+#    line 1426).
+# 5. RoPE on q at position_ids=[0] (drafter L=1 ⇒ position 0 ⇒ cos=1, sin=0
+#    ⇒ identity; SKIP entirely for clarity + perf).
+# 6. K, V from `shared_kv_states[layer_type]` — uploaded per-call as
+#    sharded (sliding) or replicated (full) onto the mesh. They were
+#    already RoPE'd + v_norm'd by the target.
+# 7. SDPA: ttnn.transformer.scaled_dot_product_attention(Q, K, V,
+#    is_causal=False, scale=1.0) — supports GQA natively per
+#    [[reference-ttnn-prefill-sdpa-gqa-native]]. scale=1.0 because Gemma 4
+#    text attention sets self.scaling=1.0 (modeling_gemma4.py:1184).
+# 8. attn → reshape [1, NQ_PER_CHIP*head_dim] → o_proj sharded matmul +
+#    all_reduce.
+# 9. residual_1 = h_in + post_attention_layernorm(attn_out)
+# 10. mlp: pre_feedforward_layernorm → gate_proj(gelu) * up_proj → down_proj
+#     + all_reduce → post_feedforward_layernorm.
+# 11. h_out = (residual_1 + mlp_out) * layer_scalar.
+
+
+def _upload_kv_sliding(state, K_np, V_np):
+    """Upload sliding shared_kv_states to mesh.
+
+    Shapes from HF oracle: K, V [B=1, NKV=8, L_kv, head_dim=256] fp32 (already
+    RoPE'd + v_norm'd by target).
+
+    Shard along NKV=8 → NKV_PER_CHIP=2 per chip [1, 2, L_kv, 256].
+    `ShardTensorToMesh(dim=1)` keeps B leading and shards heads cleanly.
+
+    Q-head h ∈ [0..15] across the mesh maps to KV-head `h // GQA_GROUP = h//2`.
+    Chip c holds Q-heads `[4c..4c+3]` (via q_proj output sharding) → KV-heads
+    `[2c, 2c+1]` — same per-chip alignment as sharding K, V on dim=1.
+    """
+    assert K_np.shape[1] == NUM_KV_HEADS_SLIDING, \
+        f"K_np head dim mismatch: {K_np.shape} expected NKV=8"
+    K_tt = ttnn.from_torch(
+        torch.from_numpy(K_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    V_tt = ttnn.from_torch(
+        torch.from_numpy(V_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    return K_tt, V_tt
+
+
+def _upload_kv_full(state, K_np, V_np):
+    """Upload full shared_kv_states to mesh.
+
+    Shapes from HF oracle: K, V [B=1, NKV=1, L_kv, head_dim=512] fp32 (already
+    p-RoPE'd + v_norm'd by target).
+
+    Replicate across mesh — each chip's 4 Q heads (NQ_PER_CHIP=4) all attend
+    to this single KV head (GQA group = NQ/NKV = 16 mesh-wide; per chip 4).
+    """
+    assert K_np.shape[1] == NUM_KV_HEADS_FULL, \
+        f"K_np head dim mismatch: {K_np.shape} expected NKV=1"
+    K_tt = ttnn.from_torch(
+        torch.from_numpy(K_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    V_tt = ttnn.from_torch(
+        torch.from_numpy(V_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    return K_tt, V_tt
+
+
+def _drafter_attn_sliding(state, h_norm, w, K_tt, V_tt):
+    """Drafter sliding attention: cross-attend Q (drafter) to K, V (target).
+
+    Shapes:
+      h_norm: replicated [1, 1, HIDDEN=1024]
+      K_tt, V_tt: sharded dim=1, per chip [1, NKV_PER_CHIP_SLIDING=2, L_kv, 256]
+      Returns: replicated [1, 1, HIDDEN] (after o_proj + all_reduce).
+    """
+    # q = h_norm @ q_proj_sharded   per chip [1, 1, NQ_PER_CHIP*head_dim=1024]
+    q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
+    # Reshape to per-head: [1, 1, NQ_PER_CHIP, head_dim].
+    q_h = ttnn.reshape(q, [1, 1, NQ_PER_CHIP, HEAD_DIM_SLIDING])
+    ttnn.deallocate(q)
+    # q_norm: rms_norm with learned weight, NO +1.0 (Gemma 4 Llama-style).
+    # ttnn.rms_norm needs rank ≥ 2; pass weight of shape [head_dim]. q_h's
+    # last dim is head_dim — broadcasts cleanly.
+    q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    ttnn.deallocate(q_h)
+    # RoPE skipped — position_ids=[0] → cos=1, sin=0 → identity.
+
+    # SDPA contract: Q [B, NQ, sq, dh], K/V [B, NKV, sk, dh]. Transpose Q so
+    # that NQ is dim 1 (Q is currently [1, 1, NQ_PER_CHIP, head_dim] = [B, sq,
+    # NQ, dh]). Permute (0, 2, 1, 3).
+    q_for_sdpa = ttnn.permute(q_n, [0, 2, 1, 3])
+    ttnn.deallocate(q_n)
+    # K, V already [1, NKV_PER_CHIP_SLIDING, L_kv, 256] — correct contract.
+    attn_out = ttnn.transformer.scaled_dot_product_attention(
+        q_for_sdpa, K_tt, V_tt,
+        is_causal=False,
+        scale=1.0,  # Gemma 4 text attention: self.scaling=1.0.
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+    )
+    ttnn.deallocate(q_for_sdpa)
+    # attn_out [1, NQ_PER_CHIP, 1, head_dim] → flatten to [1, 1, NQ_PER_CHIP*hd]
+    attn_perm = ttnn.permute(attn_out, [0, 2, 1, 3])
+    ttnn.deallocate(attn_out)
+    attn_flat = ttnn.reshape(attn_perm,
+                              [1, 1, NQ_PER_CHIP * HEAD_DIM_SLIDING])
+    ttnn.deallocate(attn_perm)
+    # o_proj input-sharded + all_reduce.
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+    return out
+
+
+def _drafter_attn_full(state, h_norm, w, K_tt, V_tt):
+    """Drafter full attention (L3): cross-attend Q to single KV head (replicated).
+
+    Shapes:
+      h_norm: replicated [1, 1, HIDDEN=1024]
+      K_tt, V_tt: REPLICATED [1, NKV=1, L_kv, head_dim=512]
+      Returns: replicated [1, 1, HIDDEN].
+    """
+    q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
+    q_h = ttnn.reshape(q, [1, 1, NQ_PER_CHIP, HEAD_DIM_FULL])
+    ttnn.deallocate(q)
+    q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    ttnn.deallocate(q_h)
+    # RoPE: position 0 → identity. SKIPPED.
+    q_for_sdpa = ttnn.permute(q_n, [0, 2, 1, 3])  # [1, NQ_PER_CHIP, 1, 512]
+    ttnn.deallocate(q_n)
+    attn_out = ttnn.transformer.scaled_dot_product_attention(
+        q_for_sdpa, K_tt, V_tt,
+        is_causal=False,
+        scale=1.0,
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+    )
+    ttnn.deallocate(q_for_sdpa)
+    attn_perm = ttnn.permute(attn_out, [0, 2, 1, 3])
+    ttnn.deallocate(attn_out)
+    attn_flat = ttnn.reshape(attn_perm,
+                              [1, 1, NQ_PER_CHIP * HEAD_DIM_FULL])
+    ttnn.deallocate(attn_perm)
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+    return out
+
+
+def drafter_layer_forward(state, h_in, layer_idx, K_tt, V_tt):
+    """One Gemma 4 drafter decoder layer.
+
+    Args:
+      h_in:  replicated [1, 1, HIDDEN] (TILE_LAYOUT bf16)
+      layer_idx: int in [0..N_LAYERS-1]
+      K_tt, V_tt: the shared KV for this layer's `layer_type` — produced
+                  once per forward by `_upload_kv_sliding` or `_upload_kv_full`.
+    Returns: replicated [1, 1, HIDDEN].
+
+    Forks `experiments/serve/server_gemma4_unified_ttnn.py:_layer_forward_pos0`
+    structurally; drops K/V projection (drafter has none) and the per-layer
+    KV cache (drafter cross-attends to target's KV).
+    """
+    w = state.per_layer_tt[layer_idx]
+    lt = state.layer_types[layer_idx]
+
+    h_norm = ttnn.rms_norm(h_in, weight=w["input_layernorm"], epsilon=EPS)
+    if lt == "sliding_attention":
+        mixer = _drafter_attn_sliding(state, h_norm, w, K_tt, V_tt)
+    else:
+        mixer = _drafter_attn_full(state, h_norm, w, K_tt, V_tt)
+    ttnn.deallocate(h_norm)
+
+    post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"],
+                               epsilon=EPS)
+    ttnn.deallocate(mixer)
+    h_after_attn = ttnn.add(h_in, post_attn)
+    ttnn.deallocate(post_attn)
+
+    pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"],
+                            epsilon=EPS)
+    gelu_gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4,
+                             activation="gelu")
+    up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(pre_ff)
+    mid = ttnn.mul(gelu_gate, up)
+    ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
+    mlp_partial = ttnn.matmul(mid, w["down_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(mid)
+    mlp_out = all_reduce_tt(mlp_partial, state.mesh)
+    ttnn.deallocate(mlp_partial)
+    post_ff = ttnn.rms_norm(mlp_out, weight=w["post_feedforward_layernorm"],
+                             epsilon=EPS)
+    ttnn.deallocate(mlp_out)
+
+    # h_out = (h_after_attn + post_ff) * layer_scalar — fused via the
+    # `activations` parameter on `ttnn.add` (Round-6 fork from target).
+    _layer_scalar_act = [ttnn.UnaryWithParam(
+        ttnn.UnaryOpType.MUL_UNARY_SFPU, float(w["layer_scalar"]))]
+    h_out = ttnn.add(h_after_attn, post_ff, activations=_layer_scalar_act)
+    ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff)
+    return h_out
+
+
+def drafter_forward(state, inputs_embeds_np, shared_kv_states):
+    """Top-level drafter forward: pre_projection → 4 layers → post_projection
+    + lm_head.
+
+    Args:
+      inputs_embeds_np: numpy fp32 [B=1, L=1, 2*BACKBONE_HIDDEN=7680] —
+                       concat(target_h_last, target_h_prev) (HF order: prev
+                       then last; see hf_oracle_gemma4_assistant.py:166).
+      shared_kv_states: dict mapping layer_type → (K_np, V_np)
+        - "sliding_attention": K, V shape (1, 8, L_kv, 256)
+        - "full_attention":    K, V shape (1, 1, L_kv, 512)
+
+    Returns:
+      dict with numpy arrays:
+        - "logits": [B, L, VOCAB=262144]
+        - "hidden": [B, L, BACKBONE_HIDDEN=3840] (= post_projection output)
+        - "argmax": [B, L] int64
+
+    NOTE: this is a single-forward eager probe; v0.4 captures a trace and
+    re-runs the same path. v0.2/v0.3 are correctness-first.
+    """
+    assert inputs_embeds_np.ndim == 3 and inputs_embeds_np.shape[2] == 2*BACKBONE_HIDDEN
+    B, L, _ = inputs_embeds_np.shape
+    assert B == 1 and L == 1, f"drafter forward only supports B=1, L=1; got [{B}, {L}]"
+
+    # 1. Upload inputs_embeds replicated.
+    x_tt = ttnn.from_torch(
+        torch.from_numpy(inputs_embeds_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # 2. pre_projection → [1, 1, HIDDEN].
+    h = ttnn.matmul(x_tt, state.pre_projection_tt,
+                    compute_kernel_config=HIFI4)
+    ttnn.deallocate(x_tt)
+
+    # 3. Upload shared KV (once for all 4 layers — all sliding layers reuse
+    # the same sliding shared_kv; the single full layer uses the full one).
+    K_sl_np, V_sl_np = shared_kv_states["sliding_attention"]
+    K_fl_np, V_fl_np = shared_kv_states["full_attention"]
+    K_sl, V_sl = _upload_kv_sliding(state, K_sl_np, V_sl_np)
+    K_fl, V_fl = _upload_kv_full(state, K_fl_np, V_fl_np)
+
+    # 4. 4 layers.
+    for li in range(N_LAYERS):
+        lt = state.layer_types[li]
+        if lt == "sliding_attention":
+            K_tt, V_tt = K_sl, V_sl
+        else:
+            K_tt, V_tt = K_fl, V_fl
+        h_next = drafter_layer_forward(state, h, li, K_tt, V_tt)
+        ttnn.deallocate(h)
+        h = h_next
+
+    ttnn.deallocate(K_sl); ttnn.deallocate(V_sl)
+    ttnn.deallocate(K_fl); ttnn.deallocate(V_fl)
+
+    # 5. final_norm (model.norm) on `h` [1, 1, HIDDEN].
+    final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
+    ttnn.deallocate(h)
+
+    # 6. post_projection → [1, 1, BACKBONE_HIDDEN=3840]. Replicated.
+    hidden_tt = ttnn.matmul(final, state.post_projection_tt,
+                             compute_kernel_config=HIFI4)
+    hidden_np = _readback_replicated(hidden_tt, state.mesh).reshape(B, L, BACKBONE_HIDDEN)
+    ttnn.deallocate(hidden_tt)
+
+    # 7. lm_head: vocab-sharded matmul + all_gather. NO softcap (drafter
+    # config has final_logit_softcapping=null; verified in
+    # ~/.cache/huggingface/hub/.../config.json).
+    sharded = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
+    ttnn.deallocate(final)
+    gathered = ttnn.all_gather(sharded, dim=-1)
+    ttnn.deallocate(sharded)
+    # Untilize + argmax on device (forks target's `_lm_head_argmax`).
+    rm = ttnn.untilize(gathered, use_multicore=True)
+    argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=False)
+    logits_np = _readback_replicated(gathered, state.mesh).reshape(B, L, VOCAB)
+    ttnn.deallocate(gathered)
+    ttnn.deallocate(rm)
+    argmax_np = ttnn.to_torch(argmax_tt,
+        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+    # argmax replicated across chips; pick first.
+    if argmax_np.shape[0] == NCHIPS:
+        argmax_np = argmax_np[0]
+    argmax_np = argmax_np.long().reshape(B, L).cpu().numpy()
+    ttnn.deallocate(argmax_tt)
+    return {
+        "logits": logits_np,
+        "hidden": hidden_np,
+        "argmax": argmax_np,
+    }
 
 
 # ── CLI entrypoint: bootstrap-only smoke ────────────────────────────────
