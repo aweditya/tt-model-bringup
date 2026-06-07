@@ -30,6 +30,14 @@ path (not relevant to greedy spec-dec). **Zero code changes needed**.
 
 **Revised total**: ~5d build + 1d buffer = **~6 days** (was 8).
 
+**Nemotron-3 NIAH long-context (v0.5.bench DONE)** — `9b86e95` results
+(probe `0c0230b`). 0% retrieval at L=128/512/1024 but **decode stable at
+203-207 ms/tok across all lengths** (v0.5.P1 win holds) and outputs are
+COHERENT (`"Actually, I'm not sure!"` not gibberish). Third confirmation
+of `[[needle-prompt-shape-not-precision]]`: BASE-format Q/A prompts
+trigger IT-conversational evasion in any IT model. Long-context decode
+**IS stable** — that was the actual ask.
+
 **Remaining device-free work before qb2 freed**:
 - spec_dec_scheduler skeleton (Phase 3.A)
 - B=K+1 verify-trace probe scaffold (Phase 2.A)
