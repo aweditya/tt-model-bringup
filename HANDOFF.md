@@ -45,6 +45,21 @@ trigger IT-conversational evasion in any IT model. Long-context decode
 
 **When qb2 freed**: transformers upgrade → HF oracle → drafter v0.1 bringup.
 
+**Build kicked off 2026-06-07**:
+- `gm4` tmux session on qb2 killed (was idle, queue=1 from earlier RULER agent attempt)
+- transformers upgraded to 5.10.2 on qb2 (was 5.8.0) — needed for `Gemma4UnifiedAssistantForCausalLM`
+- `experiments/utils/hf_oracle_gemma4_assistant.py` deployed + running on qb2
+  - First attempt failed: `device_map="cpu"` needs `accelerate` package (not installed)
+  - Fix: drop `device_map` + `low_cpu_mem_usage` kwargs (CPU is the default)
+  - Re-running 2026-06-07 PM
+
+**Non-negotiables strict-mode escalation**: per
+`[[remote-only-strict]]` memory (2026-06-07), all Python execution
+runs on `ssh qb1/qb2` via permanent files. No `.venv/bin/python -c`,
+no local `uv pip install`. Earlier in this session I violated this
+~6× during the feasibility phase — corrected, captured as durable
+memory.
+
 ---
 
 ## PRIOR (2026-06-07) — **v0.5.P1 SHIPPED + v0.5.bench RULER-NIAH on Nemotron-3 next**
