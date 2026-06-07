@@ -45,6 +45,19 @@ trigger IT-conversational evasion in any IT model. Long-context decode
 
 **When qb2 freed**: transformers upgrade → HF oracle → drafter v0.1 bringup.
 
+**Phase 1 v0.1 SHIPPED 2026-06-07** (commits `4af15ea` + `f6b45f3` + `1c45ba5`):
+- `experiments/serve/server_gemma4_12b_assistant_ttnn.py` (470 LOC) bootstrap PASS on qb2
+- **embed cos = 1.0** (bit-perfect vs HF)
+- **pre_projection cos = 0.9999774** (well above 0.999 gate)
+- Bootstrap 28s cold / 9.9s warm
+- Key arch findings: drafter has NO k_proj/v_proj (cross-attention from target's KV); L3 full attn head_dim=512 vs L0-2 sliding head_dim=256 (dual-head_dim); `tie_word_embeddings` honored
+
+**Phase 1 v0.2 in flight**: 4-layer forward with shared_kv_states injection,
+post_projection, lm_head. Build agent on qb2. Targets cos≥0.999 + 4/5
+argmax match vs HF on the 5 oracle prompts.
+
+---
+
 **Build kicked off 2026-06-07**:
 - `gm4` tmux session on qb2 killed (was idle, queue=1 from earlier RULER agent attempt)
 - transformers upgraded to 5.10.2 on qb2 (was 5.8.0) — needed for `Gemma4UnifiedAssistantForCausalLM`
