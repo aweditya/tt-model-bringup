@@ -5,19 +5,37 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## LATEST (2026-06-07 PM) — **Gemma 4 spec-dec plan ready for review (`8a982d5`)**
+## LATEST (2026-06-07 PM) — **Gemma 4 spec-dec GREENLIT, scope dropped 2 days**
 
-User asked to plan + reconvene before building. Plan-of-action lands at
-`research/gemma4_mtp_plan_of_action.md` — 5 phases (0–4) over 8 days,
-forks DeepSeek-V3 trace orchestration + Leviathan Algorithm 1. Target
-α ≥ 0.7, speedup ≥ 1.5× decode tok/s.
+User confirmed Q1+Q2+Q3. **Phase 0 DONE device-free**:
 
-**3 open decisions before kickoff** (see § Reconvene checkpoint):
-1. Run Phase 0.A 4 h feasibility code-read on `Gemma4AssistantForCausalLM`
-   (centroid embedding architecture — could be (a) lookup-table → ok,
-   (b) learned VQ → 1 day extra, or (c) not in transformers → HARD STOP)?
-2. Port determinism A+B+D from 35B to Gemma 4 12B (~2 h, free win for ~5% α)?
-3. Host: pause Gemma 4 perf on qb2 to free device, or build drafter on qb1?
+**0.A feasibility (commit pending)** — verdict OUTCOME (a) implementable
+in ttnn. `research/gemma4_assistant_feasibility.md`. Key findings:
+1. **Centroid masked-embedding DISABLED for 12B** (`use_ordered_embeddings=False`
+   in the actual 12b-it-assistant config) — standard `lm_head` Linear(1024, 262144).
+   No top-k softmax approximation needed.
+2. **Drafter is PARALLEL** (one forward → K candidates via sliding-window
+   context), NOT autoregressive Leviathan. Simpler than original plan.
+3. Drafter shares target's KV (one tuple per `layer_type` = sliding+full);
+   target server must EXPOSE its last-layer KV per step.
+4. Drafter is 4 Gemma 4 layers + pre/post projection + lm_head — forks
+   ~80% from existing `server_gemma4_unified_ttnn.py`.
+5. Requires `transformers ≥5.10.0` for the HF oracle (current 5.9.0 has
+   `Gemma4AssistantForCausalLM` for E2B, not the unified 12B variant).
+
+**0.B determinism audit** — `research/gemma4_determinism_audit.md`.
+Patches B+D already shipped on Gemma 4 12B
+(`server_gemma4_unified_ttnn.py:91-98, 1086`). Patch A is for sampling
+path (not relevant to greedy spec-dec). **Zero code changes needed**.
+
+**Revised total**: ~5d build + 1d buffer = **~6 days** (was 8).
+
+**Remaining device-free work before qb2 freed**:
+- spec_dec_scheduler skeleton (Phase 3.A)
+- B=K+1 verify-trace probe scaffold (Phase 2.A)
+- DeepSeek-V3 page-table alias fork into our file (Phase 2.B)
+
+**When qb2 freed**: transformers upgrade → HF oracle → drafter v0.1 bringup.
 
 ---
 

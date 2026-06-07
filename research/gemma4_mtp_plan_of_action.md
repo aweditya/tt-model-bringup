@@ -1,11 +1,18 @@
 # Gemma 4 12B IT spec-dec — plan of action (review before building)
 
-Status: **PLAN, awaiting greenlight**. Author: 2026-06-07 session.
-Companion: `research/gemma4_mtp_design.md` (feasibility scoping, eb014f5).
+Status: **GREENLIT 2026-06-07**. User confirmed Q1+Q2+Q3.
+Companions:
+- `research/gemma4_mtp_design.md` (initial scoping, eb014f5)
+- `research/gemma4_assistant_feasibility.md` (Phase 0.A DONE — outcome a, **scope dropped ~2d**)
+- `research/gemma4_determinism_audit.md` (Phase 0.B DONE — B+D already shipped on Gemma 4)
 
-This doc converts the design into a phased build plan with discrete
-gates. **Read § "Reconvene checkpoint" before greenlighting** — there
-are 3 open decisions the user should confirm.
+**Revised total: ~5 days build + 1 day buffer = ~6 days** (down from 8).
+
+Major scope reductions from Phase 0.A:
+1. Centroid masked-embedding DISABLED for 12B (use_ordered_embeddings=False) — standard lm_head, no topk-softmax dance
+2. Drafter is PARALLEL not autoregressive — no draft loop, no rejected-draft KV rewind
+3. Drafter forks ~80% from existing `server_gemma4_unified_ttnn.py` (4 Gemma 4 layers + pre/post projection + lm_head)
+4. transformers ≥5.10.0 required for the HF oracle (current is 5.9.0)
 
 ---
 
