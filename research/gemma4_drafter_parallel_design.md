@@ -168,17 +168,52 @@ debug prints inside the candidate generator to see exact shapes. ~1h.
 
 ## Updated total scope
 
-| Phase | Scope | Time |
-|---|---|---|
-| R-1 | Research (DONE) — found the inputs_embeds construction bug | ✅ |
-| R-2 | Corrected HF oracle (use HF candidate_generator construction) | 2h |
-| R-3 | Dropped — drafter forward at L=1 is correct | 0h |
-| R-4 | Dropped — drafter trace is correct | 0h |
-| R-5 | Scheduler fix — correct inputs_embeds in `_drafter_autoregressive_K` | 2h |
-| R-6 | Bench | 2h |
-| **Total** | | **~6h** |
+| Phase | Scope | Time | Status |
+|---|---|---|---|
+| R-1 | Research (DONE) — found the inputs_embeds construction bug | ✅ | DONE `55000c8` |
+| R-2 | Corrected HF oracle (use HF candidate_generator construction) | 2h | ✅ DONE `3934f64` |
+| R-3 | Dropped — drafter forward at L=1 is correct | 0h | DROPPED |
+| R-4 | Dropped — drafter trace is correct | 0h | DROPPED |
+| R-5 | Scheduler fix — correct inputs_embeds in `_drafter_autoregressive_K` | 2h | ✅ DONE `1e6673e` |
+| R-5.5 | Replay v2 oracle inputs through ttnn drafter — verify drafter forward | 1h | ✅ DONE `811c73b` (5/5 match) |
+| R-6a | Run multi-prompt smoke with R-5 fix | 30m | ✅ DONE — α=0.013 unchanged |
+| R-6b | Diagnose: chain probe (our h, HF h, HF kv variants) | 1h | ✅ DONE `2796d4e` — 0/5 in all variants |
+| R-6c | **DEEPER BUG**: chain produces wrong argmaxes even with all-HF inputs | TBD | OPEN |
 
-Plus the open question resolution: ~1h.
+## R-6c open finding (2026-06-08 PM)
+
+Critical discovery: the v2 oracle's stored `inputs_embeds.npy` fed
+directly into ttnn drafter gives 5/5 match (R-5.5 replay probe). But
+when the scheduler BUILDS `inputs_embeds` from
+`concat(target_embed_table[base_token], target_h_last)`, we get
+[236772, ...] instead of HF's [496, 5464, ...].
+
+The math should be identical — the same drafter, same shared_kv, same
+construction. Possible causes:
+1. **Target embed scaling**: HF's `target.get_input_embeddings()(token_id)`
+   may apply Gemma's `embed_scale = sqrt(hidden) ≈ 61.97`. Our
+   `state.embed_w_np[token_id]` does NOT apply scaling. Check Gemma 4
+   embed forward source.
+2. **bf16 vs fp32 precision**: target.embed_w_np is stored as fp32
+   numpy from bf16 weights. HF computes in bf16. Minor rounding.
+3. **BASE vs IT embed table differences**: even on the SAME prompt,
+   gemma-4-12B (BASE) and gemma-4-12B-it have potentially different
+   embed values for the same token (e.g., if IT fine-tuned the embeds).
+
+**Highest probability**: #1 embed_scale. Gemma 4 applies
+`embed_scale = sqrt(text_config.hidden_size)` after embedding lookup.
+Our `step_forward_v03` does this via `ttnn.multiply(embed, EMBED_SCALE)`
+on the EMBEDDING used in target's forward path, BUT for the DRAFTER's
+inputs_embeds construction we just slice from `state.embed_w_np`
+without scaling.
+
+**Quick fix to test**:
+```python
+last_token_emb = (target_embed_table[last_token_id].reshape(1, 1, -1)
+                  * EMBED_SCALE).astype(np.float32)
+```
+
+Where `EMBED_SCALE = math.sqrt(HIDDEN) ≈ 61.97`.
 
 ## Non-negotiables
 

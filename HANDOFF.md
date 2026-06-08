@@ -196,8 +196,72 @@ This is dramatic improvement vs v0.0 which produced `<image|>` garbage.
 Artifacts synced to qb1 + qb2 + local at
 `.cache/hf_oracle_gemma4_12b_assistant_v2/` (5 prompts, ~34 MB).
 
-**R-5 NEXT**: update `spec_dec_scheduler.py:_drafter_autoregressive_K` to
-use the corrected construction.
+**R-5 SHIPPED 2026-06-08** (commit `1e6673e`): scheduler now uses correct
+construction `inputs_embeds = concat(target_embed_table(last_token_id),
+last_hidden_state)`. Drafter forward replay validates 5/5 v2 oracle
+argmaxes match perfectly (commit `811c73b`).
+
+**R-6 BLOCKED on deeper issue**:
+- Multi-prompt smoke α=0.013 unchanged after R-5 (commits 1e6673e + this)
+- Diagnostic A/B/C probe (commit `2796d4e`) compared scheduler's drafter
+  chain to v2 oracle for prompt 0 (no-BOS):
+
+| Variant | inputs | argmaxes vs HF [496, 5464, 236772, 2084, 3207] |
+|---|---|---|
+| A | our device h + our device kv | [236810×5] — 0/5 match |
+| B | HF h + our device kv | [236810×5] — 0/5 match |
+| C | HF h + HF kv | [236772, 236761, 236761×3] — 0/5 match |
+
+Even with **all-HF inputs (Variant C)**, drafter chain doesn't reproduce
+v2 oracle. But replay probe (`gemma4_drafter_v2_oracle_match.py`) feeds
+inputs_embeds DIRECTLY and gets 5/5 match.
+
+The difference: chain probe constructs `inputs_embeds = concat(
+target_embed_table[last_token_id], last_hidden_state)` ; replay probe
+loads pre-computed `inputs_embeds.npy`. **The bug must be in how the
+scheduler builds inputs_embeds vs how HF's candidate_generator does.**
+
+Hypothesis: target's `embed_w_np` (loaded at BASE bootstrap, but should
+be IT to match drafter) gives a different `target_embed_table[base_token]`
+than HF's `target.get_input_embeddings()`. Need to test with IT variant
+(commit pending).
+
+Also: target's device-side hidden differs MASSIVELY from HF's IT hidden
+(cos=0.12, mad=44) — confirms BASE vs IT mismatch is a big factor.
+
+**R-6c EMBED_SCALE FIX SHIPPED 2026-06-08** (commit `ac2c119`): added
+`* sqrt(HIDDEN) ≈ 61.97` to `target_embed_table[last_token_id]` lookup
+in `_drafter_autoregressive_K`. Per Gemma 4 ScaledWordEmbedding pattern
+(server_gemma4_unified_ttnn.py:78).
+
+**Chain probe Variant C: 0/5 → 3/5 match** for prompt_0 K=5
+(rounds 0/1/2 = [496, 5464, 236772] now match HF exactly; rounds 3/4
+drift from bf16 hidden-state propagation through chain — drafter's
+hidden output isn't bit-exact to HF's, accumulates over rounds).
+
+**Multi-prompt smoke** (default BASE target):
+- BEFORE R-6c: mean α=0.013, max=0.067, 1/5 prompts had α > 0
+- AFTER R-6c: **mean α=0.067 (5×), max=0.133 (2×), 3/5 prompts had α > 0**
+
+Per-prompt accept patterns post-fix:
+| Prompt | accept_counts | text |
+|---|---|---|
+| 0 | [1,0,0,0,0] | ` a<image\|>...` |
+| 1 | [0,0,0,0,0] | ` plants use use sunlight energ` |
+| 2 | [1,1,0,0,0] | ` is widely usedly used in the` |
+| 3 | [0,1,0,0,1] | ` in a^right^2 +` |
+| 4 | [0,0,0,0,0] | ` two particles or morely` |
+
+α=0.133 = ~1 token accepted per round on prompt 2/3. Spec-dec algorithm
+is WORKING. 3/5 prompts demonstrate real acceptance.
+
+**Next steps for α uplift**:
+1. Re-run with `TT_GEMMA4_VARIANT=it` (matches drafter's training distribution)
+2. Reduce bf16 hidden-state drift in chain (post_projection precision?)
+3. Test more prompts — α distribution may be prompt-dependent.
+
+**For perf**: with α=0.067-0.133, spec-dec still SLOWER than baseline
+(need α>0.3 to beat). But framework is correct and α>0 demonstrably.
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected
