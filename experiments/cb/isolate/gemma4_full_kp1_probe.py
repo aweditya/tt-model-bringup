@@ -53,9 +53,11 @@ def readback_argmax(t):
         t,
         mesh_composer=ttnn.ConcatMeshToTensor(t.device(), dim=0),
     ).int().numpy()
+    # post-all_gather argmax is REPLICATED across mesh. ConcatMeshToTensor
+    # gives NCHIPS*Bv-leading values; chip 0's view is the first Bv slots.
     if arr.ndim == 3:
         return arr[0].flatten()  # [Bv]
-    return arr.flatten()
+    return arr.flatten()[:Bv]  # 2D [NCHIPS*Bv, 1] → first Bv
 
 
 def main(state=None):

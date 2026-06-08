@@ -2387,15 +2387,17 @@ def forward_token_gm4_inner_kp1(state):
     - update_verify_inputs(state, current_pos, candidate_tokens) (host writes
       tok_buf + pos_buf + rot_idxs_buf with K+1 values)
     """
-    # verify_tok_buf shape [1, Bv, 1] → embed lookup [1, Bv, HIDDEN] → squeeze
-    # leading 1 to match the [Bv, HIDDEN] per-layer contract (matches what
-    # the probe's _layer_pos0_*_paged_kp1 calls validated).
+    # verify_tok_buf shape [Bv, 1] → embed lookup → [Bv, 1, HIDDEN] (ROW_MAJOR).
+    # Reshape to 2D [Bv, HIDDEN] BEFORE to_layout(TILE) so the per-layer kp1
+    # fork (validated by per-layer probes with [Bv, HIDDEN] inputs) sees the
+    # expected 2D contract. ROW_MAJOR reshape uses logical volume; TILE_LAYOUT
+    # pads on tile boundaries and would corrupt the volume check downstream.
     Bv = state.verify_K + 1
     embed = ttnn.embedding(state.verify_tok_buf, state.embed_tt)
-    h_3d = ttnn.multiply(ttnn.to_layout(embed, ttnn.TILE_LAYOUT), EMBED_SCALE)
+    embed_2d = ttnn.reshape(embed, [Bv, HIDDEN])
     ttnn.deallocate(embed)
-    h = ttnn.reshape(h_3d, [Bv, HIDDEN])
-    ttnn.deallocate(h_3d)
+    h = ttnn.multiply(ttnn.to_layout(embed_2d, ttnn.TILE_LAYOUT), EMBED_SCALE)
+    ttnn.deallocate(embed_2d)
     # The kp1 layer forwards consume the rope_cache the same way as the
     # B=1 path (cos/sin shape [1, head_dim] broadcasts over Bv). We re-use
     # the existing _compute_rope_for_forward — it reads state.rot_idxs_buf
@@ -2493,10 +2495,14 @@ def setup_verify_kp1_state(state, K=5, log=print):
 
     state.verify_K = int(K)
     Bv = K + 1
-    # tok_buf: uint32 [1, K+1, 1] — one slot per candidate. Updated outside
-    # trace via copy_host_to_device_tensor (mirrors decode tok_buf pattern).
+    # tok_buf: uint32 [Bv, 1] — one slot per candidate as [B=Bv, S=1] (the
+    # canonical 2D embedding input contract; mirrors B=1's tok_buf shape
+    # [1, 1] with batch=Bv). Updated outside trace via
+    # copy_host_to_device_tensor. NOTE: an earlier [1, Bv, 1] shape caused
+    # ttnn.embedding to silently collapse to [1, 1] — losing the Bv dim
+    # entirely (validated via diagnostic print 2026-06-08).
     state.verify_tok_buf = ttnn.from_torch(
-        torch.zeros((1, Bv, 1), dtype=torch.int32),
+        torch.zeros((Bv, 1), dtype=torch.int32),
         dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
@@ -2552,7 +2558,7 @@ def update_verify_inputs(state, current_pos, candidate_token_ids):
     assert len(candidate_token_ids) == Bv, \
         f"need {Bv} candidate token IDs, got {len(candidate_token_ids)}"
 
-    tok_np = np.asarray(candidate_token_ids, dtype=np.int32).reshape(1, Bv, 1)
+    tok_np = np.asarray(candidate_token_ids, dtype=np.int32).reshape(Bv, 1)
     tok_host = ttnn.from_torch(
         torch.from_numpy(tok_np),
         layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
