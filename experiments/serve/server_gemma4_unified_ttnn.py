@@ -493,6 +493,18 @@ class State:
         self.tok_buf = None
         self.trace_id = None
         self.traced_argmax_tt = None
+        # ── Phase 2.A spec-dec: last sliding + last full attn layer KV
+        #    for drafter cross-attention. Populated lazily on demand by
+        #    `read_shared_kv_for_drafter(state, L_kv)`. None until first
+        #    call (no perf cost when spec-dec disabled).
+        #    Format: dict {"sliding_attention": (K_np, V_np),
+        #                  "full_attention":    (K_np, V_np)}
+        #    Shapes match HF: sliding K/V (B=1, NKV=8, L_kv, 256),
+        #                     full    K/V (B=1, NKV=1, L_kv, 512).
+        self.shared_kv_for_drafter = None
+        # Cached layer indices — derived from state.layer_types at bootstrap.
+        self.last_sliding_idx = None
+        self.last_full_idx = None
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────
@@ -572,6 +584,16 @@ def bootstrap(state, log=None):
     log(f"  {len(state.layer_types)} layers; "
         f"{sum(1 for t in state.layer_types if t == 'sliding_attention')} sliding / "
         f"{sum(1 for t in state.layer_types if t == 'full_attention')} global")
+    # Phase 2.A spec-dec: cache last sliding + last full attn layer indices.
+    # Drafter cross-attends to target's LAST-layer KV per layer_type. Per the
+    # 12B IT config + HF oracle (.cache/hf_oracle_gemma4_12b_assistant/meta.json),
+    # last_sliding_idx = 46, last_full_idx = 47. We derive from layer_types
+    # rather than hardcoding so a different variant (e.g. 27B with different
+    # last indices) keeps working.
+    state.last_sliding_idx = max(
+        i for i, t in enumerate(state.layer_types) if t == "sliding_attention")
+    state.last_full_idx = max(
+        i for i, t in enumerate(state.layer_types) if t == "full_attention")
 
     log("[bootstrap] enumerate shards + load top-level weights to mesh…")
     key_to_shard = build_key_to_shard(variant=variant)
@@ -1786,6 +1808,153 @@ def _set_pos(state, pos):
         mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
     )
     ttnn.copy_host_to_device_tensor(rot_host, state.rot_idxs_buf)
+
+
+# ── Phase 2.A spec-dec: expose last-layer KV for drafter cross-attention ──
+#
+# The Gemma 4 12B assistant drafter (server_gemma4_12b_assistant_ttnn.py)
+# is STATELESS w.r.t. KV — it cross-attends to the target's KV cache at
+# the LAST sliding (L=46) and LAST full (L=47) attention layers per
+# `Gemma4UnifiedAssistantForCausalLM.forward(shared_kv_states=...)`.
+#
+# Per the Phase 2.A.0 layout probe verdict
+# (commit `8fbecd5` / `experiments/cb/isolate/gemma4_target_kv_layout_probe.py`):
+# the on-device cache layout maps cleanly to HF's
+# `(B=1, NKV_TOTAL, L_kv, head_dim)` contract via per-chip slice
+# reassembly. Reading back ~5KB/step for sliding + ~1KB/step for full is
+# negligible vs the 50 ms target decode step; we keep the readback to
+# numpy at v0 and revisit on-device hand-off in Phase 3 perf if needed.
+#
+# Storage layout per server_gemma4_unified_ttnn.py:683-711:
+#   Sliding (L=46): 2 caches per layer.
+#     each cache [num_blocks, NCHIPS=4, BLOCK_SIZE=32, HEAD_DIM_SLIDING=256]
+#     sharded on dim=1; cache_0 on chip c → KV head 2c (even), cache_1 →
+#     KV head 2c+1 (odd). Mesh-wide KV heads = {0..7}.
+#   Full (L=47): 1 cache per layer.
+#     [num_blocks, NKV_GLOBAL=1, BLOCK_SIZE=32, HEAD_DIM_GLOBAL=512]
+#     REPLICATED. Chip-0 view suffices.
+#   Token at pos lives at block=pos//32, row=pos%32.
+
+def _read_sliding_cache_per_chip(kc, mesh):
+    """Read sliding cache to per-chip numpy stack [NCHIPS, num_blocks, 1,
+    BLOCK_SIZE, HEAD_DIM_SLIDING]. Forked verbatim from
+    `experiments/cb/isolate/gemma4_target_kv_layout_probe.py` (probe verdict
+    in commit `8fbecd5`).
+    """
+    t = ttnn.to_torch(kc,
+        mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
+    arr = t.float().cpu().numpy()
+    total_dim0, n_kv, bs, hd = arr.shape
+    assert total_dim0 % NCHIPS == 0, \
+        f"sliding cache dim-0 {total_dim0} not divisible by NCHIPS={NCHIPS}"
+    per_chip_blocks = total_dim0 // NCHIPS
+    return arr.reshape(NCHIPS, per_chip_blocks, n_kv, bs, hd)
+
+
+def _read_full_cache_replicated(kc, mesh):
+    """Read full cache (replicated) to chip-0 numpy view [num_blocks, 1,
+    BLOCK_SIZE, HEAD_DIM_GLOBAL]. Forked from probe."""
+    t = ttnn.to_torch(kc,
+        mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
+    arr = t.float().cpu().numpy()
+    total_dim0, n_kv, bs, hd = arr.shape
+    assert total_dim0 % NCHIPS == 0, \
+        f"full cache dim-0 {total_dim0} not divisible by NCHIPS={NCHIPS}"
+    per_chip_blocks = total_dim0 // NCHIPS
+    return arr.reshape(NCHIPS, per_chip_blocks, n_kv, bs, hd)[0]
+
+
+def read_shared_kv_for_drafter(state, L_kv):
+    """Phase 2.A — populate and return `state.shared_kv_for_drafter`.
+
+    Reads the LAST sliding (state.last_sliding_idx) and LAST full
+    (state.last_full_idx) paged KV caches off-device, reassembles into
+    HF's `(B=1, NKV_TOTAL, L_kv, head_dim)` contract for the drafter's
+    `shared_kv_states` consumption.
+
+    Should be called AFTER decoding has advanced `cur_pos_buf` to position
+    `L_kv - 1` (so positions 0..L_kv-1 are written in the cache).
+
+    Each call OVERWRITES `state.shared_kv_for_drafter`; the prior round's
+    snapshot is discarded (drafter consumes within the same spec-dec
+    round per `[[gemma4-mtp-plan-of-action]]` §"Architectural clarifications"
+    point 7).
+
+    Returns the dict directly for convenience; also stashed on state for
+    callers that want to read it later in the same round (e.g. the spec-dec
+    scheduler exposing it to a drafter not co-resident in this Python
+    process).
+
+    Args:
+        state: Gemma 4 server State (post-bootstrap, post-prefill or
+               mid-decode).
+        L_kv: number of valid positions in the cache to extract (1..MAX_KV).
+
+    Returns:
+        dict with two entries:
+          "sliding_attention": (K_np [1, 8, L_kv, 256], V_np same)
+          "full_attention":    (K_np [1, 1, L_kv, 512], V_np same)
+    """
+    assert state.last_sliding_idx is not None and state.last_full_idx is not None, \
+        "bootstrap did not set last_sliding_idx / last_full_idx (stale State?)"
+    assert 1 <= L_kv <= MAX_KV, f"L_kv={L_kv} out of [1, MAX_KV={MAX_KV}]"
+    BLOCK_SIZE = state.sdpa_block_size  # = 32
+
+    # ── sliding (last sliding attn layer) ──
+    sliding_caches = state.kv_caches_tt[state.last_sliding_idx]
+    assert len(sliding_caches) == 2, \
+        f"sliding cache count {len(sliding_caches)} != 2"
+    kc0_tt, vc0_tt = sliding_caches[0]
+    kc1_tt, vc1_tt = sliding_caches[1]
+    K0 = _read_sliding_cache_per_chip(kc0_tt, state.mesh)
+    V0 = _read_sliding_cache_per_chip(vc0_tt, state.mesh)
+    K1 = _read_sliding_cache_per_chip(kc1_tt, state.mesh)
+    V1 = _read_sliding_cache_per_chip(vc1_tt, state.mesh)
+
+    NKV_TOTAL = NUM_KV_HEADS_SLIDING  # = 8
+    HD = HEAD_DIM_SLIDING              # = 256
+    K_sliding = np.zeros((1, NKV_TOTAL, L_kv, HD), dtype=np.float32)
+    V_sliding = np.zeros((1, NKV_TOTAL, L_kv, HD), dtype=np.float32)
+    for h in range(NKV_TOTAL):
+        chip = h // 2
+        cache_idx = h % 2  # 0 → cache_0, 1 → cache_1
+        Karr = K0 if cache_idx == 0 else K1
+        Varr = V0 if cache_idx == 0 else V1
+        for pos in range(L_kv):
+            block = pos // BLOCK_SIZE
+            row = pos % BLOCK_SIZE
+            K_sliding[0, h, pos, :] = Karr[chip, block, 0, row, :]
+            V_sliding[0, h, pos, :] = Varr[chip, block, 0, row, :]
+
+    # ── full (last full attn layer) ──
+    full_caches = state.kv_caches_tt[state.last_full_idx]
+    assert len(full_caches) == 1, \
+        f"full cache count {len(full_caches)} != 1"
+    kcf_tt, vcf_tt = full_caches[0]
+    Kf = _read_full_cache_replicated(kcf_tt, state.mesh)
+    Vf = _read_full_cache_replicated(vcf_tt, state.mesh)
+    HDF = HEAD_DIM_GLOBAL  # = 512
+    K_full = np.zeros((1, 1, L_kv, HDF), dtype=np.float32)
+    V_full = np.zeros((1, 1, L_kv, HDF), dtype=np.float32)
+    for pos in range(L_kv):
+        block = pos // BLOCK_SIZE
+        row = pos % BLOCK_SIZE
+        K_full[0, 0, pos, :] = Kf[block, 0, row, :]
+        V_full[0, 0, pos, :] = Vf[block, 0, row, :]
+
+    state.shared_kv_for_drafter = {
+        "sliding_attention": (K_sliding, V_sliding),
+        "full_attention":    (K_full,    V_full),
+    }
+    return state.shared_kv_for_drafter
+
+
+def reset_shared_kv_for_drafter(state):
+    """Drop the prior round's KV snapshot. Called by spec-dec scheduler at
+    the start of each new sequence (so a stale snapshot from a finished
+    sequence can't leak into the next one). No-op if never populated.
+    """
+    state.shared_kv_for_drafter = None
 
 
 def step_forward_v031(state, tok_id, pos, capture=None):
