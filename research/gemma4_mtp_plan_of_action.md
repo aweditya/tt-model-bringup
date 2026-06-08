@@ -245,7 +245,7 @@ tok/s. v1.0 perf via non-aliased page table is a follow-up.
 |---|---|---|---|---|
 | 3.A v0.0a | Single-round smoke — scheduler 3 seams + step() + co-load probe | 6/6 gates PASS | DONE | ✅ commit `3c1f2ad` |
 | 3.B v0.0b | Target hidden exposure hook + multi-round generate loop | DONE | DONE | ✅ commit `9a31679` |
-| 3.C v0.0c | Multi-prompt α distribution — run N=5 rounds × each of 5 oracle prompts; report α per prompt + aggregate | per-prompt α reported + at least one prompt α > 0 | 1-2 h | IN FLIGHT |
+| 3.C v0.0c | Multi-prompt α distribution — N=5 rounds × 5 oracle prompts | prompt_3 α=0.067, max α > 0, 1/5 had α > 0 | DONE | ✅ commit `2d6792e` |
 
 **Phase 3 v0.0 SHIPPED 2026-06-08** — framework is correct + validated:
 - v0.0a single-round smoke: 6/6 gates PASS

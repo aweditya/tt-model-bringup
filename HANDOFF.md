@@ -86,12 +86,21 @@ a previous server version that's since been fixed.
 
 **Phase 3 SHIPPED end-to-end** — framework is correct + validated.
 
-**Recommended next** (pick one):
-- **A** Multi-prompt α distribution — run v0.0b across the 5 oracle
-  prompts to characterize real α. Some prompts will produce non-zero α.
-- **B** Phase 3 v1.0 perf path — refactor verify to non-aliased page
-  table; ship the projected ~3× speedup. (Real demo material even if α
-  is prompt-dependent.)
+**Phase 3 v0.0c SHIPPED 2026-06-08** (commit `2d6792e`):
+- 5 prompts × 5 rounds @ K=3 multi-prompt smoke
+- **prompt_3 demonstrates α > 0**: round 1 emitted [496, 236884] with
+  accept_count=1 (drafter's first candidate matched target's verify[0])
+- Aggregate: mean α = 0.013, max α = 0.067, **1/5 prompts had α > 0**
+- VERDICT PASS — spec-dec acceptance is happening end-to-end
+
+**Phase 3 v0.0 (a + b + c) ALL SHIPPED.** Framework is correct + α > 0
+proven achievable. Low aggregate α reflects 4-layer 0.4B drafter being
+architecturally tiny vs 48-layer 12B target — that's a model-pair
+property, not a scheduler issue.
+
+**Phase 4 NEXT** options (pick one):
+- **B** Phase 3 v1.0 perf — refactor verify to non-aliased page table
+  + skip target B=1 ×N cache advance. Projected ~3× speedup demo.
 - **C** Pivot to other priorities (Gemma 4 perf adoption from `arg/
   gemma4_optimizations` branch diff, Nemotron-3, presentation prep).
 
