@@ -52,8 +52,14 @@ trigger IT-conversational evasion in any IT model. Long-context decode
 - Bootstrap 28s cold / 9.9s warm
 - Key arch findings: drafter has NO k_proj/v_proj (cross-attention from target's KV); L3 full attn head_dim=512 vs L0-2 sliding head_dim=256 (dual-head_dim); `tie_word_embeddings` honored
 
-**Phase 1 v0.2 STRUCTURALLY COMPLETE, qb2 toolchain regression** (commits
-`ed4753f` v0.2 server + 5-prompt smoke + `7b1cdc4` rms_norm isolation):
+**Phase 1 v0.2 SHIPPED on qb1 2026-06-07** (commit `dfd44c8`):
+- 5/5 prompts: hidden cos≥0.999, logits cos≥0.999, **argmax exact match vs HF**
+- Per-prompt: p0=597, p1=107, p2=597, p3=146608, p4=255968 (all match)
+- Forward wall ~52 ms warm
+- v0.3 (full forward validates on 5 prompts) effectively shipped together
+
+**Build journey** for the record (commits `ed4753f` v0.2 server + `7b1cdc4` rms_norm
+isolation + `8781a65` pivot + `dfd44c8` fix):
 - 4-layer forward + cross-K/V attention + post_projection + lm_head all
   shipped (+280 LOC to drafter server)
 - **HARD STOP on qb2**: `TT_THROW: Failed to generate binaries for
