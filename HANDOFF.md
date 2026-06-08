@@ -135,22 +135,33 @@ candidates requires the autoregressive chain which feeds the OOD inputs.
 - Per round: 92 ms / 1.065 emit = 86 ms/tok (vs 47 baseline) = **0.55× = SLOWER**
 - Spec-dec can't beat baseline at α < ~0.3
 
-**SPEC-DEC WRAP**:
+**SPEC-DEC WRAP + RE-BRINGUP PLAN**:
 Phase 3 framework SHIPPED + CORRECT. Drafter+target pair is RIGHT
 (official Google paired model). α is fundamentally low (~0.013) because
 the autoregressive K-call drafter chain feeds OOD inputs after round 0.
-**Spec-dec can't beat baseline at this α level even with all perf fixes.**
 
-The clean fix would be re-bringing-up the drafter at L=K parallel shape
-(one forward → K candidates from K-token sliding window context, per the
-feasibility doc claim). That's ~2 days of work + re-validation.
+**ROOT CAUSE found via HF source read**:
+`modeling_gemma4_unified_assistant.py:217` shows the drafter is DESIGNED
+for arbitrary `q_len` (L>1). At L=K, it produces K predictions in one
+forward via bidirectional self-attention + cross-attention to target KV.
+Our Phase 1 v0.2 hardcoded `assert L == 1` — we built the WRONG variant.
 
-For now: spec-dec parks here as a complete-but-not-useful demo. Phase 4
-HTTP wire-up wouldn't add value at α=0.
+**Why we messed up** (durable lessons captured in
+`research/gemma4_drafter_rebringup_plan_2026-06-08.md`):
+1. Treated feasibility's "parallel" claim as theoretical, not structural
+2. HF oracle hardcoded L=1 (Phase 1 v0.0) — never tested production shape
+3. `assert L == 1` was a v0 shortcut that became a future blocker
+4. Built K-chain in scheduler without re-reading drafter spec
+5. No early α=0 sanity check at K=1 (would have caught this in hours)
 
-**NEXT** (not spec-dec):
-- Gemma 4 perf adoption (sharded rms_norm was a negative finding,
-  num_links=2 still untested), Nemotron-3, or presentation prep.
+**Re-bringup plan**: `research/gemma4_drafter_rebringup_plan_2026-06-08.md`
+- 6 phases, ~14h total: research → HF oracle L=K → re-bring-up drafter
+  L=K → trace at L=K → scheduler update → bench
+- Expected α ≥ 0.3 (real spec-dec)
+- Still won't beat baseline without write-during-verify (v1.0 perf, separate scope)
+
+**Decision point**: GO (14h investment) or PARK (pivot to GM4 perf
+adoption / Nemotron-3 / presentation prep).
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected
