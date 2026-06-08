@@ -168,36 +168,73 @@ class SpecDecScheduler:
 
     def _drafter_autoregressive_K(
         self,
-        target_h_prev_np,  # numpy [1, 1, BACKBONE_HIDDEN=3840]
+        base_token: int,
         target_h_last_np,  # numpy [1, 1, BACKBONE_HIDDEN=3840]
         shared_kv_np,       # dict: "sliding_attention"/"full_attention" → (K, V)
     ) -> list:
-        """Autoregressive drafter ×K — each call generates 1 candidate +
-        its hidden output, which feeds the next call.
+        """Autoregressive drafter ×K — HF's correct construction per R-1.
 
-        Drafter is locked at L=1 (our v0.0 bringup); to get K candidates
-        we chain K calls. Drafter's `hidden` output is the post-projection
-        target-hidden-equivalent shape [1, 1, 3840], so we use it as the
-        "current target hidden" approximation for the next drafter call.
+        Per HF `AssistedCandidateGeneratorGemma4.get_candidates()`
+        (transformers/generation/candidate_generator.py:1376-1404), each
+        round of the drafter loop uses:
+            inputs_embeds = concat(
+                target_embed_table(last_token_id),  # PREV: target's embed
+                                                     #       table lookup on
+                                                     #       the LAST PREDICTED
+                                                     #       TOKEN ID
+                last_hidden_state                    # CUR: drafter's
+                                                     #      post_projection
+                                                     #      output from prev
+                                                     #      call (round 0:
+                                                     #      target's hidden at
+                                                     #      last position)
+            )
+
+        v0.0a (pre-R-1) used `concat(prev_hidden, cur_hidden)` — both halves
+        were hidden states. That fed the drafter OOD inputs every round and
+        produced α≈0 in Phase 3 v0.0c.
+
+        Args:
+          base_token: the last accepted/prefilled token; used as round 0's
+            last_token_id for the embed lookup.
+          target_h_last_np: target's last-layer hidden at the most recent
+            decode position (= `state.last_target_hidden_cur`). Shape
+            [1, 1, BACKBONE_HIDDEN].
+          shared_kv_np: target's last-sliding + last-full KV for the
+            drafter's cross-attention. Same per round.
 
         Returns: K candidate ints.
         """
         import server_gemma4_12b_assistant_ttnn as drf
         import numpy as np
+        # Target's embed table (numpy [VOCAB, HIDDEN]), uploaded once at
+        # target bootstrap (`state.embed_w_np`).
+        target_embed_table = self.target_state.embed_w_np
+        assert target_embed_table is not None, \
+            "target_state.embed_w_np not set — target server out of date"
+
         candidates = []
-        # Round 0 of chain: use target's actual (prev, last) hidden.
-        prev_h = target_h_prev_np
-        cur_h = target_h_last_np
+        last_token_id = int(base_token)
+        last_hidden = target_h_last_np  # round 0: target's actual hidden
         for k in range(self.K):
-            inputs_embeds = np.concatenate([prev_h, cur_h], axis=-1).astype(np.float32)
-            # inputs_embeds shape [1, 1, 2*BACKBONE_HIDDEN]
-            out = drf.drafter_forward(self.drafter_state, inputs_embeds,
-                                       shared_kv_np)
+            # PREV half: target's embed table evaluated at last_token_id.
+            last_token_emb = target_embed_table[last_token_id].reshape(
+                1, 1, -1).astype(np.float32)
+            # CUR half: drafter's last hidden (round 0 = target's hidden;
+            # round k>0 = drafter's prev post_projection output).
+            inputs_embeds = np.concatenate(
+                [last_token_emb, last_hidden], axis=-1
+            ).astype(np.float32)
+            # Drafter forward.
+            out = drf.drafter_forward(
+                self.drafter_state, inputs_embeds, shared_kv_np)
             tok = int(out["argmax"].flatten()[0])
             candidates.append(tok)
-            # Chain: next call's "prev" = current "cur"; next "cur" = drafter's hidden
-            prev_h = cur_h
-            cur_h = out["hidden"]  # [1, 1, 3840]
+            # Update for next round (per HF candidate generator):
+            #   last_token_id ← drafter's argmax (this round's prediction)
+            #   last_hidden ← drafter's hidden (post_projection output)
+            last_token_id = tok
+            last_hidden = out["hidden"]  # [1, 1, 3840]
         return candidates
 
     def _target_verify_kp1(self, base_token: int, draft_tokens: list,
@@ -257,23 +294,33 @@ class SpecDecScheduler:
 
         Args:
           base_token: the last-accepted token, used as Q row 0 of verify
-            (predicts the next position the round starts at).
-          target_h_prev_np, target_h_last_np: target's last 2 hidden
-            states (post-final-norm) at positions cur_pos-1 and cur_pos.
-            Used to bootstrap the drafter's autoregressive chain.
+            (predicts the next position the round starts at) AND as
+            round-0 last_token_id for the drafter chain (per HF, R-1
+            finding).
+          target_h_prev_np: UNUSED in v0.0b (kept for backward compat
+            with existing smoke probes). Previously bootstrapped the
+            wrong-construction drafter chain.
+          target_h_last_np: target's last-layer hidden at cur_pos. Used
+            as drafter chain's initial `last_hidden_state` (post R-1
+            corrected construction).
           cur_pos: target's cur_pos_buf value (cache valid through here).
 
         Returns StepResult. Cache advances by accept_count + 1 positions
         via the target B=1 calls at the end of this method.
         """
+        del target_h_prev_np  # R-1: no longer needed; corrected construction
+                              # uses target_embed_table(last_token_id) for "prev"
         t0 = time.time()
         # Read target's shared KV history (used by drafter cross-attention).
         shared_kv = self._read_target_shared_kv(L_kv=cur_pos + 1)
         t_kv = time.time()
 
-        # Drafter ×K chain → K candidate tokens
+        # Drafter ×K chain → K candidate tokens (R-1 corrected construction)
         draft_tokens = self._drafter_autoregressive_K(
-            target_h_prev_np, target_h_last_np, shared_kv)
+            base_token=base_token,
+            target_h_last_np=target_h_last_np,
+            shared_kv_np=shared_kv,
+        )
         t_draft = time.time()
 
         # Target B=K+1 verify (read-only)
