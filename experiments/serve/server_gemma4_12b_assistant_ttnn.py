@@ -103,6 +103,16 @@ HIFI4 = ttnn.WormholeComputeKernelConfig(
 )
 
 
+# ── Compute helpers (reused from target per REUSE MANDATE) ─────────────
+def all_reduce_tt(x_tt, mesh):
+    """All-reduce sum across the (1, NCHIPS) mesh. Matches
+    `server_gemma4_unified_ttnn.py:461` verbatim. `ttnn.all_reduce` with
+    `cluster_axis=1` is the correct call on qb1's ttnn build (the
+    `experimental.all_reduce_async` path requires explicit semaphores).
+    """
+    return ttnn.all_reduce(x_tt, cluster_axis=1)
+
+
 # ── Upload helpers (reused from target per REUSE MANDATE) ──────────────
 def np_to_replicated(arr, mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT):
     return ttnn.from_torch(
