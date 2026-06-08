@@ -291,10 +291,32 @@ given HF inputs.
 
 **Total uplift since R-1 start**: 0.013 → 0.133 mean α = **10×**.
 
-**Remaining for tok/s beat**: need α > 0.3 (currently 0.267 max).
-Likely path: F-2 (keep `out["hidden"]` on-device between K rounds —
-eliminates bf16 chain drift in rounds 3-4) + try more prompts. Task
-#282 still pending; de-prioritized given F-1 closed Variant C.
+**Remaining for tok/s beat**: need α > 0.3 (currently 0.267 max) OR cut
+per-round wall. Pivoted to perf path 2026-06-08.
+
+**Perf plan 2026-06-08** — `research/gemma4_spec_dec_perf_plan_2026-06-08.md`.
+
+Current cost @ α=0.267: ~200 ms/round / 2.3 tokens = ~85 ms/tok
+(1.8× SLOWER than 47ms baseline). Two dominant costs to remove:
+
+| Lever | Saves | Status |
+|---|---|---|
+| **P-1**: drafter trace path with cur_pos RoPE | ~150 ms/round (eager 30 → traced 6 × K=5) | #283 in flight |
+| **P-2**: non-aliased verify (K/V writes during verify) | ~108 × accept_count ms/round | #284 pending |
+| F-2 / P-3 (was #282): hidden on-device | ~3 ms/round + α uplift | DELETED — de-prioritized; pursue only if needed for α |
+
+Projected @ α=0.267 after P-1 + P-2: ~97 ms/round / 2.3 tokens =
+**~42 ms/tok = 1.12× over baseline**. Scales better as α rises (1.7×
+at α=0.5; 2.2× at α=0.7).
+
+P-1 is currently broken: `drafter_forward_inner_traced` calls
+`drafter_layer_forward(state, h, li, K_tt, V_tt)` without cos/sin →
+identity RoPE → bit-wrong for cur_pos > 0. Scheduler routes through the
+eager path because of this. P-1 fix: on-device cos/sin tables + uint32
+`drafter_rot_idxs_buf`, scheduler writes the buffer pre-trace, trace
+reads via `ttnn.embedding` lookup. Forks
+`server_gemma4_unified_ttnn`'s `_lookup_rope` / `state.rot_idxs_buf`
+pattern.
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected
