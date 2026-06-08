@@ -505,6 +505,22 @@ class State:
         # Cached layer indices — derived from state.layer_types at bootstrap.
         self.last_sliding_idx = None
         self.last_full_idx = None
+        # ── Phase 2.B.1 spec-dec: B=K+1 verify trace state. Allocated by
+        #    setup_verify_kp1_state(state, K); captured by
+        #    capture_verify_trace_kp1(state). All None until spec-dec is
+        #    enabled (no perf cost otherwise).
+        #
+        #    Read-only verify decision (see research/gemma4_verify_kp1_readonly_decision.md):
+        #    K+1 candidate Q rows attend to the SAME KV history through cur_pos via
+        #    the alias page-table. NO paged_update_cache during verify; cache is
+        #    advanced only by the target's canonical B=1 decode step after accept.
+        self.verify_K = None              # int; lookahead depth (5 default)
+        self.verify_tok_buf = None        # uint32 [1, K+1, 1] — K+1 candidate token IDs
+        self.verify_pos_buf = None        # int32  [K+1]      — K+1 positions (all = cur_pos)
+        self.verify_rot_idxs_buf = None   # uint32 [K+1]      — K+1 RoPE indices (all = cur_pos)
+        self.verify_page_table_tt = None  # int32 [K+1, num_blocks] alias page-table
+        self.verify_trace_id = None       # captured trace id
+        self.verify_output_tt = None      # captured logits handle [K+1, vocab_size]
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────
@@ -1633,6 +1649,114 @@ def _layer_pos0_global_paged(state, h_norm, w, layer_idx, rope=None):
     return out
 
 
+# ── Phase 2.B.1 — B=K+1 verify variants of the paged-attention layers ─
+#
+# Read-only verify: K+1 candidate Q rows attend to the SAME KV history
+# via the alias page-table (state.verify_page_table_tt). We do NOT call
+# `paged_fused_update_cache` here — cache is written only by the canonical
+# B=1 decode step after the accept walk picks the longest matching prefix.
+# Consequence: K/V projections + K/V norms + K-RoPE + K/V shard are all
+# SKIPPED (the K/V we would compute would be discarded). Compute is Q only.
+#
+# Shape contract:
+#   Input  h_norm_kp1  shape [K+1, HIDDEN_PER_CHIP]            (3D after reshape)
+#   Output             shape [K+1, HIDDEN_PER_CHIP]
+#   SDPA Q             shape [1, K+1, Q_HALF, HEAD_DIM]        (per kernel gate c3124d2)
+#   SDPA cur_pos       shape [K+1]                             (state.verify_pos_buf)
+#   SDPA page_table    shape [K+1, num_blocks]                 (alias, rows 0..K → row 0's blocks)
+#
+# RoPE: cos/sin lookup of shape [1, HEAD_DIM] broadcasts cleanly across
+# [K+1, n_heads, HEAD_DIM] via ttnn.mul + ttnn.addcmul. Both verify rows
+# share the same current_pos so a single lookup suffices.
+
+
+def _layer_pos0_sliding_paged_kp1(state, h_norm_kp1, w, layer_idx, rope=None):
+    """B=K+1 read-only verify variant of `_layer_pos0_sliding_paged`.
+
+    Differs from the B=1 path:
+    - h_norm_kp1: [K+1, HIDDEN_PER_CHIP]
+    - SKIP paged_fused_update_cache (read-only — cache write is owned by
+      the canonical B=1 decode step that runs after accept-walk)
+    - SKIP k_proj/v_proj/k_norm/v_norm/k_RoPE (their outputs would only
+      feed the skipped cache update)
+    - SDPA reads state.verify_pos_buf + state.verify_page_table_tt
+    - Returns [K+1, HIDDEN_PER_CHIP]
+    """
+    assert state.verify_K is not None, \
+        "call setup_verify_kp1_state(state, K) before the verify forward"
+    Bv = state.verify_K + 1
+    layer_caches = state.kv_caches_tt[layer_idx]
+
+    # Q projection only. K/V are read from the cache (built by prior decode
+    # steps); the canonical B=1 decode is the sole writer of the cache.
+    q = ttnn.matmul(h_norm_kp1, w["q_proj"], compute_kernel_config=HIFI4)
+    q_h = ttnn.reshape(q, [Bv, NQ_PER_CHIP, HEAD_DIM_SLIDING])
+    ttnn.deallocate(q)
+
+    # q_norm (RMS over last dim). Broadcasts across leading [Bv, n_heads].
+    q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    ttnn.deallocate(q_h)
+
+    # RoPE on Q. cos_tt/sin_tt shape [1, head_dim] broadcasts over
+    # [Bv, n_heads, head_dim] via the mul/addcmul ops in _apply_full_rope.
+    # All Bv candidates share current_pos, so a single lookup is sufficient.
+    if rope is not None:
+        cos_tt, sin_tt = rope
+        owned_rope = False
+    else:
+        cos_tt, sin_tt = _lookup_rope(state, state.cos_sliding_tt,
+                                      state.sin_sliding_tt, HEAD_DIM_SLIDING)
+        owned_rope = True
+    q_n = _apply_full_rope(q_n_pre, cos_tt, sin_tt, NQ_PER_CHIP, HEAD_DIM_SLIDING)
+    ttnn.deallocate(q_n_pre)
+    if owned_rope:
+        ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+
+    # Two SDPA passes — one per KV head (same GQA split as B=1 path).
+    # All Bv candidate rows read the same KV cache slots through the
+    # alias page-table.
+    attn_outs = []
+    Q_HALF = NQ_PER_CHIP // NKV_PER_CHIP_SLIDING  # 2 Q heads per KV head
+    for kv_idx in range(NKV_PER_CHIP_SLIDING):
+        kc, vc = layer_caches[kv_idx]
+        # Slice Q across n_heads dim, keep all Bv rows. 3D slice:
+        # q_n [Bv, NQ_PER_CHIP, HEAD_DIM] → [Bv, Q_HALF, HEAD_DIM].
+        q_half = ttnn.slice(
+            q_n,
+            [0, kv_idx * Q_HALF, 0],
+            [Bv, (kv_idx + 1) * Q_HALF, HEAD_DIM_SLIDING],
+        )
+        q_for_sdpa = ttnn.reshape(q_half, [1, Bv, Q_HALF, HEAD_DIM_SLIDING])
+        attn_i = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+            q_for_sdpa, kc, vc,
+            cur_pos_tensor=state.verify_pos_buf,
+            page_table_tensor=state.verify_page_table_tt,
+            scale=1.0,  # Gemma 4: self.scaling=1.0 (see B=1 sliding above).
+            program_config=state.paged_sdpa_progcfg,
+            compute_kernel_config=state.sdpa_compute_kernel_config,
+            sliding_window_size=SLIDING_WINDOW,
+        )
+        attn_outs.append(attn_i)
+    ttnn.deallocate(q_n)
+
+    # Concat along Q-head axis (dim 2 of [1, Bv, Q_HALF, HEAD_DIM]) →
+    # [1, Bv, NQ_PER_CHIP, HEAD_DIM]. Then flatten to [Bv, NQ*HEAD_DIM]
+    # for o_proj.
+    attn_concat = ttnn.concat(attn_outs, dim=2)
+    for a in attn_outs:
+        ttnn.deallocate(a)
+    attn_flat = ttnn.reshape(attn_concat, [Bv, NQ_PER_CHIP * HEAD_DIM_SLIDING])
+    ttnn.deallocate(attn_concat)
+
+    # o_proj column-sharded + all_reduce. Bv is just a batch dim from the
+    # matmul's perspective — TP TPxTP semantics unchanged.
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+    return out
+
+
 def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
     """v0.3.1 layer forward — uses paged SDPA on BOTH sliding and global
     layers. Sliding has 2 caches (per-KV-head, NKV=1 each); global has 1
@@ -2169,6 +2293,129 @@ def step_forward_traced(state, token_id, cur_pos):
     arr = ttnn.to_torch(state.traced_argmax_tt,
                         mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
     return int(arr.reshape(-1)[0].item())
+
+
+# ── Phase 2.B.1: B=K+1 verify trace for spec-dec ──────────────────────
+#
+# Layout / decision document: research/gemma4_verify_kp1_readonly_decision.md
+# Kernel isolation gate (PASS): experiments/cb/isolate/gemma4_kp1_paged_kernels_smoke.py
+#
+# READ-ONLY verify variant: K+1 candidate token IDs go through the full
+# decoder stack at B=K+1, but the K/V projections' outputs are NEVER
+# written to the paged KV cache. All K+1 alias rows attend to the SAME
+# physical KV history (current cur_pos's worth of tokens, written by the
+# canonical B=1 decode path). This isolates v0 from cache-rewind logic;
+# Phase 3 may revisit with write-then-rewind if measured α at K=5
+# falls below the projected ~2× speedup floor.
+#
+# Pre-allocated buffers (set up in setup_verify_kp1_state, captured into
+# the verify trace) — never re-bound per step, per
+# [[ttnn-list-rebinding-leaks]]:
+#   state.verify_tok_buf       uint32 [1, K+1, 1] — K+1 candidate token IDs
+#   state.verify_pos_buf       int32  [K+1]      — K+1 positions (all = cur_pos)
+#   state.verify_rot_idxs_buf  uint32 [K+1]      — K+1 RoPE indices
+#   state.verify_page_table_tt int32  [K+1, num_blocks] — alias page-table
+#                                     (rows 0..K all point at row 0's blocks)
+
+
+def setup_verify_kp1_state(state, K=5, log=print):
+    """Allocate B=K+1 verify-trace buffers ONCE. Idempotent: re-calling
+    with the same K is a no-op (returns immediately if already set up).
+    Re-calling with a DIFFERENT K errors (would require buffer reallocation
+    + trace re-capture; caller should pick K at bootstrap time).
+    """
+    if getattr(state, "verify_K", None) is not None:
+        if state.verify_K != K:
+            raise ValueError(
+                f"verify state already set up at K={state.verify_K}; "
+                f"cannot reconfigure to K={K} without restart")
+        return
+    log(f"[verify] allocating B=K+1={K+1} verify-trace buffers (K={K})")
+
+    state.verify_K = int(K)
+    Bv = K + 1
+    # tok_buf: uint32 [1, K+1, 1] — one slot per candidate. Updated outside
+    # trace via copy_host_to_device_tensor (mirrors decode tok_buf pattern).
+    state.verify_tok_buf = ttnn.from_torch(
+        torch.zeros((1, Bv, 1), dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # pos_buf: int32 [K+1] — all entries set to current decode position N.
+    # paged SDPA's cur_pos_tensor contract is shape [B] (per-row positions).
+    state.verify_pos_buf = ttnn.from_torch(
+        torch.zeros((Bv,), dtype=torch.int32),
+        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # rot_idxs_buf: uint32 [K+1] — all entries set to current cur_pos.
+    # ttnn.embedding takes uint32 indices; gather into cos/sin tables.
+    state.verify_rot_idxs_buf = ttnn.from_torch(
+        torch.zeros((Bv,), dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # Alias page-table: rows 0..K all point at the SAME physical blocks
+    # (the active prompt's KV blocks). For single-stream spec-dec the active
+    # prompt's blocks are just np.arange(num_blocks) (state.page_table_tt's
+    # base contents). We materialize the aliased version by replicating that
+    # row K+1 times. Forks spec_dec_scheduler.build_verify_alias_page_table_host.
+    base_pt_row = np.arange(state.num_blocks, dtype=np.int32)
+    alias_pt = np.tile(base_pt_row[None, :], (Bv, 1))  # [K+1, num_blocks]
+    state.verify_page_table_tt = ttnn.from_torch(
+        torch.from_numpy(alias_pt),
+        dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    log(f"  verify buffers ready: tok[1,{Bv},1] pos[{Bv}] rot[{Bv}] "
+        f"page_table[{Bv},{state.num_blocks}]")
+
+
+def update_verify_inputs(state, current_pos, candidate_token_ids):
+    """Host→device write to verify_{tok,pos,rot_idxs}_buf. Outside any
+    captured trace. K+1 small writes (no embeds, no big tensors).
+
+    Args:
+      state: post-setup_verify_kp1_state state.
+      current_pos: int — the position at which all K+1 candidates verify.
+        cur_pos_tensor[i] = current_pos for i in 0..K. SDPA reads cache
+        history through position current_pos (inclusive).
+      candidate_token_ids: sequence of K+1 ints — the K+1 candidate token
+        IDs to verify in parallel. Convention: index 0 is the "current"
+        token (the bonus continuation if all K draft tokens accept),
+        indices 1..K are the K draft tokens. Caller assembles this list.
+
+    Mirrors update_input_buffers (decode B=1) pattern.
+    """
+    assert state.verify_K is not None, \
+        "call setup_verify_kp1_state(state, K) before update_verify_inputs"
+    Bv = state.verify_K + 1
+    assert len(candidate_token_ids) == Bv, \
+        f"need {Bv} candidate token IDs, got {len(candidate_token_ids)}"
+
+    tok_np = np.asarray(candidate_token_ids, dtype=np.int32).reshape(1, Bv, 1)
+    tok_host = ttnn.from_torch(
+        torch.from_numpy(tok_np),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(tok_host, state.verify_tok_buf)
+
+    pos_np = np.full((Bv,), int(current_pos), dtype=np.int32)
+    pos_host = ttnn.from_torch(
+        torch.from_numpy(pos_np),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(pos_host, state.verify_pos_buf)
+
+    rot_np = np.full((Bv,), int(current_pos), dtype=np.int32)
+    rot_host = ttnn.from_torch(
+        torch.from_numpy(rot_np),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(rot_host, state.verify_rot_idxs_buf)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ Companions:
 - `research/gemma4_assistant_feasibility.md` (Phase 0.A DONE — outcome a, **scope dropped ~2d**)
 - `research/gemma4_determinism_audit.md` (Phase 0.B DONE — B+D already shipped on Gemma 4)
 - `research/deepseek_v3_alias_page_table_reference.md` (Phase 2.B fork source)
+- `research/gemma4_verify_kp1_audit.md` (Phase 2.B.1 foreground audit, `e685c6f`)
 
 ## Architectural clarifications from 2026-06-07 spec-dec discussion
 
@@ -179,11 +180,39 @@ Currently `server_gemma4_unified_cb.py` captures only B=1. Spec-dec verify
 needs a B=K+1 forward where K+1 logical batch rows alias onto one
 physical KV slot.
 
+### Phase 2.A — KV exposure + alias-page-table SHIPPED 2026-06-07
+- 2.A.0 layout probe: per-chip reassembly works as documented (`de604fd`)
+- 2.A target server change: `read_shared_kv_for_drafter` + `reset_shared_kv_for_drafter` (`952f31e`)
+- 2.A.smoke: target + drafter co-resident on (1,4) mesh; argmax MATCH (`486d3e9`)
+- 2.B.0 alias helper `build_verify_alias_page_table_host` (`25e3fb3`, 5/5 host probe PASS)
+- 2.B.0.5 kernel gate: `paged_update_cache` + `paged_sdpa_decode` accept B=K+1 (`c3124d2`)
+
+### Phase 2.B.1 — B=K+1 verify trace in target server (foreground, ~2-3 h)
+
+Audit at `research/gemma4_verify_kp1_audit.md` (commit `e685c6f`) revised
+scope from agent's "1.5-2 day" to **~310 LOC mechanical fork**, since:
+- `_lm_head_argmax` already B-generic (no fork)
+- All kernels accept B=K+1 (gate `c3124d2`)
+- Only 4 functions need fork → `*_kp1` variants
+
+**Decision**: fork (`*_kp1` variants) NOT thread B as parameter — zero
+risk to existing 47 ms/tok B=1 path. Read-only verify (skip
+`paged_update_cache` for verify rows; feed K+1 Q only, read row 0's KV).
+
 | Step | Adds | Gate | Time |
 |---|---|---|---|
-| 2.A | Probe `experiments/cb/isolate/gemma4_verify_kp1_smoke.py` — B=K+1 forward in isolation | K+1 logits ≈ K+1 independent B=1 forwards (cos ≥ 0.999 per row) | 3 h |
-| 2.B | Fork `_build_verify_alias_page_table_host` from DeepSeek-V3 `tt/generator.py:43-101` | aliased page-table reads same physical slot K+1 times | 2 h |
-| 2.C | Capture B=K+1 trace in `server_gemma4_unified_ttnn.py` alongside existing B=1 (two-phase warmup per `[[ttnn-multi-trace-two-phase-warmup]]`) | both traces capture without TT_FATAL; replays produce matching logits | 3 h |
+| 2.B.1.1 | State buffer alloc: `tok_buf_kp1`, `cur_pos_buf_kp1`, `rot_idxs_buf_kp1`, `page_table_kp1_tt`, `verify_K`, `verify_trace_id` | bootstrap survives + buffers allocated | 20 min |
+| 2.B.1.2 | `_set_pos_kp1` + `update_verify_inputs` host writes | unit-call sanity (no device) | 15 min |
+| 2.B.1.3 | `_layer_pos0_sliding_paged_kp1` fork + isolation probe | one sliding layer K+1 forward cos ≥ 0.999 per row vs K+1 independent B=1 | 45 min |
+| 2.B.1.4 | `_layer_pos0_global_paged_kp1` fork + isolation probe | one global layer K+1 forward cos ≥ 0.999 per row | 40 min |
+| 2.B.1.5 | `_layer_forward_pos0_paged_kp1` orchestrator | per-layer dispatch covers full layer types | 20 min |
+| 2.B.1.6 | `forward_token_gm4_inner_kp1` full 48-layer | full forward at B=K+1 returns argmax `[K+1, 1]` | 30 min |
+| 2.B.1.7 | `_capture_verify_trace_kp1` two-phase warmup | trace captured, no TT_FATAL | 30 min |
+| 2.B.1.8 | End-to-end smoke: K+1 trace replay vs K+1 independent B=1 forwards | cos ≥ 0.999 per row | 30 min |
+
+Open risks the audit flagged (verify with small probes before broad fork):
+- `_apply_full_rope` at 3D input (rotate-half may not broadcast cleanly)
+- TileLayout alignment at K+1=6 < TILE=32 (probably auto-pads fine)
 
 **Phase 2 exit criteria**: target server has TWO captured traces (B=1
 decode + B=K+1 verify); K+1 verify produces logits equivalent to K+1

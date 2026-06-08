@@ -98,9 +98,15 @@ walk needs either (a) read-only verify variant (skip paged_update_cache,
 feed K+1 Q only), or (b) write-then-rewind (DeepSeek-V3 pattern).
 Decision deferred to Phase 3 design.
 
-**Phase 2.B.1 unblocked** (~1.5-2d, revised estimate per agent research):
-target server refactor adds B=K+1 verify trace capture. Scope: state.
-verify_input_* buffers, two-phase warmup, trace_region_size 50→150 MB.
+**Phase 2.B.1 unblocked + RESCOPED 2026-06-07** (foreground audit `e685c6f`):
+target server refactor adds B=K+1 verify trace capture. **~310 LOC
+mechanical fork, ~2-3 h** (NOT 1.5-2 days as agent originally estimated).
+Scope: 6 state buffers, 4 `*_kp1` function forks (sliding layer, global
+layer, per-layer dispatch, top-level forward), 2 host helpers, trace
+capture. `_lm_head_argmax` already B-generic; kernels already accept B=K+1
+(gate `c3124d2`). 8-step implementation order with per-step gate at
+`research/gemma4_verify_kp1_audit.md`. trace_region_size already at
+400 MB (no bump needed). Tasks #260-#267.
 
 **Phase 3 after Phase 2** (~1d): implement the 3 NotImplementedError seams
 in `experiments/serve/spec_dec_scheduler.py`; bench α at K∈{3,5,7}; greedy
