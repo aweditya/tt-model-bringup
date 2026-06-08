@@ -123,19 +123,24 @@ def main() -> int:
     log("STAGE 2: bootstrap DRAFTER on the SAME mesh…")
     t0 = time.time()
     drf_state = drf.State()
-    # Hard-route the drafter to reuse the target's open mesh — saves opening
-    # a second mesh handle + isolates Phase 2.A from any mesh-config skew.
-    drf_state.mesh = tgt_state.mesh
-    # The drafter's bootstrap opens its own mesh in the standard path; we
-    # patch by calling a stripped variant. Simpler: monkey-patch the
-    # ttnn.open_mesh_device temporarily so drafter's bootstrap reuses ours.
+    # Co-resident: reuse target's already-open mesh + already-initialised
+    # fabric. The drafter's bootstrap unconditionally calls
+    # ttnn.set_fabric_config + ttnn.open_mesh_device. Re-setting fabric
+    # config after the target's first call destroys its fabric context
+    # (TT_FATAL "Trying to get un-initialized fabric context" → IndexError:
+    # map::at on the next all_reduce). Monkey-patch BOTH ttnn.set_fabric_config
+    # and ttnn.open_mesh_device to no-ops for the duration of the drafter's
+    # bootstrap; the target's mesh + fabric context stay live throughout.
     _orig_open = ttnn.open_mesh_device
+    _orig_fab = ttnn.set_fabric_config
     ttnn.open_mesh_device = lambda *a, **kw: tgt_state.mesh
+    ttnn.set_fabric_config = lambda *a, **kw: None
     try:
         drf.bootstrap(drf_state, log=log)
     finally:
         ttnn.open_mesh_device = _orig_open
-    # We may have re-assigned mesh inside drf.bootstrap → reset to target's mesh.
+        ttnn.set_fabric_config = _orig_fab
+    # Ensure drafter sees the right mesh handle after bootstrap returns.
     drf_state.mesh = tgt_state.mesh
     log(f"drafter bootstrap took {time.time()-t0:.1f}s")
 
