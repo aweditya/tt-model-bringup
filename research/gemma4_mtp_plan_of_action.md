@@ -241,11 +241,11 @@ tok/s. v1.0 perf via non-aliased page table is a follow-up.
 
 ### Phase 3 v0.0 — correctness gate (~1 day)
 
-| Step | Adds | Gate | Time |
-|---|---|---|---|
-| 3.A | `spec_dec_scheduler.py` — flesh out 3 NotImplementedError seams: draft_step, target_verify, accept_walk | scheduler dispatches forward through existing trace paths | 1-2 h |
-| 3.B | Accept-walk core — host-side argmax compare drafter[0..K-1] vs verify[0..K-1]; emit accepted prefix + 1 correction; advance cache via target B=1 × N (read-only verify constraint) | greedy-equivalent: spec-dec output token sequence == B=1 target output on 5 prompts | 3-4 h |
-| 3.C | Dev-harness bench — measure α (acceptance rate) at K∈{3,5,7} | α ≥ 0.6 measured + reported (tok/s expected SLOWER than baseline due to read-only) | 2 h |
+| Step | Adds | Gate | Time | Status |
+|---|---|---|---|---|
+| 3.A v0.0a | Single-round smoke — scheduler 3 seams + step() + co-load probe | 6/6 gates PASS | DONE | ✅ commit `3c1f2ad` |
+| 3.B v0.0b | Target hidden exposure hook + multi-round generate loop + α curve at K∈{3,5,7} | α stabilizes >0; output coherent; per-K α reported | 3-4 h | IN FLIGHT |
+| 3.C v0.0c | Greedy-equivalent gate — spec-dec output bit-eq plain B=1 on 5 prompts | byte-identical token sequence | 2-3 h | PENDING |
 
 **Phase 3 v0.0 exit criteria**: spec_dec_scheduler runs through dev-harness,
 produces **greedy-equivalent output to plain B=1**, α ≥ 0.6 measured at

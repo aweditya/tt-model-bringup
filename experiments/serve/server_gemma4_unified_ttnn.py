@@ -505,6 +505,14 @@ class State:
         # Cached layer indices — derived from state.layer_types at bootstrap.
         self.last_sliding_idx = None
         self.last_full_idx = None
+        # ── Phase 3 v0.0b spec-dec: target hidden exposure. step_forward_v03
+        #    stashes a numpy copy of `final` (post-final-norm hidden, shape
+        #    [1, 1, HIDDEN]) into _cur each step, rotating prior _cur into _prev.
+        #    The scheduler uses these as the drafter's `inputs_embeds`. Cost:
+        #    one extra readback of ~15KB per target step (~2 ms; argmax
+        #    readback already syncs the device, so this is amortized free).
+        self.last_target_hidden_prev = None  # numpy [1, 1, HIDDEN] or None
+        self.last_target_hidden_cur = None
         # ── Phase 2.B.1 spec-dec: B=K+1 verify trace state. Allocated by
         #    setup_verify_kp1_state(state, K); captured by
         #    capture_verify_trace_kp1(state). All None until spec-dec is
@@ -2249,6 +2257,13 @@ def step_forward_v03(state, tok_id, capture=None):
     ttnn.deallocate(h)
     if capture is not None:
         capture["final_norm"] = _readback_replicated(final, state.mesh)
+
+    # Phase 3 v0.0b: stash target hidden for drafter's next-round inputs_embeds.
+    # Reshape to [1, 1, HIDDEN] for the drafter pre_projection contract.
+    # The argmax readback below already syncs the device — this is amortized free.
+    _final_np = _readback_replicated(final, state.mesh).reshape(1, 1, HIDDEN).astype(np.float32)
+    state.last_target_hidden_prev = state.last_target_hidden_cur
+    state.last_target_hidden_cur = _final_np
 
     argmax_tt, full_logits = _lm_head_argmax(state, final,
                                               capture_logits=(capture is not None))

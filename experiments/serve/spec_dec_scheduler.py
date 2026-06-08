@@ -316,6 +316,66 @@ class SpecDecScheduler:
             _K=self.K,
         )
 
+    def generate(self, max_new: int, log=None) -> list:
+        """Drive `step` for N rounds until max_new emitted or EOS.
+
+        Pre-conditions: target's prefill has populated
+        state.last_target_hidden_{prev,cur} (handled automatically by
+        step_forward_v03's Phase 3 v0.0b stash). cur_pos points at last
+        prefilled position. verify trace must be captured.
+
+        Returns: list of emitted token IDs (length ≤ max_new).
+        """
+        import server_gemma4_unified_ttnn as srv
+        if log is None:
+            def log(_msg): pass
+        emitted_all = []
+        base_token = None
+        rounds = 0
+        while len(emitted_all) < max_new:
+            # cur_pos from target's cur_pos_buf
+            cur_pos_arr = srv.ttnn.to_torch(
+                self.target_state.cur_pos_buf,
+                mesh_composer=srv.ttnn.ConcatMeshToTensor(
+                    self.target_state.mesh, dim=0),
+            )
+            cur_pos = int(cur_pos_arr.flatten()[0].item())
+            # base_token: the most recent token (last accepted or last prefilled).
+            if base_token is None:
+                # Need to seed from prefill — caller must pass it in; here we
+                # use a hack: re-run target B=1 at cur_pos with itself isn't
+                # right. For multi-round, we expect caller to seed first
+                # base_token before calling generate. v0.0b: use placeholder
+                # behavior — first round's base_token comes from caller.
+                raise ValueError(
+                    "first base_token required; caller must set "
+                    "scheduler._first_base_token = <last prefill tok> before generate"
+                )
+            # Read target's last 2 hidden states (set by step_forward_v03's
+            # Phase 3 v0.0b stash hook).
+            target_h_prev = self.target_state.last_target_hidden_prev
+            target_h_last = self.target_state.last_target_hidden_cur
+            if target_h_prev is None or target_h_last is None:
+                raise RuntimeError(
+                    "target hidden states not stashed — run target prefill ≥ 2 "
+                    "steps with the Phase 3 v0.0b server before generate"
+                )
+            result = self.step(base_token=base_token,
+                                target_h_prev_np=target_h_prev,
+                                target_h_last_np=target_h_last,
+                                cur_pos=cur_pos)
+            emitted_all.extend(result.accepted_tokens)
+            base_token = result.accepted_tokens[-1]
+            rounds += 1
+            if self.config.eos_ids and any(
+                    t in self.config.eos_ids for t in result.accepted_tokens):
+                log(f"  [generate] EOS hit at round {rounds}, stopping")
+                break
+            log(f"  [generate] round {rounds}: emitted "
+                f"{result.accepted_tokens} α={result.alpha:.2f} "
+                f"wall={result.target_step_ms+result.drafter_step_ms+result.verify_step_ms:.0f}ms")
+        return emitted_all[:max_new]
+
     # ─── Diagnostics ─────────────────────────────────────────────────────
 
     def stats(self) -> dict:
