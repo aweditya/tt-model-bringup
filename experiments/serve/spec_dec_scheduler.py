@@ -209,6 +209,7 @@ class SpecDecScheduler:
         """
         import server_gemma4_12b_assistant_ttnn as drf
         import numpy as np
+        import ttnn
         # Target's embed table (numpy [VOCAB, HIDDEN]), uploaded once at
         # target bootstrap (`state.embed_w_np`).
         target_embed_table = self.target_state.embed_w_np
@@ -221,6 +222,56 @@ class SpecDecScheduler:
         # If we forget it, drafter sees inputs ~62× too small → garbage.
         import math
         EMBED_SCALE = math.sqrt(target_embed_table.shape[-1])
+
+        # P-1: drafter trace path. SPEC_DEC_DRAFTER_EAGER=1 disables
+        # tracing (back to eager — useful for debugging/comparison).
+        # Drafter trace is L_kv-fixed; L_kv = cur_pos + 1 changes per
+        # spec-dec round, so we release+recapture each round. Per-capture
+        # ~400ms; per-K=3 round saves drafter eager (~1500ms) - traced
+        # (~30ms) = ~1470ms - 400ms = ~1070ms net.
+        import os as _os
+        use_trace = not _os.environ.get("SPEC_DEC_DRAFTER_EAGER")
+        L_kv = int(cur_pos) + 1
+
+        if use_trace:
+            # Re-capture for this round's L_kv. Drafter trace is
+            # L_kv-fixed; release any prior trace + deallocate buffers
+            # before re-setup. setup_drafter_trace_state would otherwise
+            # raise on a different L_kv.
+            drf_state = self.drafter_state
+            prev_L_kv = getattr(drf_state, "drafter_trace_L_kv", None)
+            if prev_L_kv != L_kv:
+                if getattr(drf_state, "drafter_trace_id", None) is not None:
+                    ttnn.release_trace(drf_state.mesh,
+                                        drf_state.drafter_trace_id)
+                    drf_state.drafter_trace_id = None
+                    drf_state.drafter_argmax_tt = None
+                    drf_state.drafter_hidden_tt = None
+                # Deallocate prior buffers (they're L_kv-shaped).
+                for attr in ("drafter_inputs_buf", "drafter_K_sl_buf",
+                              "drafter_V_sl_buf", "drafter_K_fl_buf",
+                              "drafter_V_fl_buf"):
+                    buf = getattr(drf_state, attr, None)
+                    if buf is not None:
+                        ttnn.deallocate(buf)
+                        setattr(drf_state, attr, None)
+                drf_state.drafter_trace_L_kv = None
+                # Allocate fresh buffers at this L_kv.
+                drf.setup_drafter_trace_state(drf_state, L_kv=L_kv,
+                                                log=lambda *a, **k: None)
+            # Seed buffers with this round's KV + rot_idx.
+            K_sl_np, V_sl_np = shared_kv_np["sliding_attention"]
+            K_fl_np, V_fl_np = shared_kv_np["full_attention"]
+            drf.update_drafter_trace_kv(drf_state, K_sl_np, V_sl_np,
+                                          K_fl_np, V_fl_np)
+            drf.update_drafter_rot_idx(drf_state, cur_pos)
+            # Seed a dummy inputs_embeds for warmup if first capture at
+            # this L_kv. Drafter expects 2*BACKBONE_HIDDEN=7680.
+            if getattr(drf_state, "drafter_trace_id", None) is None:
+                dummy = np.zeros((1, 1, 7680), dtype=np.float32)
+                drf.update_drafter_trace_inputs_only(drf_state, dummy)
+                drf.ensure_drafter_trace(drf_state, L_kv=L_kv,
+                                           log=lambda *a, **k: None)
 
         candidates = []
         last_token_id = int(base_token)
@@ -237,23 +288,27 @@ class SpecDecScheduler:
             inputs_embeds = np.concatenate(
                 [last_token_emb, last_hidden], axis=-1
             ).astype(np.float32)
-            # Drafter forward. cur_pos is CONSTANT across all K rounds
-            # (matches HF candidate_generator.py:1373 — position_ids is
-            # computed once before the loop and never incremented).
-            out = drf.drafter_forward(
-                self.drafter_state, inputs_embeds, shared_kv_np,
-                cur_pos=cur_pos)
-            tok = int(out["argmax"].flatten()[0])
-            candidates.append(tok)
-            import os as _os
+            if use_trace:
+                # Write inputs_embeds to the captured buffer; KV +
+                # rot_idx already set once at top of round.
+                drf.update_drafter_trace_inputs_only(self.drafter_state,
+                                                       inputs_embeds)
+                out = drf.drafter_step_traced_full(self.drafter_state)
+                tok = out["argmax"]
+                hidden = out["hidden"]
+            else:
+                # Eager fallback — F-1 RoPE path.
+                out = drf.drafter_forward(
+                    self.drafter_state, inputs_embeds, shared_kv_np,
+                    cur_pos=cur_pos)
+                tok = int(out["argmax"].flatten()[0])
+                hidden = out["hidden"]
+            candidates.append(int(tok))
             if _os.environ.get("SPEC_DEC_DEBUG"):
                 print(f"      [drafter k={k}] last_token_id={last_token_id} "
                       f"→ argmax={tok}", flush=True)
-            # Update for next round (per HF candidate generator):
-            #   last_token_id ← drafter's argmax (this round's prediction)
-            #   last_hidden ← drafter's hidden (post_projection output)
-            last_token_id = tok
-            last_hidden = out["hidden"]  # [1, 1, 3840]
+            last_token_id = int(tok)
+            last_hidden = hidden  # [1, 1, 3840]
         return candidates
 
     def _target_verify_kp1(self, base_token: int, draft_tokens: list,
