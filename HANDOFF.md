@@ -82,9 +82,25 @@ See `[[gm4-asst-dev-harness]]` for usage.
   logits cos=0.968 (gate 0.95), top-8 overlap 5/8.
   `experiments/cb/isolate/gemma4_target_kv_expose_smoke.py`
 
-**Phase 2.B next** (~1d): fork DeepSeek-V3
-`_build_verify_alias_page_table_host` for B=K+1 verify trace. State
-exposes the KV pipe; the verify-trace probe can drive against it.
+**Phase 2.B.0 (alias helper) + 2.B.0.5 (kernel gate) SHIPPED 2026-06-07**
+(commits `25e3fb3` + `c3124d2`):
+- `build_verify_alias_page_table_host` host helper in `spec_dec_scheduler.py`
+  (5/5 host probe PASS at K∈{3,5,7} × verify_offset∈{1,8})
+- **B=K+1 kernel isolation gate: PASS** — both `paged_update_cache` AND
+  `paged_scaled_dot_product_attention_decode` accept B=6 with the
+  alias-page-table pattern; no TT_FATAL. HARD-STOP risk surfaced by
+  Phase 2.B agent research is CLEARED. Output shape `[1, 6, 16, 256]`
+  exactly matches the K+1-logits-per-row contract.
+
+**Cache write race finding** (kernel-level): with K+1 alias rows all
+writing to row 0, only the LAST writer's K/V persists. Phase 3 accept
+walk needs either (a) read-only verify variant (skip paged_update_cache,
+feed K+1 Q only), or (b) write-then-rewind (DeepSeek-V3 pattern).
+Decision deferred to Phase 3 design.
+
+**Phase 2.B.1 unblocked** (~1.5-2d, revised estimate per agent research):
+target server refactor adds B=K+1 verify trace capture. Scope: state.
+verify_input_* buffers, two-phase warmup, trace_region_size 50→150 MB.
 
 **Phase 3 after Phase 2** (~1d): implement the 3 NotImplementedError seams
 in `experiments/serve/spec_dec_scheduler.py`; bench α at K∈{3,5,7}; greedy
