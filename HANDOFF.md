@@ -53,9 +53,26 @@ page table follows.
 - Per-round: drafter×5 eager 480ms + verify traced **59ms** + target B=1 advance 188ms = 794ms / 1 emit (α=0 single round, expected)
 - Verify trace replay matched prior Phase 2.B.1 number (59ms ✓)
 
-**Phase 3 v0.0b NEXT** — multi-round generation (N=10+ rounds) +
-α stabilization measurement + target hidden exposure hook for drafter
-chaining across rounds.
+**Phase 3 v0.0b SHIPPED 2026-06-08** (commit `9a31679`):
+- Multi-round spec-dec across 5 rounds at K=3 — VERDICT PASS
+- Target hidden exposure hook stashes post-final-norm hidden per step
+- Scheduler.generate() multi-round loop drives target+drafter+verify+walk
+- Cache advances correctly each round (5→10 in 5 rounds)
+- **α=0 across all rounds** — root cause is pre-existing **target prefill
+  argmax bug #259**, NOT scheduler. Target outputs t₆=496 (" a") instead
+  of HF's t₆=597 (" Paris"). Drafter is HF-bit-validated (argmax=597 ✓)
+  so when #259 is fixed, drafter's predictions will match target's and α > 0
+  will appear automatically.
+- Spec-dec correctly emits target's correction at each round (Leviathan
+  fallback) — proves scheduler is faithfully reproducing target output.
+
+**Phase 3 v0.0c CONDITIONAL on fixing #259** (target prefill argmax) —
+byte-equiv vs plain B=1 gate. Without #259 fix, both spec-dec and plain B=1
+produce the same broken output (by construction). Gate is implicit.
+
+**Recommended next**: fix #259 (target prefill argmax bug) BEFORE moving
+to v1.0 perf path. Without it, α will always be 0 and no perf measurement
+is meaningful.
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected
