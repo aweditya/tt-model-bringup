@@ -1970,6 +1970,63 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
     return h_out
 
 
+def _layer_forward_pos0_paged_kp1(state, h_in_kp1, layer_idx, rope_cache=None):
+    """B=K+1 read-only verify variant of `_layer_forward_pos0_paged`.
+
+    Wraps the kp1 attention layer forks in the same per-layer scaffolding
+    (input RMSNorm → mixer → post-attention RMSNorm → residual add →
+     pre-feedforward RMSNorm → MLP block → post-feedforward RMSNorm →
+     residual add with layer_scalar SFPU-fused multiply).
+
+    Differs from B=1 orchestrator:
+    - h_in_kp1: [Bv, HIDDEN_PER_CHIP]
+    - Routes to `_layer_pos0_{sliding,global}_paged_kp1` per layer type
+    - Drops GM4_SKIP_SLIDING/GLOBAL debug env (not needed for verify)
+    - Uses default (non-DRAM-sharded) MLP path — DRAM-sharded path bakes
+      M=TILE=32 into its program config; Bv=6 < TILE auto-pad semantics
+      unproven, and the verify trace runs once per spec-dec round so the
+      simpler path is the right tradeoff for v0
+    """
+    w = state.per_layer_tt[layer_idx]
+    lt = state.layer_types[layer_idx]
+
+    h_norm = ttnn.rms_norm(h_in_kp1, weight=w["input_layernorm"], epsilon=EPS)
+    if lt == "sliding_attention":
+        rope = (rope_cache[0], rope_cache[1]) if rope_cache is not None else None
+        mixer = _layer_pos0_sliding_paged_kp1(state, h_norm, w, layer_idx, rope=rope)
+    else:
+        rope = (rope_cache[2], rope_cache[3]) if rope_cache is not None else None
+        mixer = _layer_pos0_global_paged_kp1(state, h_norm, w, layer_idx, rope=rope)
+    ttnn.deallocate(h_norm)
+    post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
+    ttnn.deallocate(mixer)
+    h_after_attn = ttnn.add(h_in_kp1, post_attn)
+    ttnn.deallocate(post_attn)
+    pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"], epsilon=EPS)
+
+    # Default MLP path (Round-4 matmul-gelu fusion preserved). Matmul is
+    # B-generic — Bv flows through as the leading dim.
+    gelu_gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4,
+                            activation="gelu")
+    up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(pre_ff)
+    mid = ttnn.mul(gelu_gate, up)
+    ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
+    mlp_partial = ttnn.matmul(mid, w["down_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(mid)
+    mlp_out = all_reduce_tt(mlp_partial, state.mesh)
+    ttnn.deallocate(mlp_partial)
+    post_ff = ttnn.rms_norm(mlp_out, weight=w["post_feedforward_layernorm"], epsilon=EPS)
+    ttnn.deallocate(mlp_out)
+
+    # Final residual + layer_scalar SFPU-fused multiply (Round 6 perf).
+    _layer_scalar_act = [ttnn.UnaryWithParam(
+        ttnn.UnaryOpType.MUL_UNARY_SFPU, float(w["layer_scalar"]))]
+    h_out = ttnn.add(h_after_attn, post_ff, activations=_layer_scalar_act)
+    ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff)
+    return h_out
+
+
 def _set_pos(state, pos):
     """Update cur_pos_buf + rot_idxs_buf for the new decode position via
     in-place copy_host_to_device_tensor (the 27B prod pattern at
@@ -2307,6 +2364,47 @@ def forward_token_gm4_inner(state):
     rope_cache = _compute_rope_for_forward(state)
     for L in range(NUM_LAYERS):
         h_new = _layer_forward_pos0_paged(state, h, L, rope_cache=rope_cache)
+        ttnn.deallocate(h)
+        h = h_new
+    _release_rope_for_forward(rope_cache)
+    final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
+    ttnn.deallocate(h)
+    argmax_tt, _ = _lm_head_argmax(state, final, capture_logits=False)
+    return argmax_tt
+
+
+def forward_token_gm4_inner_kp1(state):
+    """Trace-captureable B=K+1 verify forward.
+
+    Mirrors `forward_token_gm4_inner` (B=1) but:
+    - Reads state.verify_tok_buf (shape [1, K+1, 1]) instead of state.tok_buf
+    - Routes through _layer_forward_pos0_paged_kp1 for all 48 layers
+    - Returns argmax [K+1, 1] (one argmax per candidate row); _lm_head_argmax
+      is already B-generic
+
+    Caller is responsible for:
+    - setup_verify_kp1_state(state, K) (allocates verify_* buffers)
+    - update_verify_inputs(state, current_pos, candidate_tokens) (host writes
+      tok_buf + pos_buf + rot_idxs_buf with K+1 values)
+    """
+    # verify_tok_buf shape [1, Bv, 1] → embed lookup [1, Bv, HIDDEN] → squeeze
+    # leading 1 to match the [Bv, HIDDEN] per-layer contract (matches what
+    # the probe's _layer_pos0_*_paged_kp1 calls validated).
+    Bv = state.verify_K + 1
+    embed = ttnn.embedding(state.verify_tok_buf, state.embed_tt)
+    h_3d = ttnn.multiply(ttnn.to_layout(embed, ttnn.TILE_LAYOUT), EMBED_SCALE)
+    ttnn.deallocate(embed)
+    h = ttnn.reshape(h_3d, [Bv, HIDDEN])
+    ttnn.deallocate(h_3d)
+    # The kp1 layer forwards consume the rope_cache the same way as the
+    # B=1 path (cos/sin shape [1, head_dim] broadcasts over Bv). We re-use
+    # the existing _compute_rope_for_forward — it reads state.rot_idxs_buf
+    # (B=1 buffer), but for verify all K+1 rows share cur_pos so a single
+    # rope-row lookup is correct and matches state.verify_rot_idxs_buf
+    # semantics (all entries == cur_pos).
+    rope_cache = _compute_rope_for_forward(state)
+    for L in range(NUM_LAYERS):
+        h_new = _layer_forward_pos0_paged_kp1(state, h, L, rope_cache=rope_cache)
         ttnn.deallocate(h)
         h = h_new
     _release_rope_for_forward(rope_cache)
