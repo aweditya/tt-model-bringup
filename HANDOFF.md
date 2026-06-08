@@ -5,7 +5,32 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## LATEST (2026-06-07 PM) — **Gemma 4 spec-dec GREENLIT, scope dropped 2 days**
+## LATEST (2026-06-08) — Tenstorrent feedback + Phase 2.B.1 6/8 steps green
+
+**Yossi at Tenstorrent (email 2026-06-08)** — they are reading our wiki +
+research dirs over the weekend. Captured at
+`research/tenstorrent_feedback_2026-06-08.md`. Three durable references:
+
+- [[reference-tt-metal-gemma4-branch]] — `arg/gemma4_optimizations` at
+  commit `f7d0161`, directly relevant to our active Gemma 4 perf work
+  (#178/#179/Round 11+). Diff task #269.
+- [[reference-tt-metal-qwen36-branch]] — Qwen 3.6 9B Blackhole demo at
+  commit `1cecd16`. Our prior MoE+trace research agent missed it. Read
+  task #270.
+- [[reference-tile-ai-megakernel]] — TileRT/TileOps + megakernel paper
+  research direction. Task #271 (deferred until after spec-dec ships).
+
+**Phase 2.B.1 progress (2026-06-08)** — 6 of 8 steps green:
+- #260/#261 (state buffers + helpers) already shipped by Phase 2.A agent
+- #262 sliding kp1 fork — 15/15 invariant, 15/15 sensitive PASS
+- #263 global kp1 fork — 15/15 invariant, 15/15 sensitive PASS
+- #264 orchestrator `_layer_forward_pos0_paged_kp1` — mechanical wrap
+- #265 full 48-layer `forward_token_gm4_inner_kp1` — probe in flight
+- #266 trace capture + #267 e2e smoke pending
+
+---
+
+## PRIOR (2026-06-07 PM) — **Gemma 4 spec-dec GREENLIT, scope dropped 2 days**
 
 User confirmed Q1+Q2+Q3. **Phase 0 DONE device-free**:
 
