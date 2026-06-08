@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Speculative-decoding scheduler — wraps cb_scheduler with parallel-drafter
-verify/accept logic.
+"""Speculative-decoding scheduler — wraps target+drafter+verify with
+accept-walk logic. Phase 3 v0.0 correctness-first implementation
+(2026-06-08).
 
-This is the SKELETON committed during Phase 0 of the Gemma 4 spec-dec
-build (greenlit 2026-06-07). Methods marked NotImplementedError still
-need device-side work (see Phase 2 + 3 in
-`research/gemma4_mtp_plan_of_action.md`).
+**v0.0 limitations** (documented):
+1. Drafter runs AUTOREGRESSIVELY at L=1 × K calls per round (the
+   "parallel K-position drafter" claim in feasibility doc would need
+   re-bringup at L=K). Cost: K × 6.4 ms traced ≈ 32 ms instead of ~8 ms.
+2. Verify is READ-ONLY (Phase 2.B.1 ship decision). Cache writes for
+   accepted tokens via target B=1 × accepted_count per round. Cost:
+   N × 47 ms ≈ 188 ms at α=0.7. Tok/s SLOWER than plain B=1 baseline.
+3. v1.0 perf upgrade: write-during-verify (non-aliased page-table)
+   + parallel L=K drafter. Projected 3× speedup.
 
 Architecture (parallel-drafter pattern, NOT autoregressive Leviathan):
 
@@ -140,134 +146,175 @@ class SpecDecScheduler:
 
     # ─── Phase 2/3 device APIs (to be filled in) ─────────────────────────
 
-    def _target_step(self, token_id: int) -> tuple:
-        """Run target's decode forward at the new token, return
-        (target_hidden_state, shared_kv_dict).
+    def _target_step(self, token_id: int, cur_pos: int) -> int:
+        """Run target B=1 decode forward at cur_pos via existing eager path.
+        Returns argmax_int. Cache advances by 1.
 
-        NEW vs current `server_gemma4_unified_ttnn.attn_decode_step_tt`:
-        target must populate `state.shared_kv_for_drafter = {
-            "sliding_attention": (K_last, V_last),
-            "full_attention":    (K_last, V_last),
-        }` — the K/V tensors from the LAST sliding attn layer and LAST
-        full attn layer. Phase 2.A deliverable.
+        This is the cache-write path. For v0.0 read-only verify, called N
+        times per round to advance cache by N=accepted_count positions.
         """
-        raise NotImplementedError("Phase 2.A: target.expose_shared_kv hook")
+        import server_gemma4_unified_ttnn as srv
+        return srv.step_forward_v031(
+            self.target_state, tok_id=token_id, pos=cur_pos)
 
-    def _drafter_parallel_forward(
+    def _read_target_shared_kv(self, L_kv: int):
+        """Read target's last-sliding + last-full KV history of length L_kv
+        from the target's paged cache. Output matches HF oracle shape:
+            sliding: (1, NKV=8, L_kv, 256)
+            full:    (1, NKV=1, L_kv, 512)
+        """
+        import server_gemma4_unified_ttnn as srv
+        return srv.read_shared_kv_for_drafter(self.target_state, L_kv=L_kv)
+
+    def _drafter_autoregressive_K(
         self,
-        target_hidden_2_last,  # ttnn.Tensor [B, 2, 3840] — concat of last 2 target hidden
-        shared_kv,             # dict per layer_type → (K_tensor, V_tensor)
-    ):
-        """One drafter forward → K candidate logits + drafter's projected
-        last_hidden_state (for next round's t-1 slot).
+        target_h_prev_np,  # numpy [1, 1, BACKBONE_HIDDEN=3840]
+        target_h_last_np,  # numpy [1, 1, BACKBONE_HIDDEN=3840]
+        shared_kv_np,       # dict: "sliding_attention"/"full_attention" → (K, V)
+    ) -> list:
+        """Autoregressive drafter ×K — each call generates 1 candidate +
+        its hidden output, which feeds the next call.
 
-        Forks Phase 1's `server_gemma4_unified_assistant_ttnn.py` pattern
-        (4 Gemma 4 layers + pre/post Linear projection + lm_head). At
-        v0 the drafter is eager B=1; trace integration is Phase 3.C.
+        Drafter is locked at L=1 (our v0.0 bringup); to get K candidates
+        we chain K calls. Drafter's `hidden` output is the post-projection
+        target-hidden-equivalent shape [1, 1, 3840], so we use it as the
+        "current target hidden" approximation for the next drafter call.
+
+        Returns: K candidate ints.
         """
-        raise NotImplementedError("Phase 1: drafter bringup")
+        import server_gemma4_12b_assistant_ttnn as drf
+        import numpy as np
+        candidates = []
+        # Round 0 of chain: use target's actual (prev, last) hidden.
+        prev_h = target_h_prev_np
+        cur_h = target_h_last_np
+        for k in range(self.K):
+            inputs_embeds = np.concatenate([prev_h, cur_h], axis=-1).astype(np.float32)
+            # inputs_embeds shape [1, 1, 2*BACKBONE_HIDDEN]
+            out = drf.drafter_forward(self.drafter_state, inputs_embeds,
+                                       shared_kv_np)
+            tok = int(out["argmax"].flatten()[0])
+            candidates.append(tok)
+            # Chain: next call's "prev" = current "cur"; next "cur" = drafter's hidden
+            prev_h = cur_h
+            cur_h = out["hidden"]  # [1, 1, 3840]
+        return candidates
 
-    def _target_verify_kp1(self, draft_tokens: list[int]) -> list:
-        """Single target forward at B=K+1 verifying the K draft tokens
-        in parallel.
+    def _target_verify_kp1(self, base_token: int, draft_tokens: list,
+                            cur_pos: int) -> list:
+        """Target B=K+1 verify trace: K+1 Q rows with tokens
+        [base_token, draft_tokens[0], ..., draft_tokens[K-1]] all reading
+        the same cache history through `cur_pos` via the alias page-table.
 
-        Uses aliased page-table (forks DeepSeek-V3
-        `_build_verify_alias_page_table_host` at
-        `tt-metal/models/demos/deepseek_v3/tt/generator.py:43-101`)
-        so all K+1 logical batch rows read from the same physical KV
-        slot.
-
-        Returns K+1 logits arrays (numpy) — one per logical row.
+        Returns K+1 argmaxes (host ints) — one per row.
         """
-        raise NotImplementedError("Phase 2.B: aliased page-table + B=K+1 trace")
+        import server_gemma4_unified_ttnn as srv
+        assert len(draft_tokens) == self.K
+        candidate_token_ids = [base_token] + list(draft_tokens)
+        # setup_verify_kp1_state is idempotent at same K.
+        srv.setup_verify_kp1_state(self.target_state, K=self.K)
+        srv.update_verify_inputs(self.target_state,
+                                  current_pos=cur_pos,
+                                  candidate_token_ids=candidate_token_ids)
+        # Trace must be captured once before first call (caller invokes
+        # ensure_verify_trace_kp1 ahead of the first step).
+        argmaxes = srv.verify_step_traced(self.target_state)
+        # verify_step_traced returns numpy [Bv] = K+1 argmaxes.
+        return [int(x) for x in argmaxes]
 
     # ─── Host-side accept walk (final Phase 3.B) ─────────────────────────
 
-    @staticmethod
-    def _argmax_with_tiebreak(logits) -> int:
-        """numpy argmax breaks ties by lowest index — exactly the
-        deterministic tie-break we want for Leviathan correctness
-        (matches HF do_sample=False)."""
-        return int(logits.argmax(axis=-1))
+    def _accept_walk(self, draft_tokens: list, target_argmaxes_kp1: list) -> tuple:
+        """Greedy accept walk over K+1 argmaxes vs K draft candidates.
 
-    def _accept_walk(self, draft_tokens: list[int], target_logits_kp1) -> tuple:
-        """Greedy accept walk. For i=0..K-1, accept draft[i] iff
-        argmax(target_verify_logits[i]) == draft[i]. At first mismatch,
-        emit (accepted prefix) + (target's argmax at the mismatch row).
-        If all K accepted, also emit target_verify_logits[K]'s argmax
-        (the bonus K+1-th token).
+        For i in 0..K-1: target_argmaxes_kp1[i] is target's prediction
+        for position (cur_pos+i+1) given context [base, draft_0..draft_{i-1}].
+        Accept draft[i] iff target_argmaxes_kp1[i] == draft[i].
+
+        At first mismatch: emit accepted prefix + target's correction at
+        that row. If all K accepted: emit accepted + target_argmaxes_kp1[K]
+        as the K+1-th bonus token.
+
+        Returns (emitted_tokens_list, accept_count).
         """
-        accepted = []
+        emitted = []
         for i in range(self.K):
-            target_tok = self._argmax_with_tiebreak(target_logits_kp1[i])
-            if target_tok == draft_tokens[i]:
-                accepted.append(draft_tokens[i])
+            if target_argmaxes_kp1[i] == draft_tokens[i]:
+                emitted.append(draft_tokens[i])
             else:
-                # First reject. Emit target's correction.
-                accepted.append(target_tok)
-                return accepted, i  # i = number of draft accepts
-        # All K drafts accepted. Emit bonus token from row K (K+1-th logit).
-        bonus = self._argmax_with_tiebreak(target_logits_kp1[self.K])
-        accepted.append(bonus)
-        return accepted, self.K
+                # First reject. Emit target's correction; stop.
+                emitted.append(int(target_argmaxes_kp1[i]))
+                return emitted, i  # i = number of draft accepts
+        # All K drafts accepted. Emit row K's argmax as bonus.
+        emitted.append(int(target_argmaxes_kp1[self.K]))
+        return emitted, self.K
 
     # ─── Public step API ─────────────────────────────────────────────────
 
-    def step(self, prev_token: int) -> StepResult:
-        """One spec-dec round. Returns 1..K+1 tokens.
+    def step(self, base_token: int, target_h_prev_np, target_h_last_np,
+             cur_pos: int) -> StepResult:
+        """One spec-dec round at cur_pos.
 
-        Call repeatedly with `prev_token = result.accepted_tokens[-1]`
-        until EOS or max_new reached.
+        Args:
+          base_token: the last-accepted token, used as Q row 0 of verify
+            (predicts the next position the round starts at).
+          target_h_prev_np, target_h_last_np: target's last 2 hidden
+            states (post-final-norm) at positions cur_pos-1 and cur_pos.
+            Used to bootstrap the drafter's autoregressive chain.
+          cur_pos: target's cur_pos_buf value (cache valid through here).
+
+        Returns StepResult. Cache advances by accept_count + 1 positions
+        via the target B=1 calls at the end of this method.
         """
         t0 = time.time()
-        target_hidden_2_last, shared_kv = self._target_step(prev_token)
-        t_target = time.time()
+        # Read target's shared KV history (used by drafter cross-attention).
+        shared_kv = self._read_target_shared_kv(L_kv=cur_pos + 1)
+        t_kv = time.time()
 
-        # Drafter parallel forward → K candidate logits
-        draft_logits = self._drafter_parallel_forward(
-            target_hidden_2_last, shared_kv,
-        )
-        draft_tokens = [
-            self._argmax_with_tiebreak(draft_logits[i])
-            for i in range(self.K)
-        ]
+        # Drafter ×K chain → K candidate tokens
+        draft_tokens = self._drafter_autoregressive_K(
+            target_h_prev_np, target_h_last_np, shared_kv)
         t_draft = time.time()
 
-        # Target B=K+1 verify
-        target_logits_kp1 = self._target_verify_kp1(draft_tokens)
+        # Target B=K+1 verify (read-only)
+        target_argmaxes_kp1 = self._target_verify_kp1(
+            base_token, draft_tokens, cur_pos)
         t_verify = time.time()
 
         # Host accept walk
-        accepted, accept_count = self._accept_walk(draft_tokens, target_logits_kp1)
+        emitted, accept_count = self._accept_walk(draft_tokens, target_argmaxes_kp1)
         t_walk = time.time()
+
+        # ── Cache advance ──
+        # Read-only verify (Phase 2.B.1 ship constraint): must run target B=1
+        # for each emitted token to write K/V to cache at positions
+        # cur_pos+1, cur_pos+2, ..., cur_pos+len(emitted).
+        # cur_pos at scheduler entry points at last-written cache slot;
+        # emitted tokens go into slots cur_pos+1..cur_pos+len(emitted).
+        # The token to FEED to target B=1 at slot cur_pos+i is emitted[i-1]
+        # (the previous emitted token; first one is the base_token).
+        # We discard the argmax outputs — they would be the NEXT prediction
+        # which we've already verified.
+        feed_tokens = [base_token] + emitted  # length len(emitted)+1
+        for i in range(len(emitted)):
+            slot_pos = cur_pos + 1 + i
+            self._target_step(token_id=feed_tokens[i], cur_pos=slot_pos)
+        t_advance = time.time()
 
         # Stats
         self.total_rounds += 1
         self.total_accepts += accept_count
-        self.total_emitted += len(accepted)
+        self.total_emitted += len(emitted)
 
         return StepResult(
-            accepted_tokens=accepted,
+            accepted_tokens=emitted,
             accept_count=accept_count,
-            target_step_ms=(t_target - t0) * 1e3,
-            drafter_step_ms=(t_draft - t_target) * 1e3,
+            target_step_ms=(t_advance - t_walk) * 1e3,
+            drafter_step_ms=(t_draft - t_kv) * 1e3,
             verify_step_ms=(t_verify - t_draft) * 1e3,
             host_walk_ms=(t_walk - t_verify) * 1e3,
             _K=self.K,
         )
-
-    def generate(self, prompt_ids, log=None):
-        """Drive `step` until max_new or EOS. Returns the generated
-        token list (not including prompt).
-        """
-        if log is None:
-            def log(_msg): pass
-
-        # NOTE: prompt prefill happens OUTSIDE this scheduler — caller
-        # runs the existing target prefill via cb_scheduler's prefill
-        # path, gets the first sampled token, then drives spec-dec from
-        # there.
-        raise NotImplementedError("Phase 4: integrate with cb_api prefill")
 
     # ─── Diagnostics ─────────────────────────────────────────────────────
 

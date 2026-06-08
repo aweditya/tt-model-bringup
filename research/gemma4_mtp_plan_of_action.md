@@ -229,19 +229,39 @@ Open risks the audit flagged (verify with small probes before broad fork):
 decode + B=K+1 verify); K+1 verify produces logits equivalent to K+1
 independent B=1 forwards.
 
-## Phase 3 — spec-dec scheduler (~1.5 days)
+## Phase 3 — spec-dec scheduler
 
-Forks Leviathan Algorithm 1 + DeepSeek-V3's accept-walk machinery.
+**Architectural finding 2026-06-08**: Phase 2.B.1 shipped read-only
+verify (skip `paged_fused_update_cache`). This means cache must advance
+via target B=1 × N per round → **NO tok/s speedup vs baseline** at v0.
+The projected 1.65× requires verify to ALSO write K/V (write-then-rewind
+or non-aliased page-table). **User decision (correctness first)**: ship
+Phase 3 v0.0 with read-only verify, measure α correctness, accept slow
+tok/s. v1.0 perf via non-aliased page table is a follow-up.
+
+### Phase 3 v0.0 — correctness gate (~1 day)
 
 | Step | Adds | Gate | Time |
 |---|---|---|---|
-| 3.A | `spec_dec_scheduler.py` skeleton — wraps cb_scheduler step interface | drives one model's forward through existing path | 2 h |
-| 3.B | Accept-walk core — `draft_step(slot, K) → K tokens`, `target_verify(slot, K) → K logits`, host-side argmax compare, emit accepted prefix + 1 correction | greedy-equivalent: spec-dec output token sequence == B=1 target output on 10 prompts | 5 h |
-| 3.C | KV cache rewind on rejected drafts — fork DeepSeek-V3 `_MtpDecodeLoopResult` walk | accept_rate + accept count match Algorithm 1 reference | 3 h |
-| 3.D | Dev-harness bench — measure α (acceptance rate) + tok/s gain at K∈{3,5,7} | α ≥ 0.6 + measured gain ≥ 1.4× at one K | 2 h |
+| 3.A | `spec_dec_scheduler.py` — flesh out 3 NotImplementedError seams: draft_step, target_verify, accept_walk | scheduler dispatches forward through existing trace paths | 1-2 h |
+| 3.B | Accept-walk core — host-side argmax compare drafter[0..K-1] vs verify[0..K-1]; emit accepted prefix + 1 correction; advance cache via target B=1 × N (read-only verify constraint) | greedy-equivalent: spec-dec output token sequence == B=1 target output on 5 prompts | 3-4 h |
+| 3.C | Dev-harness bench — measure α (acceptance rate) at K∈{3,5,7} | α ≥ 0.6 measured + reported (tok/s expected SLOWER than baseline due to read-only) | 2 h |
 
-**Phase 3 exit criteria**: spec_dec_scheduler runs through dev-harness,
-produces greedy-equivalent output to plain B=1, α ≥ 0.6, gain ≥ 1.4×.
+**Phase 3 v0.0 exit criteria**: spec_dec_scheduler runs through dev-harness,
+produces **greedy-equivalent output to plain B=1**, α ≥ 0.6 measured at
+each K. tok/s deliberately not gated — known-slower with read-only verify.
+
+### Phase 3 v1.0 — perf path (follow-up, ~3-4 h)
+
+Refactor verify trace to non-aliased page table (each K+1 row writes K/V
+to its own slot at `cur_pos+1+k`); abandon unused slots after accept
+walk (no rewind needed). Fork `_layer_pos0_*_paged_kp1` to UN-skip
+`paged_fused_update_cache`; per-row update_idxs + per-row page table.
+Expected: spec-dec round 6.4 (drafter) + 60 (verify+write) + <1 (host)
+≈ 67 ms / ~4.5 tokens ≈ **15 ms/tok ≈ 3× over 47 ms baseline**.
+
+**Phase 3 v1.0 exit criteria**: tok/s gain ≥ 1.4× at one K (revised
+estimate after v0.0 α measurement).
 
 ## Phase 4 — HTTP wire-up + first prod measurement (~0.5 day)
 

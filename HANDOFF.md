@@ -40,8 +40,22 @@ Multi-bucket v1 deferred to HTTP follow-up.
 - accept walk: <1 ms
 - **Total: ~114 ms per round** → α=0.7 → **~28.5 ms/tok ≈ 1.65× over 47 ms baseline**
 
-**Phase 3 NEXT** — `spec_dec_scheduler.py` accept walk + bench α at K∈{3,5,7}.
-Phase 4 HTTP wire-up follows.
+**Phase 3 design call 2026-06-08**: Phase 2.B.1 shipped READ-ONLY verify
+(no `paged_fused_update_cache` in K+1 forward). Discovered this means
+spec-dec round needs target B=1 × N for cache writes → **no tok/s
+speedup at v0**. User decision: **correctness first**. Ship Phase 3 v0.0
+to validate accept walk + α; accept slow tok/s. v1.0 perf via non-aliased
+page table follows.
+
+**Phase 3 v0.0 NEXT** — `spec_dec_scheduler.py` accept walk +
+greedy-equivalent gate + bench α at K∈{3,5,7}. tok/s deliberately not
+gated (known-slower with read-only verify).
+
+**Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
+table (write K/V at K+1 distinct slots, abandon unused). Projected
+~15 ms/tok ≈ 3× over baseline.
+
+Phase 4 HTTP wire-up after v0.0.
 
 ---
 
