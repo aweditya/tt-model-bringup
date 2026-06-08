@@ -413,17 +413,22 @@ class SpecDecScheduler:
         # ── Cache advance ──
         # Read-only verify (Phase 2.B.1 ship constraint): must run target B=1
         # for each emitted token to write K/V to cache at positions
-        # cur_pos+1, cur_pos+2, ..., cur_pos+len(emitted).
-        # cur_pos at scheduler entry points at last-written cache slot;
-        # emitted tokens go into slots cur_pos+1..cur_pos+len(emitted).
-        # The token to FEED to target B=1 at slot cur_pos+i is emitted[i-1]
-        # (the previous emitted token; first one is the base_token).
-        # We discard the argmax outputs — they would be the NEXT prediction
-        # which we've already verified.
-        feed_tokens = [base_token] + emitted  # length len(emitted)+1
-        for i in range(len(emitted)):
+        # cur_pos+1, cur_pos+2, ..., cur_pos+len(emitted). K/V cache at
+        # position p stores the projection of the token AT position p; so
+        # to place emitted[i] at position cur_pos+1+i, we FEED emitted[i]
+        # at that position. Argmax outputs are discarded (they predict
+        # the NEXT token, which we already verified or will produce next
+        # round).
+        #
+        # The prior version of this loop fed [base_token, emitted[0], ...]
+        # at slots [cur_pos+1, cur_pos+2, ...] — that duplicated
+        # base_token's K/V (already written last round at cur_pos),
+        # shifted every emitted token one slot back, and never wrote
+        # K/V for the LAST emitted token. Symptom: duplicated tokens in
+        # output text (e.g. "Paris Paris" instead of "Paris"). Fixed.
+        for i, tok in enumerate(emitted):
             slot_pos = cur_pos + 1 + i
-            self._target_step(token_id=feed_tokens[i], cur_pos=slot_pos)
+            self._target_step(token_id=int(tok), cur_pos=slot_pos)
         t_advance = time.time()
 
         # Stats
