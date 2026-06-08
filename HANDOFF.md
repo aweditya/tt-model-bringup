@@ -27,8 +27,14 @@ way: `ttnn.embedding` silently collapsing 3D input → 2D; TILE_LAYOUT
 padding the Bv=6 dim → 32 breaking reshape volume; mesh-replicated
 argmax readback needing first-Bv slice.
 
-**Next: Phase 3** (spec_dec_scheduler accept walk + bench α at K∈{3,5,7}).
-Phase 4 HTTP wire-up follows.
+**IMMEDIATE NEXT: drafter trace capture (#255)** — drafter currently
+runs eager at 52 ms (Phase 1 v0.2). Without trace, spec-dec round
+budget blows out: target 47 + drafter EAGER 52 + verify 60 = 159 ms →
+α=0.7 → ~40 ms/tok (barely matches baseline). **With drafter trace
+target ~5-10 ms**: round 47+8+60 = 115 ms → ~28 ms/tok ≈ 1.7×.
+
+**Phase 3 after #255** (spec_dec_scheduler accept walk + bench α at
+K∈{3,5,7}). Phase 4 HTTP wire-up follows.
 
 ---
 

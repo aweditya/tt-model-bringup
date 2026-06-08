@@ -260,6 +260,19 @@ class State:
         # Misc
         self.vocab_size = None
 
+        # ── Phase 1 v0.4 — trace capture state. Allocated lazily by
+        #    `setup_drafter_trace_state(state, L_kv)`. Single-bucket v0:
+        #    fixed L_kv set at first capture; reconfiguration requires
+        #    restart. Multi-bucket (fixed-bucket) v1 follow-up.
+        self.drafter_trace_L_kv = None      # int — fixed L_kv buffer extent
+        self.drafter_inputs_buf = None      # [1, 1, 2*BACKBONE_HIDDEN] bf16 TILE
+        self.drafter_K_sl_buf = None        # [1, 8, L_kv, 256] bf16 TILE (sharded dim=1)
+        self.drafter_V_sl_buf = None
+        self.drafter_K_fl_buf = None        # [1, 1, L_kv, 512] bf16 TILE (replicated)
+        self.drafter_V_fl_buf = None
+        self.drafter_trace_id = None        # captured trace handle
+        self.drafter_argmax_tt = None       # captured argmax output handle
+
 
 # ── Bootstrap ──────────────────────────────────────────────────────────
 def bootstrap(state, log=None):
@@ -782,6 +795,208 @@ def drafter_forward(state, inputs_embeds_np, shared_kv_states):
         "hidden": hidden_np,
         "argmax": argmax_np,
     }
+
+
+# ── Phase 1 v0.4 — drafter trace capture ────────────────────────────────
+#
+# Pre-allocate persistent device buffers (tok input + sliding K/V + full K/V),
+# move all numpy uploads OUT of the captured region via
+# `copy_host_to_device_tensor`. Inner forward reads from buffers only.
+# Two-phase warmup: 2 eager forwards JIT all kernels first, then capture.
+#
+# v0 limitation (single-bucket): L_kv is FIXED at first capture. Spec-dec
+# uses ONE drafter forward per round at L_kv = target's current decode
+# position. For a single-prompt bench (Phase 3), pin L_kv to the post-
+# prefill position and recapture if a fresh prompt arrives.
+# Fixed-bucket v1 (multiple traces at L_kv ∈ {128,256,512,1024,2048,4096})
+# is a Phase 4 HTTP follow-up.
+
+
+def setup_drafter_trace_state(state, L_kv, log=print):
+    """Allocate persistent device buffers for the drafter trace forward.
+
+    Idempotent at same L_kv; raises if called with a different L_kv (would
+    need re-allocation + trace re-capture).
+    """
+    if getattr(state, "drafter_trace_L_kv", None) is not None:
+        if state.drafter_trace_L_kv != L_kv:
+            raise ValueError(
+                f"drafter trace state already set up at L_kv="
+                f"{state.drafter_trace_L_kv}; cannot reconfigure to L_kv="
+                f"{L_kv} without restart")
+        return
+    log(f"[drafter trace] allocating buffers at L_kv={L_kv}")
+    state.drafter_trace_L_kv = int(L_kv)
+
+    # inputs_embeds buffer: replicated [1, 1, 2*BACKBONE_HIDDEN=7680] bf16 TILE
+    state.drafter_inputs_buf = ttnn.from_torch(
+        torch.zeros((1, 1, 2 * BACKBONE_HIDDEN), dtype=torch.float32),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    # K_sliding [1, NKV=8, L_kv, 256] sharded dim=1 (NKV_PER_CHIP=2 per chip)
+    state.drafter_K_sl_buf = ttnn.from_torch(
+        torch.zeros((1, NUM_KV_HEADS_SLIDING, L_kv, HEAD_DIM_SLIDING),
+                    dtype=torch.float32),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    state.drafter_V_sl_buf = ttnn.from_torch(
+        torch.zeros((1, NUM_KV_HEADS_SLIDING, L_kv, HEAD_DIM_SLIDING),
+                    dtype=torch.float32),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    # K_full [1, NKV=1, L_kv, 512] replicated
+    state.drafter_K_fl_buf = ttnn.from_torch(
+        torch.zeros((1, NUM_KV_HEADS_FULL, L_kv, HEAD_DIM_FULL),
+                    dtype=torch.float32),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    state.drafter_V_fl_buf = ttnn.from_torch(
+        torch.zeros((1, NUM_KV_HEADS_FULL, L_kv, HEAD_DIM_FULL),
+                    dtype=torch.float32),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    log(f"  drafter trace buffers ready: inputs[1,1,{2*BACKBONE_HIDDEN}] "
+        f"K_sl[1,{NUM_KV_HEADS_SLIDING},{L_kv},{HEAD_DIM_SLIDING}] "
+        f"K_fl[1,{NUM_KV_HEADS_FULL},{L_kv},{HEAD_DIM_FULL}]")
+
+
+def update_drafter_trace_inputs(state, inputs_embeds_np,
+                                  K_sl_np, V_sl_np, K_fl_np, V_fl_np):
+    """Host→device write into pre-allocated drafter trace buffers.
+
+    All numpy arrays must match the L_kv set at `setup_drafter_trace_state`.
+    Outside any captured trace; called per spec-dec round.
+    """
+    assert state.drafter_trace_L_kv is not None, \
+        "call setup_drafter_trace_state(state, L_kv) first"
+    L_kv = state.drafter_trace_L_kv
+
+    assert inputs_embeds_np.shape == (1, 1, 2 * BACKBONE_HIDDEN), \
+        f"inputs_embeds shape {inputs_embeds_np.shape}"
+    inp_host = ttnn.from_torch(
+        torch.from_numpy(inputs_embeds_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(inp_host, state.drafter_inputs_buf)
+
+    assert K_sl_np.shape == (1, NUM_KV_HEADS_SLIDING, L_kv, HEAD_DIM_SLIDING), \
+        f"K_sl shape {K_sl_np.shape}, expected (1, {NUM_KV_HEADS_SLIDING}, {L_kv}, {HEAD_DIM_SLIDING})"
+    Ksl_host = ttnn.from_torch(
+        torch.from_numpy(K_sl_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    ttnn.copy_host_to_device_tensor(Ksl_host, state.drafter_K_sl_buf)
+    Vsl_host = ttnn.from_torch(
+        torch.from_numpy(V_sl_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    ttnn.copy_host_to_device_tensor(Vsl_host, state.drafter_V_sl_buf)
+
+    assert K_fl_np.shape == (1, NUM_KV_HEADS_FULL, L_kv, HEAD_DIM_FULL), \
+        f"K_fl shape {K_fl_np.shape}, expected (1, {NUM_KV_HEADS_FULL}, {L_kv}, {HEAD_DIM_FULL})"
+    Kfl_host = ttnn.from_torch(
+        torch.from_numpy(K_fl_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(Kfl_host, state.drafter_K_fl_buf)
+    Vfl_host = ttnn.from_torch(
+        torch.from_numpy(V_fl_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(Vfl_host, state.drafter_V_fl_buf)
+
+
+def drafter_forward_inner_traced(state):
+    """Trace-captureable drafter forward: reads ONLY from pre-allocated
+    state.drafter_*_buf tensors; produces on-device argmax tensor.
+
+    Returns argmax_tt (uint32 [1, 1]).
+    """
+    # 1. pre_projection: replicated [1, 1, 2*BACKBONE_HIDDEN] → [1, 1, HIDDEN]
+    h = ttnn.matmul(state.drafter_inputs_buf, state.pre_projection_tt,
+                    compute_kernel_config=HIFI4)
+
+    # 2. 4 decoder layers — reuse drafter_layer_forward, just pass the
+    # pre-allocated K/V buffers (kept alive in state).
+    for li in range(N_LAYERS):
+        lt = state.layer_types[li]
+        if lt == "sliding_attention":
+            K_tt, V_tt = state.drafter_K_sl_buf, state.drafter_V_sl_buf
+        else:
+            K_tt, V_tt = state.drafter_K_fl_buf, state.drafter_V_fl_buf
+        h_next = drafter_layer_forward(state, h, li, K_tt, V_tt)
+        ttnn.deallocate(h)
+        h = h_next
+
+    # 3. final_norm + lm_head + argmax (on-device).
+    final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
+    ttnn.deallocate(h)
+    sharded = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
+    ttnn.deallocate(final)
+    gathered = ttnn.all_gather(sharded, dim=-1)
+    ttnn.deallocate(sharded)
+    rm = ttnn.untilize(gathered, use_multicore=True)
+    ttnn.deallocate(gathered)
+    argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=False)
+    ttnn.deallocate(rm)
+    return argmax_tt
+
+
+def ensure_drafter_trace(state, L_kv, log=print):
+    """Capture the drafter forward once at the given L_kv. Two-phase
+    warmup per `[[ttnn-multi-trace-two-phase-warmup]]`: 2 eager forwards
+    JIT all kernels, then begin_trace_capture + capture + end_trace_capture.
+
+    Caller is responsible for calling `update_drafter_trace_inputs(...)`
+    BEFORE this so the warmup forwards have valid data (zeros would also
+    work but real data exercises kernel paths more faithfully).
+
+    Stores: state.drafter_trace_id, state.drafter_argmax_tt.
+    """
+    if getattr(state, "drafter_trace_id", None) is not None:
+        return
+    setup_drafter_trace_state(state, L_kv, log=log)
+    log(f"[drafter trace] warmup + capture at L_kv={L_kv}…")
+    t0 = time.time()
+    # Two warmup eager forwards to JIT all kernels.
+    a = drafter_forward_inner_traced(state); ttnn.deallocate(a)
+    ttnn.synchronize_device(state.mesh)
+    a = drafter_forward_inner_traced(state); ttnn.deallocate(a)
+    ttnn.synchronize_device(state.mesh)
+    # Capture.
+    state.drafter_trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
+    state.drafter_argmax_tt = drafter_forward_inner_traced(state)
+    ttnn.end_trace_capture(state.mesh, state.drafter_trace_id, cq_id=0)
+    log(f"[drafter trace] captured in {(time.time()-t0)*1000:.0f} ms "
+        f"(id={state.drafter_trace_id})")
+
+
+def drafter_step_traced(state):
+    """Execute the captured drafter trace; return argmax as int.
+
+    Caller must have called `update_drafter_trace_inputs(...)` before
+    each call to write the round's inputs_embeds + shared K/V.
+    """
+    ttnn.execute_trace(state.mesh, state.drafter_trace_id,
+                        cq_id=0, blocking=False)
+    arr = ttnn.to_torch(
+        state.drafter_argmax_tt,
+        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    )
+    # argmax replicated across chips post-all_gather; take chip 0.
+    if arr.shape[0] == NCHIPS:
+        arr = arr[0]
+    return int(arr.long().reshape(-1)[0].item())
 
 
 # ── CLI entrypoint: bootstrap-only smoke ────────────────────────────────

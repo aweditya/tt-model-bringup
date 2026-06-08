@@ -168,7 +168,8 @@ forward.
 | v0.1 | Bootstrap on (1,4) qb2 mesh; embed + final_norm + lm_head | embed cos ≥ 0.999 vs HF | 4 h |
 | v0.2 | Full 4-layer forward + argmax matches HF | argmax_last matches HF on 5 prompts | 6 h |
 | v0.3 | Multi-step decode + trace capture | 100 traced steps == 100 eager token-for-token | 6 h |
-| v0.4 | Drafter v0.5 perf — measure ms/tok at B=1 | ms/tok floor measured | 2 h |
+| v0.4 | Drafter trace capture (#255) — two-phase warmup, ensure_drafter_trace + drafter_step_traced helpers | trace replay bit-equivalent to eager; warm replay ms measured | 1-2 h |
+| v0.5 | Drafter v0.5 perf — measure ms/tok at B=1 | ms/tok floor measured | 2 h |
 
 **Phase 1 exit criteria**: drafter runs end-to-end at B=1, produces same
 tokens as HF reference greedy on 100-token prompts. Trace captured + 100
