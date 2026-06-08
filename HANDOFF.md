@@ -113,18 +113,44 @@ Two root causes:
    non-aliased verify (v1.0 refactor)
 Both fixes still require **α > ~0.2** to beat baseline.
 
-**MODEL MISMATCH found**: drafter is `google/gemma-4-12b-it-assistant`
-(paired with IT target). Our spec-dec probes ran without
-`TT_GEMMA4_VARIANT=it`, so target loaded BASE. BASE and IT have
-DIFFERENT distributions — HF target BASE predicts "a"(496), HF drafter
-trained for IT predicts "Paris"(597). Mismatch explains α ≈ 0.013.
+**MODEL MISMATCH disproven 2026-06-08**: Tested with `TT_GEMMA4_VARIANT=it`
+— α=0 across ALL 5 prompts (vs BASE which had 1 accept on prompt_3).
+The model pair IS correct.
 
-**Phase 4 NEXT** (in priority order):
-- **A** Re-run v0.0c with `TT_GEMMA4_VARIANT=it` to test mismatch hypothesis
-  (~5 min, single env var change, expect α uplift)
-- **B** Phase 3 v1.0 perf — refactor verify to non-aliased + re-trace
-  drafter with hidden output. Projected ~3× speedup demo.
-- **C** Pivot to other priorities.
+**REAL CAUSE — autoregressive drafter chain feeds OOD inputs**:
+- Drafter forward signature takes `inputs_embeds = concat(target_h_prev, target_h_last)`
+- Round 0: uses target's actual stashed hidden — correct distribution
+- Rounds 1-K: substitutes DRAFTER'S OWN hidden (4 layers, 0.4B) as the
+  "current target hidden" approximation — distribution drifts
+- Drafter only trained on TARGET hidden (48 layers, 12B) inputs
+- → rounds 1+ produce out-of-distribution predictions → α=0
+
+The drafter feasibility doc claimed "parallel" (one forward → K candidates
+from K-token sliding window). Our v0.2 bringup hardcoded L=1; getting K
+candidates requires the autoregressive chain which feeds the OOD inputs.
+
+**Honest perf math at α=0.013** (even with all our v1.0 fixes):
+- Drafter ×5 traced (would need re-trace returning hidden): 32 ms
+- Verify B=K+1 traced: 60 ms
+- Per round: 92 ms / 1.065 emit = 86 ms/tok (vs 47 baseline) = **0.55× = SLOWER**
+- Spec-dec can't beat baseline at α < ~0.3
+
+**SPEC-DEC WRAP**:
+Phase 3 framework SHIPPED + CORRECT. Drafter+target pair is RIGHT
+(official Google paired model). α is fundamentally low (~0.013) because
+the autoregressive K-call drafter chain feeds OOD inputs after round 0.
+**Spec-dec can't beat baseline at this α level even with all perf fixes.**
+
+The clean fix would be re-bringing-up the drafter at L=K parallel shape
+(one forward → K candidates from K-token sliding window context, per the
+feasibility doc claim). That's ~2 days of work + re-validation.
+
+For now: spec-dec parks here as a complete-but-not-useful demo. Phase 4
+HTTP wire-up wouldn't add value at α=0.
+
+**NEXT** (not spec-dec):
+- Gemma 4 perf adoption (sharded rms_norm was a negative finding,
+  num_links=2 still untested), Nemotron-3, or presentation prep.
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected

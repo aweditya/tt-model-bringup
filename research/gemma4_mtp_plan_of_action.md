@@ -245,7 +245,8 @@ tok/s. v1.0 perf via non-aliased page table is a follow-up.
 |---|---|---|---|---|
 | 3.A v0.0a | Single-round smoke — scheduler 3 seams + step() + co-load probe | 6/6 gates PASS | DONE | ✅ commit `3c1f2ad` |
 | 3.B v0.0b | Target hidden exposure hook + multi-round generate loop | DONE | DONE | ✅ commit `9a31679` |
-| 3.C v0.0c | Multi-prompt α distribution — N=5 rounds × 5 oracle prompts | prompt_3 α=0.067, max α > 0, 1/5 had α > 0 | DONE | ✅ commit `2d6792e` |
+| 3.C v0.0c | Multi-prompt α distribution — N=5 rounds × 5 oracle prompts (BASE + IT variants) | BASE: max α=0.067 (1/5). IT: α=0 throughout. Variant mismatch DISPROVEN. Real cause: drafter chain feeds OOD inputs after round 0 | DONE | ✅ commits `2d6792e` + `0fdaa44` |
+| **Phase 3 WRAP** | Framework complete + correct. Drafter pair correct. α fundamentally low due to autoregressive chain → OOD drafter inputs. Spec-dec can't beat baseline at α<0.3 even with all perf fixes. Re-bring-up drafter at parallel L=K shape (~2 days) would be required for useful α | DONE (parked) | — |
 
 **Phase 3 v0.0 SHIPPED 2026-06-08** — framework is correct + validated:
 - v0.0a single-round smoke: 6/6 gates PASS
