@@ -2444,6 +2444,56 @@ def ensure_decode_trace(state, log=print):
         f"(id={state.trace_id})")
 
 
+def ensure_verify_trace_kp1(state, log=print):
+    """Capture the B=K+1 verify forward once. Two-phase warmup per
+    `[[ttnn-multi-trace-two-phase-warmup]]`: K+1 eager forwards FIRST so
+    every kernel JITs, then `begin_trace_capture` + forward + `end_trace_capture`.
+
+    Requires `setup_verify_kp1_state(state, K)` to have run already so the
+    verify_* buffers exist. Captures the trace at cur_pos = state's current
+    cur_pos_buf value — caller is responsible for the cache being in the
+    state they want to verify against.
+
+    Stores: state.verify_trace_id (handle), state.verify_output_tt (argmax tensor).
+    """
+    if getattr(state, "verify_trace_id", None) is not None:
+        return
+    assert state.verify_K is not None, \
+        "call setup_verify_kp1_state(state, K) before ensure_verify_trace_kp1"
+    Bv = state.verify_K + 1
+    log(f"[verify-trace] warmup + capture B=K+1={Bv} verify trace…")
+    t0 = time.time()
+    # Warmup eager twice — JIT-compile all kp1 kernel programs the inner
+    # forward touches. Reuse the current verify buffer contents (caller
+    # set them up before this); just call forward to JIT, discard output.
+    a = forward_token_gm4_inner_kp1(state); ttnn.deallocate(a)
+    ttnn.synchronize_device(state.mesh)
+    a = forward_token_gm4_inner_kp1(state); ttnn.deallocate(a)
+    ttnn.synchronize_device(state.mesh)
+    # Capture.
+    state.verify_trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
+    state.verify_output_tt = forward_token_gm4_inner_kp1(state)
+    ttnn.end_trace_capture(state.mesh, state.verify_trace_id, cq_id=0)
+    log(f"[verify-trace] captured in {(time.time()-t0)*1000:.0f} ms "
+        f"(id={state.verify_trace_id})")
+
+
+def verify_step_traced(state):
+    """Execute the captured B=K+1 verify trace. Reads back argmax via
+    ConcatMeshToTensor; returns flat numpy [Bv] int array. Caller must have
+    run `ensure_verify_trace_kp1(state)` once + `update_verify_inputs(...)`
+    to write the candidate tokens + position before each call.
+    """
+    Bv = state.verify_K + 1
+    ttnn.execute_trace(state.mesh, state.verify_trace_id, cq_id=0, blocking=False)
+    arr = ttnn.to_torch(
+        state.verify_output_tt,
+        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    ).int().numpy()
+    # Replicated post-all_gather; chip 0's view = first Bv elements.
+    return arr.flatten()[:Bv]
+
+
 def step_forward_traced(state, token_id, cur_pos):
     """Equivalent to step_forward_v031 but uses the captured trace. Caller
     must have run `ensure_decode_trace(state)` once before the first call.
