@@ -27,14 +27,21 @@ way: `ttnn.embedding` silently collapsing 3D input → 2D; TILE_LAYOUT
 padding the Bv=6 dim → 32 breaking reshape volume; mesh-replicated
 argmax readback needing first-Bv slice.
 
-**IMMEDIATE NEXT: drafter trace capture (#255)** — drafter currently
-runs eager at 52 ms (Phase 1 v0.2). Without trace, spec-dec round
-budget blows out: target 47 + drafter EAGER 52 + verify 60 = 159 ms →
-α=0.7 → ~40 ms/tok (barely matches baseline). **With drafter trace
-target ~5-10 ms**: round 47+8+60 = 115 ms → ~28 ms/tok ≈ 1.7×.
+**Drafter trace SHIPPED 2026-06-08** (commit `c3f5fc8` + foreground
+follow-up): 5/5 gates PASS. Eager 63.6 ms → **traced 6.4 ms warm**
+(**9.99× speedup**). Argmax bit-equivalent to eager AND HF (=597 on
+prompt_0). v0 limitation: single-bucket L_kv fixed at first capture.
+Multi-bucket v1 deferred to HTTP follow-up.
 
-**Phase 3 after #255** (spec_dec_scheduler accept walk + bench α at
-K∈{3,5,7}). Phase 4 HTTP wire-up follows.
+**Spec-dec round budget (all traced)**:
+- target B=1: 47 ms
+- drafter B=1: 6.4 ms ✓ NEW
+- verify B=K+1: 59.8 ms
+- accept walk: <1 ms
+- **Total: ~114 ms per round** → α=0.7 → **~28.5 ms/tok ≈ 1.65× over 47 ms baseline**
+
+**Phase 3 NEXT** — `spec_dec_scheduler.py` accept walk + bench α at K∈{3,5,7}.
+Phase 4 HTTP wire-up follows.
 
 ---
 
