@@ -230,6 +230,10 @@ class SpecDecScheduler:
                 self.drafter_state, inputs_embeds, shared_kv_np)
             tok = int(out["argmax"].flatten()[0])
             candidates.append(tok)
+            import os as _os
+            if _os.environ.get("SPEC_DEC_DEBUG"):
+                print(f"      [drafter k={k}] last_token_id={last_token_id} "
+                      f"→ argmax={tok}", flush=True)
             # Update for next round (per HF candidate generator):
             #   last_token_id ← drafter's argmax (this round's prediction)
             #   last_hidden ← drafter's hidden (post_projection output)
