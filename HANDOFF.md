@@ -263,6 +263,25 @@ is WORKING. 3/5 prompts demonstrate real acceptance.
 **For perf**: with α=0.067-0.133, spec-dec still SLOWER than baseline
 (need α>0.3 to beat). But framework is correct and α>0 demonstrably.
 
+**Spec-dec audit 2026-06-08 (post-R-6c)** —
+`research/gemma4_drafter_audit_2026-06-08.md`. End-to-end HF source
+walkthrough; identified 14 candidate behaviours, all but two confirmed
+correct in our impl. **Highest-suspect remaining gap**: drafter SKIPS
+RoPE on Q (`server_gemma4_12b_assistant_ttnn.py:587,629` — comment claims
+"position 0 → identity" but HF actually applies RoPE at `position_ids=[L-1]`,
+which is non-identity for any L>1 prompt).
+
+Why this matters: target's `shared_kv_states` was already RoPE'd at
+positions `[0..L-1]` during target's prefill. HF rotates Q at L-1 so that
+attention scores capture the correct relative position `(L-1)-i`. Our Q
+is unrotated → attention scores see relative position `-i` instead, which
+the drafter only tolerates because the `prev_hidden` input already encodes
+position info. Once bf16 chain drift corrupts `prev_hidden` (rounds 3-4),
+the missing RoPE compounds and flips argmax.
+
+**Next action**: F-1 (add RoPE on Q at `cur_pos = L-1`). Plan in audit doc
+§ "Proposed fix order". Tasks #280-#282 track audit + F-1 + F-2 work.
+
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected
 ~15 ms/tok ≈ 3× over baseline.
