@@ -152,13 +152,13 @@ def main():
 
         # Save target artifacts.
         np.save(prompt_dir / "target_h_last.npy",
-                target_h[:, -1:, :].float().cpu().numpy())
+                target_h[:, -1:, :].detach().float().cpu().numpy())
         np.save(prompt_dir / "shared_kv_sliding_K.npy",
-                kv_sliding_K.float().cpu().numpy())
+                kv_sliding_K.detach().float().cpu().numpy())
         np.save(prompt_dir / "shared_kv_sliding_V.npy",
-                kv_sliding_V.float().cpu().numpy())
-        np.save(prompt_dir / "shared_kv_full_K.npy", kv_full_K.float().cpu().numpy())
-        np.save(prompt_dir / "shared_kv_full_V.npy", kv_full_V.float().cpu().numpy())
+                kv_sliding_V.detach().float().cpu().numpy())
+        np.save(prompt_dir / "shared_kv_full_K.npy", kv_full_K.detach().float().cpu().numpy())
+        np.save(prompt_dir / "shared_kv_full_V.npy", kv_full_V.detach().float().cpu().numpy())
 
         shared_kv_states = {
             "sliding_attention": (kv_sliding_K, kv_sliding_V),
@@ -202,13 +202,13 @@ def main():
                 round_dir = k_dir / f"round_{round_r}"
                 round_dir.mkdir(exist_ok=True)
                 np.save(round_dir / "inputs_embeds.npy",
-                        inputs_embeds.float().cpu().numpy())
+                        inputs_embeds.detach().float().cpu().numpy())
                 np.save(round_dir / "drafter_logits.npy",
-                        drafter_logits.float().cpu().numpy())
+                        drafter_logits.detach().float().cpu().numpy())
                 np.save(round_dir / "drafter_argmax.npy",
                         argmax.cpu().numpy())
                 np.save(round_dir / "drafter_hidden.npy",
-                        drafter_hidden.float().cpu().numpy())
+                        drafter_hidden.detach().float().cpu().numpy())
 
                 tok_int = int(argmax.flatten()[0])
                 log(f"    round {round_r}: argmax={tok_int} "
