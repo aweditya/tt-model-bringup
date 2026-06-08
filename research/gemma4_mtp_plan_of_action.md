@@ -1,10 +1,42 @@
 # Gemma 4 12B IT spec-dec — plan of action (review before building)
 
-Status: **GREENLIT 2026-06-07**. User confirmed Q1+Q2+Q3.
+Status: **Phase 1 SHIPPED 2026-06-07. Phase 2 next.**
 Companions:
-- `research/gemma4_mtp_design.md` (initial scoping, eb014f5)
+- `research/gemma4_mtp_design.md` (initial scoping, `eb014f5`)
 - `research/gemma4_assistant_feasibility.md` (Phase 0.A DONE — outcome a, **scope dropped ~2d**)
 - `research/gemma4_determinism_audit.md` (Phase 0.B DONE — B+D already shipped on Gemma 4)
+- `research/deepseek_v3_alias_page_table_reference.md` (Phase 2.B fork source)
+
+## Architectural clarifications from 2026-06-07 spec-dec discussion
+
+Captured in conversation; codifying here for durability:
+
+1. **Drafter placement on (1,4) mesh**: weights REPLICATED across all 4 chips
+   (760 MB/chip × 4 = 3 GB total, negligible vs target's 24 GB). Drafter's
+   matmuls run independently per chip — no TP on the drafter trunk. lm_head
+   is vocab-sharded (P22 pattern, 65536/chip). v0.2 shipped exactly this.
+2. **"Parallel" in spec-dec is the verify step, not concurrent execution.**
+   Drafter waits for target's hidden + KV (sequential dependency). The win
+   is one B=K+1 target forward replaces K sequential B=1 forwards —
+   amortizes fixed overheads + reads the same 24 GB of weights once
+   instead of K times.
+3. **Per-round wall budget**: target B=1 (~47 ms) + drafter B=1 (~5-10 ms) +
+   target verify B=K+1 (~70-90 ms) + host accept walk (<1 ms) ≈ 125 ms for
+   ~4.5 tokens at α=0.7 → **~28 ms/tok effective, 1.7× speedup over 47 ms baseline**.
+4. **Three traces total** on the same mesh; trace_region_size bump 50 MB → 150 MB:
+   - target single-step decode (exists)
+   - drafter forward (Phase 1 v0.4)
+   - target verify B=K+1 (Phase 2.B)
+5. **KV layout risk** for Phase 2.A: target's KV is TP-sharded on NKV heads;
+   drafter's cross-attention needs all-reduce. Path (a) — drafter does its
+   cross-attention TP-sharded — is the right choice; path (b) — all-gather
+   target's full KV onto every chip — is too expensive. Verify at Phase 2.A.0
+   before committing to the refactor.
+6. **Memory budget on (1,4) qb1**: ~9-10 GB/chip total (target ~6 + drafter ~0.76
+   + KV ~1.6 + traces 0.15 + activations 1) out of 32 GB. 22+ GB headroom.
+7. **Multi-CQ overlap is NOT useful** for single-stream spec-dec (every step
+   depends on previous). Could become useful in CB if we want to overlap
+   one request's draft with another request's verify; deferred past v1.
 
 **Revised total: ~5 days build + 1 day buffer = ~6 days** (down from 8).
 

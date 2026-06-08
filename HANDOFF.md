@@ -52,11 +52,30 @@ trigger IT-conversational evasion in any IT model. Long-context decode
 - Bootstrap 28s cold / 9.9s warm
 - Key arch findings: drafter has NO k_proj/v_proj (cross-attention from target's KV); L3 full attn head_dim=512 vs L0-2 sliding head_dim=256 (dual-head_dim); `tie_word_embeddings` honored
 
-**Phase 1 v0.2 SHIPPED on qb1 2026-06-07** (commit `dfd44c8`):
+**Phase 1 v0.2/v0.3 SHIPPED on qb1 2026-06-07** (commit `dfd44c8`):
 - 5/5 prompts: hidden cos≥0.999, logits cos≥0.999, **argmax exact match vs HF**
 - Per-prompt: p0=597, p1=107, p2=597, p3=146608, p4=255968 (all match)
 - Forward wall ~52 ms warm
-- v0.3 (full forward validates on 5 prompts) effectively shipped together
+- **Phase 1 drafter bringup COMPLETE** (oracle + bootstrap + 4-layer forward + multi-prompt validate in ONE session)
+- Drafter compute fully on-device; smoke I/O is correctness-gate only
+
+**Phase 2 next** (target KV exposure + B=K+1 verify trace, ~1d):
+- 2.A.0: validate KV layout — target's KV is TP-sharded; drafter cross-attn
+  needs TP path with all_reduce (path a chosen, see plan §"KV layout risk")
+- 2.A: modify target server's attn_decode_step_tt to populate
+  `state.shared_kv_for_drafter = {"sliding": (K_last, V_last), "full": (K_last, V_last)}`
+- 2.B: fork DeepSeek-V3 `_build_verify_alias_page_table_host` for B=K+1
+  verify trace
+
+**Phase 3 after Phase 2** (~1d): implement the 3 NotImplementedError seams
+in `experiments/serve/spec_dec_scheduler.py`; bench α at K∈{3,5,7}; greedy
+correctness gate.
+
+**Architectural clarifications** (codified in plan `research/gemma4_mtp_plan_of_action.md`):
+- Drafter REPLICATED across 4 chips (not TP); shipped at v0.2
+- "Parallel" = B=K+1 verify (not concurrent execution); host-step dependency chain
+- 3 traces total, `trace_region_size` 50→150 MB
+- ~9-10 GB/chip memory footprint (22 GB headroom)
 
 **Build journey** for the record (commits `ed4753f` v0.2 server + `7b1cdc4` rms_norm
 isolation + `8781a65` pivot + `dfd44c8` fix):
