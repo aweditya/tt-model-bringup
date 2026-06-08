@@ -39,6 +39,49 @@ import os
 import time
 from dataclasses import dataclass
 
+import torch
+
+
+def build_verify_alias_page_table_host(
+    base_page_table: torch.Tensor,
+    K: int,
+    verify_offset: int = 1,
+) -> torch.Tensor:
+    """Build a host-side aliased page-table for B=K+1 spec-dec verify.
+
+    Single-stream adaptation of DeepSeek-V3's
+    `_build_verify_alias_page_table_host` (tt-metal/models/demos/deepseek_v3/
+    tt/generator.py:58-99). For one active prompt, all K+1 verify rows
+    are aliased to row 0's KV blocks so a single B=K+1 forward reads
+    the SAME KV history K+1 times.
+
+    Args:
+      base_page_table: int32 tensor [num_rows, pages_per_seq]. Row 0 is
+        the active prompt's slot; rows [1, num_rows) are spare.
+      K: spec-dec lookahead depth. K+1 verify rows aliased.
+      verify_offset: starting row for the aliased verify rows. Default 1
+        (row 0 = active prompt, rows [1, 1+K+1) = aliased reads).
+
+    Returns:
+      int32 tensor [num_rows, pages_per_seq]. Rows
+      [verify_offset, verify_offset+K+1) point at row 0's KV blocks.
+      Other rows unchanged.
+
+    Forked from `research/deepseek_v3_alias_page_table_reference.md` §
+    "Our adaptation for single-stream B=K+1 spec-dec".
+    """
+    assert base_page_table.dim() == 2, \
+        f"base_page_table must be rank-2; got {tuple(base_page_table.shape)}"
+    num_rows = int(base_page_table.shape[0])
+    assert num_rows >= verify_offset + K + 1, (
+        f"page_table has {num_rows} rows; need at least "
+        f"{verify_offset + K + 1} for K={K} + verify_offset={verify_offset}"
+    )
+    alias = base_page_table.clone().to(torch.int32)
+    for i in range(K + 1):
+        alias[verify_offset + i] = alias[0]
+    return alias
+
 
 @dataclass
 class SpecDecConfig:
