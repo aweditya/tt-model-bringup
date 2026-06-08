@@ -291,6 +291,32 @@ given HF inputs.
 
 **Total uplift since R-1 start**: 0.013 → 0.133 mean α = **10×**.
 
+**P-1 drafter trace SHIPPED 2026-06-08** (commits `6e09c97` +
+`743fea2`): trace path now correctness-passing (chain probe Variant C
+5/5 BIT-EXACT) AND wired into scheduler with per-round release+recapture.
+
+Real-world bench PROMPT 0 (24 tokens, IT chat-style prompt) at α=0.20:
+| Stage | Pre-P-1 (eager) | **Post-P-1 (traced)** | speedup |
+|---|---|---|---|
+| drafter ms/round | 1467 | **102** | **14×** |
+| verify ms/round | 50 | 50 | 1× |
+| target_adv ms/round | 286 | 312 | ~1× |
+| TOTAL ms/round | 1870 | **529** | **3.5×** |
+| ms/tok | 1169 | **331** | **3.5×** |
+| vs baseline (47ms/tok) | 25× SLOWER | **7× SLOWER** | progress |
+
+P-1 worked as predicted but **spec-dec still 7× slower than baseline**.
+New dominant cost: `target_adv` (target B=1 × emit_count cache writes,
+312ms/round). To beat baseline at α=0.2, K=3 we need P-2 (eliminate
+target_adv) — projected round 150ms / 1.6 emit = ~94 ms/tok, **still
+slower** than 47ms baseline. Real α needs to reach ~0.73 at K=3 to
+break even after P-2.
+
+**This means P-1 + P-2 are NOT enough at IT chat α=0.2**. The path to a
+real win is α uplift: try drafter at K=5 (more candidates per round),
+maybe pair-tune the drafter, or accept that this spec-dec drafter pair
+isn't a tok/s win on this workload mix.
+
 **Remaining for tok/s beat**: need α > 0.3 (currently 0.267 max) OR cut
 per-round wall. Pivoted to perf path 2026-06-08.
 
