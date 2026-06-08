@@ -180,7 +180,24 @@ validated against the wrong reference. Drafter WEIGHTS are correct.
 correct, trace is correct). Only R-2 (corrected oracle) + R-5
 (scheduler fix) + R-6 (bench) needed.
 
-**Decision point**: GO with revised 6h plan.
+**R-2 PASS 2026-06-08** (commit `3934f64`): v2 oracle runs on qb2 in
+~37s for 5 prompts × K∈{3,5,7}. Drafter produces COHERENT text with
+the corrected construction:
+
+| Prompt | K=5 drafter output |
+|---|---|
+| "The capital of France is" | ` a machine-type city` |
+| "Photosynthesis is the process by which" | ` is a simple thing.` |
+| "Quantum entanglement occurs when" | ` it's a.` |
+
+K=3/5/7 share identical prefixes → autoregressive chain is correct.
+This is dramatic improvement vs v0.0 which produced `<image|>` garbage.
+
+Artifacts synced to qb1 + qb2 + local at
+`.cache/hf_oracle_gemma4_12b_assistant_v2/` (5 prompts, ~34 MB).
+
+**R-5 NEXT**: update `spec_dec_scheduler.py:_drafter_autoregressive_K` to
+use the corrected construction.
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected
