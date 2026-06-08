@@ -140,16 +140,17 @@ def main() -> int:
         log(f"    last full attn layer idx: {last_full_idx}")
         log(f"    last sliding attn layer idx: {last_sliding_idx}")
 
-        # past_key_values may be a Cache object in 5.10.x — extract per-layer KV
-        try:
-            kv_full_K, kv_full_V = pkv[last_full_idx]
-            kv_sliding_K, kv_sliding_V = pkv[last_sliding_idx]
-        except Exception:
-            # Cache object API; pull from .key_cache / .value_cache lists
-            kv_full_K = pkv.key_cache[last_full_idx]
-            kv_full_V = pkv.value_cache[last_full_idx]
-            kv_sliding_K = pkv.key_cache[last_sliding_idx]
-            kv_sliding_V = pkv.value_cache[last_sliding_idx]
+        # past_key_values is a DynamicCache in transformers 5.10+. Try the
+        # legacy tuple API first, fall back to .layers[i] container API.
+        if hasattr(pkv, "to_legacy_cache"):
+            legacy = pkv.to_legacy_cache()
+            kv_full_K, kv_full_V = legacy[last_full_idx]
+            kv_sliding_K, kv_sliding_V = legacy[last_sliding_idx]
+        else:
+            kv_full_K = pkv.layers[last_full_idx].keys
+            kv_full_V = pkv.layers[last_full_idx].values
+            kv_sliding_K = pkv.layers[last_sliding_idx].keys
+            kv_sliding_V = pkv.layers[last_sliding_idx].values
         log(f"    full KV shapes: K={tuple(kv_full_K.shape)} V={tuple(kv_full_V.shape)}")
         log(f"    sliding KV shapes: K={tuple(kv_sliding_K.shape)} V={tuple(kv_sliding_V.shape)}")
 
