@@ -298,6 +298,33 @@ which (a) duplicated base_token's K/V (already written last round),
 K/V for the last emitted token. Fix: `for i, tok in enumerate(emitted):
 target_step(tok, cur_pos+1+i)`.
 
+**Next workstreams (in order, 2026-06-08 PM)**:
+
+1. **#288 Spec-dec correctness tests** (PRIORITY, do first).
+   After finding the off-by-one, lock down KV cache logic with
+   regression tests. Two probes:
+   - Pure-host unit tests for `_accept_walk` semantics (no device).
+   - Device-side cache-invariance probe: run spec-dec for N tokens,
+     capture emitted + cur_pos, re-prefill + run plain B=1 with the
+     same sequence, assert cur_pos matches + next argmax matches.
+   Prevents future cache bugs from sliding in silently.
+
+2. **#289 Gemma 4 layout-op overhead** (33% of prefill time is
+   non-compute layout shuffling: Slice 10%, Typecast 9%, Tilize+
+   Untilize+Sharded+Reshape+Concat 25%). Pre-work: clean tracy run
+   with named ops (current capture has empty OP NAME due to tracy
+   post-process crash). Then find where the slices/tilizes come from
+   per layer and fuse / eliminate.
+
+3. **#290 Gemma 4 chunked prefill** (#195 NEXT-C kickoff). Currently
+   prefill = N × decode forward (O(L) full passes). Long prompts have
+   horrible TTFT (200-tok = 9.4s). Fork 27B server_tp.py + Qwen-style
+   chunked SDPA from S2.1. Gate: cos match vs B=1 prefill at L=128/
+   512/2048, TTFT ≥ 5× faster.
+
+P-2 (spec-dec non-aliased verify) and P-1's L_kv-recapture cost
+de-prioritized until #288 lands — testing first.
+
 **Impact**: α **0.20 → 0.50 (2.5×)** on PROMPT 0; output text went
 from garbled ("Paris Paris**, and** and**") to coherent (close to
 baseline modulo minor duplications). User instinct was right —
