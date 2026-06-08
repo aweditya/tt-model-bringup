@@ -87,9 +87,9 @@ def main():
     drf_state.mesh = tgt_state.mesh
     log(f"  drafter bootstrap took {time.time()-t0:.1f}s")
 
-    log("STAGE 2: prefill 'The capital of France is' (5 tokens after BOS)")
-    # Canonical prompt: [2, 818, 5279, 529, 7001, 563] = BOS + "The capital of France is"
-    prompt_ids = [2, 818, 5279, 529, 7001, 563]
+    log("STAGE 2: prefill 'The capital of France is' (NO BOS — matches HF v2 oracle)")
+    # HF v2 oracle did NOT add BOS. Use raw 5-token prefix.
+    prompt_ids = [818, 5279, 529, 7001, 563]
     L = len(prompt_ids)
     last_argmax = None
     for pos in range(L):
@@ -111,9 +111,13 @@ def main():
     our_Kfl, our_Vfl = shared_kv_ours["full_attention"]
     log(f"  our K_sliding shape {our_Ksl.shape} vs HF {hf_kv_sl_K.shape}")
     log(f"  our K_full shape    {our_Kfl.shape} vs HF {hf_kv_fl_K.shape}")
-    c_ksl = cos(our_Ksl, hf_kv_sl_K)
-    c_kfl = cos(our_Kfl, hf_kv_fl_K)
-    log(f"  cos(K_sliding) = {c_ksl:.6f}, cos(K_full) = {c_kfl:.6f}")
+    # Only compare if shapes match; otherwise log size mismatch.
+    if our_Ksl.shape == hf_kv_sl_K.shape:
+        c_ksl = cos(our_Ksl, hf_kv_sl_K)
+        c_kfl = cos(our_Kfl, hf_kv_fl_K)
+        log(f"  cos(K_sliding) = {c_ksl:.6f}, cos(K_full) = {c_kfl:.6f}")
+    else:
+        log(f"  ⚠ KV shape mismatch — skipping cos compare")
 
     log("=" * 64)
     log(f"STAGE 3: run scheduler._drafter_autoregressive_K (K={K})")
