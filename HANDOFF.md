@@ -154,14 +154,33 @@ Our Phase 1 v0.2 hardcoded `assert L == 1` — we built the WRONG variant.
 4. Built K-chain in scheduler without re-reading drafter spec
 5. No early α=0 sanity check at K=1 (would have caught this in hours)
 
-**Re-bringup plan**: `research/gemma4_drafter_rebringup_plan_2026-06-08.md`
-- 6 phases, ~14h total: research → HF oracle L=K → re-bring-up drafter
-  L=K → trace at L=K → scheduler update → bench
-- Expected α ≥ 0.3 (real spec-dec)
-- Still won't beat baseline without write-during-verify (v1.0 perf, separate scope)
+**R-1 RESEARCH DONE 2026-06-08** (commit pending) — found the actual bug:
+`research/gemma4_drafter_parallel_design.md`
 
-**Decision point**: GO (14h investment) or PARK (pivot to GM4 perf
-adoption / Nemotron-3 / presentation prep).
+HF candidate_generator.py:1376-1404 shows the OFFICIAL drafter loop:
+```python
+for _ in range(K):
+    last_token_embedding = target_model_input_embeddings(last_token_id)
+    inputs_embeds = torch.cat([last_token_embedding, last_hidden_state], dim=-1)
+    outputs = assistant_model(inputs_embeds=inputs_embeds, ...)
+    last_token_id = outputs.logits.argmax(dim=-1)
+    last_hidden_state = outputs.last_hidden_state
+```
+
+**The drafter IS L=1 (we built it right). The bug is the inputs:**
+- prev = `target_embed_table(last_predicted_token_id)` — target's EMBED
+  lookup, NOT a hidden state (we used previous round's hidden)
+- cur = drafter's `post_projection` output (we got this right)
+
+Our Phase 1 v0.0 HF oracle ALSO used the wrong construction (concat of
+two consecutive target hidden states) — so the drafter trace was
+validated against the wrong reference. Drafter WEIGHTS are correct.
+
+**Revised scope**: ~6h (was 14h). R-3 and R-4 DROPPED (drafter at L=1 is
+correct, trace is correct). Only R-2 (corrected oracle) + R-5
+(scheduler fix) + R-6 (bench) needed.
+
+**Decision point**: GO with revised 6h plan.
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected

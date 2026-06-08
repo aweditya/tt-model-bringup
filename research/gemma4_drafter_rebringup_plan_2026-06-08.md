@@ -40,7 +40,16 @@ Captured as durable feedback for future bringups:
    produces α>0 on at least one prompt, the framework works. If not,
    STOP and investigate before scaling to K=5.
 
-## Re-bringup plan — 6 phases, ~14h total
+## ⚠️ SCOPE REVISED 2026-06-08 PM after R-1 finding
+
+R-1 found that the drafter doesn't need re-bringup at all. The bug is in
+how we constructed `inputs_embeds` for the autoregressive K-call loop.
+See `research/gemma4_drafter_parallel_design.md` for the full finding.
+
+**New scope: ~6 hours (was 14h).** R-3 and R-4 are DROPPED. R-2 and R-5
+are reformulated.
+
+## Re-bringup plan — 6 phases, ~14h total (DEPRECATED — see above)
 
 ### Phase R-1: Research (~2h)
 
