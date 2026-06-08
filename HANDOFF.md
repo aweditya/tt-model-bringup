@@ -65,13 +65,26 @@ resident; iteration drops from ~60-100s/smoke to ~5-10s. Trigger
 names resolve as `gemma4_assistant_<name>` / `gm4_asst_<name>` / `<name>`.
 See `[[gm4-asst-dev-harness]]` for usage.
 
-**Phase 2 next** (target KV exposure + B=K+1 verify trace, ~1d):
-- 2.A.0: validate KV layout — target's KV is TP-sharded; drafter cross-attn
-  needs TP path with all_reduce (path a chosen, see plan §"KV layout risk")
-- 2.A: modify target server's attn_decode_step_tt to populate
-  `state.shared_kv_for_drafter = {"sliding": (K_last, V_last), "full": (K_last, V_last)}`
-- 2.B: fork DeepSeek-V3 `_build_verify_alias_page_table_host` for B=K+1
-  verify trace
+**Phase 2.A SHIPPED on qb1 2026-06-07** (commits `de604fd` + `8fbecd5` +
+`952f31e` + `486d3e9`):
+- 2.A.0 layout probe: per-chip reassembly works as documented
+  (cache_0 → KV head 2c, cache_1 → 2c+1; full replicated). Shape
+  strict-match HF; cos sliding=0.96, full=0.99 (bf16 chain drift, not
+  layout). `experiments/cb/isolate/gemma4_target_kv_layout_probe.py`
+- 2.A target server change: `read_shared_kv_for_drafter(state, L_kv)` +
+  `reset_shared_kv_for_drafter(state)` helpers; `state.last_sliding_idx`
+  + `state.last_full_idx` derived at bootstrap. ZERO change to hot path
+  (helpers only run when spec-dec scheduler calls them).
+- 2.A.smoke: target + drafter co-resident on (1,4) mesh (drafter monkey-
+  patches `set_fabric_config`/`open_mesh_device` to no-op during boot to
+  preserve target's fabric context). Prefill prompt 0, read TT KV via
+  helper, drafter forward with TT KV vs HF KV: **argmax MATCH (597=HF)**,
+  logits cos=0.968 (gate 0.95), top-8 overlap 5/8.
+  `experiments/cb/isolate/gemma4_target_kv_expose_smoke.py`
+
+**Phase 2.B next** (~1d): fork DeepSeek-V3
+`_build_verify_alias_page_table_host` for B=K+1 verify trace. State
+exposes the KV pipe; the verify-trace probe can drive against it.
 
 **Phase 3 after Phase 2** (~1d): implement the 3 NotImplementedError seams
 in `experiments/serve/spec_dec_scheduler.py`; bench α at K∈{3,5,7}; greedy
