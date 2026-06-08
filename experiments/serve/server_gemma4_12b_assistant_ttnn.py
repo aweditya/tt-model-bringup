@@ -270,11 +270,24 @@ class State:
         # full p-RoPE theta=1e6 partial=0.25 with non-rotated dims at
         # inv_freq=0 so cos=1/sin=0 there). sin tables sign-bake the
         # first half to enable roll+addcmul fusion in _apply_full_rope.
-        # Per-call slices uploaded as TILE [1, head_dim] replicated.
+        # EAGER path: per-call slice uploaded as TILE [1, head_dim].
         self.cos_sliding_np = None         # numpy [MAX_KV, HEAD_DIM_SLIDING=256] fp32
         self.sin_sliding_np = None
         self.cos_full_np = None            # numpy [MAX_KV, HEAD_DIM_FULL=512] fp32
         self.sin_full_np = None
+        # TRACE path (P-1): on-device replicated [MAX_KV, head_dim] tables
+        # ROW_MAJOR + uint32 [1] buffer holding cur_pos. Trace reads cos/sin
+        # via `ttnn.embedding(rot_idxs_buf, table)` inside the captured
+        # region; scheduler updates the buffer via copy_host_to_device_tensor
+        # OUTSIDE the trace, per round. Forks target's `state.rot_idxs_buf`
+        # / `_lookup_rope` pattern at server_gemma4_unified_ttnn.py:1339.
+        self.cos_sliding_tt = None         # ttnn replicated [MAX_KV, 256] ROW_MAJOR
+        self.sin_sliding_tt = None
+        self.cos_full_tt = None            # ttnn replicated [MAX_KV, 512] ROW_MAJOR
+        self.sin_full_tt = None
+        self.drafter_rot_idxs_buf = None   # uint32 device [1] (replicated)
+        self.drafter_hidden_tt = None      # captured device handle for hidden
+                                            # output ([1, 1, BACKBONE_HIDDEN])
 
         # ── Phase 1 v0.4 — trace capture state. Allocated lazily by
         #    `setup_drafter_trace_state(state, L_kv)`. Single-bucket v0:
@@ -362,6 +375,27 @@ def bootstrap(state, log=None):
         partial_rotary_factor=PARTIAL_ROTARY_FULL)
     log(f"  RoPE tables (host): sliding [{state.cos_sliding_np.shape}] + "
         f"full [{state.cos_full_np.shape}] up to MAX_KV={MAX_KV}")
+
+    # P-1: also upload tables to device for trace-friendly lookup.
+    # ROW_MAJOR is required by ttnn.embedding (matches target's pattern at
+    # server_gemma4_unified_ttnn.py:840-859).
+    state.cos_sliding_tt = np_to_replicated(
+        state.cos_sliding_np, state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT)
+    state.sin_sliding_tt = np_to_replicated(
+        state.sin_sliding_np, state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT)
+    state.cos_full_tt = np_to_replicated(
+        state.cos_full_np, state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT)
+    state.sin_full_tt = np_to_replicated(
+        state.sin_full_np, state.mesh, layout=ttnn.ROW_MAJOR_LAYOUT)
+    # rot_idxs_buf: uint32 [1] replicated. Default cur_pos=0; scheduler
+    # updates via update_drafter_rot_idx() per spec-dec round.
+    state.drafter_rot_idxs_buf = ttnn.from_torch(
+        torch.tensor([0], dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    log(f"  RoPE tables (device, P-1): sliding + full ROW_MAJOR ; "
+        f"rot_idxs_buf uint32 [1] = 0")
 
     # ── Embed: replicated, ROW_MAJOR (ttnn.embedding requires it) ──
     # Tied to lm_head. Drafter prefix is `model.` (NOT `model.language_model.`).
@@ -596,6 +630,43 @@ def _apply_full_rope(x, cos_tt, sin_tt, head_dim):
     x_rope = ttnn.addcmul(x_cos, swapped, sin_tt, value=1.0)
     ttnn.deallocate(x_cos); ttnn.deallocate(swapped)
     return x_rope
+
+
+def _lookup_drafter_rope(state, cos_table_tt, sin_table_tt, head_dim):
+    """P-1: trace-friendly RoPE row lookup. Reads cos/sin rows from the
+    on-device tables at index state.drafter_rot_idxs_buf (uint32 [1]).
+
+    Forks `server_gemma4_unified_ttnn._lookup_rope` verbatim. Returns
+    (cos_tt, sin_tt) shape [1, head_dim] TILE_LAYOUT ready for
+    _apply_full_rope.
+
+    Caller MUST deallocate the returned tensors.
+    """
+    cos_row = ttnn.embedding(state.drafter_rot_idxs_buf, cos_table_tt)
+    sin_row = ttnn.embedding(state.drafter_rot_idxs_buf, sin_table_tt)
+    cos_tt = ttnn.to_layout(cos_row, ttnn.TILE_LAYOUT)
+    sin_tt = ttnn.to_layout(sin_row, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(cos_row); ttnn.deallocate(sin_row)
+    cos_tt = ttnn.reshape(cos_tt, [1, head_dim])
+    sin_tt = ttnn.reshape(sin_tt, [1, head_dim])
+    return cos_tt, sin_tt
+
+
+def update_drafter_rot_idx(state, cur_pos):
+    """P-1: write cur_pos into state.drafter_rot_idxs_buf OUTSIDE any trace.
+
+    Called by the scheduler once per spec-dec round (cur_pos is constant
+    within K drafter calls). Forks target's `_set_pos` style updates via
+    `copy_host_to_device_tensor` for zero allocation churn.
+    """
+    assert 0 <= cur_pos < MAX_KV, \
+        f"cur_pos={cur_pos} out of range [0, MAX_KV={MAX_KV})"
+    host = ttnn.from_torch(
+        torch.tensor([int(cur_pos)], dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(host, state.drafter_rot_idxs_buf)
 
 
 def _upload_rope_row(state, cos_np, sin_np, cur_pos):
@@ -1064,31 +1135,117 @@ def update_drafter_trace_inputs(state, inputs_embeds_np,
     ttnn.copy_host_to_device_tensor(Vfl_host, state.drafter_V_fl_buf)
 
 
+def update_drafter_trace_inputs_only(state, inputs_embeds_np):
+    """P-1: write ONLY inputs_embeds into the trace buffer.
+
+    Used by scheduler per-K-call within a spec-dec round. KV is the same
+    across K calls — write it once via `update_drafter_trace_kv` at
+    round start.
+    """
+    assert state.drafter_trace_L_kv is not None, \
+        "call setup_drafter_trace_state(state, L_kv) first"
+    assert inputs_embeds_np.shape == (1, 1, 2 * BACKBONE_HIDDEN), \
+        f"inputs_embeds shape {inputs_embeds_np.shape}"
+    inp_host = ttnn.from_torch(
+        torch.from_numpy(inputs_embeds_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(inp_host, state.drafter_inputs_buf)
+
+
+def update_drafter_trace_kv(state, K_sl_np, V_sl_np, K_fl_np, V_fl_np):
+    """P-1: write ONLY shared K/V into the trace buffers.
+
+    Used by scheduler ONCE per spec-dec round (KV is constant across K
+    drafter calls in the same round).
+    """
+    assert state.drafter_trace_L_kv is not None, \
+        "call setup_drafter_trace_state(state, L_kv) first"
+    L_kv = state.drafter_trace_L_kv
+
+    assert K_sl_np.shape == (1, NUM_KV_HEADS_SLIDING, L_kv, HEAD_DIM_SLIDING), \
+        f"K_sl shape {K_sl_np.shape}, expected (1, {NUM_KV_HEADS_SLIDING}, {L_kv}, {HEAD_DIM_SLIDING})"
+    Ksl_host = ttnn.from_torch(
+        torch.from_numpy(K_sl_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    ttnn.copy_host_to_device_tensor(Ksl_host, state.drafter_K_sl_buf)
+    Vsl_host = ttnn.from_torch(
+        torch.from_numpy(V_sl_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ShardTensorToMesh(state.mesh, dim=1),
+    )
+    ttnn.copy_host_to_device_tensor(Vsl_host, state.drafter_V_sl_buf)
+
+    assert K_fl_np.shape == (1, NUM_KV_HEADS_FULL, L_kv, HEAD_DIM_FULL), \
+        f"K_fl shape {K_fl_np.shape}, expected (1, {NUM_KV_HEADS_FULL}, {L_kv}, {HEAD_DIM_FULL})"
+    Kfl_host = ttnn.from_torch(
+        torch.from_numpy(K_fl_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(Kfl_host, state.drafter_K_fl_buf)
+    Vfl_host = ttnn.from_torch(
+        torch.from_numpy(V_fl_np.astype(np.float32)),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(Vfl_host, state.drafter_V_fl_buf)
+
+
 def drafter_forward_inner_traced(state):
     """Trace-captureable drafter forward: reads ONLY from pre-allocated
-    state.drafter_*_buf tensors; produces on-device argmax tensor.
+    state.drafter_*_buf tensors; produces on-device (argmax, hidden) tensors.
 
-    Returns argmax_tt (uint32 [1, 1]).
+    P-1: RoPE cos/sin looked up from on-device tables via
+    `ttnn.embedding(state.drafter_rot_idxs_buf, table)`. Scheduler updates
+    rot_idxs_buf via `update_drafter_rot_idx(state, cur_pos)` BEFORE
+    `ttnn.execute_trace` (out of the captured region).
+
+    Returns (argmax_tt, hidden_tt):
+      argmax_tt: uint32 [1, 1] replicated
+      hidden_tt: bf16 TILE [1, 1, BACKBONE_HIDDEN] replicated (post_projection)
     """
     # 1. pre_projection: replicated [1, 1, 2*BACKBONE_HIDDEN] → [1, 1, HIDDEN]
     h = ttnn.matmul(state.drafter_inputs_buf, state.pre_projection_tt,
                     compute_kernel_config=HIFI4)
 
-    # 2. 4 decoder layers — reuse drafter_layer_forward, just pass the
-    # pre-allocated K/V buffers (kept alive in state).
+    # 2. P-1: lookup cos/sin for this round (cur_pos in drafter_rot_idxs_buf).
+    # SAME cos/sin used for all 4 layers within ONE forward (matches HF's
+    # constant position_ids across the K-round loop).
+    cos_sl_tt, sin_sl_tt = _lookup_drafter_rope(
+        state, state.cos_sliding_tt, state.sin_sliding_tt, HEAD_DIM_SLIDING)
+    cos_fl_tt, sin_fl_tt = _lookup_drafter_rope(
+        state, state.cos_full_tt, state.sin_full_tt, HEAD_DIM_FULL)
+
+    # 3. 4 decoder layers — reuse drafter_layer_forward, just pass the
+    # pre-allocated K/V buffers (kept alive in state) + RoPE rows.
     for li in range(N_LAYERS):
         lt = state.layer_types[li]
         if lt == "sliding_attention":
             K_tt, V_tt = state.drafter_K_sl_buf, state.drafter_V_sl_buf
         else:
             K_tt, V_tt = state.drafter_K_fl_buf, state.drafter_V_fl_buf
-        h_next = drafter_layer_forward(state, h, li, K_tt, V_tt)
+        h_next = drafter_layer_forward(
+            state, h, li, K_tt, V_tt,
+            cos_sl_tt=cos_sl_tt, sin_sl_tt=sin_sl_tt,
+            cos_fl_tt=cos_fl_tt, sin_fl_tt=sin_fl_tt,
+        )
         ttnn.deallocate(h)
         h = h_next
 
-    # 3. final_norm + lm_head + argmax (on-device).
+    ttnn.deallocate(cos_sl_tt); ttnn.deallocate(sin_sl_tt)
+    ttnn.deallocate(cos_fl_tt); ttnn.deallocate(sin_fl_tt)
+
+    # 4. final_norm + post_projection (hidden) + lm_head + argmax.
     final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
     ttnn.deallocate(h)
+    # post_projection: [1, 1, HIDDEN] → [1, 1, BACKBONE_HIDDEN] replicated.
+    # Returned to scheduler for the next round's inputs_embeds (cur half).
+    hidden_tt = ttnn.matmul(final, state.post_projection_tt,
+                             compute_kernel_config=HIFI4)
     sharded = ttnn.matmul(final, state.lm_head_tt, compute_kernel_config=HIFI4)
     ttnn.deallocate(final)
     gathered = ttnn.all_gather(sharded, dim=-1)
@@ -1097,7 +1254,7 @@ def drafter_forward_inner_traced(state):
     ttnn.deallocate(gathered)
     argmax_tt = ttnn.argmax(rm, dim=-1, keepdim=True, use_multicore=False)
     ttnn.deallocate(rm)
-    return argmax_tt
+    return argmax_tt, hidden_tt
 
 
 def ensure_drafter_trace(state, L_kv, log=print):
@@ -1106,10 +1263,12 @@ def ensure_drafter_trace(state, L_kv, log=print):
     JIT all kernels, then begin_trace_capture + capture + end_trace_capture.
 
     Caller is responsible for calling `update_drafter_trace_inputs(...)`
-    BEFORE this so the warmup forwards have valid data (zeros would also
-    work but real data exercises kernel paths more faithfully).
+    + `update_drafter_rot_idx(...)` BEFORE this so the warmup forwards
+    have valid data (zeros would also work but real data exercises
+    kernel paths more faithfully).
 
-    Stores: state.drafter_trace_id, state.drafter_argmax_tt.
+    Stores: state.drafter_trace_id, state.drafter_argmax_tt,
+            state.drafter_hidden_tt.
     """
     if getattr(state, "drafter_trace_id", None) is not None:
         return
@@ -1117,13 +1276,16 @@ def ensure_drafter_trace(state, L_kv, log=print):
     log(f"[drafter trace] warmup + capture at L_kv={L_kv}…")
     t0 = time.time()
     # Two warmup eager forwards to JIT all kernels.
-    a = drafter_forward_inner_traced(state); ttnn.deallocate(a)
+    a, h = drafter_forward_inner_traced(state)
+    ttnn.deallocate(a); ttnn.deallocate(h)
     ttnn.synchronize_device(state.mesh)
-    a = drafter_forward_inner_traced(state); ttnn.deallocate(a)
+    a, h = drafter_forward_inner_traced(state)
+    ttnn.deallocate(a); ttnn.deallocate(h)
     ttnn.synchronize_device(state.mesh)
     # Capture.
     state.drafter_trace_id = ttnn.begin_trace_capture(state.mesh, cq_id=0)
-    state.drafter_argmax_tt = drafter_forward_inner_traced(state)
+    state.drafter_argmax_tt, state.drafter_hidden_tt = \
+        drafter_forward_inner_traced(state)
     ttnn.end_trace_capture(state.mesh, state.drafter_trace_id, cq_id=0)
     log(f"[drafter trace] captured in {(time.time()-t0)*1000:.0f} ms "
         f"(id={state.drafter_trace_id})")
@@ -1132,8 +1294,13 @@ def ensure_drafter_trace(state, L_kv, log=print):
 def drafter_step_traced(state):
     """Execute the captured drafter trace; return argmax as int.
 
-    Caller must have called `update_drafter_trace_inputs(...)` before
-    each call to write the round's inputs_embeds + shared K/V.
+    Back-compat shim: returns just the argmax (the v0.4 trace smoke
+    expects an int). For the new spec-dec scheduler path that needs
+    `hidden` for the next round's inputs_embeds, use
+    `drafter_step_traced_full()`.
+
+    Caller must have called `update_drafter_trace_inputs(...)` and
+    `update_drafter_rot_idx(...)` before each call.
     """
     ttnn.execute_trace(state.mesh, state.drafter_trace_id,
                         cq_id=0, blocking=False)
@@ -1145,6 +1312,32 @@ def drafter_step_traced(state):
     if arr.shape[0] == NCHIPS:
         arr = arr[0]
     return int(arr.long().reshape(-1)[0].item())
+
+
+def drafter_step_traced_full(state):
+    """Execute the captured drafter trace; return dict with argmax + hidden.
+
+    Used by the spec-dec scheduler's K-chain — `hidden` (post_projection
+    output) is fed back as the next round's `last_hidden_state` in HF's
+    `concat(embed(last_tok), last_hidden_state)` inputs_embeds construction.
+
+    Returns dict:
+      - "argmax": int (predicted token id)
+      - "hidden": numpy fp32 [1, 1, BACKBONE_HIDDEN]
+    """
+    ttnn.execute_trace(state.mesh, state.drafter_trace_id,
+                        cq_id=0, blocking=False)
+    arr = ttnn.to_torch(
+        state.drafter_argmax_tt,
+        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0),
+    )
+    if arr.shape[0] == NCHIPS:
+        arr = arr[0]
+    argmax_int = int(arr.long().reshape(-1)[0].item())
+    hidden_np = _readback_replicated(
+        state.drafter_hidden_tt, state.mesh
+    ).reshape(1, 1, BACKBONE_HIDDEN).astype(np.float32)
+    return {"argmax": argmax_int, "hidden": hidden_np}
 
 
 # ── CLI entrypoint: bootstrap-only smoke ────────────────────────────────
