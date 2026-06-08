@@ -5,7 +5,34 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## LATEST (2026-06-08) — Tenstorrent feedback + Phase 2.B.1 6/8 steps green
+## LATEST (2026-06-08) — **🎉 Phase 2.B.1 COMPLETE — verify trace works, Phase 3 unblocked**
+
+**B=K+1 verify trace SHIPPED + ALL 4 GATES PASS** (commit `2dea4cb` + foreground iterations):
+
+| Metric | Value |
+|---|---|
+| Eager B=K+1 forward (warm) | **114.9 ms** |
+| **Traced B=K+1 forward (3/3 warm replays)** | **59.8 ms** |
+| Trace capture wall | 414 ms |
+| Argmax bit-equivalent eager vs traced | ✓ (all 6 rows = 198) |
+| Per-row matches independent B=1 forward | ✓ (all 6 = B=1 argmax 198) |
+
+**Projected spec-dec wall per round** (target B=1 47ms + drafter ~5ms +
+verify 60ms = ~112ms for K+1 candidates). At α=0.7 → ~4 accepted →
+**~28 ms/tok effective ≈ 1.7× over 47 ms baseline**.
+
+Phase 2.B.1 implementation: 8 steps in 8 commits per
+`research/gemma4_verify_kp1_audit.md`. Bugs caught + resolved on the
+way: `ttnn.embedding` silently collapsing 3D input → 2D; TILE_LAYOUT
+padding the Bv=6 dim → 32 breaking reshape volume; mesh-replicated
+argmax readback needing first-Bv slice.
+
+**Next: Phase 3** (spec_dec_scheduler accept walk + bench α at K∈{3,5,7}).
+Phase 4 HTTP wire-up follows.
+
+---
+
+## PRIOR (2026-06-08 AM) — Tenstorrent feedback + Phase 2.B.1 6/8 steps green
 
 **Yossi at Tenstorrent (email 2026-06-08)** — they are reading our wiki +
 research dirs over the weekend. Captured at

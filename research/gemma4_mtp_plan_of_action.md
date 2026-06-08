@@ -174,7 +174,17 @@ forward.
 tokens as HF reference greedy on 100-token prompts. Trace captured + 100
 traced replays match eager. Drafter forward time measured.
 
-## Phase 2 — target B=K+1 verify trace (~1 day)
+## Phase 2 — target B=K+1 verify trace (~1 day) — **SHIPPED 2026-06-08 ✓**
+
+**ALL 4 GATES PASS** (`2dea4cb` + foreground iterations on `df3e00e`):
+- Trace captures cleanly (414 ms wall)
+- Replay shape `(Bv,)` non-NaN
+- Traced argmaxes bit-equivalent to eager kp1
+- Per-row argmaxes match independent B=1 step
+- **Eager 114.9 ms / Traced 59.8 ms** (3/3 warm replays)
+- Projected spec-dec wall ~112ms per round; α=0.7 → ~28 ms/tok (1.7× over baseline)
+
+
 
 Currently `server_gemma4_unified_cb.py` captures only B=1. Spec-dec verify
 needs a B=K+1 forward where K+1 logical batch rows alias onto one
