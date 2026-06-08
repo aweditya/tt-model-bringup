@@ -47,9 +47,15 @@ speedup at v0**. User decision: **correctness first**. Ship Phase 3 v0.0
 to validate accept walk + α; accept slow tok/s. v1.0 perf via non-aliased
 page table follows.
 
-**Phase 3 v0.0 NEXT** — `spec_dec_scheduler.py` accept walk +
-greedy-equivalent gate + bench α at K∈{3,5,7}. tok/s deliberately not
-gated (known-slower with read-only verify).
+**Phase 3 v0.0a SHIPPED 2026-06-08** (commit `3c1f2ad`):
+- Full spec-dec round runs end-to-end (target+drafter+verify+accept walk)
+- 6/6 gates PASS: co-load, prefill, scheduler.step, emit/accept count, cur_pos advance
+- Per-round: drafter×5 eager 480ms + verify traced **59ms** + target B=1 advance 188ms = 794ms / 1 emit (α=0 single round, expected)
+- Verify trace replay matched prior Phase 2.B.1 number (59ms ✓)
+
+**Phase 3 v0.0b NEXT** — multi-round generation (N=10+ rounds) +
+α stabilization measurement + target hidden exposure hook for drafter
+chaining across rounds.
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected
