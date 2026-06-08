@@ -98,11 +98,33 @@ proven achievable. Low aggregate α reflects 4-layer 0.4B drafter being
 architecturally tiny vs 48-layer 12B target — that's a model-pair
 property, not a scheduler issue.
 
-**Phase 4 NEXT** options (pick one):
-- **B** Phase 3 v1.0 perf — refactor verify to non-aliased page table
-  + skip target B=1 ×N cache advance. Projected ~3× speedup demo.
-- **C** Pivot to other priorities (Gemma 4 perf adoption from `arg/
-  gemma4_optimizations` branch diff, Nemotron-3, presentation prep).
+**SPEC-DEC SLOWNESS ANALYSIS 2026-06-08**:
+
+Per-round timing (v0.0b prompt_0, K=3):
+- Drafter ×5 **EAGER 480 ms** ← bottleneck (drafter trace returns only argmax;
+  hidden output needed for autoregressive chaining isn't traced)
+- Verify B=K+1 traced: 60 ms
+- Target B=1 advance ×1: 188 ms
+- **Total: 794 ms / 1 emit ≈ 17× slower than 47 ms/tok baseline**
+
+Two root causes:
+1. **Drafter eager** — saves 90% (480→32 ms) if we re-trace returning hidden
+2. **Read-only verify + target B=1 ×N advance** — saves N×47ms with
+   non-aliased verify (v1.0 refactor)
+Both fixes still require **α > ~0.2** to beat baseline.
+
+**MODEL MISMATCH found**: drafter is `google/gemma-4-12b-it-assistant`
+(paired with IT target). Our spec-dec probes ran without
+`TT_GEMMA4_VARIANT=it`, so target loaded BASE. BASE and IT have
+DIFFERENT distributions — HF target BASE predicts "a"(496), HF drafter
+trained for IT predicts "Paris"(597). Mismatch explains α ≈ 0.013.
+
+**Phase 4 NEXT** (in priority order):
+- **A** Re-run v0.0c with `TT_GEMMA4_VARIANT=it` to test mismatch hypothesis
+  (~5 min, single env var change, expect α uplift)
+- **B** Phase 3 v1.0 perf — refactor verify to non-aliased + re-trace
+  drafter with hidden output. Projected ~3× speedup demo.
+- **C** Pivot to other priorities.
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected
