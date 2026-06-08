@@ -59,6 +59,12 @@ trigger IT-conversational evasion in any IT model. Long-context decode
 - **Phase 1 drafter bringup COMPLETE** (oracle + bootstrap + 4-layer forward + multi-prompt validate in ONE session)
 - Drafter compute fully on-device; smoke I/O is correctness-gate only
 
+**Drafter dev harness shipped** (commit pending) — forks `nm3_dev_harness`
+pattern. `bash scripts/run_harness_tmux.sh gm4_asst qb1` keeps state
+resident; iteration drops from ~60-100s/smoke to ~5-10s. Trigger
+names resolve as `gemma4_assistant_<name>` / `gm4_asst_<name>` / `<name>`.
+See `[[gm4-asst-dev-harness]]` for usage.
+
 **Phase 2 next** (target KV exposure + B=K+1 verify trace, ~1d):
 - 2.A.0: validate KV layout — target's KV is TP-sharded; drafter cross-attn
   needs TP path with all_reduce (path a chosen, see plan §"KV layout risk")

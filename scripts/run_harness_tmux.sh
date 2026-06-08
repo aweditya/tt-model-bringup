@@ -17,10 +17,11 @@ MODEL="${1:-cb35}"
 HOST="${2:-qb1}"
 
 case "$MODEL" in
-  cb35) HARNESS_PATH="experiments/cb/dev/cb35_dev_harness.py"; RUNTIME_DIR="cb35_runtime";;
-  gm4)  HARNESS_PATH="experiments/cb/dev/gm4_dev_harness.py";  RUNTIME_DIR="gm4_runtime";;
-  nm3)  HARNESS_PATH="experiments/cb/dev/nm3_dev_harness.py";  RUNTIME_DIR="nm3_runtime";;
-  *) echo "unknown model: $MODEL (expected cb35|gm4|nm3)"; exit 1;;
+  cb35)     HARNESS_PATH="experiments/cb/dev/cb35_dev_harness.py";     RUNTIME_DIR="cb35_runtime";;
+  gm4)      HARNESS_PATH="experiments/cb/dev/gm4_dev_harness.py";      RUNTIME_DIR="gm4_runtime";;
+  gm4_asst) HARNESS_PATH="experiments/cb/dev/gm4_asst_dev_harness.py"; RUNTIME_DIR="gm4_asst_runtime";;
+  nm3)      HARNESS_PATH="experiments/cb/dev/nm3_dev_harness.py";      RUNTIME_DIR="nm3_runtime";;
+  *) echo "unknown model: $MODEL (expected cb35|gm4|gm4_asst|nm3)"; exit 1;;
 esac
 
 # Propagate select env vars into the tmux session so model-variant
