@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
-"""Phase 2.B.1.3 — sliding-attention B=K+1 verify variant isolation gate.
+"""Phase 2.B.1.4 — global-attention B=K+1 verify variant isolation gate.
 
-Validates `_layer_pos0_sliding_paged_kp1` in isolation:
-1. PLUMBING: forward at Bv=K+1 returns shape [Bv, HIDDEN] non-NaN.
-2. INVARIANCE: K+1 IDENTICAL h_norm rows → K+1 IDENTICAL output rows
-   (cos ≥ 0.9999 between any two rows). Proves per-row computation is
-   independent (no row-to-row leakage).
-3. SENSITIVITY: K+1 DISTINCT h_norm rows → outputs that DIFFER row to row
-   (row-pair cos < 0.999 between distinct rows). Proves the forward is
-   functional in h_norm, not a constant.
+Mirror of `gemma4_sliding_kp1_probe.py` but exercises the global-attention
+layer (NKV=1, single SDPA call, head_dim=512, p-RoPE).
 
-The strong "per-row equals independent B=1 forward" gate runs at
-Step #267 (end-to-end smoke after the full forward is built), where we can
-do a clean fresh-bootstrap A/B without cache-mutation conflicts.
+Same gates:
+1. PLUMBING: kp1 forward returns [Bv, HIDDEN] non-NaN.
+2. INVARIANCE: K+1 IDENTICAL h_norm rows → K+1 IDENTICAL output rows.
+3. SENSITIVITY: K+1 DISTINCT h_norm rows → outputs that differ row-to-row.
 
-Run on qb1 via dev harness:
-  touch ~/tt-xla/.cache/gm4_runtime/trig/gemma4_sliding_kp1_probe
-or direct:
-  ssh qb1 'cd ~/tt-xla && bash scripts/run_remote.sh \
-      experiments/cb/isolate/gemma4_sliding_kp1_probe.py'
+Trigger:  touch ~/tt-xla/.cache/gm4_runtime/trig/gemma4_global_kp1_probe
 """
 from __future__ import annotations
 
@@ -40,7 +31,7 @@ ORACLE_DIR = PROJECT_ROOT / ".cache" / "hf_oracle_gemma4_12b"
 K = 5
 Bv = K + 1
 GATE_INVARIANCE_COS = 0.9999
-GATE_SENSITIVITY_MAX_COS = 0.999  # row pairs must NOT all be > this
+GATE_SENSITIVITY_MAX_COS = 0.999
 
 
 def log(msg):
@@ -54,11 +45,6 @@ def cos(a, b):
 
 
 def upload_h_replicated(h_np, mesh):
-    """Upload [Bv, HIDDEN] float numpy as bf16 replicated across mesh.
-
-    Production h_norm is replicated across chips (each chip sees the full
-    HIDDEN-wide activation; weights are column-sharded). Mirror that here.
-    """
     return ttnn.from_torch(
         torch.from_numpy(h_np.astype(np.float32)),
         dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh,
@@ -67,26 +53,16 @@ def upload_h_replicated(h_np, mesh):
 
 
 def readback_h_out(t):
-    """Read [Bv, HIDDEN] output back to numpy fp32. The matmul + all_reduce
-    output is replicated across mesh after all_reduce, so we read chip 0.
-
-    ConcatMeshToTensor(dim=0) returns [NCHIPS, Bv, HIDDEN]. Post-all-reduce
-    all 4 chip views are identical, so [0] is sufficient.
-    """
     arr = ttnn.to_torch(
         t,
         mesh_composer=ttnn.ConcatMeshToTensor(t.device(), dim=0),
     ).float().numpy()
-    # Sanity: all chips should agree post-all-reduce.
     if arr.ndim == 3:
         return arr[0]  # [Bv, HIDDEN]
-    return arr  # already [Bv, HIDDEN] (single-chip path)
+    return arr
 
 
 def main(state=None):
-    """Probe entrypoint. Accepts pre-bootstrapped state (dev harness) or
-    None (cold bootstrap + prefill).
-    """
     cold_start = state is None
     if cold_start:
         log("cold-start path: bootstrap")
@@ -97,14 +73,11 @@ def main(state=None):
     else:
         log("dev-harness path: using pre-bootstrapped state")
 
-    # Prefill once per harness lifetime (~18s). Subsequent probe re-runs
-    # reuse the cached KV state; just re-set cur_pos. Saves dev iteration
-    # time. Flag stored on `state` to survive importlib.reload of the probe.
     prompt_ids = np.load(ORACLE_DIR / "prompt_ids.npy")
     L_prefill = int(prompt_ids.shape[0])
     cur_pos_val = L_prefill - 1
     if not getattr(state, "_kp1_probe_prefilled", False):
-        log(f"prefill {L_prefill}-token canonical prompt (cold — first run)")
+        log(f"prefill {L_prefill}-token canonical prompt (cold)")
         t = time.time()
         for pos in range(L_prefill):
             tok = int(prompt_ids[pos])
@@ -114,61 +87,49 @@ def main(state=None):
     else:
         log(f"re-using cached prefill from prior probe run")
         srv._set_pos(state, cur_pos_val)
-    log(f"  cur_pos (last prefilled position) = {cur_pos_val}")
+    log(f"  cur_pos = {cur_pos_val}")
 
-    # Ensure verify-state is set up at K=5.
     srv.setup_verify_kp1_state(state, K=K, log=log)
-
-    # All K+1 verify candidates verify AT cur_pos_val (the position the
-    # cache reflects). The candidate_token_ids are irrelevant for the
-    # sliding-layer probe (tok_buf is only read by embed at the start of
-    # the full forward — not by the per-layer kp1 fork itself).
     srv.update_verify_inputs(state, current_pos=cur_pos_val,
                              candidate_token_ids=[0] * Bv)
 
-    # Pick the FIRST sliding-attention layer.
+    # Pick the FIRST global-attention layer.
     layer_idx = next(
         i for i in range(srv.NUM_LAYERS)
-        if state.layer_types[i] == "sliding_attention"
+        if state.layer_types[i] == "full_attention"
     )
-    log(f"  layer_idx = {layer_idx} (first sliding layer)")
+    log(f"  layer_idx = {layer_idx} (first global layer)")
     w = state.per_layer_tt[layer_idx]
 
-    # Compute rope cache once (forward-scoped optimization; matches production).
     rope_cache = srv._compute_rope_for_forward(state)
-    rope_sl = (rope_cache[0], rope_cache[1])
+    rope_gl = (rope_cache[2], rope_cache[3])
 
-    # ───────────── GATE 1: PLUMBING + INVARIANCE ─────────────
+    rc = 0
+    # GATE 1 — invariance
     log("─" * 64)
     log("GATE 1: B=Kp1 with K+1 IDENTICAL h_norm rows → all outputs equal")
     log("─" * 64)
     rng = np.random.default_rng(seed=42)
-    # Single random h_norm row, tiled K+1 times. Use HIDDEN (not HIDDEN_PER_CHIP)
-    # because h_norm is REPLICATED across chips (each chip sees full HIDDEN).
     h_one = rng.normal(0, 0.5, (1, srv.HIDDEN)).astype(np.float32)
-    h_identical_np = np.tile(h_one, (Bv, 1))  # [Bv, HIDDEN]
-    log(f"  h_identical shape = {h_identical_np.shape} (all {Bv} rows == row 0)")
+    h_identical_np = np.tile(h_one, (Bv, 1))
 
     h_identical_tt = upload_h_replicated(h_identical_np, state.mesh)
     t = time.time()
-    out_identical_tt = srv._layer_pos0_sliding_paged_kp1(
-        state, h_identical_tt, w, layer_idx, rope=rope_sl)
+    out_identical_tt = srv._layer_pos0_global_paged_kp1(
+        state, h_identical_tt, w, layer_idx, rope=rope_gl)
     ttnn.synchronize_device(state.mesh)
     log(f"  kp1 forward (identical inputs) wall: {(time.time()-t)*1000:.1f} ms")
 
-    out_identical_np = readback_h_out(out_identical_tt)  # [Bv, HIDDEN]
+    out_identical_np = readback_h_out(out_identical_tt)
     ttnn.deallocate(out_identical_tt); ttnn.deallocate(h_identical_tt)
 
     log(f"  output shape = {out_identical_np.shape}")
     if np.isnan(out_identical_np).any():
-        log("  ✗ output contains NaN — FAIL")
-        return 1
+        log("  ✗ output contains NaN — FAIL"); return 1
     log(f"  output mean={out_identical_np.mean():.4f} "
         f"std={out_identical_np.std():.4f} "
         f"max|x|={np.abs(out_identical_np).max():.4f}")
 
-    # All Bv rows must be identical (or near-identical post-bf16).
-    rc = 0
     log("  pairwise cos between output rows (expect ≥ "
         f"{GATE_INVARIANCE_COS:.4f}):")
     bad_pairs = []
@@ -180,23 +141,20 @@ def main(state=None):
             if c < GATE_INVARIANCE_COS:
                 bad_pairs.append((i, j, c))
     if bad_pairs:
-        log(f"  ✗ GATE 1 FAIL — {len(bad_pairs)} row-pairs below "
-            f"{GATE_INVARIANCE_COS:.4f}")
+        log(f"  ✗ GATE 1 FAIL — {len(bad_pairs)} row-pairs below {GATE_INVARIANCE_COS}")
         rc = 1
     else:
         log(f"  ✓ GATE 1 PASS — all {Bv*(Bv-1)//2} row-pairs identical")
 
-    # ───────────── GATE 2: SENSITIVITY (different Q → different out) ─────────────
+    # GATE 2 — sensitivity
     log("─" * 64)
     log("GATE 2: B=Kp1 with K+1 DISTINCT h_norm rows → outputs DIFFER")
     log("─" * 64)
     h_distinct_np = rng.normal(0, 0.5, (Bv, srv.HIDDEN)).astype(np.float32)
-    log(f"  h_distinct shape = {h_distinct_np.shape} (all rows independent)")
-
     h_distinct_tt = upload_h_replicated(h_distinct_np, state.mesh)
     t = time.time()
-    out_distinct_tt = srv._layer_pos0_sliding_paged_kp1(
-        state, h_distinct_tt, w, layer_idx, rope=rope_sl)
+    out_distinct_tt = srv._layer_pos0_global_paged_kp1(
+        state, h_distinct_tt, w, layer_idx, rope=rope_gl)
     ttnn.synchronize_device(state.mesh)
     log(f"  kp1 forward (distinct inputs) wall: {(time.time()-t)*1000:.1f} ms")
 
@@ -204,13 +162,13 @@ def main(state=None):
     ttnn.deallocate(out_distinct_tt); ttnn.deallocate(h_distinct_tt)
 
     if np.isnan(out_distinct_np).any():
-        log("  ✗ output contains NaN — FAIL"); rc = 1; return rc
+        log("  ✗ output contains NaN — FAIL"); return 1
     log(f"  output mean={out_distinct_np.mean():.4f} "
         f"std={out_distinct_np.std():.4f} "
         f"max|x|={np.abs(out_distinct_np).max():.4f}")
 
     log("  pairwise cos between output rows (expect at LEAST ONE pair < "
-        f"{GATE_SENSITIVITY_MAX_COS:.3f}):")
+        f"{GATE_SENSITIVITY_MAX_COS}):")
     max_cos = -1.0
     distinct_pair_count = 0
     for i in range(Bv):
@@ -223,17 +181,14 @@ def main(state=None):
     log(f"  max pairwise cos = {max_cos:.6f}  distinct pairs = "
         f"{distinct_pair_count}/{Bv*(Bv-1)//2}")
     if distinct_pair_count == 0:
-        log(f"  ✗ GATE 2 FAIL — all row-pairs cos ≥ {GATE_SENSITIVITY_MAX_COS}; "
-            f"forward may be ignoring h_norm inputs")
+        log(f"  ✗ GATE 2 FAIL — all row-pairs cos ≥ {GATE_SENSITIVITY_MAX_COS}")
         rc = 1
     else:
         log(f"  ✓ GATE 2 PASS — distinct inputs produce distinct outputs")
 
-    # ───────────── VERDICT ─────────────
     log("=" * 64)
     if rc == 0:
-        log("VERDICT: PASS — sliding kp1 fork plumbing + invariance + "
-            "sensitivity all gate-clean")
+        log("VERDICT: PASS — global kp1 fork plumbing + invariance + sensitivity all gate-clean")
     else:
         log("VERDICT: FAIL — see gate diagnostics above")
     log("=" * 64)

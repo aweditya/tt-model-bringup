@@ -1757,6 +1757,67 @@ def _layer_pos0_sliding_paged_kp1(state, h_norm_kp1, w, layer_idx, rope=None):
     return out
 
 
+def _layer_pos0_global_paged_kp1(state, h_norm_kp1, w, layer_idx, rope=None):
+    """B=K+1 read-only verify variant of `_layer_pos0_global_paged`.
+
+    Same read-only contract as sliding kp1 fork:
+    - h_norm_kp1: [K+1, HIDDEN_PER_CHIP]
+    - SKIP paged_fused_update_cache (cache writes owned by B=1 decode)
+    - SKIP k_proj/v_proj/k_norm/v_norm/k_RoPE
+    - Returns [K+1, HIDDEN_PER_CHIP]
+
+    Global-specific:
+    - SINGLE SDPA call (NKV=1 → no GQA split)
+    - head_dim = HEAD_DIM_GLOBAL=512 (vs 256 for sliding)
+    - p-RoPE handled inline by cos/sin global tables (identity on last 384 dims)
+    - No `sliding_window_size` kwarg
+    """
+    assert state.verify_K is not None, \
+        "call setup_verify_kp1_state(state, K) before the verify forward"
+    Bv = state.verify_K + 1
+    layer_caches = state.kv_caches_tt[layer_idx]
+    kc, vc = layer_caches[0]
+
+    # Q projection only — K/V come from cache.
+    q = ttnn.matmul(h_norm_kp1, w["q_proj"], compute_kernel_config=HIFI4)
+    q_h = ttnn.reshape(q, [Bv, NQ_PER_CHIP, HEAD_DIM_GLOBAL])
+    ttnn.deallocate(q)
+
+    q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    ttnn.deallocate(q_h)
+
+    if rope is not None:
+        cos_tt, sin_tt = rope
+        owned_rope = False
+    else:
+        cos_tt, sin_tt = _lookup_rope(state, state.cos_global_tt,
+                                      state.sin_global_tt, HEAD_DIM_GLOBAL)
+        owned_rope = True
+    q_n = _apply_full_rope(q_n_pre, cos_tt, sin_tt, NQ_PER_CHIP, HEAD_DIM_GLOBAL)
+    ttnn.deallocate(q_n_pre)
+    if owned_rope:
+        ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
+
+    # Single SDPA call — NKV=1 matches kernel contract cleanly.
+    q_for_sdpa = ttnn.reshape(q_n, [1, Bv, NQ_PER_CHIP, HEAD_DIM_GLOBAL])
+    attn_out = ttnn.transformer.paged_scaled_dot_product_attention_decode(
+        q_for_sdpa, kc, vc,
+        cur_pos_tensor=state.verify_pos_buf,
+        page_table_tensor=state.verify_page_table_tt,
+        scale=1.0,  # Gemma 4: self.scaling=1.0
+        program_config=state.paged_sdpa_progcfg_global,
+        compute_kernel_config=state.sdpa_compute_kernel_config,
+    )
+    ttnn.deallocate(q_n)
+    attn_flat = ttnn.reshape(attn_out, [Bv, NQ_PER_CHIP * HEAD_DIM_GLOBAL])
+
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh)
+    ttnn.deallocate(partial)
+    return out
+
+
 def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
     """v0.3.1 layer forward — uses paged SDPA on BOTH sliding and global
     layers. Sliding has 2 caches (per-KV-head, NKV=1 each); global has 1
