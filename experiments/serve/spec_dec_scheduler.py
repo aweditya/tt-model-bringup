@@ -171,6 +171,8 @@ class SpecDecScheduler:
         base_token: int,
         target_h_last_np,  # numpy [1, 1, BACKBONE_HIDDEN=3840]
         shared_kv_np,       # dict: "sliding_attention"/"full_attention" → (K, V)
+        cur_pos: int = 0,   # F-1: drafter Q-RoPE position; per HF =
+                            # input_ids.shape[1] - 1, CONSTANT across K rounds
     ) -> list:
         """Autoregressive drafter ×K — HF's correct construction per R-1.
 
@@ -235,9 +237,12 @@ class SpecDecScheduler:
             inputs_embeds = np.concatenate(
                 [last_token_emb, last_hidden], axis=-1
             ).astype(np.float32)
-            # Drafter forward.
+            # Drafter forward. cur_pos is CONSTANT across all K rounds
+            # (matches HF candidate_generator.py:1373 — position_ids is
+            # computed once before the loop and never incremented).
             out = drf.drafter_forward(
-                self.drafter_state, inputs_embeds, shared_kv_np)
+                self.drafter_state, inputs_embeds, shared_kv_np,
+                cur_pos=cur_pos)
             tok = int(out["argmax"].flatten()[0])
             candidates.append(tok)
             import os as _os
@@ -329,11 +334,15 @@ class SpecDecScheduler:
         shared_kv = self._read_target_shared_kv(L_kv=cur_pos + 1)
         t_kv = time.time()
 
-        # Drafter ×K chain → K candidate tokens (R-1 corrected construction)
+        # Drafter ×K chain → K candidate tokens (R-1 corrected construction).
+        # F-1: pass cur_pos for Q-RoPE rotation; HF computes
+        # position_ids = [[input_ids.shape[1] - 1]] = cur_pos and uses it
+        # for all K rounds.
         draft_tokens = self._drafter_autoregressive_K(
             base_token=base_token,
             target_h_last_np=target_h_last_np,
             shared_kv_np=shared_kv,
+            cur_pos=cur_pos,
         )
         t_draft = time.time()
 

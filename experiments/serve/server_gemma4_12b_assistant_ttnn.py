@@ -94,6 +94,11 @@ HIDDEN_PER_CHIP = HIDDEN // NCHIPS  # 256
 INTERMEDIATE_PER_CHIP = INTERMEDIATE // NCHIPS  # 2048
 VOCAB_PER_CHIP = VOCAB // NCHIPS  # 65536
 
+# Max KV positions our cos/sin tables cover. HF's max_position_embeddings is
+# 32k; we cap at 8k for v0 spec-dec single-prompt smokes (table is
+# 8192 * (256 + 512) * 4 = ~24 MB host-side, trivial).
+MAX_KV = 8192
+
 # HiFi4 + fp32_dest_acc — same recipe as target. Determinism patch D.
 HIFI4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -260,6 +265,17 @@ class State:
         # Misc
         self.vocab_size = None
 
+        # F-1 (RoPE on Q at cur_pos = L-1) — host-side cos/sin tables
+        # using target's RoPE formula (sliding theta=10k full head_dim;
+        # full p-RoPE theta=1e6 partial=0.25 with non-rotated dims at
+        # inv_freq=0 so cos=1/sin=0 there). sin tables sign-bake the
+        # first half to enable roll+addcmul fusion in _apply_full_rope.
+        # Per-call slices uploaded as TILE [1, head_dim] replicated.
+        self.cos_sliding_np = None         # numpy [MAX_KV, HEAD_DIM_SLIDING=256] fp32
+        self.sin_sliding_np = None
+        self.cos_full_np = None            # numpy [MAX_KV, HEAD_DIM_FULL=512] fp32
+        self.sin_full_np = None
+
         # ── Phase 1 v0.4 — trace capture state. Allocated lazily by
         #    `setup_drafter_trace_state(state, L_kv)`. Single-bucket v0:
         #    fixed L_kv set at first capture; reconfiguration requires
@@ -332,6 +348,20 @@ def bootstrap(state, log=None):
     # `sdpa_compute_kernel_config` setup at server_gemma4_unified_ttnn.py
     # bootstrap).
     state.sdpa_compute_kernel_config = HIFI4
+
+    # F-1: build host-side RoPE cos/sin tables matching HF
+    # (Gemma4UnifiedTextRotaryEmbedding) + target's bootstrap recipe.
+    # Drafter cross-attends to target's shared_kv (already RoPE'd by target
+    # at positions [0..L-1]); to capture correct relative position
+    # (cur_pos - i), drafter Q must also be RoPE'd at cur_pos = L - 1.
+    state.cos_sliding_np, state.sin_sliding_np = _build_rope_tables_np(
+        MAX_KV, HEAD_DIM_SLIDING, ROPE_THETA_SLIDING,
+        partial_rotary_factor=1.0)
+    state.cos_full_np, state.sin_full_np = _build_rope_tables_np(
+        MAX_KV, HEAD_DIM_FULL, ROPE_THETA_FULL,
+        partial_rotary_factor=PARTIAL_ROTARY_FULL)
+    log(f"  RoPE tables (host): sliding [{state.cos_sliding_np.shape}] + "
+        f"full [{state.cos_full_np.shape}] up to MAX_KV={MAX_KV}")
 
     # ── Embed: replicated, ROW_MAJOR (ttnn.embedding requires it) ──
     # Tied to lm_head. Drafter prefix is `model.` (NOT `model.language_model.`).
@@ -514,6 +544,80 @@ def pre_projection_tt(state, inputs_embeds_np):
 # 11. h_out = (residual_1 + mlp_out) * layer_scalar.
 
 
+def _build_rope_tables_np(max_kv, head_dim, theta, partial_rotary_factor=1.0):
+    """Build host-side cos/sin RoPE tables (forks target's bootstrap recipe).
+
+    For partial RoPE (factor < 1.0): rotated dims have inv_freq from theta,
+    non-rotated dims have inv_freq=0 so cos=1, sin=0 there (passes through
+    in _apply_full_rope's rotate-half math).
+
+    sin's first half is sign-baked (multiplied by -1) so _apply_full_rope
+    can fuse rotate_half via ttnn.roll + ttnn.addcmul (one less op than
+    the explicit neg+concat path). Bit-identical math.
+
+    Returns (cos [max_kv, head_dim], sin [max_kv, head_dim]) fp32 numpy.
+    """
+    positions = np.arange(max_kv, dtype=np.float64)
+    rope_angles = int(partial_rotary_factor * head_dim // 2)
+    inv_freq_rot = 1.0 / (theta ** (
+        np.arange(0, 2 * rope_angles, 2, dtype=np.float64) / head_dim))
+    inv_freq = np.concatenate(
+        [inv_freq_rot, np.zeros(head_dim // 2 - rope_angles, dtype=np.float64)])
+    ang = np.outer(positions, inv_freq)  # [max_kv, head_dim/2]
+    cos = np.concatenate([np.cos(ang), np.cos(ang)], axis=1).astype(np.float32)
+    sin = np.concatenate([np.sin(ang), np.sin(ang)], axis=1).astype(np.float32)
+    # Sign-bake first half of sin for roll+addcmul fusion (see target's
+    # bootstrap comment at server_gemma4_unified_ttnn.py:833-839).
+    half = head_dim // 2
+    sin[:, :half] *= -1.0
+    return cos, sin
+
+
+def _apply_full_rope(x, cos_tt, sin_tt, head_dim):
+    """Apply RoPE (rotate-half, roll-fused) to x using cos/sin tables.
+
+    Forks `server_gemma4_unified_ttnn._apply_full_rope`. The sin table
+    must have its first half sign-baked (done in `_build_rope_tables_np`).
+
+    Math: x_rope = x * cos + roll(x, head_dim/2, dim=-1) * sin_signed
+                = x * cos + rotate_half(x) * sin
+                = x * cos + concat([-x2, x1]) * sin
+
+    Args:
+      x: [..., head_dim]. cos_tt/sin_tt: [1, head_dim] broadcasting over
+         leading dims via ttnn elementwise ops.
+
+    At pos 0 cos=1, sin=0 → identity (matches our prior v0.4 trace
+    behavior; F-1 only changes things at cur_pos > 0).
+    """
+    half = head_dim // 2
+    swapped = ttnn.roll(x, shifts=half, dim=-1)
+    x_cos = ttnn.mul(x, cos_tt)
+    x_rope = ttnn.addcmul(x_cos, swapped, sin_tt, value=1.0)
+    ttnn.deallocate(x_cos); ttnn.deallocate(swapped)
+    return x_rope
+
+
+def _upload_rope_row(state, cos_np, sin_np, cur_pos):
+    """Slice host cos/sin tables at cur_pos and upload as TILE replicated
+    [1, head_dim] ttnn tensors. Returns (cos_tt, sin_tt). Caller must
+    deallocate after use.
+    """
+    cos_row = cos_np[cur_pos:cur_pos + 1].copy()  # [1, head_dim] fp32
+    sin_row = sin_np[cur_pos:cur_pos + 1].copy()
+    cos_tt = ttnn.from_torch(
+        torch.from_numpy(cos_row),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    sin_tt = ttnn.from_torch(
+        torch.from_numpy(sin_row),
+        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    return cos_tt, sin_tt
+
+
 def _upload_kv_sliding(state, K_np, V_np):
     """Upload sliding shared_kv_states to mesh.
 
@@ -566,12 +670,15 @@ def _upload_kv_full(state, K_np, V_np):
     return K_tt, V_tt
 
 
-def _drafter_attn_sliding(state, h_norm, w, K_tt, V_tt):
+def _drafter_attn_sliding(state, h_norm, w, K_tt, V_tt, cos_sl_tt=None,
+                           sin_sl_tt=None):
     """Drafter sliding attention: cross-attend Q (drafter) to K, V (target).
 
     Shapes:
       h_norm: replicated [1, 1, HIDDEN=1024]
       K_tt, V_tt: sharded dim=1, per chip [1, NKV_PER_CHIP_SLIDING=2, L_kv, 256]
+      cos_sl_tt, sin_sl_tt: replicated [1, HEAD_DIM_SLIDING=256] TILE_LAYOUT
+        for RoPE at cur_pos (F-1; None = legacy v0.4 behavior at pos 0).
       Returns: replicated [1, 1, HIDDEN] (after o_proj + all_reduce).
     """
     # q = h_norm @ q_proj_sharded   per chip [1, 1, NQ_PER_CHIP*head_dim=1024]
@@ -584,7 +691,15 @@ def _drafter_attn_sliding(state, h_norm, w, K_tt, V_tt):
     # last dim is head_dim — broadcasts cleanly.
     q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
     ttnn.deallocate(q_h)
-    # RoPE skipped — position_ids=[0] → cos=1, sin=0 → identity.
+    # F-1: RoPE on Q at cur_pos. cos_sl_tt/sin_sl_tt [1, head_dim] broadcast
+    # across [1, 1, NQ_PER_CHIP, head_dim]. Matches HF's
+    # Gemma4UnifiedTextAttention.forward:421 (apply_rotary_pos_emb on Q
+    # unconditionally). K already pre-RoPE'd by target's prefill.
+    # If tables not supplied: legacy v0.4 behavior at pos 0 (identity).
+    if cos_sl_tt is not None and sin_sl_tt is not None:
+        q_n_rope = _apply_full_rope(q_n, cos_sl_tt, sin_sl_tt, HEAD_DIM_SLIDING)
+        ttnn.deallocate(q_n)
+        q_n = q_n_rope
 
     # SDPA contract: Q [B, NQ, sq, dh], K/V [B, NKV, sk, dh]. Transpose Q so
     # that NQ is dim 1 (Q is currently [1, 1, NQ_PER_CHIP, head_dim] = [B, sq,
@@ -613,12 +728,15 @@ def _drafter_attn_sliding(state, h_norm, w, K_tt, V_tt):
     return out
 
 
-def _drafter_attn_full(state, h_norm, w, K_tt, V_tt):
+def _drafter_attn_full(state, h_norm, w, K_tt, V_tt, cos_fl_tt=None,
+                        sin_fl_tt=None):
     """Drafter full attention (L3): cross-attend Q to single KV head (replicated).
 
     Shapes:
       h_norm: replicated [1, 1, HIDDEN=1024]
       K_tt, V_tt: REPLICATED [1, NKV=1, L_kv, head_dim=512]
+      cos_fl_tt, sin_fl_tt: replicated [1, HEAD_DIM_FULL=512] TILE_LAYOUT
+        for p-RoPE at cur_pos. None = legacy v0.4 behavior at pos 0.
       Returns: replicated [1, 1, HIDDEN].
     """
     q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
@@ -626,7 +744,13 @@ def _drafter_attn_full(state, h_norm, w, K_tt, V_tt):
     ttnn.deallocate(q)
     q_n = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
     ttnn.deallocate(q_h)
-    # RoPE: position 0 → identity. SKIPPED.
+    # F-1: p-RoPE on Q at cur_pos. Non-rotated dims have inv_freq=0 so
+    # cos=1/sin=0 there → identity passes through. K already pre-RoPE'd by
+    # target. Matches HF's apply_rotary_pos_emb on the kv-shared branch.
+    if cos_fl_tt is not None and sin_fl_tt is not None:
+        q_n_rope = _apply_full_rope(q_n, cos_fl_tt, sin_fl_tt, HEAD_DIM_FULL)
+        ttnn.deallocate(q_n)
+        q_n = q_n_rope
     q_for_sdpa = ttnn.permute(q_n, [0, 2, 1, 3])  # [1, NQ_PER_CHIP, 1, 512]
     ttnn.deallocate(q_n)
     attn_out = ttnn.transformer.scaled_dot_product_attention(
@@ -648,7 +772,9 @@ def _drafter_attn_full(state, h_norm, w, K_tt, V_tt):
     return out
 
 
-def drafter_layer_forward(state, h_in, layer_idx, K_tt, V_tt):
+def drafter_layer_forward(state, h_in, layer_idx, K_tt, V_tt,
+                            cos_sl_tt=None, sin_sl_tt=None,
+                            cos_fl_tt=None, sin_fl_tt=None):
     """One Gemma 4 drafter decoder layer.
 
     Args:
@@ -656,6 +782,8 @@ def drafter_layer_forward(state, h_in, layer_idx, K_tt, V_tt):
       layer_idx: int in [0..N_LAYERS-1]
       K_tt, V_tt: the shared KV for this layer's `layer_type` — produced
                   once per forward by `_upload_kv_sliding` or `_upload_kv_full`.
+      cos_sl_tt/sin_sl_tt/cos_fl_tt/sin_fl_tt: per-cur_pos RoPE tables for
+        Q-side rotation (F-1). None = legacy v0.4 behavior at pos 0.
     Returns: replicated [1, 1, HIDDEN].
 
     Forks `experiments/serve/server_gemma4_unified_ttnn.py:_layer_forward_pos0`
@@ -667,9 +795,11 @@ def drafter_layer_forward(state, h_in, layer_idx, K_tt, V_tt):
 
     h_norm = ttnn.rms_norm(h_in, weight=w["input_layernorm"], epsilon=EPS)
     if lt == "sliding_attention":
-        mixer = _drafter_attn_sliding(state, h_norm, w, K_tt, V_tt)
+        mixer = _drafter_attn_sliding(state, h_norm, w, K_tt, V_tt,
+                                       cos_sl_tt=cos_sl_tt, sin_sl_tt=sin_sl_tt)
     else:
-        mixer = _drafter_attn_full(state, h_norm, w, K_tt, V_tt)
+        mixer = _drafter_attn_full(state, h_norm, w, K_tt, V_tt,
+                                    cos_fl_tt=cos_fl_tt, sin_fl_tt=sin_fl_tt)
     ttnn.deallocate(h_norm)
 
     post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"],
@@ -703,7 +833,7 @@ def drafter_layer_forward(state, h_in, layer_idx, K_tt, V_tt):
     return h_out
 
 
-def drafter_forward(state, inputs_embeds_np, shared_kv_states):
+def drafter_forward(state, inputs_embeds_np, shared_kv_states, cur_pos=0):
     """Top-level drafter forward: pre_projection → 4 layers → post_projection
     + lm_head.
 
@@ -727,6 +857,9 @@ def drafter_forward(state, inputs_embeds_np, shared_kv_states):
     assert inputs_embeds_np.ndim == 3 and inputs_embeds_np.shape[2] == 2*BACKBONE_HIDDEN
     B, L, _ = inputs_embeds_np.shape
     assert B == 1 and L == 1, f"drafter forward only supports B=1, L=1; got [{B}, {L}]"
+    assert 0 <= cur_pos < MAX_KV, (
+        f"cur_pos={cur_pos} out of range [0, MAX_KV={MAX_KV}); bump MAX_KV "
+        f"if a longer prompt is needed")
 
     # 1. Upload inputs_embeds replicated.
     x_tt = ttnn.from_torch(
@@ -746,6 +879,15 @@ def drafter_forward(state, inputs_embeds_np, shared_kv_states):
     K_sl, V_sl = _upload_kv_sliding(state, K_sl_np, V_sl_np)
     K_fl, V_fl = _upload_kv_full(state, K_fl_np, V_fl_np)
 
+    # F-1: per-cur_pos RoPE slices for Q. Uploaded ONCE per forward (all 4
+    # layers share the same cur_pos = the position of the drafter's L=1
+    # query token, matching HF's position_ids=[[L-1]] constant across the
+    # K-round candidate loop). cos/sin are [1, head_dim] replicated TILE.
+    cos_sl_tt, sin_sl_tt = _upload_rope_row(
+        state, state.cos_sliding_np, state.sin_sliding_np, cur_pos)
+    cos_fl_tt, sin_fl_tt = _upload_rope_row(
+        state, state.cos_full_np, state.sin_full_np, cur_pos)
+
     # 4. 4 layers.
     for li in range(N_LAYERS):
         lt = state.layer_types[li]
@@ -753,12 +895,18 @@ def drafter_forward(state, inputs_embeds_np, shared_kv_states):
             K_tt, V_tt = K_sl, V_sl
         else:
             K_tt, V_tt = K_fl, V_fl
-        h_next = drafter_layer_forward(state, h, li, K_tt, V_tt)
+        h_next = drafter_layer_forward(
+            state, h, li, K_tt, V_tt,
+            cos_sl_tt=cos_sl_tt, sin_sl_tt=sin_sl_tt,
+            cos_fl_tt=cos_fl_tt, sin_fl_tt=sin_fl_tt,
+        )
         ttnn.deallocate(h)
         h = h_next
 
     ttnn.deallocate(K_sl); ttnn.deallocate(V_sl)
     ttnn.deallocate(K_fl); ttnn.deallocate(V_fl)
+    ttnn.deallocate(cos_sl_tt); ttnn.deallocate(sin_sl_tt)
+    ttnn.deallocate(cos_fl_tt); ttnn.deallocate(sin_fl_tt)
 
     # 5. final_norm (model.norm) on `h` [1, 1, HIDDEN].
     final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)

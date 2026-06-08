@@ -138,6 +138,7 @@ def main():
         base_token=base_token,
         target_h_last_np=our_h_last,
         shared_kv_np=shared_kv_ours,
+        cur_pos=cur_pos,   # F-1: Q-RoPE at last prompt position L-1
     )
     log(f"  our argmaxes: {draftA}")
     log(f"  HF expected:  {HF_V2_EXPECTED}")
@@ -154,6 +155,7 @@ def main():
         base_token=base_token,
         target_h_last_np=hf_target_h_last,
         shared_kv_np=shared_kv_ours,
+        cur_pos=cur_pos,
     )
     log(f"  our argmaxes: {draftB}")
     matches_B = sum(1 for a, b in zip(draftB, HF_V2_EXPECTED) if a == b)
@@ -172,6 +174,7 @@ def main():
         base_token=base_token,
         target_h_last_np=hf_target_h_last,
         shared_kv_np=shared_kv_hf,
+        cur_pos=cur_pos,
     )
     log(f"  our argmaxes: {draftC}")
     matches_C = sum(1 for a, b in zip(draftC, HF_V2_EXPECTED) if a == b)
