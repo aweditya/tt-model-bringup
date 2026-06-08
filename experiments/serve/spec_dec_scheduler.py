@@ -213,13 +213,23 @@ class SpecDecScheduler:
         assert target_embed_table is not None, \
             "target_state.embed_w_np not set — target server out of date"
 
+        # Gemma 4 applies EMBED_SCALE = sqrt(hidden) to the embed lookup
+        # (server_gemma4_unified_ttnn.py:78). HF's target.get_input_embeddings
+        # also applies this scaling via Gemma4UnifiedTextScaledWordEmbedding.
+        # If we forget it, drafter sees inputs ~62× too small → garbage.
+        import math
+        EMBED_SCALE = math.sqrt(target_embed_table.shape[-1])
+
         candidates = []
         last_token_id = int(base_token)
         last_hidden = target_h_last_np  # round 0: target's actual hidden
         for k in range(self.K):
-            # PREV half: target's embed table evaluated at last_token_id.
-            last_token_emb = target_embed_table[last_token_id].reshape(
-                1, 1, -1).astype(np.float32)
+            # PREV half: target's embed table evaluated at last_token_id,
+            # scaled by sqrt(hidden) per Gemma 4 ScaledWordEmbedding.
+            last_token_emb = (
+                target_embed_table[last_token_id].reshape(1, 1, -1)
+                * EMBED_SCALE
+            ).astype(np.float32)
             # CUR half: drafter's last hidden (round 0 = target's hidden;
             # round k>0 = drafter's prev post_projection output).
             inputs_embeds = np.concatenate(
