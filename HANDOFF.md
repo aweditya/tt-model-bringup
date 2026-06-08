@@ -291,6 +291,18 @@ given HF inputs.
 
 **Total uplift since R-1 start**: 0.013 → 0.133 mean α = **10×**.
 
+**Cache-advance off-by-one FIXED 2026-06-08** (commit `5aa1550`): old
+loop fed `[base_token, emitted[0], ...]` at slots `[cur_pos+1, ...]`,
+which (a) duplicated base_token's K/V (already written last round),
+(b) shifted every emitted token's K/V back one slot, (c) never wrote
+K/V for the last emitted token. Fix: `for i, tok in enumerate(emitted):
+target_step(tok, cur_pos+1+i)`.
+
+**Impact**: α **0.20 → 0.50 (2.5×)** on PROMPT 0; output text went
+from garbled ("Paris Paris**, and** and**") to coherent (close to
+baseline modulo minor duplications). User instinct was right —
+spec-dec shouldn't be this hard, we had a real algorithm bug.
+
 **P-1 drafter trace SHIPPED 2026-06-08** (commits `6e09c97` +
 `743fea2`): trace path now correctness-passing (chain probe Variant C
 5/5 BIT-EXACT) AND wired into scheduler with per-round release+recapture.
