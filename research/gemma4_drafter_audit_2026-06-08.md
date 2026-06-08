@@ -241,3 +241,20 @@ per round, K=5 → 5ms saved) and can be deferred.
 
 If F-1 keeps Variant C at 3/5 → escalate to F-2 + per-round hidden
 cosine probe instrumentation to localize.
+
+## F-1 OUTCOME (committed `86528f6`)
+
+Hypothesis CONFIRMED. Chain probe Variant C jumped from 3/5 → **5/5
+BIT-EXACT** [496, 5464, 236772, 2084, 3207] vs HF v2 oracle prompt_0
+K=5. Drafter forward fully validated when given HF inputs.
+
+Multi-prompt smoke (5 prompts, K=3, IT target):
+- Mean α: 0.067 → **0.133** (2×)
+- Max α: 0.133 → **0.267** (2×)
+- Prompts with α>0: 3/5 → **5/5** (100%)
+- Best round: NEW **α=1.00 (3/3 accept)** on prompt_2 round 3
+
+F-2 (keep hidden on-device between rounds) now de-prioritized for
+correctness — Variant C is BIT-EXACT without it. Only relevant for
+removing bf16 chain noise on prompts where target/drafter naturally
+diverge less. Pursue only if further α uplift needed for the perf demo.

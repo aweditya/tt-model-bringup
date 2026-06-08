@@ -266,21 +266,35 @@ is WORKING. 3/5 prompts demonstrate real acceptance.
 **Spec-dec audit 2026-06-08 (post-R-6c)** —
 `research/gemma4_drafter_audit_2026-06-08.md`. End-to-end HF source
 walkthrough; identified 14 candidate behaviours, all but two confirmed
-correct in our impl. **Highest-suspect remaining gap**: drafter SKIPS
-RoPE on Q (`server_gemma4_12b_assistant_ttnn.py:587,629` — comment claims
-"position 0 → identity" but HF actually applies RoPE at `position_ids=[L-1]`,
-which is non-identity for any L>1 prompt).
+correct in our impl. Highest-suspect gap was drafter SKIPPING RoPE on Q
+(comment falsely claimed "position 0 → identity" but HF applies RoPE at
+`position_ids=[L-1]` constant across K rounds — non-identity for L>1).
 
-Why this matters: target's `shared_kv_states` was already RoPE'd at
-positions `[0..L-1]` during target's prefill. HF rotates Q at L-1 so that
-attention scores capture the correct relative position `(L-1)-i`. Our Q
-is unrotated → attention scores see relative position `-i` instead, which
-the drafter only tolerates because the `prev_hidden` input already encodes
-position info. Once bf16 chain drift corrupts `prev_hidden` (rounds 3-4),
-the missing RoPE compounds and flips argmax.
+**F-1 RoPE FIX SHIPPED 2026-06-08** (commit `86528f6`): added cos/sin
+host tables to drafter bootstrap + `_apply_full_rope` helper (forks
+`server_gemma4_unified_ttnn._apply_full_rope`) + per-call
+`_upload_rope_row` slice. `drafter_forward` now takes `cur_pos:int`,
+scheduler `_drafter_autoregressive_K` threads it through. Q gets RoPE
+after `q_norm` in both `_drafter_attn_sliding` / `_drafter_attn_full`.
 
-**Next action**: F-1 (add RoPE on Q at `cur_pos = L-1`). Plan in audit doc
-§ "Proposed fix order". Tasks #280-#282 track audit + F-1 + F-2 work.
+**Chain probe Variant C: 3/5 → 5/5 BIT-EXACT** to HF
+`[496, 5464, 236772, 2084, 3207]`. Drafter forward fully validated when
+given HF inputs.
+
+**Multi-prompt smoke (IT target, F-1 + R-6c)**:
+| Metric | Pre-F-1 (BASE) | Post-F-1 (IT) | uplift |
+|---|---|---|---|
+| Mean α | 0.067 | **0.133** | 2× |
+| Max α | 0.133 | **0.267** | 2× |
+| Prompts with α>0 | 3/5 | **5/5** | 100% |
+| Best round | partial | **α=1.00 (3/3)** | NEW |
+
+**Total uplift since R-1 start**: 0.013 → 0.133 mean α = **10×**.
+
+**Remaining for tok/s beat**: need α > 0.3 (currently 0.267 max).
+Likely path: F-2 (keep `out["hidden"]` on-device between K rounds —
+eliminates bf16 chain drift in rounds 3-4) + try more prompts. Task
+#282 still pending; de-prioritized given F-1 closed Variant C.
 
 **Phase 3 v1.0 follow-up** — refactor verify trace to non-aliased page
 table (write K/V at K+1 distinct slots, abandon unused). Projected
