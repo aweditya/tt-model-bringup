@@ -37,6 +37,18 @@ Captured in conversation; codifying here for durability:
 7. **Multi-CQ overlap is NOT useful** for single-stream spec-dec (every step
    depends on previous). Could become useful in CB if we want to overlap
    one request's draft with another request's verify; deferred past v1.
+8. **Single-client v0, multi-client deferred to v1** (user-decided 2026-06-07):
+   ship `num_prompts=1` + `prompt_indices=[0]` through Phase 4 (HTTP + α
+   measurement). All architecturally hard pieces (alias page-table, accept
+   walk, KV semantics, two-phase warmup, three-trace orchestration) land
+   in v0. Multi-client v1 generalizes parameters in `_build_verify_alias_
+   page_table_host`, adds per-slot accept-walk + admission/eviction; not
+   an architectural rewrite. **Reasons**: (a) Stanford CS440LX demo +
+   personal usage is single-stream; (b) CB+spec-dec together = vLLM-scale
+   complexity, not our scope; (c) the alias page-table mechanism is
+   needed for spec-dec REGARDLESS (it's "the parallel-verify thing", not
+   "the multi-client thing" — K+1 alias rows always read the same prompt's
+   KV history to amortize K verifies into 1 forward).
 
 **Revised total: ~5 days build + 1 day buffer = ~6 days** (down from 8).
 
