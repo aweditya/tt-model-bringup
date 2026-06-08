@@ -132,7 +132,11 @@ def run_spec_dec(tgt_state, drf_state, ids, n_target):
         if rounds > n_target * 2:
             log(f"  ⚠ safety bound; emitted={len(emitted)}, rounds={rounds}")
             break
-    return emitted[:n_target], _cur_pos(tgt_state)
+    # Return ALL emitted tokens (no truncation). The scheduler already
+    # wrote K/V for every emitted token; truncating here would make the
+    # baseline replay feed fewer tokens and mis-detect a cache divergence
+    # at the LENGTH level instead of at the CONTENTS level.
+    return emitted, _cur_pos(tgt_state)
 
 
 def run_baseline_seq(tgt_state, ids, seq):
@@ -207,11 +211,11 @@ def main():
     log("=" * 72)
     log("GATES")
     log("=" * 72)
-    gate_a = len(emitted_sd) == N_TOKENS
+    gate_a = len(emitted_sd) >= N_TOKENS
     gate_b = cp_sd_after == cp_bl_after
     gate_c = probe_sd == probe_bl
     log(f"  GATE A (emitted length)  : "
-        f"len={len(emitted_sd)} target={N_TOKENS} "
+        f"len={len(emitted_sd)} target≥{N_TOKENS} "
         f"{'✓ PASS' if gate_a else '✗ FAIL'}")
     log(f"  GATE B (cur_pos match)   : "
         f"sd={cp_sd_after} bl={cp_bl_after} "
