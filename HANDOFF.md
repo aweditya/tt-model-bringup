@@ -379,13 +379,39 @@ precision. Step 2 (selective fp32_dest_acc disable) still has the
   matmul already runs `activation="gelu"`, fusion forces gelu out,
   net device-time ≈ 0).
 
-**Next**:
-1. Tracy delta with TT_GM4_FUSE_QKV=1 (`GM4_NUM_LAYERS_OVERRIDE=4`) →
-   confirm matmul + typecast count drop.
-2. If delta is real, flip default ON, drop the unfused upload to
-   reclaim DRAM bytes.
-3. Move to Step 2 (selective fp32_dest_acc on Q/K/V/gate/up, the
-   bigger win — bisect-by-op).
+**Tracy delta SHIPPED 2026-06-09** with TT_GM4_FUSE_QKV=1 at
+GM4_NUM_LAYERS_OVERRIDE=4. Honest read:
+
+| Op | Pre-fuse | Post-fuse | Δ |
+|---|---|---|---|
+| Matmul | 116 calls, 198.8s (16.4%) | 84 calls, 143.0s (11.9%) | **-32 calls, -55s (-3.6%)** ✓ |
+| Slice | 160, 0.1ms | 208, 0.2ms | +48 free |
+| Typecast | 308, 459s (37.9%) | 324, 484s (40.1%) | **+16 calls, +24s** ✗ |
+| Tilize | 200, 261s | 216, 286s | +25s ✗ |
+| **TOTAL** | **1213.7s** | **1205.7s** | **-8s = -0.7%** |
+
+Matmul drop matches the math exactly. But the slice output layouts
+feeding rms_norm add typecast + tilize work that mostly offsets the
+matmul savings. **Net 0.7% wall** — real but marginal.
+
+**Decision 2026-06-09**: keep #293 **default OFF** (env-gated). The
+0.7% win doesn't pay back the upload-size cost (extra ~16MB/chip/layer
+× 40 sliding = ~640MB). Revisit if downstream layout fixes (e.g.
+Step 2 or DRAM-sharded) compose differently.
+
+**Next: Step 2 (selective `fp32_dest_acc=False`)** —
+`research/gemma4_step2_fp32_acc_plan_2026-06-09.md` locked. Per #292
+research, this is the bigger projected win (~15-20% wall on small-K
+matmuls). Phased rollout:
+- 2a: HIFI4_BF16_ACC config + per-op bisect probe
+- 2b: extend argmax_gate to L=4096; re-baseline
+- 2c: flip Q proj only → --verify 5/5 L
+- 2d: K + V proj → --verify
+- 2e: gate + up (MLP) → --verify
+- 2f: tracy delta
+- 2g: needle haystack @ 4k as secondary gate
+- 2h: ship default-on; document the safety contract for o_proj/
+  down_proj/lm_head (keep fp32_acc — long-context blast radius)
 
 **#292 research SHIPPED** — `research/precision_long_context_2026-06-08.md`
 (~780 words). Decision-relevant findings:
