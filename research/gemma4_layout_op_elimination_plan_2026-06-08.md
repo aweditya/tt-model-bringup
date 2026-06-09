@@ -5,20 +5,41 @@ vanilla Gemma 4 forward. Tracy capture
 (`~/tt-xla/.cache/perf_logs/tracy_gemma4_v2_132855/.logs/` on qb1)
 shows actual matmul = 8%, layout = 33% of host wall.
 
-## Top targets
+## Top targets — UPDATED 2026-06-08 PM with clean N=4 device CSV
 
-| Op | % host | est calls/fwd | likely source | first-pass fix |
+The original ranking was HOST WALL — turns out dispatch overhead and
+device-kernel time are completely decoupled. Re-ran tracy with
+`GM4_NUM_LAYERS_OVERRIDE=4` to avoid marker overflow → clean
+`ops_perf_results_*.csv` with populated `OP CODE` + `DEVICE KERNEL
+DURATION`. The true ranking:
+
+| Op | **device kernel %** | host wall % | calls (N=4 fwd) | priority |
 |---|---|---|---|---|
-| SliceDeviceOperation | **10%** | ~560 | RoPE row lookups + Q/KV-head splits in attention | hoist once per forward; persistent shape buffers |
-| TypecastDeviceOperation | **9%** | ~1050 | bf16 ↔ fp32 transitions (somewhere upcasting) | audit `from_torch` dtype, `to_layout` dtype |
-| TilizeWithValPadding | **8%** | ~600 | inputs to `paged_fused_update_cache` need TILE+pad | pre-stage cache K/V as TILE in update path |
-| TilizeDeviceOperation | **5%** | ~660 | generic ROW_MAJOR → TILE before matmul | pre-stage RoPE tables as TILE? cos/sin currently ROW_MAJOR |
-| UntilizeWithUnpadding | **5%** | ~260 | paged_sdpa output → unpacked | argmax path? readback path? |
-| InterleavedToSharded | **4%** | ~230 | between matmuls switching shard pattern | persistent sharded outputs across layers |
-| ReshapeView | **4%** | ~230 | per-head reshape, per-NKV split | usually free (view); count includes program build dispatch |
-| ConcatDeviceOperation | **3%** | ~175 | RoPE rotate-half (when not roll-fused), QKV gather | already roll-fused on Gemma 4 — investigate residue |
+| **TypecastDeviceOperation** | **38%** | 9% | 308 | **HIGHEST** |
+| **TilizeDeviceOperation** | **22%** | 5% | 200 | **HIGH** |
+| MatmulDeviceOperation | 16% | 8% | 116 | actual compute |
+| BinaryNgDeviceOperation | 13% | 5% | 92 | mul/add (RoPE, residuals) |
+| TernaryDeviceOperation | 4.5% | 2% | 32 | addcmul (RoPE fused) |
+| UntilizeDeviceOperation | 3.4% | <1% | 24 | small |
+| UnaryNgDeviceOperation | 2.8% | <1% | 20 | small |
+| AllGather | 0.6% | 2% | 36 | small |
+| **LayerNormDeviceOperation** | **0.0%** (28us total!) | 8% | 116 | NOT a target |
+| **SliceDeviceOperation** | **0.0%** | 10% | 160 | NOT a target |
+| ReshapeView | 0.0% | 4% | 64 | NOT a target |
+| TilizeWithValPadding | 0.0% | 8% | 192 | NOT a target |
+| InterleavedToSharded | 0.0% | 4% | 64 | NOT a target |
+| ConcatDeviceOperation | 0.0% | 3% | 48 | NOT a target |
+| PagedFusedUpdateCache | 0.0% | 2% | 32 | already fast |
 
-**Sum**: ~48% of host time is layout-or-precision shuffling.
+### Key reversal
+
+The plan's original priorities (sharded RMSNorm, slice reduction,
+TileWithValPadding pre-stage) attack **near-zero-cost device ops**.
+Host wall = (kernel + dispatch + sync) was misleading on small ops.
+
+**Real targets**: Typecast and Tilize, which together are **60% of
+device kernel time**. Eliminating Typecast (~38%) could drop the
+forward by ~18ms at the 47ms baseline = **1.6× speedup**.
 
 ## Pre-work
 
@@ -66,21 +87,47 @@ and move on. If not, fall back to Option A.
 - InterleavedToSharded: grep `interleaved_to_sharded` + per-matmul
   `output_mem_config`
 
-### Step 3: one-line fixes
-Likely candidates based on prior 27B / Gemma 4 experience:
+### Step 3: REVISED fix priorities (post device-CSV finding)
 
-1. **Persistent TILE cos/sin tables** — currently ROW_MAJOR (per
-   target's pattern). Each `_lookup_rope` does
-   `embedding (ROW_MAJOR) → to_layout(TILE)`. If we store TILE upfront,
-   the per-call to_layout disappears. ~80-100 Tilize ops/fwd saved.
+The new device-time ranking puts Typecast (38%) and Tilize (22%) far
+ahead of everything else. Hypothesis (needs confirmation):
 
-2. **`paged_fused_update_cache` input pre-tiled** — task #198
-   already pending. K/V going into the cache currently need
-   TilizeWithValPadding because the projection output is in a
-   sharded layout the cache expects differently.
+1. **Typecast tax = fp32_dest_acc + bf16 downstream**.
+   Our matmul config has `fp32_dest_acc_en=True` (line 106) — the
+   matmul accumulator stays in fp32 for precision. The packer then
+   converts the result back to bf16 for the downstream rms_norm /
+   binary / next matmul. THAT conversion shows up as
+   TypecastDeviceOperation. We can't simply turn off fp32_dest_acc
+   (we know from `[[bf16-chain-drift-at-B-gt-1]]` that we need it).
 
-3. **bf16 throughout** — find the typecast spots. Most likely
-   candidates: lm_head final, argmax input, RoPE rotation.
+   **Real fix options**:
+   - (a) Specify `output_dtype=bfloat16` explicitly on matmul calls —
+     might be no-op if packer already does this, but worth measuring.
+   - (b) Reduce matmul COUNT — every fused matmul kills a typecast.
+     `paged_fused_update_cache` (already done), QKV concat-fuse
+     (worth exploring), gate+up fuse for SwiGLU (Tenstorrent does
+     this).
+   - (c) Keep certain chains in fp32 (norm → matmul → norm) so the
+     typecast happens ONCE per layer, not per-matmul.
+
+2. **Tilize 22%** — fewer but bigger. Likely sources:
+   - matmul output ROW_MAJOR → next op TILE
+   - rms_norm output dtype/layout mismatches
+   - cos/sin table ROW_MAJOR → embedding lookup TILE conversion
+     (every layer's RoPE chain)
+
+   **Real fix**: persistent TILE rep for cos/sin tables; specify
+   `output_mem_config` for matmul + layernorm to skip the implicit
+   conversion.
+
+### REMOVED priorities (do NOT pursue based on data)
+- ~~Sharded decode rms_norm (#194)~~: LayerNorm is **0.0% device
+  time, 28us total over 116 calls**. Already negligible — chasing
+  this is misallocated effort. (The audit doc claimed "claimed ~10×
+  speedup" but at 28us total it doesn't matter.)
+- ~~Slice elimination~~: 160 slices, 0.0% device time. Pure dispatch
+  overhead — already free.
+- ~~Reshape/Concat reduction~~: same — host wall ≠ device cost.
 
 ### Step 4: re-capture + diff
 After each fix, re-run tracy_profile_one_gemma4_layer_v2 + diff against

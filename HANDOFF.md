@@ -320,6 +320,29 @@ user. Workstream is now #289 (layout op elimination) **in progress**
 `research/gemma4_layout_op_elimination_plan_2026-06-08.md` +
 `research/gemma4_chunked_prefill_plan_2026-06-08.md`.
 
+**#289 BIG FINDING 2026-06-08 PM** (commit `9538491` + plan update):
+clean tracy with `GM4_NUM_LAYERS_OVERRIDE=4` revealed
+**HOST WALL ≠ DEVICE KERNEL TIME** for Gemma 4. Real ranking:
+
+| Op | device kernel % | host wall % (was misleading) |
+|---|---|---|
+| **TypecastDeviceOperation** | **38%** | 9% |
+| **TilizeDeviceOperation** | **22%** | 5% |
+| MatmulDeviceOperation | 16% | 8% |
+| BinaryNgDeviceOperation | 13% | 5% |
+| LayerNormDeviceOperation | **0.0%** (28us total!) | 8% (red herring) |
+| SliceDeviceOperation | **0.0%** | 10% (red herring) |
+
+Original plan attacked sharded RMSNorm + slice reduction — both are
+near-zero device time, would have been wasted effort. True target is
+Typecast (likely fp32_dest_acc → bf16 packer conversion at every
+matmul output) + Tilize. Estimated win: ~18 ms/tok at 47 ms baseline
+= **1.6× speedup** if Typecast can be eliminated without losing
+fp32 accumulator precision.
+
+Next step pending data-driven decision: are the typecasts in matmul
+output stage (need `dtype=bfloat16`) or elsewhere?
+
 2. **#289 Gemma 4 layout-op overhead** (33% of prefill time is
    non-compute layout shuffling: Slice 10%, Typecast 9%, Tilize+
    Untilize+Sharded+Reshape+Concat 25%). Pre-work: clean tracy run
