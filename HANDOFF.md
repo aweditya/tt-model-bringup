@@ -343,19 +343,18 @@ fp32 accumulator precision.
 Next step pending data-driven decision: are the typecasts in matmul
 output stage (need `dtype=bfloat16`) or elsewhere?
 
-**BLOCKER 2026-06-08 PM (user-set)**: precision changes touch
-`[[bf16-chain-drift-at-B-gt-1]]` territory. BEFORE any output_dtype
-edit or fp32_dest_acc tweak, must land:
+**BLOCKER 2026-06-08 PM (user-set, RELEASED)**:
+- ✅ **#291 long-context argmax baseline SHIPPED** (commits `62c1e40`
+  + `3c14835`). Probe at `experiments/cb/isolate/gemma4_long_context_argmax_gate.py`,
+  baseline at `research/gemma4_long_context_baseline.json`. Records
+  the first 8 decoded argmaxes after prefill at L ∈ {128, 512, 1024,
+  2048}. **Workflow lock: any precision-changing PR must run
+  `--verify` and post the result.**
+- ✅ **#292 research SHIPPED** — see block above. Strategy locked.
 
-- **#291 long-context correctness gate** — HF oracle vs our decode at
-  L ∈ {128, 512, 1024, 2048, 4096}. Gates per L: cosine ≥ 0.99 on
-  last hidden, argmax matches HF, needle haystack recall holds.
-- **#292 precision-tradeoff research** — what do vLLM / llama.cpp / HF /
-  DeepSeek-V3 / Llama 3 / Qwen 3 actually do at L > 8k? Are typecasts
-  load-bearing or a holdover? Output: short research note that
-  informs the typecast strategy.
-
-No Typecast or output_dtype change ships until BOTH land green.
+BLOCKER released for **#289 Step 1 (fusion-only)** which doesn't touch
+precision. Step 2 (selective fp32_dest_acc disable) still has the
+--verify + needle@4k+32k gates per-op.
 
 **#292 research SHIPPED** — `research/precision_long_context_2026-06-08.md`
 (~780 words). Decision-relevant findings:
