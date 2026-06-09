@@ -406,6 +406,31 @@ Running re-verify with same env to test (a) deterministic divergence
 2 differs from run 1 → Step 2 unshippable; pivot to #290 chunked
 prefill which is the bigger structural TTFT win anyway).
 
+**Step 2 verdict 2026-06-09 — DETERMINISTICALLY UNSHIPPABLE**:
+Run 2 with identical env produces byte-identical fingerprints to run
+1. The L=1024 catastrophe is reproducible: bf16-acc deterministically
+pushes position-1 token from `236772 → 258882` (BASE filler), and the
+model then collapses to regurgitating the seed prompt. Diagnosis: a
+narrow "precision danger zone" near L=1024 where the top-2 token
+margin is small enough that bf16's mantissa rounding flips the argmax,
+which then cascades. L=512/2048/4032 pass byte-identical, so the
+problem is NOT general "bf16 chain drift" — it's a specific cliff.
+
+Even with env gate ON, we'd be shipping a known precision cliff at
+that specific length. **Step 2 PARKED.** The HIFI4_BF16_ACC config +
+`_small_k_matmul_config()` helper + env-gated flips at the 5 matmul
+sites are retained for future investigation (bisect by op, or per-L
+adaptive selection). Default is unchanged (HIFI4 / fp32_acc).
+
+**#289 final state**: Step 1a env-gated (~0.7% wall, default OFF;
+commit `c1a3c3a`). Step 1b parked (gelu fold blocker). Step 2 parked
+(precision cliff). The win went to #293 (which we kept) — not Step 2.
+
+**Next: #290 chunked prefill** — the structural TTFT win. Currently
+prefill = N × decode = 200-token chat takes 9.4s TTFT. Chunked
+parallel prefill (fork 27B `forward_prefill_chunked_tp`) projects 5-10×
+speedup, the actual user-facing improvement.
+
 **Tracy delta SHIPPED 2026-06-09** with TT_GM4_FUSE_QKV=1 at
 GM4_NUM_LAYERS_OVERRIDE=4. Honest read:
 
