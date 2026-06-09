@@ -33,6 +33,12 @@ from pathlib import Path
 
 DEVICE_CSV = "cpp_device_perf_report.csv"
 HOST_CSV = "tracy_ops_data.csv"
+# Canonical tt-perf-report input — lives under reports/<timestamp>/
+# (NOT .logs/). Has OP CODE column populated post-process. Only created
+# when the tracy post-process completes successfully — the 48-layer
+# Gemma 4 v2 capture crashed before this file was generated; the
+# subset N=4 capture has it.
+REPORT_CSV_GLOB = "ops_perf_results_*.csv"
 
 # Tracy host messages look like:
 #   `TT_DNN_DEVICE_OP: "TilizeWithValPaddingDeviceOperation", 102, 3, false, 1027 -> ...`
@@ -40,13 +46,18 @@ HOST_MSG_RE = re.compile(r'TT_DNN_DEVICE_OP:\s*"([^"]+)"')
 
 
 def _aggregate_device(csv_path: Path):
+    """Aggregate device kernel time by op. Handles two CSV formats:
+    - `cpp_device_perf_report.csv` (uses "OP NAME") — pre-process raw
+    - `ops_perf_results_*.csv` (uses "OP CODE") — canonical post-process
+    Returns (totals, n_total, n_blank).
+    """
     totals: dict[str, list] = defaultdict(lambda: [0.0, 0])
     n_blank = 0
     n_total = 0
     with csv_path.open() as f:
         reader = csv.DictReader(f)
         for row in reader:
-            op = row.get("OP NAME") or ""
+            op = (row.get("OP CODE") or row.get("OP NAME") or "").strip()
             try:
                 dur_ns = float(row.get("DEVICE KERNEL DURATION [ns]", 0) or 0)
             except ValueError:
@@ -125,6 +136,14 @@ def main() -> int:
 
     device_csv = args.logs_dir / DEVICE_CSV
     host_csv = args.logs_dir / HOST_CSV
+    # Prefer the canonical report CSV if it exists (post-process completed
+    # successfully). It lives under <run>/reports/<timestamp>/ and has
+    # named OP CODE columns.
+    run_root = args.logs_dir.parent
+    canonical = sorted((run_root / "reports").glob(f"*/{REPORT_CSV_GLOB}"),
+                        reverse=True)
+    if canonical:
+        device_csv = canonical[0]
 
     use = args.source
     if use == "auto":
