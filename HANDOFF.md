@@ -343,6 +343,20 @@ fp32 accumulator precision.
 Next step pending data-driven decision: are the typecasts in matmul
 output stage (need `dtype=bfloat16`) or elsewhere?
 
+**BLOCKER 2026-06-08 PM (user-set)**: precision changes touch
+`[[bf16-chain-drift-at-B-gt-1]]` territory. BEFORE any output_dtype
+edit or fp32_dest_acc tweak, must land:
+
+- **#291 long-context correctness gate** — HF oracle vs our decode at
+  L ∈ {128, 512, 1024, 2048, 4096}. Gates per L: cosine ≥ 0.99 on
+  last hidden, argmax matches HF, needle haystack recall holds.
+- **#292 precision-tradeoff research** — what do vLLM / llama.cpp / HF /
+  DeepSeek-V3 / Llama 3 / Qwen 3 actually do at L > 8k? Are typecasts
+  load-bearing or a holdover? Output: short research note that
+  informs the typecast strategy.
+
+No Typecast or output_dtype change ships until BOTH land green.
+
 2. **#289 Gemma 4 layout-op overhead** (33% of prefill time is
    non-compute layout shuffling: Slice 10%, Typecast 9%, Tilize+
    Untilize+Sharded+Reshape+Concat 25%). Pre-work: clean tracy run
