@@ -300,14 +300,19 @@ target_step(tok, cur_pos+1+i)`.
 
 **Next workstreams (in order, 2026-06-08 PM)**:
 
-1. **#288 Spec-dec correctness tests** (PRIORITY, do first).
-   After finding the off-by-one, lock down KV cache logic with
-   regression tests. Two probes:
-   - Pure-host unit tests for `_accept_walk` semantics (no device).
-   - Device-side cache-invariance probe: run spec-dec for N tokens,
-     capture emitted + cur_pos, re-prefill + run plain B=1 with the
-     same sequence, assert cur_pos matches + next argmax matches.
-   Prevents future cache bugs from sliding in silently.
+1. **#288 Spec-dec correctness tests SHIPPED** 2026-06-08
+   (commits `abef578` + `0fe04f0`). All gates green:
+   - **12/12** pure-host accept-walk unit tests
+     (`experiments/utils/spec_dec_unit_tests.py`)
+   - **3/3** device-side cache-invariance gates
+     (`experiments/cb/isolate/gemma4_spec_dec_cache_invariant_probe.py`)
+     - GATE A emitted len ✓ (14 >= 12)
+     - GATE B cur_pos match ✓ (sd=19, bl=19)
+     - GATE C probe argmax match ✓ (sd=5279, bl=5279)
+   The probe writes spec-dec for N tokens then replays the SAME
+   token sequence via plain target B=1; cache state must be
+   byte-equivalent (probe argmax confirms it at the SDPA layer). Bonus
+   first-run caught a real flaw in the probe's own truncation logic.
 
 2. **#289 Gemma 4 layout-op overhead** (33% of prefill time is
    non-compute layout shuffling: Slice 10%, Typecast 9%, Tilize+
