@@ -314,6 +314,12 @@ target_step(tok, cur_pos+1+i)`.
    byte-equivalent (probe argmax confirms it at the SDPA layer). Bonus
    first-run caught a real flaw in the probe's own truncation logic.
 
+**Pivot 2026-06-08 PM**: spec-dec P-2 + the spec-dec bench paused per
+user. Workstream is now #289 (layout op elimination) **in progress**
++ #290 (chunked prefill) planning in parallel. Plan docs:
+`research/gemma4_layout_op_elimination_plan_2026-06-08.md` +
+`research/gemma4_chunked_prefill_plan_2026-06-08.md`.
+
 2. **#289 Gemma 4 layout-op overhead** (33% of prefill time is
    non-compute layout shuffling: Slice 10%, Typecast 9%, Tilize+
    Untilize+Sharded+Reshape+Concat 25%). Pre-work: clean tracy run
