@@ -41,6 +41,7 @@ Run via cosine probe at `experiments/cb/isolate/gm4_v01_L0_cos.py`.
 """
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -63,7 +64,16 @@ import ttnn  # noqa: E402
 # ── Model constants (plan §1.1, verified from config.json) ──────────────
 MODEL_ID = "google/gemma-4-12B"
 HIDDEN = 3840
-NUM_LAYERS = 48
+# GM4_NUM_LAYERS_OVERRIDE truncates the per-step forward to the first N
+# layers. ONLY for tracy profiling — the full 48-layer forward overflows
+# tracy's 12k-marker DRAM buffer, leaving cpp_device_perf_report.csv with
+# blank OP NAME columns. With N≤8 the marker count fits, device-side per-op
+# kernel duration is recoverable, and #289 can make data-driven decisions
+# about which layout ops to attack. Bootstrap still loads all 48 layer
+# weights (we just iterate fewer layer indices in the forward path).
+_LAYERS_OVERRIDE = os.environ.get("GM4_NUM_LAYERS_OVERRIDE")
+NUM_LAYERS = int(_LAYERS_OVERRIDE) if _LAYERS_OVERRIDE else 48
+NUM_LAYERS_FULL = 48  # never truncated — used for cache/weight allocation
 NUM_Q_HEADS = 16
 NUM_KV_HEADS_SLIDING = 8
 NUM_KV_HEADS_GLOBAL = 1
