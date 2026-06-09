@@ -93,18 +93,31 @@ prefill (#290) makes those tractable.
 BEFORE Step 2 ships. (L=4096 sequential prefill costs ~190s — slow
 but bearable for a one-time baseline; trivial during --verify replay.)
 
-## Phased rollout
+## Phased rollout — SIMPLIFIED 2026-06-09
 
-| Phase | What | Validation |
+The per-op bisect (phases 2c → 2d → 2e flipping one op family at a
+time) is **overkill given the research already gives the safe contract**.
+Decision: flip all 5 op families (Q, K, V, gate, up) together behind
+ONE master env gate `TT_GM4_BF16_ACC_SMALL_K=1` and validate
+once via --verify @ 5 L's. If green → ship. If fail → bisect.
+
+| Phase | What | Status |
 |---|---|---|
-| 2a | Add HIFI4_BF16_ACC config + bisect probe | probe lands green at default (all fp32 on) |
-| 2b | Add L=4096 to argmax gate; re-capture baseline | argmax_gate --verify passes with new L |
-| 2c | Flip Q proj only (40 sliding + 8 global). Re-verify. | argmax_gate 5/5 L PASS |
-| 2d | Flip K + V proj (sliding + global). Re-verify. | argmax_gate 5/5 L PASS |
-| 2e | Flip gate + up (MLP). Re-verify. | argmax_gate 5/5 L PASS |
-| 2f | Tracy delta — total Typecast count drop | confirm projection |
-| 2g | Flip remaining "safe" sites all at once. Final --verify + needle@4k | 5/5 L PASS + needle retains recall |
-| 2h | Ship as default; document the safety contract for o_proj/down_proj/lm_head | docs updated |
+| 2a | HIFI4_BF16_ACC config + `_small_k_matmul_config` helper; flip Q/K/V (sliding + global) + gate/up (DRAM + non-DRAM) sites behind TT_GM4_BF16_ACC_SMALL_K | ✅ shipped `689db4f` |
+| 2b | Extend `argmax_gate` to L=4096; re-capture baseline | ✅ code shipped `689db4f`; baseline capture **in flight** |
+| 2c | --verify with TT_GM4_BF16_ACC_SMALL_K=1 at 5 L's | pending baseline |
+| 2d | Tracy delta — total Typecast count drop | pending verify |
+| 2e | Needle haystack @ L=4k (secondary precision gate) | pending verify |
+| 2f | Flip default; document safety contract | pending all gates |
+
+## Original per-op bisect plan kept here for reference if 2c fails
+
+If the single-flip --verify fails at any L, fall back to bisect:
+- (i) Flip Q proj only → --verify
+- (ii) Flip K + V proj → --verify
+- (iii) Flip gate + up → --verify
+First op-family that fails IS the precision cliff; KEEP that one
+enabled and ship the rest.
 
 ## Expected impact
 
