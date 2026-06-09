@@ -357,6 +357,29 @@ edit or fp32_dest_acc tweak, must land:
 
 No Typecast or output_dtype change ships until BOTH land green.
 
+**#292 research SHIPPED** — `research/precision_long_context_2026-06-08.md`
+(~780 words). Decision-relevant findings:
+
+- `fp32_dest_acc` is real but K-dependent. BF16 mantissa-rounding error
+  grows as O(sqrt(K)·eps). Invisible at K ≤ 4096; matters for o_proj,
+  down_proj, lm_head, attention's S·V.
+- No production stack runs fp32 KV. DeepSeek-V3's aggressive FP8
+  recipe explicitly carves out attention + norms + lm_head.
+- Typecast as a separate op is Tenstorrent-specific (NVIDIA folds the
+  cast into MMA epilogue at ~0% cost; Tensix exposes it as a packer
+  instruction → what Tracy reports).
+
+**Revised #289 attack order**:
+1. **Matmul fusion (QKV concat + gate+up SwiGLU)** — pure win, no
+   precision change. Halves matmul→typecast pairs. ~15% wall saved.
+2. **Selective `fp32_dest_acc=False` on Q/K/V/gate/up** (K ≤ 4096) —
+   safe per K-sensitivity. Keep enabled on o_proj, down_proj, lm_head,
+   S·V. Bisect-by-op; gate via #291 + needle at 4k + 32k.
+3. Verify matmul output already bf16. Sanity grep.
+4. fp32 chains — deferred (L1 footprint + 35B TRISC precedent).
+
+Projected: 47 → ~32 ms/tok = **1.5× speedup, no long-context regression**.
+
 2. **#289 Gemma 4 layout-op overhead** (33% of prefill time is
    non-compute layout shuffling: Slice 10%, Typecast 9%, Tilize+
    Untilize+Sharded+Reshape+Concat 25%). Pre-work: clean tracy run

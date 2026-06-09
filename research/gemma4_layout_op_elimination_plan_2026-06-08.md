@@ -129,6 +129,61 @@ ahead of everything else. Hypothesis (needs confirmation):
   overhead — already free.
 - ~~Reshape/Concat reduction~~: same — host wall ≠ device cost.
 
+### Final strategy after #292 research (research/precision_long_context_2026-06-08.md)
+
+The research note nails down the precision tradeoff. Key facts:
+
+- **`fp32_dest_acc` is real, but K-dependent**. The mantissa-rounding
+  error in bf16 accumulation grows as O(sqrt(K)·eps). For K ≤ 4096
+  (Q/K/V/gate/up projections) it's invisible to cosine; for o_proj,
+  down_proj, lm_head, and **S·V where K = sequence length**, it
+  matters and gets worse with context.
+- **Typecast as a separate op is Tenstorrent-specific**. NVIDIA folds
+  the FP32→bf16 cast into the MMA epilogue at ~0% cost. Tensix issues
+  it as a packer instruction — what Tracy reports.
+- **No production stack runs fp32 KV**. All default to model dtype.
+  Even DeepSeek-V3's aggressive FP8 deployment **explicitly keeps
+  attention + norms + lm_head in BF16/FP32**.
+
+### Concrete fix order (replaces earlier guesses)
+
+**Step 0: BLOCKER GATE — #291 long-context argmax baseline captured**
+(in flight at the time of this revision). No Step 1+ ships until that
+baseline is committed AND the change keeps it green.
+
+**Step 1: (b) Reduce matmul COUNT via fusion — DO FIRST**
+- QKV concat-fuse: one matmul instead of three for Q, K, V projections
+- gate+up SwiGLU fuse: one matmul instead of two for MLP gate, up
+- Halves the matmul→typecast pairs in attention + MLP
+- Pure win: no precision change, no long-context risk
+- Standard fusion every production stack already does
+- Per layer: ~5 matmuls → ~3 matmuls = ~40% matmul-typecast pair reduction
+
+**Step 2: (d) Selectively disable `fp32_dest_acc` on small-K matmuls — GATED**
+- SAFE to disable: Q/K/V/gate/up where K ≤ 4096
+- KEEP enabled: o_proj (K = num_heads × head_dim), down_proj (K =
+  intermediate_size = 15360), lm_head (K = hidden, feeds argmax),
+  attention S·V (K = sequence length — the long-context blast radius)
+- Per-op probe: flip ONE matmul, run cosine ladder + needle, expand
+- Gate sequence: (i) #291 argmax baseline still matches at L=2048,
+  (ii) #294 needle haystack passes at L=4k AND L=32k, (iii) cosine
+  ladder ≥ 0.999 at every layer
+
+**Step 3: (a) Verify matmul output is already bf16 — sanity check**
+- Grep `ttnn.matmul` for any `output_dtype=fp32`; should be none
+- If found, fix (low-risk)
+
+**Step 4: (c) fp32 chain handling — DEFERRED**
+- Doubles L1 footprint; conflicts with trace budget
+- 35B precedent of fp32 RMSNorm TRISC hang
+- Only revisit if Steps 1-3 don't get us under 30 ms/tok
+
+### Projected impact
+- Step 1 alone: ~40% Typecast reduction (5 matmul/layer → 3) → ~15% wall
+  saved → 47 ms → ~40 ms/tok
+- Step 1 + Step 2: 38% Typecast → ~10-15% Typecast → 47 ms → ~32 ms/tok
+- 1.5× total speedup, all without touching long-context accuracy
+
 ### Step 4: re-capture + diff
 After each fix, re-run tracy_profile_one_gemma4_layer_v2 + diff against
 baseline. Target: layout-op share drops 33% → < 20%.
