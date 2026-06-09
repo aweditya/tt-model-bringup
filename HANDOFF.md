@@ -385,6 +385,27 @@ crash. Fix: use L=4032 instead (4032 + 8 = 4040 ≤ 4096, 64 positions
 of slack). The gate still exercises the long-context S·V K-dim near
 the cap.
 
+**Step 2 verify result 2026-06-09 (run 1)** with
+TT_GM4_BF16_ACC_SMALL_K=1 — UNUSUAL FAIL PATTERN:
+
+| L | match | what |
+|---|---|---|
+| 128 | 7/8 ✗ | mild divergence (1 token) |
+| 512 | 8/8 ✓ | identical |
+| 1024 | **1/8 ✗** | **catastrophic — looks like prompt regurgitation** |
+| 2048 | 8/8 ✓ | identical |
+| 4032 | 8/8 ✓ | identical |
+
+L=512/2048/4032 (the longest = HIGHEST K = sequence_length) pass
+byte-identical while L=1024 catastrophically collapses. That's the
+OPPOSITE of a clean "long-context precision degradation" pattern,
+which says the bf16 accumulator should hurt MORE at long L.
+
+Running re-verify with same env to test (a) deterministic divergence
+(repro then bisect by op) vs (b) non-determinism in bf16 matmul (run
+2 differs from run 1 → Step 2 unshippable; pivot to #290 chunked
+prefill which is the bigger structural TTFT win anyway).
+
 **Tracy delta SHIPPED 2026-06-09** with TT_GM4_FUSE_QKV=1 at
 GM4_NUM_LAYERS_OVERRIDE=4. Honest read:
 
