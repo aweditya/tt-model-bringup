@@ -151,3 +151,49 @@ enabled and ship the rest.
 - No /tmp — outputs to `.cache/perf_logs/`
 - Frequent commits — one per phase (2a → 2h)
 - Plan first → execute → verify — argmax gate is the contract
+
+---
+
+## FINAL OUTCOME — 2026-06-09 (PARKED)
+
+Step 2 attempted, **verified deterministically unshippable**.
+
+`--verify` with `TT_GM4_BF16_ACC_SMALL_K=1` produced byte-identical
+fingerprints on two consecutive runs. So the divergence is
+deterministic, not a non-determinism artifact. The pattern was:
+
+| L | match |
+|---|---|
+| 128 | 7/8 ✗ (1 token differs) |
+| 512 | 8/8 ✓ |
+| **1024** | **1/8 ✗ catastrophic — output regresses to seed-prompt regurgitation** |
+| 2048 | 8/8 ✓ |
+| 4032 | 8/8 ✓ |
+
+At L=1024 specifically, bf16-acc pushes position-1 from `236772 →
+258882` (BASE filler), and the model then collapses to repeating the
+seed prompt. L=512/2048/4032 pass byte-identical. This is NOT a clean
+"long-context bf16 chain drift" pattern (which would compound and fail
+the LONGEST L first). It's a NARROW local precision cliff at a
+specific sequence length where the top-2 token margin is small enough
+for mantissa rounding to flip it.
+
+**Decision**: PARK. The HIFI4_BF16_ACC config + `_small_k_matmul_config()`
+helper + 5 matmul-site flips stay in the code (env-gated, default OFF)
+for future investigation — per-op bisect, per-L adaptive accumulator
+picking, or distribution-aware tuning. We could potentially salvage
+some safe-by-op subset via the bisect (Q only? K+V only? gate+up only?
+3 × ~22 min verify runs to find out), but the gain projection shrank
+further and the L=1024 cliff teaches that single-flip safety isn't
+guaranteed without a multi-L gate.
+
+Memorized as [[feedback-gemma4-bf16-acc-L1024-cliff]] for future
+sessions.
+
+## Lessons captured
+- The `--verify` byte-equiv gate IS the contract. It caught a non-obvious
+  L-specific cliff that needle haystack might have missed.
+- The L=4096 → silent kernel crash gotcha (MAX_KV bound). L=4032 leaves
+  64 positions of slack.
+- The "concat-then-shard" vs "shard-then-concat" trap on the upload
+  side ([[feedback-tp-concat-fuse-order]]).

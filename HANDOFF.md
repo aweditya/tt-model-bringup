@@ -5,6 +5,71 @@ Read top to bottom; everything else is linked.
 
 ---
 
+## CURRENT STATE 2026-06-09 (PRE-COMPACTION CHECKPOINT)
+
+**Active workstream: #290 chunked prefill (Gemma 4).** Scaffold landed
+(commit `61fc7e2`); P1.1-P1.7 work-list is in
+`experiments/cb/isolate/gemma4_chunked_prefill_L128.py`'s docstring.
+First implementation lever for user-facing TTFT gain (200-tok chat
+goes from 9.4s to projected <1s).
+
+### Recently CLOSED (this session)
+- **#289 Gemma 4 layout overhead** — closed with engineering honesty.
+  - Step 1a (#293) sliding QKV concat-fuse: env-gated `TT_GM4_FUSE_QKV=1`,
+    correctness-verified at 5/5 L's (commit `c1a3c3a`); tracy delta
+    showed only **0.7% wall** (matmul drop offset by slice→typecast
+    cost), so kept default OFF.
+  - Step 1b (#294) gate+up SwiGLU fuse: **PARKED**. Production
+    `_layer_forward_pos0_paged` already folds gelu into the gate matmul
+    via `activation="gelu"` (Round-4 bit-identical fold). Concat-fuse
+    would force gelu out, net device-time ≈ 0.
+  - Step 2 selective `fp32_dest_acc=False` on Q/K/V/gate/up
+    (`TT_GM4_BF16_ACC_SMALL_K=1`): **PARKED — deterministic precision
+    cliff**. Run 1 + Run 2 of `--verify` produce byte-identical
+    fingerprints with L=128 (7/8 ✗) and **L=1024 (1/8 ✗ — catastrophic
+    collapse to prompt regurgitation)** while L=512/2048/4032 pass.
+    Even with env gate ON we'd be shipping a known cliff. Code kept
+    (`HIFI4_BF16_ACC` config + `_small_k_matmul_config()`), default OFF.
+
+- **#291 long-context correctness gate** — 5 L's
+  (128/512/1024/2048/4032). `research/gemma4_long_context_baseline.json`
+  is the byte-equiv contract; `--verify` is the gate.
+- **#292 precision-at-long-context research** —
+  `research/precision_long_context_2026-06-08.md`. Locked Step 2
+  attack order; the verdict was honored.
+
+### Key learnings recorded
+- **Long-context probe `L + N_DECODE ≤ MAX_KV`** (4096). L=4096 + 8
+  decodes = 4104 → silent kernel crash. Use L=4032.
+- **bf16-acc precision cliff at L=1024** for Gemma 4 12B on Blackhole:
+  position-1 token deterministically flips `236772 → 258882`
+  (BASE filler), model collapses. **Don't ship Step 2.**
+- **TP weight concat-fuse order**: shard-each-then-concat-per-chip,
+  NOT concat-then-shard. The naive order gives chip 0 the first 2048
+  cols of Q only (no K, no V). Cost me one --verify cycle (commit
+  `c7d35e4`).
+
+### Cold-start actions for next session
+1. Read `experiments/cb/isolate/gemma4_chunked_prefill_L128.py`
+   docstring → P1.1-P1.7 work-list.
+2. Read `experiments/serve/server_tp.py:forward_prefill_chunked_tp`
+   (line 1945) — the 27B precedent to fork outer structure.
+3. Start with P1.1 (multi-token embed + RoPE) → P1.2 (sliding
+   attention forward at q_len=L using **causal** SDPA, NOT
+   paged_decode).
+4. Each TODO is self-contained; gate via `--verify` (the L=4032
+   baseline) + cos vs sequential.
+
+### Workflow contracts active
+- `experiments/cb/isolate/gemma4_long_context_argmax_gate.py --verify`
+  on qb1 — required for any precision-touching PR. Workflow lock.
+- `experiments/cb/isolate/gemma4_spec_dec_cache_invariant_probe.py`
+  on qb2 — required for any spec-dec K/V cache touch.
+- `experiments/utils/spec_dec_unit_tests.py` on qb1 — accept walk
+  semantics.
+
+---
+
 ## LATEST (2026-06-08) — **🎉 Phase 2.B.1 COMPLETE — verify trace works, Phase 3 unblocked**
 
 **B=K+1 verify trace SHIPPED + ALL 4 GATES PASS** (commit `2dea4cb` + foreground iterations):
