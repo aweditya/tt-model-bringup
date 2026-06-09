@@ -431,6 +431,28 @@ prefill = N × decode = 200-token chat takes 9.4s TTFT. Chunked
 parallel prefill (fork 27B `forward_prefill_chunked_tp`) projects 5-10×
 speedup, the actual user-facing improvement.
 
+**#290 Phase 1 SCAFFOLD landed 2026-06-09** (commit `61fc7e2`).
+`experiments/cb/isolate/gemma4_chunked_prefill_L128.py` runs baseline
+sequential prefill (works today) and exits gracefully at the chunked
+path with a NotImplementedError pointing to the embedded TODO work-list:
+
+- **P1.1** Multi-token embed + RoPE rebuild (cos/sin over L positions)
+- **P1.2** `_layer_prefill_sliding` (forks `_layer_pos0_sliding_paged`):
+  Q/K/V matmul over [L, HIDDEN]; per-head reshape + norms; RoPE on
+  Q+K over L positions; **CAUSAL SDPA at q_len=L** (not paged_decode);
+  `paged_fused_update_cache` writing K/V for ALL L positions; o_proj
+  + all_reduce.
+- **P1.3** `_layer_prefill_global` (head_dim=512, p-RoPE, V aliases
+  K_raw)
+- **P1.4** `_layer_prefill_mlp` (reuse — matmuls are leading-dim
+  agnostic)
+- **P1.5** `step_forward_prefill` orchestrator
+- **P1.6** Gates: cos ≥ 0.999, eager TTFT ≥ 2× faster, argmax match
+- **P1.7** Iterate on qb1
+
+Each TODO is a self-contained fork from an existing decode helper.
+Reuse map in the file docstring.
+
 **Tracy delta SHIPPED 2026-06-09** with TT_GM4_FUSE_QKV=1 at
 GM4_NUM_LAYERS_OVERRIDE=4. Honest read:
 
