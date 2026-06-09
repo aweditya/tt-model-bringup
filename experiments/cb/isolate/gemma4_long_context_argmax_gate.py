@@ -50,7 +50,14 @@ import server_gemma4_unified_ttnn as srv  # noqa: E402
 BASELINE_PATH = (PROJECT_ROOT / "research" /
                   "gemma4_long_context_baseline.json")
 
-LENGTHS = [128, 512, 1024, 2048]
+# L=4096 added 2026-06-09 for #289 Step 2 (selective fp32_dest_acc
+# disable). The K = sequence_length attention S·V contraction is the
+# long-context precision blast radius per #292 research; covering up
+# to MAX_KV=4096 closes the gap that the Step 1 L∈{128..2048} sample
+# left. L=4096 sequential prefill costs ~190s on the BASE variant
+# (47 ms/tok × 4096 ≈ 192 s); --verify replays are trivial after the
+# baseline is captured.
+LENGTHS = [128, 512, 1024, 2048, 4096]
 N_DECODE = 8        # tokens to sample after prefill (greedy argmax)
 BOS = 2
 

@@ -107,6 +107,37 @@ HIFI4 = ttnn.WormholeComputeKernelConfig(
     packer_l1_acc=False,
 )
 
+# #289 Step 2 (2026-06-09) — selective `fp32_dest_acc=False` for small-K
+# matmuls. Per #292 research, BF16 dot-product rounding error grows as
+# O(sqrt(K)·eps). Invisible for K ≤ 4096 (Q/K/V/gate/up projections);
+# load-bearing for o_proj (K = 4096-8192), down_proj (K=15360), lm_head
+# (argmax magnitude), and attention S·V (K = sequence length). Use this
+# config ONLY on small-K candidates; KEEP HIFI4 everywhere else.
+# Validation contract: `gemma4_long_context_argmax_gate.py --verify`
+# must reproduce baseline byte-identical at L ∈ {128, 512, 1024, 2048,
+# 4096}; needle haystack @ L=4k must retain recall.
+HIFI4_BF16_ACC = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4,
+    math_approx_mode=False,
+    fp32_dest_acc_en=False,    # disabled; safe ONLY on small-K matmuls
+    packer_l1_acc=False,
+)
+
+
+def _small_k_matmul_config():
+    """Picks HIFI4_BF16_ACC when TT_GM4_BF16_ACC_SMALL_K=1, else HIFI4.
+
+    Use on Q/K/V/gate/up projections (K ≤ 4096) ONLY. The o_proj,
+    down_proj, lm_head, and SDPA's S·V are NEVER eligible — they have
+    K > 4096 or feed magnitude-sensitive downstream paths and must
+    keep the fp32 accumulator.
+
+    Default (env unset or "0"): HIFI4 (preserves correctness contract).
+    """
+    return (HIFI4_BF16_ACC
+             if os.environ.get("TT_GM4_BF16_ACC_SMALL_K") == "1"
+             else HIFI4)
+
 # Round 7 perf (2026-06-05) — HiFi2 NEGATIVE FINDING (reverted).
 # Profile-driven hypothesis: matmuls were 23.58% of measured kernel time
 # in the post-Round-6 tt-perf-report; HiFi2 was inlined-suggested by the
@@ -1492,9 +1523,10 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None, rope=No
     Q_OUT = NQ_PER_CHIP * HEAD_DIM_SLIDING           # 1024
     K_OUT = NKV_PER_CHIP_SLIDING * HEAD_DIM_SLIDING  # 512
     V_OUT = NKV_PER_CHIP_SLIDING * HEAD_DIM_SLIDING  # 512
+    _qkv_acc_cfg = _small_k_matmul_config()  # #289 Step 2 (small-K safe)
     if os.environ.get("TT_GM4_FUSE_QKV") == "1":
         qkv = ttnn.matmul(h_norm, w["qkv_proj_combined"],
-                           compute_kernel_config=HIFI4)
+                           compute_kernel_config=_qkv_acc_cfg)
         # 3D rank for slice indices: [B=1, L=1, output_dim].
         q = ttnn.slice(qkv, [0, 0, 0],         [1, 1, Q_OUT])
         k = ttnn.slice(qkv, [0, 0, Q_OUT],     [1, 1, Q_OUT + K_OUT])
@@ -1504,9 +1536,9 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None, rope=No
         # below materialises new storage so qkv is safe to deallocate
         # AFTER the reshape (not before).
     else:
-        q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
-        k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
-        v = ttnn.matmul(h_norm, w["v_proj"], compute_kernel_config=HIFI4)
+        q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=_qkv_acc_cfg)
+        k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=_qkv_acc_cfg)
+        v = ttnn.matmul(h_norm, w["v_proj"], compute_kernel_config=_qkv_acc_cfg)
 
     if capture is not None:
         capture["q_proj_out"] = _readback_sharded_head(q, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING)
@@ -1639,8 +1671,10 @@ def _layer_pos0_global_paged(state, h_norm, w, layer_idx, rope=None):
 
     # Q/K projections. V is aliased from K_raw (pre-norm, pre-RoPE) per HF.
     # attention_k_eq_v=True for global means v_proj is None in the weights.
-    q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
-    k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
+    # #289 Step 2: K = HIDDEN = 3840 — safe for bf16 accumulator.
+    _qk_acc_cfg_global = _small_k_matmul_config()
+    q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=_qk_acc_cfg_global)
+    k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=_qk_acc_cfg_global)
 
     q_h = ttnn.reshape(q, [NQ_PER_CHIP, HEAD_DIM_GLOBAL])
     ttnn.deallocate(q)
@@ -1965,12 +1999,17 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
 
         pre_ff_sh = ttnn.to_memory_config(pre_ff, x_mem_cfg_gate_up)
         ttnn.deallocate(pre_ff)
+        # #289 Step 2: gate/up have K = HIDDEN = 3840 — safe for bf16 acc.
+        # down_proj is NOT eligible (K=INTERMEDIATE_PER_CHIP=3840 per chip
+        # but the all-reduce afterward needs accumulator precision; conservative
+        # keep HIFI4).
+        _gu_acc_cfg = _small_k_matmul_config()
         gelu_gate_sh = ttnn.matmul(
             pre_ff_sh, w["gate_proj"], program_config=prog_gate,
-            memory_config=out_mem_cfg, compute_kernel_config=HIFI4)
+            memory_config=out_mem_cfg, compute_kernel_config=_gu_acc_cfg)
         up_sh = ttnn.matmul(
             pre_ff_sh, w["up_proj"], program_config=prog_up,
-            memory_config=out_mem_cfg, compute_kernel_config=HIFI4)
+            memory_config=out_mem_cfg, compute_kernel_config=_gu_acc_cfg)
         ttnn.deallocate(pre_ff_sh)
         mid_sh = ttnn.mul(gelu_gate_sh, up_sh)
         ttnn.deallocate(gelu_gate_sh); ttnn.deallocate(up_sh)
@@ -2002,9 +2041,13 @@ def _layer_forward_pos0_paged(state, h_in, layer_idx, rope_cache=None):
         # GELU runs inside the matmul out-block writeback, no extra pass).
         # Isolation probe: `experiments/cb/isolate/gm4_matmul_gelu_probe.py` —
         # max|delta| = 0.0 vs separate matmul + gelu (bit-identical).
-        gelu_gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4,
-                                activation="gelu")
-        up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
+        # #289 Step 2: gate/up have K = HIDDEN = 3840 — safe for bf16 acc.
+        _gu_acc_cfg = _small_k_matmul_config()
+        gelu_gate = ttnn.matmul(pre_ff, w["gate_proj"],
+                                 compute_kernel_config=_gu_acc_cfg,
+                                 activation="gelu")
+        up = ttnn.matmul(pre_ff, w["up_proj"],
+                          compute_kernel_config=_gu_acc_cfg)
         ttnn.deallocate(pre_ff)
         mid = ttnn.mul(gelu_gate, up)
         ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
