@@ -51,14 +51,52 @@ prior blocks via paged SDPA's existing cache-page mechanism.
   and chunk decision
 
 ### Phase 1 — isolated prefill forward at L=128
-- New file: `experiments/cb/isolate/gemma4_chunked_prefill_L128.py`
+
+**Status 2026-06-09**: scaffold + P1.1-P1.5 implemented in commit `fea36b7`,
+first qb1 run in flight.
+
+- File: `experiments/cb/isolate/gemma4_chunked_prefill_L128.py`
 - Single block (L=128 < chunk_size=2048), no outer loop yet
-- Bootstrap target, build `step_forward_prefill(state, token_ids,
-  start_pos)` that processes the whole L=128 in one pass
-- Gates:
-  - cos ≥ 0.999 vs ground truth from L=128 × step_forward_v031
-  - TTFT (eager): ≥ 2× faster than the sequential version
-  - HF argmax at last position matches
+- `step_forward_prefill(state, token_ids, capture_hidden=False)` processes
+  L=128 in one pass; returns (last_argmax, last_hidden_np).
+- Gates (probe driver runs all three):
+  - A: cos ≥ 0.999 vs ground truth (L × step_forward_v031) last hidden
+  - B: TTFT eager ≥ 2× faster than sequential
+  - C: argmax match at last position
+
+**P1 implementation choices (locked in scaffold)**:
+1. **SKIP K/V cache writes**. The forward math (matmul + norms + RoPE +
+   causal SDPA) is identical whether or not we write the cache, because
+   causal SDPA in this path consumes the fresh K/V tensors directly.
+   Cache writes are P1.6.5 (handoff-to-decode test): after gate A/B/C
+   pass, add `paged_fill_cache`-equivalent over L positions and verify
+   the decode path's next-token argmax matches the sequential.
+2. **IGNORE sliding-window mask at L=128**. SLIDING_WINDOW=1024 ≥ L=128
+   so causal == sliding-causal here. P2 adds the mask when L > 1024.
+3. **Simplified MLP path** (no DRAM-sharded variant). Forks the
+   `matmul + activation="gelu" + matmul + mul + matmul` chain — same as
+   the default decode path; leading-dim agnostic per 27B
+   `gated_attn_step_prefill_tp` precedent. DRAM-sharded MLP bakes
+   M=TILE=32 into its program config; we'll evaluate later whether to
+   port it to L>1 (likely yes — same M-dim treatment with L tile rows).
+4. **rms_norm on rank-3 `[L, n_heads, head_dim]`** — preserves the
+   `[[feedback-ttnn-rms-norm-shape-drift]]` shape contract (no fold).
+5. **RoPE batched** via new helper `_apply_full_rope_seq`: `[L, n_heads,
+   head_dim]` with `[L, 1, head_dim]` cos/sin broadcast — keeps the
+   rotate-half-via-roll fusion from `_apply_full_rope`.
+6. **Q/K/V matmul still uses HIFI4 fp32_acc** (not the Step 2 cliff
+   config). Once chunked prefill is bit-stable we can revisit the
+   small-K fp32_acc=False knob for prefill (separate gate per
+   [[feedback-gemma4-bf16-acc-L1024-cliff]]).
+
+**Risk register for P1 first run** (think-first per non-negotiable):
+- `ttnn.permute((1, 0, 2))` on `[L, NQ, HD]` may not be supported in all
+  layouts — fall-through to a reshape-then-transpose if so.
+- `ttnn.transformer.scaled_dot_product_attention` GQA contract may need
+  N_KV repeat-interleave at the SDPA layer for some shapes — 27B path
+  uses native GQA; we expect the same for Gemma 4.
+- bf16 chain at L=128 may push cos < 0.999. Mitigation: loosen to 0.99
+  only if absolutely needed and document the relaxation.
 
 ### Phase 2 — TILE-aligned L (L=128 → L=256 → L=2048)
 - Same probe at L ∈ {128, 256, 512, 1024, 2048}
