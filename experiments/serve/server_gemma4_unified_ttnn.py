@@ -387,6 +387,19 @@ def upload_attn_layer_sliding(layer_sd, mesh):
     w["k_proj"] = np_stacked_to_sharded(shard_along(k_w, axis=1), mesh)
     w["v_proj"] = np_stacked_to_sharded(shard_along(v_w, axis=1), mesh)
     w["o_proj"] = np_stacked_to_sharded(shard_along(o_w, axis=0), mesh)
+    # #293 Step 1a: QKV concat-fuse weight for the sliding production
+    # decode path. Q/K/V all shard along the SAME output axis (axis=1)
+    # with the SAME per-chip pattern, so concat is straight numpy +
+    # one shard. Per-chip shape: [HIDDEN=3840, NQ_PER_CHIP*HEAD_DIM_SLIDING +
+    # 2 * NKV_PER_CHIP_SLIDING * HEAD_DIM_SLIDING] = [3840, 2048].
+    # Env gate TT_GM4_FUSE_QKV=1 picks the fused matmul path in
+    # _layer_pos0_sliding_paged. Q/K/V matmuls have NO fused activation
+    # so this is a clean win (unlike #294 gate+up which loses the
+    # gelu fold — parked, see research/gemma4_step1_fusion_plan).
+    import numpy as _np_gm4
+    qkv_w = _np_gm4.concatenate([q_w, k_w, v_w], axis=1)  # [3840, 8192]
+    w["qkv_proj_combined"] = np_stacked_to_sharded(
+        shard_along(qkv_w, axis=1), mesh)
     # Gemma 4 Llama-style RMSNorm: `w` directly. NO +1.0.
     w["q_norm"] = np_to_replicated(layer_sd["self_attn.q_norm.weight"], mesh)
     w["k_norm"] = np_to_replicated(layer_sd["self_attn.k_norm.weight"], mesh)
@@ -1461,10 +1474,30 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None, rope=No
     """
     layer_caches = state.kv_caches_tt[layer_idx]  # list of 2 (kc, vc) tuples
 
-    # Q/K/V projections.
-    q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
-    k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
-    v = ttnn.matmul(h_norm, w["v_proj"], compute_kernel_config=HIFI4)
+    # #293 Step 1a: QKV concat-fuse path. TT_GM4_FUSE_QKV=1 picks the
+    # combined weight (single matmul + 3 slices) instead of 3 separate
+    # matmuls. Slicing is 0% device kernel time per #289 tracy. Saves 2
+    # matmul-typecast pairs per sliding layer × 40 layers = 80 pairs/fwd.
+    # No precision change (matmul kernel config unchanged) — long-context
+    # argmax_gate --verify should reproduce baseline byte-for-byte.
+    Q_OUT = NQ_PER_CHIP * HEAD_DIM_SLIDING           # 1024
+    K_OUT = NKV_PER_CHIP_SLIDING * HEAD_DIM_SLIDING  # 512
+    V_OUT = NKV_PER_CHIP_SLIDING * HEAD_DIM_SLIDING  # 512
+    if os.environ.get("TT_GM4_FUSE_QKV") == "1":
+        qkv = ttnn.matmul(h_norm, w["qkv_proj_combined"],
+                           compute_kernel_config=HIFI4)
+        # 3D rank for slice indices: [B=1, L=1, output_dim].
+        q = ttnn.slice(qkv, [0, 0, 0],         [1, 1, Q_OUT])
+        k = ttnn.slice(qkv, [0, 0, Q_OUT],     [1, 1, Q_OUT + K_OUT])
+        v = ttnn.slice(qkv, [0, 0, Q_OUT + K_OUT],
+                            [1, 1, Q_OUT + K_OUT + V_OUT])
+        # Slices are views per [[ttnn-slice-view-decay]]; the reshape
+        # below materialises new storage so qkv is safe to deallocate
+        # AFTER the reshape (not before).
+    else:
+        q = ttnn.matmul(h_norm, w["q_proj"], compute_kernel_config=HIFI4)
+        k = ttnn.matmul(h_norm, w["k_proj"], compute_kernel_config=HIFI4)
+        v = ttnn.matmul(h_norm, w["v_proj"], compute_kernel_config=HIFI4)
 
     if capture is not None:
         capture["q_proj_out"] = _readback_sharded_head(q, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING)
@@ -1477,6 +1510,10 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None, rope=No
     ttnn.deallocate(k)
     v_h = ttnn.reshape(v, [NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])  # [2, 256]
     ttnn.deallocate(v)
+    # Now safe to release the fused parent (the reshape above made each
+    # head buffer independently-backed).
+    if os.environ.get("TT_GM4_FUSE_QKV") == "1":
+        ttnn.deallocate(qkv)
 
     # q_norm, k_norm (learned weight) + v_norm (all-ones).
     q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
