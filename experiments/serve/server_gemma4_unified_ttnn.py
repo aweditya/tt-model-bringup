@@ -389,17 +389,26 @@ def upload_attn_layer_sliding(layer_sd, mesh):
     w["o_proj"] = np_stacked_to_sharded(shard_along(o_w, axis=0), mesh)
     # #293 Step 1a: QKV concat-fuse weight for the sliding production
     # decode path. Q/K/V all shard along the SAME output axis (axis=1)
-    # with the SAME per-chip pattern, so concat is straight numpy +
-    # one shard. Per-chip shape: [HIDDEN=3840, NQ_PER_CHIP*HEAD_DIM_SLIDING +
-    # 2 * NKV_PER_CHIP_SLIDING * HEAD_DIM_SLIDING] = [3840, 2048].
-    # Env gate TT_GM4_FUSE_QKV=1 picks the fused matmul path in
-    # _layer_pos0_sliding_paged. Q/K/V matmuls have NO fused activation
-    # so this is a clean win (unlike #294 gate+up which loses the
-    # gelu fold — parked, see research/gemma4_step1_fusion_plan).
+    # with the SAME per-chip pattern.
+    #
+    # CRITICAL ORDER: must shard-each-weight FIRST, then concat per chip.
+    # The naïve "concat all three then shard" wrongly splits the combined
+    # [Q|K|V] matrix into 4 contiguous output-dim slabs; chip 0 gets the
+    # FIRST 2048 cols of Q only (no K, no V), chip 1 gets the SECOND
+    # 1024 cols of Q + the FIRST 1024 of K, etc. Each chip must hold its
+    # OWN per-chip slice of Q, K, AND V — corresponding to its Q-head
+    # subset. (First verify run with the wrong order collapsed all L to
+    # the BASE filler token 258882 across all 8 decoded positions —
+    # diagnostic confirmation of garbage projections.)
     import numpy as _np_gm4
-    qkv_w = _np_gm4.concatenate([q_w, k_w, v_w], axis=1)  # [3840, 8192]
-    w["qkv_proj_combined"] = np_stacked_to_sharded(
-        shard_along(qkv_w, axis=1), mesh)
+    q_chunks = shard_along(q_w, axis=1)  # 4 × [3840, 1024]
+    k_chunks = shard_along(k_w, axis=1)  # 4 × [3840, 512]
+    v_chunks = shard_along(v_w, axis=1)  # 4 × [3840, 512]
+    qkv_per_chip = [
+        _np_gm4.concatenate([q_chunks[i], k_chunks[i], v_chunks[i]], axis=1)
+        for i in range(NCHIPS)
+    ]  # 4 × [3840, 1024 + 512 + 512 = 2048]
+    w["qkv_proj_combined"] = np_stacked_to_sharded(qkv_per_chip, mesh)
     # Gemma 4 Llama-style RMSNorm: `w` directly. NO +1.0.
     w["q_norm"] = np_to_replicated(layer_sd["self_attn.q_norm.weight"], mesh)
     w["k_norm"] = np_to_replicated(layer_sd["self_attn.k_norm.weight"], mesh)
