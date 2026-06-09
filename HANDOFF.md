@@ -356,6 +356,18 @@ BLOCKER released for **#289 Step 1 (fusion-only)** which doesn't touch
 precision. Step 2 (selective fp32_dest_acc disable) still has the
 --verify + needle@4k+32k gates per-op.
 
+**Step 1 plan locked** — `research/gemma4_step1_fusion_plan_2026-06-08.md`
+- #294 gate+up SwiGLU fuse FIRST (simpler — all 48 layers, no sliding/
+  global split). Saves 48 matmuls/fwd.
+- #293 sliding QKV fuse SECOND (sliding 40 layers; global K/V replicate
+  blocks the fuse, defer to v2). Saves 80 matmuls/fwd.
+- Per-layer reduction in matmul → typecast pairs. Expected wall save:
+  ~3-4% (matmul-typecast is only a slice of the 38% total).
+- Forks `server_35b_ttnn.py:400 in_proj_combined` pattern (28% local
+  speedup on 35B DN block — bit-exact).
+- Env gates (`TT_GM4_FUSE_QKV`, `TT_GM4_FUSE_GATE_UP`) default-off
+  during smoke; default-on after #291 --verify green.
+
 **#292 research SHIPPED** — `research/precision_long_context_2026-06-08.md`
 (~780 words). Decision-relevant findings:
 
