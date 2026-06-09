@@ -150,13 +150,33 @@ because not every typecast comes from matmul output. Still a real
 win, and **the safer setup for Step 2** (selective fp32_dest_acc
 disable on small-K projections) which delivers the big chunk.
 
-## Implementation order
+## Implementation order — REVISED 2026-06-08 PM
 
-1. #294 (gate+up MLP fuse) FIRST — simpler (all 48 layers, no global vs sliding split)
-2. #293 (sliding QKV fuse) SECOND — sliding-only, requires picking the per-layer branch
+**Implementation pass 1 found a blocker for #294.** The production
+non-DRAM MLP path (`_layer_forward_pos0_paged`:1984+) already runs
+gate's matmul with `activation="gelu"` folded in (Round-4 win, commit
+chain bit-identical to separate `ttnn.gelu`). Concat-fusing gate+up
+into one matmul would FORCE the activation OUT of the matmul (you
+can't gelu only the gate-half of a concatenated [gate, up] output
+inside the matmul kernel). Net result:
+
+- Before: 2 matmuls (1 with gelu folded, 0 cost) + 1 mul = 3 device ops
+- After fuse: 1 matmul + 1 separate gelu + 1 mul = 3 device ops
+
+The "1 typecast saved from matmul output" is offset (roughly) by "1
+separate gelu kernel issued". Net change ≈ 0.
+
+**Pivot**: #293 (sliding QKV fuse) FIRST instead. Q/K/V matmuls have
+NO activation fold — three plain matmuls. Concat-fuse is a clean win
+of 2 matmuls per sliding layer × 40 layers = 80 matmul-typecast pairs.
+
+Revised order:
+1. **#293 sliding QKV fuse FIRST** — clean win, sliding 40 layers
+2. **#294 gate+up MLP fuse PARKED** — would need to either accept the
+   gelu-fold loss (might be neutral or negative) OR find a way to fuse
+   that preserves activation on the slice. Defer pending evidence.
 3. Run --verify after each
-4. Combine both env gates default-on
-5. Re-tracy to confirm matmul + typecast count drop
+4. Re-tracy to confirm delta
 
 ## Risks + mitigations
 
