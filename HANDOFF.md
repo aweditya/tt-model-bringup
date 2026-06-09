@@ -379,6 +379,12 @@ precision. Step 2 (selective fp32_dest_acc disable) still has the
   matmul already runs `activation="gelu"`, fusion forces gelu out,
   net device-time ≈ 0).
 
+**Step 2 gotcha 2026-06-09** (commit `262589f`): L=4096 prefill +
+N_DECODE=8 decodes = 4104 positions, but MAX_KV=4096 → silent kernel
+crash. Fix: use L=4032 instead (4032 + 8 = 4040 ≤ 4096, 64 positions
+of slack). The gate still exercises the long-context S·V K-dim near
+the cap.
+
 **Tracy delta SHIPPED 2026-06-09** with TT_GM4_FUSE_QKV=1 at
 GM4_NUM_LAYERS_OVERRIDE=4. Honest read:
 
