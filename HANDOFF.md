@@ -356,17 +356,36 @@ BLOCKER released for **#289 Step 1 (fusion-only)** which doesn't touch
 precision. Step 2 (selective fp32_dest_acc disable) still has the
 --verify + needle@4k+32k gates per-op.
 
-**Step 1 plan locked** — `research/gemma4_step1_fusion_plan_2026-06-08.md`
-- #294 gate+up SwiGLU fuse FIRST (simpler — all 48 layers, no sliding/
-  global split). Saves 48 matmuls/fwd.
-- #293 sliding QKV fuse SECOND (sliding 40 layers; global K/V replicate
-  blocks the fuse, defer to v2). Saves 80 matmuls/fwd.
-- Per-layer reduction in matmul → typecast pairs. Expected wall save:
-  ~3-4% (matmul-typecast is only a slice of the 38% total).
-- Forks `server_35b_ttnn.py:400 in_proj_combined` pattern (28% local
-  speedup on 35B DN block — bit-exact).
-- Env gates (`TT_GM4_FUSE_QKV`, `TT_GM4_FUSE_GATE_UP`) default-off
-  during smoke; default-on after #291 --verify green.
+**Step 1 progress** — `research/gemma4_step1_fusion_plan_2026-06-08.md`
+
+- **#293 sliding QKV concat-fuse** ✅ **CORRECTNESS-VERIFIED 2026-06-08**
+  (commits `bad60a2` ship + `c7d35e4` fix). All four L
+  (128/512/1024/2048) match the pre-fuse baseline byte-identical via
+  `gemma4_long_context_argmax_gate.py --verify`. Env-gated behind
+  `TT_GM4_FUSE_QKV=1` (default-off until tracy delta confirms a win).
+
+  Saves 2 matmul-typecast pairs per sliding layer × 40 layers = 80
+  pairs/fwd at no precision cost.
+
+  **Debugging note**: first run with the natural-feeling "concat all
+  three weights then shard along output axis" order FAILED all four L
+  (collapse to BASE filler token 258882). Correct order is **shard each
+  weight first, then concat per-chip** — each chip needs its own
+  `[Q_head | K_head | V_head]` triple, not a contiguous slab of the
+  combined matrix. `git c7d35e4` is the fix; the false-start commit
+  `bad60a2` is kept for diff-history continuity.
+
+- #294 gate+up SwiGLU fuse **PARKED** (gelu fold blocker — production
+  matmul already runs `activation="gelu"`, fusion forces gelu out,
+  net device-time ≈ 0).
+
+**Next**:
+1. Tracy delta with TT_GM4_FUSE_QKV=1 (`GM4_NUM_LAYERS_OVERRIDE=4`) →
+   confirm matmul + typecast count drop.
+2. If delta is real, flip default ON, drop the unfused upload to
+   reclaim DRAM bytes.
+3. Move to Step 2 (selective fp32_dest_acc on Q/K/V/gate/up, the
+   bigger win — bisect-by-op).
 
 **#292 research SHIPPED** — `research/precision_long_context_2026-06-08.md`
 (~780 words). Decision-relevant findings:
