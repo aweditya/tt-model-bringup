@@ -5,34 +5,49 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## CURRENT STATE 2026-06-10 (P1 IN PROGRESS — CORRECTNESS BISECTION)
+## CURRENT STATE 2026-06-10 (P1 IN PROGRESS — BUG LOCALIZED TO SDPA / POST-RoPE)
 
-**Active workstream: #290 P1 chunked prefill — DEBUGGING.** P1.1-P1.5
-implementation landed (`fea36b7`); shape pipeline runs clean end-to-end
-on qb1; speedup gate B passes 10-15× at L=128 + 1 layer. **Correctness
-gate A FAILING**: cos vs sequential = 0.4-0.6 instead of ≥0.999.
+**Active workstream: #290 P1 chunked prefill — bug isolated via
+teacher-forced per-sub-op ladder.** P1.1-P1.5 implementation runs clean
+end-to-end on qb1 at L=128 with 10-15× speedup. **Correctness gate A
+FAILING with cos = 0.4-0.6 — but per-sub-op ladder pinpoints the
+divergence locus:**
 
-**Bisection so far** (all NUM_LAYERS=1, L=4):
-- baseline (no env flags): cos 0.41
-- + GM4_REPEAT_KV=1 (force NKV==NQ via repeat_interleave): cos 0.60
-- + GM4_RESHAPE_VIA_RM=1 (route per-head reshape through ROW_MAJOR): cos 0.63
-- + both above + GM4_CHUNKED_SKIP_ROPE=1/GM4_ROPE_ZERO=1: cos 0.44 (worse)
-- L=1: probe crashes on degenerate slice — sidestepped via L=2
+| sub-op (layer 0) | cos vs sequential, every pos |
+|---|---|
+| q_proj_out / k_proj_out / v_proj_out | 1.000000 |
+| q_norm_out / k_norm_out / v_norm_out | 1.000000 |
+| **q_rope_out / k_rope_out** | **1.000000** |
+| attn_out (post-SDPA) | TBD — currently capturing |
+| final hidden (full chain) | 0.4-0.6 |
 
-Chunked argmax stays at 85 across ALL variants — bug is structural in the
-layer math, not in any single env-gated path. Probe at
-`experiments/cb/isolate/gemma4_chunked_prefill_L128.py` carries 4 env-gated
-debug flags + layer-0 shape prints (commit `bdb31c7`).
+So embed + input_layernorm + matmuls + Q/K/V norms + RoPE are all
+**bit-identical**. Bug is in SDPA or the post-SDPA reshape/o_proj/
+all_reduce/MLP chain.
 
-**Next debug step**: per-row hidden capture/compare — extract row 0 of
-chunked vs sequential pos 0, compare elementwise. Then bisect by ablating
-ops (skip Q/K/V norms, skip permute, try 2-call SDPA mirroring decode's
-GQA split).
+**Code state** — gate probe `gemma4_chunked_prefill_L128.py` cleaned of
+env-flag bloat (commit removes 76 lines, keeps 21). 4 dead-end debug
+flags removed:
+- `GM4_REPEAT_KV`, `GM4_RESHAPE_VIA_RM`, `GM4_CHUNKED_SKIP_ROPE` (all proven
+  not the cause)
+- Single CLI arg replaces `GM4_CHUNKED_L` env var
 
-Cold-start path: read
-`experiments/cb/isolate/gemma4_chunked_prefill_L128.py` (probe + 4
-env flags), then `research/gemma4_chunked_prefill_plan_2026-06-08.md`
-(plan + risk register).
+**Tools**:
+- `experiments/cb/isolate/gemma4_chunked_prefill_L128.py` — clean correctness
+  gate (cos / TTFT / argmax)
+- `experiments/cb/isolate/gemma4_chunked_prefill_ladder.py` — per-sub-op
+  ladder for bug isolation
+- `experiments/serve/server_gemma4_unified_ttnn.py:_layer_pos0_sliding_paged`
+  — added `q_rope_out` + `k_rope_out` + `attn_out` to the existing capture
+  pattern (opt-in; no perf impact when capture=None)
+
+**Next debug step**: finish capturing `attn_out` cos on chunked side (last
+run crashed on slice-view chain), then if attn_out is the cliff →
+compare 1-call vs 2-call SDPA (mirror decode's `for kv_idx` per-KV-head
+split). If attn_out is fine → the reshape/o_proj/all_reduce chain.
+
+Cold-start path: `experiments/cb/isolate/gemma4_chunked_prefill_ladder.py`
++ `research/gemma4_chunked_prefill_plan_2026-06-08.md`.
 
 ### Recently CLOSED (this session)
 - **#289 Gemma 4 layout overhead** — closed with engineering honesty.

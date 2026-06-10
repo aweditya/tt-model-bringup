@@ -1589,6 +1589,10 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None, rope=No
     if owned_rope:
         ttnn.deallocate(cos_tt); ttnn.deallocate(sin_tt)
 
+    if capture is not None:
+        capture["q_rope_out"] = _readback_sharded_head(q_n, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING)
+        capture["k_rope_out"] = _readback_sharded_head(k_n, state.mesh, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+
     # Two SDPA passes — one per (cache, KV-head, Q-half) trio.
     attn_outs = []
     Q_HALF = NQ_PER_CHIP // NKV_PER_CHIP_SLIDING  # 2 Q heads per KV head
@@ -1645,6 +1649,11 @@ def _layer_pos0_sliding_paged(state, h_norm, w, layer_idx, capture=None, rope=No
     attn_concat = ttnn.concat(attn_outs, dim=2)
     for a in attn_outs:
         ttnn.deallocate(a)
+    if capture is not None:
+        # attn_concat shape [1, 1, NQ_PER_CHIP, head_dim] per chip → reshape
+        # to [NQ_PER_CHIP, head_dim] for the standard readback path.
+        _ac = ttnn.reshape(attn_concat, [NQ_PER_CHIP, HEAD_DIM_SLIDING])
+        capture["attn_out"] = _readback_sharded_head(_ac, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING)
     attn_flat = ttnn.reshape(attn_concat, [1, NQ_PER_CHIP * HEAD_DIM_SLIDING])
     ttnn.deallocate(attn_concat)
 

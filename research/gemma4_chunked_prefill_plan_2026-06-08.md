@@ -64,6 +64,20 @@ first qb1 run in flight.
   - B: TTFT eager ≥ 2× faster than sequential
   - C: argmax match at last position
 
+**P1 status 2026-06-10**: per-sub-op teacher-forced ladder cleared the
+bug locus —
+
+| sub-op (layer 0) | cos vs sequential |
+|---|---|
+| q_proj_out / k_proj_out / v_proj_out | 1.000000 |
+| q_norm_out / k_norm_out / v_norm_out | 1.000000 |
+| q_rope_out / k_rope_out | 1.000000 |
+| post-SDPA (`attn_out`) | capturing (last run crashed on chunked slice) |
+
+Bug is **at SDPA or downstream**. Embed/norms/RoPE all bit-identical.
+Code state: probe stripped to clean (the 4 debug env flags were
+dead-end hypotheses); only the bring-up CLI L override remains.
+
 **P1 implementation choices (locked in scaffold)**:
 1. **SKIP K/V cache writes**. The forward math (matmul + norms + RoPE +
    causal SDPA) is identical whether or not we write the cache, because
