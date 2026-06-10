@@ -744,11 +744,33 @@ def bootstrap(state, log=None):
     state.MAX_KV = MAX_KV
     state.sdpa_block_size = 32  # tile-height; matches 35B
     # #290 P5: cb_scheduler reads this to decide chunked-vs-decode prefill
-    # routing — prompts L ≤ prefill_chunk_size go through chunked
-    # (forward_prefill_chunked_tp); longer fall back to the 1-tok/iter decode
-    # path. 4032 is the long-context gate's max-validated L (MAX_KV=4096
-    # minus 64-pos decode slack).
-    state.prefill_chunk_size = 4032
+    # routing — prompts L ≤ prefill_chunk_size go through chunked. 2048
+    # covers most chat use (sub-2k prompts) and keeps the per-trace logits
+    # readback tractable (~2 GB at vocab=262144). Longer prompts (>2048)
+    # fall through to the slow 1-tok/iter decode path — TODO multi-chunk
+    # outer loop later if needed.
+    state.prefill_chunk_size = 2048
+    # #290 P4 (trace prereqs): infrastructure landed but the prefill-trace
+    # CAPTURE produces incorrect logits (smoke saw garbled first tokens).
+    # Disabled for now — eager chunked-prefill path (forward_prefill_chunked_tp)
+    # handles HTTP requests fine without it. Re-enable once we have a
+    # ladder-style cos check against the eager path:
+    #   1. Uncomment `state.dn_chunked_q = None` below to satisfy the
+    #      cb_scheduler hasattr guard at cb_scheduler.py:404.
+    #   2. Run gate against eager: capture, replay, compare per-row logits.
+    #   3. Investigate the first-token mismatch (likely in lm_head over L
+    #      rows or untilize layout).
+    # state.dn_chunked_q = None  # DISABLED (see above)
+    state.prefill_tok_buf = ttnn.from_torch(
+        torch.zeros((1, state.prefill_chunk_size), dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    state.prefill_pos_buf = ttnn.from_torch(
+        torch.zeros((1, state.prefill_chunk_size), dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
     # cur_pos_buf: int32 [1] device-resident — kernel asserts INT32 at
     # `paged_update_cache_device_operation.cpp:112`. rot_idxs_buf: uint32 [1]
     # for ttnn.embedding into the cos/sin tables. Both pre-allocated ONCE
@@ -2754,6 +2776,100 @@ def _reset_state_buffers(state):
     unconditionally.
     """
     pass
+
+
+# ── #290 P4: trace-friendly chunked prefill ───────────────────────────
+# Mirrors 27B's `forward_prefill_chunked_traced_inner` (server_tp.py:2013).
+# Pre-allocated input buffers + branch-free fixed-L forward — captureable
+# by `ttnn.begin_trace_capture` / `ttnn.execute_trace`. Returns the full
+# [chunk_size, VOCAB] last-row logits, matching cb_scheduler's
+# `full[L-1]` indexing contract (cb_scheduler.py:465).
+
+
+def update_prefill_input_buffers(state, prompt_ids, chunk_start_idx=0):
+    """Host→device write to state.prefill_tok_buf + state.prefill_pos_buf.
+    Outside any captured trace. Pads to chunk_size with 0 for both tokens
+    and positions. Caller must hold prompt L ≤ chunk_size; longer prompts
+    fall back to the slow eager path (cb_scheduler line 608).
+    """
+    L = state.prefill_chunk_size
+    L_actual = len(prompt_ids)
+    if L_actual > L:
+        raise ValueError(f"prompt L={L_actual} > chunk_size={L}; needs chunking")
+
+    padded_toks = list(prompt_ids) + [0] * (L - L_actual)
+    padded_pos = list(range(L_actual)) + [0] * (L - L_actual)
+
+    tok_host = ttnn.from_torch(
+        torch.tensor([padded_toks], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(tok_host, state.prefill_tok_buf)
+
+    pos_host = ttnn.from_torch(
+        torch.tensor([padded_pos], dtype=torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    ttnn.copy_host_to_device_tensor(pos_host, state.prefill_pos_buf)
+
+
+def forward_prefill_chunked_traced_inner(state):
+    """Trace-friendly twin of `forward_prefill_chunked_tp` at fixed
+    L = state.prefill_chunk_size. Reads tok+pos from state buffers (no
+    inline host allocations). Returns a [chunk_size, VOCAB] row-major
+    device tensor; caller does readback after
+    `ttnn.execute_trace` + `ttnn.synchronize_device`.
+
+    Cache writes inside `_layer_prefill` use the same CB/single-slot
+    routing logic as the eager path (`getattr(state, "cb_kv_caches_tt")`).
+    """
+    L = state.prefill_chunk_size
+
+    # Embed from pre-allocated tok_buf (no from_torch).
+    embed_rm = ttnn.embedding(state.prefill_tok_buf, state.embed_tt)
+    embed_tile = ttnn.to_layout(embed_rm, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(embed_rm)
+    h = ttnn.multiply(embed_tile, EMBED_SCALE)
+    ttnn.deallocate(embed_tile)
+
+    # RoPE table lookups from pre-allocated pos_buf.
+    def _lookup(table_tt, head_dim):
+        row_rm = ttnn.embedding(state.prefill_pos_buf, table_tt)
+        row_tile = ttnn.to_layout(row_rm, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(row_rm)
+        return ttnn.reshape(row_tile, [L, head_dim])
+    cos_s = _lookup(state.cos_sliding_tt, HEAD_DIM_SLIDING)
+    sin_s = _lookup(state.sin_sliding_tt, HEAD_DIM_SLIDING)
+    cos_g = _lookup(state.cos_global_tt, HEAD_DIM_GLOBAL)
+    sin_g = _lookup(state.sin_global_tt, HEAD_DIM_GLOBAL)
+    rope_seq = (cos_s, sin_s, cos_g, sin_g)
+
+    for layer_idx in range(NUM_LAYERS):
+        h_new = _layer_prefill(state, h, layer_idx, rope_seq, L)
+        ttnn.deallocate(h); h = h_new
+
+    for t in rope_seq: ttnn.deallocate(t)
+
+    final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
+    ttnn.deallocate(h)
+
+    # LM head over ALL L positions (matches 27B prefill contract — see
+    # cb_scheduler line 462-465 which indexes full[L-1] for last-pos logits).
+    # Softcap is monotonic so we skip it (argmax-invariant).
+    final_2d = ttnn.reshape(final, [L, HIDDEN])  # view of `final`
+    sharded = ttnn.matmul(final_2d, state.lm_head_tt,
+                           compute_kernel_config=HIFI4)
+    ttnn.deallocate(final)  # final_2d view dies with it
+    gathered = ttnn.all_gather(sharded, dim=-1)
+    ttnn.deallocate(sharded)
+    # slice returns a VIEW per [[ttnn-slice-view-decay]] — keep `gathered`
+    # alive until after untilize materialises new storage.
+    sliced = ttnn.slice(gathered, [0, 0], [L, VOCAB])
+    out = ttnn.untilize(sliced, use_multicore=True)
+    ttnn.deallocate(gathered)
+    return out
 
 
 # ── v0.4 traced decode ────────────────────────────────────────────────
