@@ -98,6 +98,30 @@ first qb1 run in flight.
 - bf16 chain at L=128 may push cos < 0.999. Mitigation: loosen to 0.99
   only if absolutely needed and document the relaxation.
 
+### Phase 1.6.5 — cache write + handoff-to-decode test
+
+After P1 gate A/B/C green, add KV-cache writes back so the next decode
+step from a prefilled prompt produces the same argmax as the sequential
+baseline's next step.
+
+Approach options:
+- (a) `paged_fill_cache(cache, K_for_cache, page_table, batch_idx=0)`
+  over the full L positions in one call. 27B precedent at
+  `gated_attn_step_prefill_tp:1812-1815`. Cleanest, but Gemma 4's cache
+  layout is per-KV-head (NKV_PER_CHIP_SLIDING=2 caches per sliding
+  layer) — need to split K/V by KV-head before fill.
+- (b) `paged_fused_update_cache` per position in a loop (matches the
+  decode-step writer exactly, just iterated L times). Easier to validate
+  against sequential's cache state byte-for-byte. Slower but bulletproof.
+
+Decision: start with (b) for the correctness gate (clear semantic match
+to sequential's per-step cache write), then move to (a) for perf once
+correctness is locked.
+
+Gate: after a chunked prefill of L tokens, call `step_forward_v031` once
+at pos=L with a sampled next token; argmax must match what the
+sequential baseline would have produced from the same state.
+
 ### Phase 2 — TILE-aligned L (L=128 → L=256 → L=2048)
 - Same probe at L ∈ {128, 256, 512, 1024, 2048}
 - Each L padded to next multiple of 32 (TILE_SIZE for the seq dim)

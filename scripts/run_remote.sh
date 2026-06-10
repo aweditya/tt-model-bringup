@@ -8,6 +8,10 @@
 #
 # Host defaults to qb1; override with TT_HOST=qb2. Assumes the file is already
 # synced to the host (use scripts/deploy.sh first, or `make dr`).
+#
+# Extra remote env vars: pass a comma-separated list of KEY=VALUE pairs via
+# REMOTE_ENV. Example:
+#   REMOTE_ENV="GM4_CHUNKED_L=4,GM4_NUM_LAYERS_OVERRIDE=1" scripts/run_remote.sh ...
 set -euo pipefail
 
 HOST="${TT_HOST:-qb1}"
@@ -18,6 +22,13 @@ script="${1:?usage: run_remote.sh [--no-reset] <script.py> [args...]}"; shift ||
 reset_cmd=""
 [[ "$reset" == 1 ]] && reset_cmd="tt-smi -r 0,1,2,3 >/dev/null 2>&1 &&"
 
+# Optional extra env vars (comma-separated KEY=VAL). Expanded as a remote
+# prefix in front of the python command.
+extra_env=""
+if [[ -n "${REMOTE_ENV:-}" ]]; then
+  extra_env=$(echo "$REMOTE_ENV" | tr ',' ' ')
+fi
+
 # shellcheck disable=SC2029  # env vars intentionally expand on the remote host
 ssh "$HOST" "cd ~/tt-xla && ${reset_cmd} \
   TT_METAL_HOME=\$HOME/tenstorrent/tt-metal \
@@ -25,4 +36,5 @@ ssh "$HOST" "cd ~/tt-xla && ${reset_cmd} \
   ARCH_NAME=blackhole \
   PYTHONPATH=\$HOME/tenstorrent/tt-metal/ttnn \
   LD_LIBRARY_PATH=\$HOME/tenstorrent/tt-metal/ttnn/ttnn:\$HOME/tenstorrent/tt-metal/build_Release/ttnn:\$HOME/tenstorrent/tt-metal/build_Release/lib \
+  ${extra_env} \
   .venv/bin/python -u ${script} $*"

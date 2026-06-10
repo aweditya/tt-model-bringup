@@ -36,6 +36,7 @@ Run:
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -49,7 +50,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "experiments" / "serve"))
 import ttnn  # noqa: E402
 import server_gemma4_unified_ttnn as srv  # noqa: E402
 
-L = 128
+L = int(os.environ.get("GM4_CHUNKED_L", "128"))
 
 # Re-import the constants we need from the server module.
 HIDDEN = srv.HIDDEN
@@ -72,15 +73,14 @@ def log(msg):
 # ── P1.1: multi-token embed + RoPE table lookup over positions [0, L) ──
 
 def _embed_and_lookup_rope_seq(state, token_ids):
-    """Embed L tokens → [L, HIDDEN] TILE bf16; lookup cos/sin tables at
+    """Embed L tokens → [1, L, HIDDEN] TILE bf16 (rank-3 throughout, matches
+    decode's `[1, 1, HIDDEN]` activation rank); lookup cos/sin tables at
     positions [0..L-1] → 4-tuple ([L, HD_SLIDING], same, [L, HD_GLOBAL], same).
 
     Caller MUST deallocate h and all four rope tensors after the forward.
     """
     Ltok = len(token_ids)
 
-    # Multi-token embed: tok_tt [1, L] → embedding [1, L, HIDDEN] → TILE
-    # → scaled by EMBED_SCALE → reshape to [L, HIDDEN].
     tok_tt = ttnn.from_torch(
         torch.tensor([list(token_ids)], dtype=torch.int32),  # [1, L]
         dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
@@ -90,10 +90,8 @@ def _embed_and_lookup_rope_seq(state, token_ids):
     ttnn.deallocate(tok_tt)
     embed_tile = ttnn.to_layout(embed_rm, ttnn.TILE_LAYOUT)
     ttnn.deallocate(embed_rm)
-    h_3d = ttnn.multiply(embed_tile, EMBED_SCALE)
+    h = ttnn.multiply(embed_tile, EMBED_SCALE)  # [1, L, HIDDEN] rank-3
     ttnn.deallocate(embed_tile)
-    h = ttnn.reshape(h_3d, [Ltok, HIDDEN])
-    # h_3d is a view of h's storage — do NOT deallocate it.
 
     # Multi-position RoPE table lookup for sliding + global.
     pos_tt = ttnn.from_torch(
@@ -159,35 +157,67 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
     - P1: IGNORE sliding window — at L=128 << SLIDING_WINDOW=1024, causal == sliding.
     """
     cos_seq, sin_seq = rope
+    DBG = (layer_idx == 0)
+    def _shp(t, name):
+        if DBG:
+            print(f"  [L0 dbg] {name}.shape = {list(t.shape)}", flush=True)
 
+    _shp(h_norm_seq, "h_norm_seq")
     q = ttnn.matmul(h_norm_seq, w["q_proj"], compute_kernel_config=HIFI4)
     k = ttnn.matmul(h_norm_seq, w["k_proj"], compute_kernel_config=HIFI4)
     v = ttnn.matmul(h_norm_seq, w["v_proj"], compute_kernel_config=HIFI4)
+    _shp(q, "q_after_matmul")
 
-    q_h = ttnn.reshape(q, [Ltok, NQ_PER_CHIP, HEAD_DIM_SLIDING])
-    ttnn.deallocate(q)
-    k_h = ttnn.reshape(k, [Ltok, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
-    ttnn.deallocate(k)
-    v_h = ttnn.reshape(v, [Ltok, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING])
-    ttnn.deallocate(v)
+    # GM4_RESHAPE_VIA_RM=1: route reshape through ROW_MAJOR to force a real
+    # layout change (vs the metadata-only TILE reshape which may silently
+    # mis-tile when the mid dim NQ=4 isn't tile-aligned).
+    def _reshape_per_head(t, L_, nh, hd):
+        if os.environ.get("GM4_RESHAPE_VIA_RM") == "1":
+            t_rm = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
+            ttnn.deallocate(t)
+            t_rm_reshaped = ttnn.reshape(t_rm, [L_, nh, hd])
+            ttnn.deallocate(t_rm)
+            t_tile = ttnn.to_layout(t_rm_reshaped, ttnn.TILE_LAYOUT)
+            ttnn.deallocate(t_rm_reshaped)
+            return t_tile
+        else:
+            out = ttnn.reshape(t, [L_, nh, hd])
+            ttnn.deallocate(t)
+            return out
+
+    q_h = _reshape_per_head(q, Ltok, NQ_PER_CHIP, HEAD_DIM_SLIDING)
+    _shp(q_h, "q_h_after_reshape")
+    k_h = _reshape_per_head(k, Ltok, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+    v_h = _reshape_per_head(v, Ltok, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
 
     q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
     k_n_pre = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
     v_n = ttnn.rms_norm(v_h, weight=state.ones_head_dim_sliding, epsilon=EPS)
     ttnn.deallocate(q_h); ttnn.deallocate(k_h); ttnn.deallocate(v_h)
+    _shp(q_n_pre, "q_n_pre_after_norm")
 
-    q_n = _apply_full_rope_seq(q_n_pre, cos_seq, sin_seq, Ltok,
-                                NQ_PER_CHIP, HEAD_DIM_SLIDING)
-    ttnn.deallocate(q_n_pre)
-    k_n = _apply_full_rope_seq(k_n_pre, cos_seq, sin_seq, Ltok,
-                                NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
-    ttnn.deallocate(k_n_pre)
+    # GM4_CHUNKED_SKIP_ROPE=1: bypass RoPE entirely. Pair with sequential's
+    # GM4_ROPE_ZERO=1 to compare paths with RoPE disabled — if cos jumps high,
+    # RoPE is the divergence.
+    if os.environ.get("GM4_CHUNKED_SKIP_ROPE") == "1":
+        q_n = q_n_pre
+        k_n = k_n_pre
+    else:
+        q_n = _apply_full_rope_seq(q_n_pre, cos_seq, sin_seq, Ltok,
+                                    NQ_PER_CHIP, HEAD_DIM_SLIDING)
+        ttnn.deallocate(q_n_pre)
+        k_n = _apply_full_rope_seq(k_n_pre, cos_seq, sin_seq, Ltok,
+                                    NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+        ttnn.deallocate(k_n_pre)
+    _shp(q_n, "q_n_after_rope")
 
     # Reshape for SDPA: [L, nh, hd] → [1, nh, L, hd] via permute + reshape.
     q_t = ttnn.permute(q_n, (1, 0, 2))   # [NQ, L, HD]
     ttnn.deallocate(q_n)
+    _shp(q_t, "q_t_after_permute")
     q_for_sdpa = ttnn.reshape(q_t, [1, NQ_PER_CHIP, Ltok, HEAD_DIM_SLIDING])
     ttnn.deallocate(q_t)
+    _shp(q_for_sdpa, "q_for_sdpa")
     k_t = ttnn.permute(k_n, (1, 0, 2))   # [NKV, L, HD]
     ttnn.deallocate(k_n)
     k_for_sdpa = ttnn.reshape(k_t, [1, NKV_PER_CHIP_SLIDING, Ltok, HEAD_DIM_SLIDING])
@@ -197,6 +227,18 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
     v_for_sdpa = ttnn.reshape(v_t, [1, NKV_PER_CHIP_SLIDING, Ltok, HEAD_DIM_SLIDING])
     ttnn.deallocate(v_t)
 
+    # GM4_REPEAT_KV=1: repeat-interleave K/V to NQ to force NKV==NQ.
+    # Tests whether the prefill SDPA's "native GQA" is actually
+    # GQA-by-caller-repeat for Gemma 4's shapes.
+    if os.environ.get("GM4_REPEAT_KV") == "1":
+        gqa_group = NQ_PER_CHIP // NKV_PER_CHIP_SLIDING  # 4 // 2 = 2
+        k_rep = ttnn.repeat_interleave(k_for_sdpa, gqa_group, dim=1)
+        v_rep = ttnn.repeat_interleave(v_for_sdpa, gqa_group, dim=1)
+        ttnn.deallocate(k_for_sdpa); ttnn.deallocate(v_for_sdpa)
+        k_for_sdpa, v_for_sdpa = k_rep, v_rep
+        if DBG:
+            print(f"  [L0 dbg] k_for_sdpa AFTER repeat = {list(k_for_sdpa.shape)}", flush=True)
+
     attn_out = ttnn.transformer.scaled_dot_product_attention(
         q_for_sdpa, k_for_sdpa, v_for_sdpa,
         is_causal=True,
@@ -204,17 +246,20 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
         compute_kernel_config=state.sdpa_compute_kernel_config,
     )
     ttnn.deallocate(q_for_sdpa); ttnn.deallocate(k_for_sdpa); ttnn.deallocate(v_for_sdpa)
+    _shp(attn_out, "attn_out_after_sdpa")
 
     # attn_out: [1, NQ_PER_CHIP, L, HEAD_DIM_SLIDING] → [L, NQ*HD]
     attn_perm = ttnn.permute(attn_out, (0, 2, 1, 3))  # [1, L, NQ, HD]
     ttnn.deallocate(attn_out)
     attn_flat = ttnn.reshape(attn_perm, [Ltok, NQ_PER_CHIP * HEAD_DIM_SLIDING])
     ttnn.deallocate(attn_perm)
+    _shp(attn_flat, "attn_flat_pre_oproj")
 
     partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
     ttnn.deallocate(attn_flat)
     out = srv.all_reduce_tt(partial, state.mesh)
     ttnn.deallocate(partial)
+    _shp(out, "out_after_all_reduce")
     return out
 
 
@@ -361,16 +406,17 @@ def step_forward_prefill(state, token_ids, capture_hidden=False):
 
     final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
     ttnn.deallocate(h)
+    print(f"  [chunked dbg] final shape = {list(final.shape)}", flush=True)
+
+    # Slice last position on device — final is rank-3 [1, L, HIDDEN] (rms_norm
+    # preserves rank; reshape upstream is metadata-only).
+    last_row = ttnn.slice(final, [0, Ltok - 1, 0], [1, Ltok, HIDDEN])
+    ttnn.deallocate(final)
 
     last_hidden_np = None
     if capture_hidden:
-        full_np = srv._readback_replicated(final, state.mesh)  # [L, HIDDEN]
-        last_hidden_np = full_np[Ltok - 1].astype(np.float32).reshape(1, 1, HIDDEN)
-
-    # LM head on last position only — slice the last row.
-    # final is [L, HIDDEN] TILE; need [1, HIDDEN] for _lm_head_argmax.
-    last_row = ttnn.slice(final, [Ltok - 1, 0], [Ltok, HIDDEN])
-    ttnn.deallocate(final)
+        last_hidden_np = srv._readback_replicated(last_row, state.mesh).astype(
+            np.float32).reshape(1, 1, HIDDEN)
 
     argmax_tt, _ = srv._lm_head_argmax(state, last_row, capture_logits=False)
     ttnn.deallocate(last_row)
