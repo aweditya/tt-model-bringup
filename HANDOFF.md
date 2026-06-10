@@ -52,7 +52,12 @@ another run.
    — bf16 chain drift is reaching its limit; trace + bf16-acc tuning
    may tighten later.
 4. **P4** — trace capture (5× win expected per S2.6 precedent)
-5. **P5** — server integration (admit-time short→sequential, long→chunked)
+5. ✅ **P5** — server-level API DONE. `forward_prefill_chunked_tp` exposed
+   from `server_gemma4_unified_ttnn.py`. End-to-end chat smoke proves
+   coherent text generation through the chunked → decode handoff.
+   - File: `experiments/cb/isolate/gemma4_chunked_prefill_chat_smoke.py`
+   - Full cb_engine HTTP integration needs Gemma-4-specific
+     `cb_prefill_transplant` (separate workstream).
 6. (Deferred after #290 ships) tool-call / agentic — task #307
 
 ### Engineering lesson recorded
