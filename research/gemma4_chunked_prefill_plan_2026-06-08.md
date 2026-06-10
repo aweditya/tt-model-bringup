@@ -133,15 +133,42 @@ After P4 trace capture, expect another ~5× → ~4.4s.
 
 ## P4-P5 plan
 
-- **P4 — trace capture**: pre-allocate fixed-size buffers for chunk_size
-  (likely L=2048 or L=4032 as the trace bucket). Two-phase warmup per
-  [[feedback-two-phase-warmup]]. Mirror 27B's `forward_prefill_chunked_traced_inner`
-  at `server_tp.py:2013`. Gate: traced argmax matches eager, traced TTFT
-  ≥ 3× faster than eager.
-- **P5 — server integration**: wire into `step_forward_prefill_chunked`
-  exposed by server; cb_engine admit path checks length (short →
-  sequential, long → chunked); cb_api dispatches accordingly. Smoke
-  via HTTP chat.
+- ✅ **P5 — server integration DONE** (2026-06-10). HTTP wired via
+  `cb_engine` + `TT_CB_CHUNKED_PREFILL=1`. Real OpenAI API serves
+  coherent chat ("Tensix processor is a specialized type of integrated
+  circuit…"). Code: `forward_prefill_chunked_tp` server-level entry +
+  `cb_prefill_transplant` + `cb_api` `TT_CB_USE_TRACE` auto-off.
+
+- ⚠️ **P4 — trace capture: ATTEMPTED, DEFERRED** (2026-06-10).
+  Infrastructure landed:
+  - Pre-allocated `state.prefill_tok_buf` + `state.prefill_pos_buf`
+    ([1, chunk_size] uint32, ReplicateTensorToMesh).
+  - `update_prefill_input_buffers(state, prompt_ids)` — pads to
+    chunk_size with `0`/`0`, host writes via `copy_host_to_device_tensor`.
+  - `forward_prefill_chunked_traced_inner(state)` — branch-free fixed-L
+    forward reading from buffers; returns `[chunk_size, VOCAB]` row-major
+    device tensor (matches scheduler `full[L-1]` contract).
+  - Lowered `state.prefill_chunk_size` to 2048 (was 4032) for tractable
+    ~2 GB lm-head readback.
+  - `state.dn_chunked_q = None` sentinel to satisfy cb_scheduler's
+    hasattr guard (currently **commented out** to disable trace).
+
+  **Bug**: HTTP smoke produced garbled first tokens after enabling trace
+  capture. Output looked like "thought111111…" — suggests the
+  per-row logits returned by the traced inner are corrupt at the
+  scheduler's `full[L-1]` index.
+
+  **Next debug step (when resumed)**: ladder probe at L=2048 comparing
+  traced inner's per-row logits against eager `forward_prefill_chunked_tp`.
+  Capture intermediate tensors (h after each layer, final norm output,
+  lm_head output) for both paths and find the first row where cos drops
+  below 0.999. Likely candidates:
+  - lm_head matmul over L=2048 rows (vs eager's single row)
+  - all_gather over the vocab-sharded output
+  - untilize of the [2048, 262144] tensor (4-chip composition?)
+
+  **For now**: HTTP serving works via eager. TTFT 3-5s at L=512, ~22s at
+  L=4032. Acceptable for chat demo. Trace would buy another ~3-5×.
 
 **P1 implementation choices (locked in scaffold)**:
 1. **SKIP K/V cache writes**. The forward math (matmul + norms + RoPE +
