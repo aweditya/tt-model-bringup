@@ -143,9 +143,11 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
     - Q/K/V norms broadcast over [L, n_heads] via rank-3 [L, nh, hd]
       (rms_norm last-dim contract — avoids [[feedback-ttnn-rms-norm-shape-drift]])
     - RoPE batched via _apply_full_rope_seq
-    - Causal SDPA via ttnn.transformer.scaled_dot_product_attention with
-      Q [1, NQ_PER_CHIP, L, HD] and K/V [1, NKV_PER_CHIP_SLIDING, L, HD]
-      — SDPA handles GQA natively per [[reference-ttnn-sdpa-gqa-native]].
+    - SDPA: 2 calls (one per KV head, Q split into Q_HALF=2 groups). This
+      mirrors decode's per-KV-head split EXACTLY because the 1-call GQA SDPA
+      on NKV<NQ inputs mis-routes Q heads to KV heads beyond pos 0 (verified
+      via per-sub-op ladder: 1-call attn_out cos = 1.0 at pos 0 but drops to
+      0.45 / 0.29 / 0.23 at pos 1/2/3; 2-call cos ≥ 0.99999 at every pos).
     - P1: SKIP cache writes (validates forward math; cache+handoff = P1.6.5).
     - P1: IGNORE sliding window — at L=128 << SLIDING_WINDOW=1024, causal == sliding.
     """
@@ -174,29 +176,42 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
                                 NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
     ttnn.deallocate(k_n_pre)
 
-    # Reshape for SDPA: [L, nh, hd] → [1, nh, L, hd] via permute + reshape.
-    q_t = ttnn.permute(q_n, (1, 0, 2))   # [NQ, L, HD]
+    # Decode-mirror per-KV-head SDPA split. NQ=4, NKV=2 → Q_HALF=2.
+    # Q heads (2c, 2c+1) attend to KV head c only.
+    Q_HALF = NQ_PER_CHIP // NKV_PER_CHIP_SLIDING
+    q_perm = ttnn.permute(q_n, (1, 0, 2))  # [NQ, L, HD]
     ttnn.deallocate(q_n)
-    q_for_sdpa = ttnn.reshape(q_t, [1, NQ_PER_CHIP, Ltok, HEAD_DIM_SLIDING])
-    ttnn.deallocate(q_t)
-    k_t = ttnn.permute(k_n, (1, 0, 2))   # [NKV, L, HD]
+    k_perm = ttnn.permute(k_n, (1, 0, 2))  # [NKV, L, HD]
     ttnn.deallocate(k_n)
-    k_for_sdpa = ttnn.reshape(k_t, [1, NKV_PER_CHIP_SLIDING, Ltok, HEAD_DIM_SLIDING])
-    ttnn.deallocate(k_t)
-    v_t = ttnn.permute(v_n, (1, 0, 2))
+    v_perm = ttnn.permute(v_n, (1, 0, 2))
     ttnn.deallocate(v_n)
-    v_for_sdpa = ttnn.reshape(v_t, [1, NKV_PER_CHIP_SLIDING, Ltok, HEAD_DIM_SLIDING])
-    ttnn.deallocate(v_t)
 
-    attn_out = ttnn.transformer.scaled_dot_product_attention(
-        q_for_sdpa, k_for_sdpa, v_for_sdpa,
-        is_causal=True,
-        scale=1.0,  # Gemma 4: self.scaling=1.0
-        compute_kernel_config=state.sdpa_compute_kernel_config,
-    )
-    ttnn.deallocate(q_for_sdpa); ttnn.deallocate(k_for_sdpa); ttnn.deallocate(v_for_sdpa)
+    attn_outs = []
+    for kv_idx in range(NKV_PER_CHIP_SLIDING):
+        q_half = ttnn.slice(q_perm, [kv_idx * Q_HALF, 0, 0],
+                             [(kv_idx + 1) * Q_HALF, Ltok, HEAD_DIM_SLIDING])
+        q_for = ttnn.reshape(q_half, [1, Q_HALF, Ltok, HEAD_DIM_SLIDING])
+        k_one = ttnn.slice(k_perm, [kv_idx, 0, 0],
+                            [kv_idx + 1, Ltok, HEAD_DIM_SLIDING])
+        k_for = ttnn.reshape(k_one, [1, 1, Ltok, HEAD_DIM_SLIDING])
+        v_one = ttnn.slice(v_perm, [kv_idx, 0, 0],
+                            [kv_idx + 1, Ltok, HEAD_DIM_SLIDING])
+        v_for = ttnn.reshape(v_one, [1, 1, Ltok, HEAD_DIM_SLIDING])
+        attn_i = ttnn.transformer.scaled_dot_product_attention(
+            q_for, k_for, v_for,
+            is_causal=True,
+            scale=1.0,  # Gemma 4: self.scaling=1.0
+            compute_kernel_config=state.sdpa_compute_kernel_config,
+        )
+        attn_outs.append(attn_i)
+    ttnn.deallocate(q_perm); ttnn.deallocate(k_perm); ttnn.deallocate(v_perm)
 
-    # attn_out [1, NQ, L, HD] → [L, NQ*HD] for o_proj.
+    # Concat over Q-head dim (dim 1): NKV × [1, Q_HALF, L, HD] → [1, NQ, L, HD].
+    attn_out = ttnn.concat(attn_outs, dim=1)
+    for a in attn_outs:
+        ttnn.deallocate(a)
+
+    # [1, NQ, L, HD] → [L, NQ*HD] for o_proj.
     attn_perm = ttnn.permute(attn_out, (0, 2, 1, 3))  # [1, L, NQ, HD]
     ttnn.deallocate(attn_out)
     attn_flat = ttnn.reshape(attn_perm, [Ltok, NQ_PER_CHIP * HEAD_DIM_SLIDING])
@@ -218,6 +233,9 @@ def _layer_prefill_global(state, h_norm_seq, w, layer_idx, rope, Ltok):
     - HEAD_DIM_GLOBAL=512
     - p-RoPE encoded INLINE in cos/sin global tables (last 384 dims have
       inv_freq=0 → cos=1/sin=0 act as identity).
+    - SDPA: repeat K/V to NQ to bypass the prefill SDPA's NKV<NQ GQA bug
+      (same root cause as sliding's 2-call split; NKV=1 here so the
+      cleanest mirror is repeat-interleave).
     - SKIP cache writes (P1).
     """
     cos_seq, sin_seq = rope
@@ -243,26 +261,42 @@ def _layer_prefill_global(state, h_norm_seq, w, layer_idx, rope, Ltok):
                                 NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL)
     ttnn.deallocate(k_n_pre)
 
-    q_t = ttnn.permute(q_n, (1, 0, 2))   # [NQ, L, HD]
-    ttnn.deallocate(q_n)
-    q_for_sdpa = ttnn.reshape(q_t, [1, NQ_PER_CHIP, Ltok, HEAD_DIM_GLOBAL])
-    ttnn.deallocate(q_t)
-    k_t = ttnn.permute(k_n, (1, 0, 2))
-    ttnn.deallocate(k_n)
-    k_for_sdpa = ttnn.reshape(k_t, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
-    ttnn.deallocate(k_t)
-    v_t = ttnn.permute(v_n, (1, 0, 2))
-    ttnn.deallocate(v_n)
-    v_for_sdpa = ttnn.reshape(v_t, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
-    ttnn.deallocate(v_t)
+    # SDPA: 2 calls, each with Q [1, Q_HALF=2, L, HD] and K/V [1, 1, L, HD].
+    # Sidesteps the prefill SDPA's NKV<NQ kernel bug (proven via ladder for
+    # sliding's NQ=4/NKV=2; global has NQ=4/NKV=1 → same bug pattern).
+    # Each call has NQ_per_call=2, NKV_per_call=1 — the shape sliding's
+    # 2-call split also uses (proven to give cos ≥ 0.99999 at every pos).
+    Q_HALF = NQ_PER_CHIP // 2  # 2
 
-    attn_out = ttnn.transformer.scaled_dot_product_attention(
-        q_for_sdpa, k_for_sdpa, v_for_sdpa,
-        is_causal=True,
-        scale=1.0,
-        compute_kernel_config=state.sdpa_compute_kernel_config,
-    )
-    ttnn.deallocate(q_for_sdpa); ttnn.deallocate(k_for_sdpa); ttnn.deallocate(v_for_sdpa)
+    q_perm = ttnn.permute(q_n, (1, 0, 2))   # [NQ, L, HD]
+    ttnn.deallocate(q_n)
+    k_perm = ttnn.permute(k_n, (1, 0, 2))   # [1, L, HD]
+    ttnn.deallocate(k_n)
+    v_perm = ttnn.permute(v_n, (1, 0, 2))
+    ttnn.deallocate(v_n)
+
+    # K/V are shared across both calls (single global KV head).
+    k_for = ttnn.reshape(k_perm, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
+    v_for = ttnn.reshape(v_perm, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
+
+    attn_outs = []
+    for q_grp in range(2):
+        q_half = ttnn.slice(q_perm, [q_grp * Q_HALF, 0, 0],
+                             [(q_grp + 1) * Q_HALF, Ltok, HEAD_DIM_GLOBAL])
+        q_for = ttnn.reshape(q_half, [1, Q_HALF, Ltok, HEAD_DIM_GLOBAL])
+        attn_i = ttnn.transformer.scaled_dot_product_attention(
+            q_for, k_for, v_for,
+            is_causal=True,
+            scale=1.0,
+            compute_kernel_config=state.sdpa_compute_kernel_config,
+        )
+        attn_outs.append(attn_i)
+    ttnn.deallocate(q_perm); ttnn.deallocate(k_perm); ttnn.deallocate(v_perm)
+    ttnn.deallocate(k_for); ttnn.deallocate(v_for)
+
+    attn_out = ttnn.concat(attn_outs, dim=1)  # [1, NQ, L, HD]
+    for a in attn_outs:
+        ttnn.deallocate(a)
 
     attn_perm = ttnn.permute(attn_out, (0, 2, 1, 3))  # [1, L, NQ, HD]
     ttnn.deallocate(attn_out)

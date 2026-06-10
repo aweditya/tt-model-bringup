@@ -65,18 +65,27 @@ first qb1 run in flight.
   - C: argmax match at last position
 
 **P1 status 2026-06-10**: per-sub-op teacher-forced ladder cleared the
-bug locus —
+bug locus + landed the fix for sliding —
 
-| sub-op (layer 0) | cos vs sequential |
+| sub-op (layer 0, sliding) | cos vs sequential |
 |---|---|
-| q_proj_out / k_proj_out / v_proj_out | 1.000000 |
-| q_norm_out / k_norm_out / v_norm_out | 1.000000 |
-| q_rope_out / k_rope_out | 1.000000 |
-| post-SDPA (`attn_out`) | capturing (last run crashed on chunked slice) |
+| q_proj / k_proj / v_proj | 1.000000 |
+| q_norm / k_norm / v_norm | 1.000000 |
+| q_rope / k_rope | 1.000000 |
+| attn_out — 1-call SDPA | 1.0 / 0.45 / 0.29 / 0.23 (per pos) |
+| **attn_out — 2-call SDPA per-KV-head split** | **≥0.99999 every pos** |
 
-Bug is **at SDPA or downstream**. Embed/norms/RoPE all bit-identical.
-Code state: probe stripped to clean (the 4 debug env flags were
-dead-end hypotheses); only the bring-up CLI L override remains.
+Root cause: `ttnn.transformer.scaled_dot_product_attention` non-paged op
+has a NKV<NQ GQA bug. Decode sidesteps via `paged_sdpa_decode`'s own GQA
+handling. Workaround: 2 SDPA calls per layer (one per KV head, Q split
+into Q_HALF groups) — NQ_per_call=2, NKV_per_call=1, a kernel shape that
+works.
+
+Gate (L=128, full 48-layer chain) with sliding fix only: argmax PASS,
+cos 0.696, speedup 47×. Global layer still uses buggy 1-call SDPA;
+iterating now. **Next debug step if global iteration doesn't close
+cos**: apply the SAME ladder to a global layer instead of guessing —
+proven technique pinpointed sliding's bug, will pinpoint global's.
 
 **P1 implementation choices (locked in scaffold)**:
 1. **SKIP K/V cache writes**. The forward math (matmul + norms + RoPE +

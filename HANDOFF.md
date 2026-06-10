@@ -5,49 +5,61 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## CURRENT STATE 2026-06-10 (P1 IN PROGRESS — BUG LOCALIZED TO SDPA / POST-RoPE)
+## CURRENT STATE 2026-06-10 (P1 — SLIDING FIXED, GLOBAL ITERATING)
 
-**Active workstream: #290 P1 chunked prefill — bug isolated via
-teacher-forced per-sub-op ladder.** P1.1-P1.5 implementation runs clean
-end-to-end on qb1 at L=128 with 10-15× speedup. **Correctness gate A
-FAILING with cos = 0.4-0.6 — but per-sub-op ladder pinpoints the
-divergence locus:**
+**Active workstream: #290 P1 chunked prefill — sliding attention layer
+fix landed and proven via ladder. Global layer being iterated on.**
 
-| sub-op (layer 0) | cos vs sequential, every pos |
+### Findings (via teacher-forced per-sub-op ladder)
+Per-sub-op cos vs sequential at layer 0 (sliding), L=4:
+
+| sub-op | cos |
 |---|---|
 | q_proj_out / k_proj_out / v_proj_out | 1.000000 |
 | q_norm_out / k_norm_out / v_norm_out | 1.000000 |
-| **q_rope_out / k_rope_out** | **1.000000** |
-| attn_out (post-SDPA) | TBD — currently capturing |
-| final hidden (full chain) | 0.4-0.6 |
+| q_rope_out / k_rope_out | 1.000000 |
+| attn_out — 1-call SDPA (NQ=4, NKV=2) | 1.0 / 0.45 / 0.29 / 0.23 by pos |
+| **attn_out — 2-call SDPA (Q split, NQ=2/NKV=1 each)** | **≥0.99999 at every pos** |
 
-So embed + input_layernorm + matmuls + Q/K/V norms + RoPE are all
-**bit-identical**. Bug is in SDPA or the post-SDPA reshape/o_proj/
-all_reduce/MLP chain.
+**Root cause**: `ttnn.transformer.scaled_dot_product_attention` non-paged
+op has a NKV<NQ kernel bug — it mis-routes Q heads to KV heads beyond
+pos 0. Decode sidesteps this by using `paged_scaled_dot_product_attention_decode`
+which has its own GQA handling. The 2-call split (one SDPA per KV
+head, Q sliced into Q_HALF groups) gives each call NQ=2/NKV=1, which is
+a kernel shape that works.
 
-**Code state** — gate probe `gemma4_chunked_prefill_L128.py` cleaned of
-env-flag bloat (commit removes 76 lines, keeps 21). 4 dead-end debug
-flags removed:
-- `GM4_REPEAT_KV`, `GM4_RESHAPE_VIA_RM`, `GM4_CHUNKED_SKIP_ROPE` (all proven
-  not the cause)
-- Single CLI arg replaces `GM4_CHUNKED_L` env var
+### Gate state (L=128, full 48-layer chain)
+| Gate | Sliding-only fix | Result |
+|---|---|---|
+| C: argmax | ✅ PASS (chunk=1091, base=1091) |
+| A: cos ≥ 0.999 | ⏳ 0.696 (sliding-only); global still uses buggy 1-call | global fix in flight |
+| B: TTFT ≥ 2× | ✅ PASS 47× speedup (0.4s vs 19.6s) |
 
-**Tools**:
-- `experiments/cb/isolate/gemma4_chunked_prefill_L128.py` — clean correctness
-  gate (cos / TTFT / argmax)
+### Code state
+- `experiments/cb/isolate/gemma4_chunked_prefill_L128.py` — gate probe
+  with sliding 2-call fix committed; global being iterated
+- Probe is clean (no env flag bloat); CLI arg for L override only
+- Sliding `_layer_prefill_sliding` mirrors decode's per-KV-head loop EXACTLY
+- Global `_layer_prefill_global` currently being iterated (1-call broke;
+  trying 2-call style)
+
+### Tools
+- `experiments/cb/isolate/gemma4_chunked_prefill_L128.py` — gate
 - `experiments/cb/isolate/gemma4_chunked_prefill_ladder.py` — per-sub-op
-  ladder for bug isolation
+  ladder for bug isolation (sliding layer; global ladder TODO)
 - `experiments/serve/server_gemma4_unified_ttnn.py:_layer_pos0_sliding_paged`
-  — added `q_rope_out` + `k_rope_out` + `attn_out` to the existing capture
-  pattern (opt-in; no perf impact when capture=None)
+  — extended capture dict with q_rope_out / k_rope_out / attn_out
 
-**Next debug step**: finish capturing `attn_out` cos on chunked side (last
-run crashed on slice-view chain), then if attn_out is the cliff →
-compare 1-call vs 2-call SDPA (mirror decode's `for kv_idx` per-KV-head
-split). If attn_out is fine → the reshape/o_proj/all_reduce chain.
+### Next steps (in order)
+1. Wait for global 2-call gate result. If cos ≥ 0.999 → ship P1
+2. If global 2-call doesn't hit ≥0.999 → **point the ladder at a global
+   layer** instead of guessing. Same per-sub-op technique that pinpointed
+   sliding will pinpoint global.
+3. After P1 green: P1.6.5 cache writes + decode handoff test
+4. Then P2 (TILE-aligned L scaling), P3 (outer-chunk loop), P4 (trace)
 
-Cold-start path: `experiments/cb/isolate/gemma4_chunked_prefill_ladder.py`
-+ `research/gemma4_chunked_prefill_plan_2026-06-08.md`.
+Cold-start: read this block + the gate probe + the ladder. The technique
+to use first if anything fails is the ladder, not env-flag iteration.
 
 ### Recently CLOSED (this session)
 - **#289 Gemma 4 layout overhead** — closed with engineering honesty.

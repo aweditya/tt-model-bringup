@@ -142,7 +142,7 @@ def _capture_chunked_layer0_subops(state, token_ids):
     captures["q_norm_out"] = _readback_per_row(q_n_pre, NQ_PER_CHIP)
     captures["k_norm_out"] = _readback_per_row(k_n_pre, NKV_PER_CHIP_SLIDING)
     captures["v_norm_out"] = _readback_per_row(v_n, NKV_PER_CHIP_SLIDING)
-    ttnn.deallocate(v_n)
+    # NOTE: v_n stays alive — needed for the SDPA pass below.
 
     # RoPE — multi-position. Forks _apply_full_rope_seq from the gate probe
     # (we don't import to keep the ladder self-contained on the cos/sin
@@ -182,44 +182,56 @@ def _capture_chunked_layer0_subops(state, token_ids):
     captures["q_rope_out"] = _readback_per_row(q_n, NQ_PER_CHIP)
     captures["k_rope_out"] = _readback_per_row(k_n, NKV_PER_CHIP_SLIDING)
 
-    # SDPA: [L, NQ, HD] / [L, NKV, HD] / [L, NKV, HD]
-    #   → permute (1,0,2) → [nh, L, HD]
-    #   → reshape [1, nh, L, HD]
-    #   → causal SDPA
-    #   → reshape per-row to [NQ, HD]
-    q_t = ttnn.permute(q_n, (1, 0, 2))
+    # SDPA — mirror decode's per-KV-head split (2 SDPA calls, one per KV
+    # head, with Q split into Q_HALF=2 groups). Decode does this at line
+    # 1593 of server_gemma4_unified_ttnn.py. If the 1-call GQA SDPA on
+    # NKV<NQ was the bug, mirroring decode here should make attn_out
+    # cos=1.0 at every position.
+    # q_n: [L, NQ, HD]. k_n / v_n: [L, NKV, HD]. NKV=2, NQ=4, Q_HALF=2.
+    Q_HALF = NQ_PER_CHIP // NKV_PER_CHIP_SLIDING
+
+    # Permute Q/K/V to head-leading so we can slice per-KV-head cleanly.
+    q_perm = ttnn.permute(q_n, (1, 0, 2))  # [NQ, L, HD]
     ttnn.deallocate(q_n)
-    q_for_sdpa = ttnn.reshape(q_t, [1, NQ_PER_CHIP, Ltok, HEAD_DIM_SLIDING])
-    ttnn.deallocate(q_t)
-    k_t = ttnn.permute(k_n, (1, 0, 2))
+    k_perm = ttnn.permute(k_n, (1, 0, 2))  # [NKV, L, HD]
     ttnn.deallocate(k_n)
-    k_for_sdpa = ttnn.reshape(k_t, [1, NKV_PER_CHIP_SLIDING, Ltok, HEAD_DIM_SLIDING])
-    ttnn.deallocate(k_t)
-    v_t = ttnn.permute(v_n, (1, 0, 2))
+    v_perm = ttnn.permute(v_n, (1, 0, 2))
     ttnn.deallocate(v_n)
-    v_for_sdpa = ttnn.reshape(v_t, [1, NKV_PER_CHIP_SLIDING, Ltok, HEAD_DIM_SLIDING])
-    ttnn.deallocate(v_t)
 
-    attn_out = ttnn.transformer.scaled_dot_product_attention(
-        q_for_sdpa, k_for_sdpa, v_for_sdpa,
-        is_causal=True,
-        scale=1.0,
-        compute_kernel_config=state.sdpa_compute_kernel_config,
-    )
-    ttnn.deallocate(q_for_sdpa); ttnn.deallocate(k_for_sdpa); ttnn.deallocate(v_for_sdpa)
-    # attn_out [1, NQ, L, HD]: capture per row → permute back to [1, L, NQ, HD]
-    # → slice per row p → [NQ, HD] readback.
-    attn_perm = ttnn.permute(attn_out, (0, 2, 1, 3))  # [1, L, NQ, HD]
+    attn_outs = []
+    for kv_idx in range(NKV_PER_CHIP_SLIDING):
+        # Q heads for this KV: [kv_idx*Q_HALF .. (kv_idx+1)*Q_HALF)
+        q_half = ttnn.slice(q_perm, [kv_idx * Q_HALF, 0, 0],
+                             [(kv_idx + 1) * Q_HALF, Ltok, HEAD_DIM_SLIDING])
+        q_for = ttnn.reshape(q_half, [1, Q_HALF, Ltok, HEAD_DIM_SLIDING])
+        # K, V for this KV head only.
+        k_one = ttnn.slice(k_perm, [kv_idx, 0, 0],
+                            [kv_idx + 1, Ltok, HEAD_DIM_SLIDING])
+        k_for = ttnn.reshape(k_one, [1, 1, Ltok, HEAD_DIM_SLIDING])
+        v_one = ttnn.slice(v_perm, [kv_idx, 0, 0],
+                            [kv_idx + 1, Ltok, HEAD_DIM_SLIDING])
+        v_for = ttnn.reshape(v_one, [1, 1, Ltok, HEAD_DIM_SLIDING])
+
+        attn_i = ttnn.transformer.scaled_dot_product_attention(
+            q_for, k_for, v_for,
+            is_causal=True,
+            scale=1.0,
+            compute_kernel_config=state.sdpa_compute_kernel_config,
+        )
+        attn_outs.append(attn_i)
+    ttnn.deallocate(q_perm); ttnn.deallocate(k_perm); ttnn.deallocate(v_perm)
+
+    # Concat along Q-head axis (dim 1): [1, Q_HALF, L, HD] x NKV → [1, NQ, L, HD]
+    attn_out = ttnn.concat(attn_outs, dim=1)
+    for a in attn_outs:
+        ttnn.deallocate(a)
+
+    arr = ttnn.to_torch(attn_out, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
     ttnn.deallocate(attn_out)
-
-    attn_rows = []
-    for p in range(Ltok):
-        row = ttnn.slice(attn_perm, [0, p, 0, 0], [1, p + 1, NQ_PER_CHIP, HEAD_DIM_SLIDING])
-        row_2d = ttnn.reshape(row, [NQ_PER_CHIP, HEAD_DIM_SLIDING])
-        attn_rows.append(srv._readback_sharded_head(
-            row_2d, state.mesh, NQ_PER_CHIP, HEAD_DIM_SLIDING))
-    ttnn.deallocate(attn_perm)
-    captures["attn_out"] = np.stack(attn_rows, axis=0)
+    arr = arr.float().cpu().numpy()                # [NCHIPS, NQ_PER_CHIP, L, HD]
+    arr = arr.transpose(0, 2, 1, 3)                # [NCHIPS, L, NQ_PER_CHIP, HD]
+    captures["attn_out"] = arr.transpose(1, 0, 2, 3).reshape(
+        Ltok, NCHIPS * NQ_PER_CHIP, HEAD_DIM_SLIDING)
 
     return captures
 
