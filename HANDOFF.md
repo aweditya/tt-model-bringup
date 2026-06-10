@@ -5,10 +5,62 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## CURRENT STATE 2026-06-10 (#290 P1 + P1.6.5 — ✅ ALL 4 GATES PASS)
+## CURRENT STATE 2026-06-10 (PRE-COMPACTION SUMMARY)
 
-**Active workstream: #290 P1 chunked prefill + cache handoff — DONE.
-Next is P2 (L scaling).**
+### #290 Gemma 4 chunked prefill — substantively complete
+
+| Phase | Status | Headline |
+|---|---|---|
+| P1 (L=128 correctness) | ✅ | cos 0.999234, 9.45× |
+| P1.6.5 (cache + handoff) | ✅ | argmax @ pos L matches sequential |
+| P2 (L=2048) | ✅ | cos 0.999615, **100× speedup** (294s→2.9s) |
+| P3 (L=4032) | ✅ | cos 0.999002, 26× speedup (573s→22s) |
+| **P5 HTTP serving** | ✅ | **Real OpenAI API serves coherent chat via chunked prefill** |
+| P4 trace capture | infrastructure landed, ⚠️ disabled | first-token garble; needs ladder debug |
+| Tool calls (#307) | ✅ chat.py ready | Gemma 4 `<|tool_call>` pattern added |
+
+### Launch command (everything required)
+```bash
+ssh qb1 'TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it \
+        TT_CB_CHUNKED_PREFILL=1 TT_CB_SLOTS=1 TT_CB_TOPK_K=0 \
+        bash ~/tt-xla/experiments/serve/scripts/serve_cb.sh start'
+```
+Local chat client (after `ssh -L 8000:localhost:8000 qb1`):
+```bash
+python3 scripts/chat.py --tools
+```
+
+### P4 trace status — important context for resumption
+- All infrastructure landed: pre-allocated `state.prefill_tok_buf` /
+  `state.prefill_pos_buf`, `update_prefill_input_buffers()`,
+  `forward_prefill_chunked_traced_inner()`.
+- Capture pipeline runs but produces garbled first tokens at HTTP
+  request time. Disabled by commenting out the `state.dn_chunked_q =
+  None` sentinel in bootstrap (line ~755 of `server_gemma4_unified_ttnn.py`).
+- To re-enable: uncomment the sentinel, run a ladder-style cos check
+  comparing the traced inner's per-row logits against the eager
+  `forward_prefill_chunked_tp` at L=2048. Likely candidates for the
+  divergence: lm_head matmul over L rows, all_gather output layout, or
+  untilize of the [L=2048, VOCAB=262144] tensor.
+- HTTP serving WORKS without trace via the eager path — TTFT 3-5s at
+  L=2k, ~22s at L=4k. Good enough for chat demo.
+
+### Tool-call status — ready to test
+- `scripts/chat.py --tools` has 4 built-in tools: `shell` (allowlisted),
+  `read_file`, `write_file`, `calc`.
+- Parser handles 4 emission formats including Gemma 4's new
+  `<|tool_call|>` token (commit `c99edc1`). Untested against actual
+  Gemma 4 IT emission — if model emits a 5th format, add to
+  `_TOOL_PATTERNS` (15 LOC pattern + 0 logic changes).
+- cb_api already passes `tools=[]` to `apply_chat_template` so the
+  tokenizer renders them via Gemma's chat template.
+
+### Bug-finding technique that won (keep using it)
+**Teacher-forced per-sub-op ladder.** Ran at L=4 + layer 0 against
+sequential ground truth, capturing q_proj / k_proj / v_proj / q_norm /
+k_norm / v_norm / q_rope / k_rope / attn_out per position. Pinpointed
+the SDPA GQA bug in ONE run. Same technique should be the first move
+for the P4 trace correctness debug.
 
 ### Final gate result (L=128, full 48-layer chain, cache writes ON)
 | Gate | Result |
