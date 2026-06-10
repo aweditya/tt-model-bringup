@@ -64,28 +64,21 @@ first qb1 run in flight.
   - B: TTFT eager ≥ 2× faster than sequential
   - C: argmax match at last position
 
-**P1 status 2026-06-10**: per-sub-op teacher-forced ladder cleared the
-bug locus + landed the fix for sliding —
+## P1 GREEN 2026-06-10
 
-| sub-op (layer 0, sliding) | cos vs sequential |
+| Gate | Result |
 |---|---|
-| q_proj / k_proj / v_proj | 1.000000 |
-| q_norm / k_norm / v_norm | 1.000000 |
-| q_rope / k_rope | 1.000000 |
-| attn_out — 1-call SDPA | 1.0 / 0.45 / 0.29 / 0.23 (per pos) |
-| **attn_out — 2-call SDPA per-KV-head split** | **≥0.99999 every pos** |
+| C: argmax | ✅ PASS  chunk=1091, base=1091 |
+| A: cos ≥ 0.999 | ✅ PASS  0.999234 |
+| B: TTFT ≥ 2× | ✅ PASS  9.45× speedup |
 
-Root cause: `ttnn.transformer.scaled_dot_product_attention` non-paged op
-has a NKV<NQ GQA bug. Decode sidesteps via `paged_sdpa_decode`'s own GQA
-handling. Workaround: 2 SDPA calls per layer (one per KV head, Q split
-into Q_HALF groups) — NQ_per_call=2, NKV_per_call=1, a kernel shape that
-works.
+Bug: `ttnn.transformer.scaled_dot_product_attention` non-paged op has a
+NKV<NQ GQA mis-routing. Pinpointed in 1 ladder run (attn_out cos 1.0 /
+0.45 / 0.29 / 0.23 by position; everything upstream cos=1.0).
 
-Gate (L=128, full 48-layer chain) with sliding fix only: argmax PASS,
-cos 0.696, speedup 47×. Global layer still uses buggy 1-call SDPA;
-iterating now. **Next debug step if global iteration doesn't close
-cos**: apply the SAME ladder to a global layer instead of guessing —
-proven technique pinpointed sliding's bug, will pinpoint global's.
+Fix: per-KV-head SDPA split — both sliding AND global use 2 SDPA calls
+per layer with NQ_per_call=2 / NKV_per_call=1. Mirrors decode's pattern
+exactly (which already does this for sliding via paged_sdpa_decode).
 
 **P1 implementation choices (locked in scaffold)**:
 1. **SKIP K/V cache writes**. The forward math (matmul + norms + RoPE +

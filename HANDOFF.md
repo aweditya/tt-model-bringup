@@ -5,61 +5,57 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## CURRENT STATE 2026-06-10 (P1 — SLIDING FIXED, GLOBAL ITERATING)
+## CURRENT STATE 2026-06-10 (#290 P1 — ✅ ALL THREE GATES PASS)
 
-**Active workstream: #290 P1 chunked prefill — sliding attention layer
-fix landed and proven via ladder. Global layer being iterated on.**
+**Active workstream: #290 P1 chunked prefill — DONE.**
 
-### Findings (via teacher-forced per-sub-op ladder)
-Per-sub-op cos vs sequential at layer 0 (sliding), L=4:
-
-| sub-op | cos |
+### Final gate result (L=128, full 48-layer chain)
+| Gate | Result |
 |---|---|
-| q_proj_out / k_proj_out / v_proj_out | 1.000000 |
-| q_norm_out / k_norm_out / v_norm_out | 1.000000 |
-| q_rope_out / k_rope_out | 1.000000 |
-| attn_out — 1-call SDPA (NQ=4, NKV=2) | 1.0 / 0.45 / 0.29 / 0.23 by pos |
-| **attn_out — 2-call SDPA (Q split, NQ=2/NKV=1 each)** | **≥0.99999 at every pos** |
+| C: argmax | ✅ PASS  chunk=1091, base=1091 |
+| A: cos ≥ 0.999 | ✅ PASS  0.999234 |
+| B: TTFT ≥ 2× | ✅ PASS  9.45× speedup (2.0s vs 19.3s) |
 
-**Root cause**: `ttnn.transformer.scaled_dot_product_attention` non-paged
-op has a NKV<NQ kernel bug — it mis-routes Q heads to KV heads beyond
-pos 0. Decode sidesteps this by using `paged_scaled_dot_product_attention_decode`
-which has its own GQA handling. The 2-call split (one SDPA per KV
-head, Q sliced into Q_HALF groups) gives each call NQ=2/NKV=1, which is
-a kernel shape that works.
+### The fix
+Both sliding AND global attention layers use a per-KV-head SDPA split
+(mirroring decode's pattern). Each SDPA call has NQ_per_call=2 /
+NKV_per_call=1 — a kernel shape that works. The 1-call multi-NKV SDPA
+has a GQA bug in the prefill (non-paged) op:
+`ttnn.transformer.scaled_dot_product_attention` mis-routes Q→KV when
+NKV<NQ, causing pos-1+ output divergence.
 
-### Gate state (L=128, full 48-layer chain)
-| Gate | Sliding-only fix | Result |
-|---|---|---|
-| C: argmax | ✅ PASS (chunk=1091, base=1091) |
-| A: cos ≥ 0.999 | ⏳ 0.696 (sliding-only); global still uses buggy 1-call | global fix in flight |
-| B: TTFT ≥ 2× | ✅ PASS 47× speedup (0.4s vs 19.6s) |
+### Bug-finding technique that won
+**Teacher-forced per-sub-op ladder.** Ran at L=4 + layer 0 against
+sequential ground truth, capturing q_proj / k_proj / v_proj / q_norm /
+k_norm / v_norm / q_rope / k_rope / attn_out per position. Every sub-op
+through q_rope/k_rope showed cos=1.000000 — bug pinpointed at attn_out
+in ONE run. Then 2-call SDPA workaround validated at cos ≥ 0.99999 in
+another run.
 
 ### Code state
-- `experiments/cb/isolate/gemma4_chunked_prefill_L128.py` — gate probe
-  with sliding 2-call fix committed; global being iterated
-- Probe is clean (no env flag bloat); CLI arg for L override only
-- Sliding `_layer_prefill_sliding` mirrors decode's per-KV-head loop EXACTLY
-- Global `_layer_prefill_global` currently being iterated (1-call broke;
-  trying 2-call style)
-
-### Tools
-- `experiments/cb/isolate/gemma4_chunked_prefill_L128.py` — gate
+- `experiments/cb/isolate/gemma4_chunked_prefill_L128.py` — clean gate
+  probe, both sliding + global use 2-call SDPA pattern
 - `experiments/cb/isolate/gemma4_chunked_prefill_ladder.py` — per-sub-op
-  ladder for bug isolation (sliding layer; global ladder TODO)
+  bug-localization tool
 - `experiments/serve/server_gemma4_unified_ttnn.py:_layer_pos0_sliding_paged`
   — extended capture dict with q_rope_out / k_rope_out / attn_out
 
 ### Next steps (in order)
-1. Wait for global 2-call gate result. If cos ≥ 0.999 → ship P1
-2. If global 2-call doesn't hit ≥0.999 → **point the ladder at a global
-   layer** instead of guessing. Same per-sub-op technique that pinpointed
-   sliding will pinpoint global.
-3. After P1 green: P1.6.5 cache writes + decode handoff test
-4. Then P2 (TILE-aligned L scaling), P3 (outer-chunk loop), P4 (trace)
+1. **P1.6.5** — cache write + handoff-to-decode test (proves prefill's
+   K/V are correctly readable by subsequent decode steps)
+2. **P2** — TILE-aligned L scaling (L=128 → 256 → 512 → 1024 → 2048)
+3. **P3** — outer-chunk loop for L > 2048
+4. **P4** — trace capture (5× win expected per S2.6 precedent)
+5. **P5** — server integration (admit-time short→sequential, long→chunked)
 
-Cold-start: read this block + the gate probe + the ladder. The technique
-to use first if anything fails is the ladder, not env-flag iteration.
+### Engineering lesson recorded
+When attn output diverges and you've already validated norms/RoPE via
+the ladder, the SDPA op is the canonical suspect. Workaround is the
+decode per-KV-head split — every Gemma 4 sliding decode already does
+this; my new prefill code just needed to mirror that contract.
+
+Cold-start: read this block + the gate + the ladder. The technique to
+use first if anything fails is the ladder.
 
 ### Recently CLOSED (this session)
 - **#289 Gemma 4 layout overhead** — closed with engineering honesty.
