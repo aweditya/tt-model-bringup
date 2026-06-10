@@ -22,9 +22,8 @@ Reuse map:
 P1 SCOPE
 - K/V cache writes via paged_fill_cache inside the SDPA per-KV-head loop
   (P1.6.5 — gate D validates handoff to subsequent decode step at pos L).
-- IGNORE sliding-window mask — at L=128 every position sees all prior
-  tokens within SLIDING_WINDOW=1024, so causal == sliding-causal. P2
-  scales L > 1024 and adds the mask back.
+- Sliding layers: SDPA passes `sliding_window_size=SLIDING_WINDOW` (1024)
+  to match decode behavior at L > 1024 (P2).
 
 Run (default L=128):
   scripts/run_remote.sh experiments/cb/isolate/gemma4_chunked_prefill_L128.py
@@ -211,6 +210,7 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
             q_for, k_for, v_for,
             is_causal=True,
             scale=1.0,  # Gemma 4: self.scaling=1.0
+            sliding_window_size=srv.SLIDING_WINDOW,
             compute_kernel_config=state.sdpa_compute_kernel_config,
         )
         attn_outs.append(attn_i)

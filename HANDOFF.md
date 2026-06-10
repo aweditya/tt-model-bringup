@@ -44,11 +44,21 @@ another run.
 
 ### Next steps (in order)
 1. ✅ **P1.6.5** — cache write + handoff-to-decode test DONE
-2. **P2** — TILE-aligned L scaling (L=128 → 256 → 512 → 1024 → 2048).
-   Same probe + 4 gates, just increase L. Expect to hold all gates green.
+2. ⏳ **P2 in flight** — TILE-aligned L scaling. First L=2048 attempt
+   revealed missing sliding-window mask (cos collapsed from 0.999 @
+   L=128 to 0.47 @ L=2048; argmax + handoff still PASS because top-1 is
+   robust). Fix: `sliding_window_size=SLIDING_WINDOW` kwarg on the
+   non-paged SDPA call (op supports it natively per sdpa_nanobind.cpp
+   line 239). Rerunning L=2048 now.
 3. **P3** — outer-chunk loop for L > 2048
 4. **P4** — trace capture (5× win expected per S2.6 precedent)
 5. **P5** — server integration (admit-time short→sequential, long→chunked)
+
+### Lesson from L=2048 attempt
+The probe docstring even warned: "IGNORE sliding-window mask — P2 scales
+L > 1024 and adds the mask back." I should have added it BEFORE running.
+Saved ~5 min of bootstrap by catching it on the cos check; could've
+saved another ~5 min by reading my own warning.
 
 ### Engineering lesson recorded
 When attn output diverges and you've already validated norms/RoPE via

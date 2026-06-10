@@ -66,7 +66,7 @@ first qb1 run in flight.
 
 ## P1 GREEN 2026-06-10
 
-| Gate | Result |
+| Gate (L=128) | Result |
 |---|---|
 | C: argmax | ✅ PASS  chunk=1091, base=1091 |
 | A: cos ≥ 0.999 | ✅ PASS  0.999234 |
@@ -79,6 +79,35 @@ NKV<NQ GQA mis-routing. Pinpointed in 1 ladder run (attn_out cos 1.0 /
 Fix: per-KV-head SDPA split — both sliding AND global use 2 SDPA calls
 per layer with NQ_per_call=2 / NKV_per_call=1. Mirrors decode's pattern
 exactly (which already does this for sliding via paged_sdpa_decode).
+
+## P1.6.5 GREEN 2026-06-10
+
+Added `paged_fill_cache` inside the per-KV-head SDPA loops in both
+sliding (2 calls/layer) and global (1 call/layer). Gate D handoff test:
+
+| Gate (L=128) | Result |
+|---|---|
+| D: handoff @ pos L | ✅ PASS  chunk=236761, base=236761 |
+| C/A/B (prior gates) | ✅ all still PASS |
+
+## P2 IN FLIGHT 2026-06-10
+
+First L=2048 attempt (sliding-window-OFF):
+- argmax PASS (3797 == 3797)
+- handoff PASS (102905 == 102905)
+- cos FAIL 0.473 ← top-1 robust to drift but hidden vector diverged
+
+Root cause: missing sliding-window mask. Sequential's decode SDPA uses
+`sliding_window_size=SLIDING_WINDOW=1024`; my chunked was using
+`is_causal=True` only. At L > 1024, sequential masks out positions
+beyond the window but mine doesn't.
+
+Fix: 1-line add `sliding_window_size=srv.SLIDING_WINDOW` to the
+sliding-layer SDPA call. The non-paged op supports it natively (per
+`sdpa_nanobind.cpp:239`). Global layers don't get the kwarg (no
+sliding window).
+
+Rerunning L=2048 now.
 
 **P1 implementation choices (locked in scaffold)**:
 1. **SKIP K/V cache writes**. The forward math (matmul + norms + RoPE +
