@@ -742,15 +742,27 @@ def _exec_tool(name: str, args: dict) -> str:
 
 
 # Detect tool calls in plain text output (since our cb_api doesn't
-# emit proper OpenAI tool_call deltas yet). Both Gemma IT and Qwen3.6
-# emit JSON in their assistant turn when given tool definitions:
+# emit proper OpenAI tool_call deltas yet).
+#
+# Gemma 4 (Apr 2026 release): uses 6 dedicated special tokens —
+# `<|tool>` (system-prompt tool defs), `<|tool_call>call:` (assistant
+# invocation), `<|tool_response>response:` (env→model), plus `<|"|>`
+# delimiter for structured string values. Tokenizer may render these
+# as literal `<|tool_call>` substrings in the text stream when not
+# stripped, OR fall back to the older ```tool_code``` block format
+# that older Gemma + Qwen3.6 emit.
+#
+# Gemma IT / Qwen3.6 / older format:
 #   ```tool_code
 #   {"name":"calc","arguments":{"expr":"2+2"}}
 #   ```
-# OR:
+# Qwen alternative:
 #   <tool_call>{"name":...,"arguments":...}</tool_call>
 _TOOL_PATTERNS = [
     re.compile(r"```tool_code\s*(\{.*?\})\s*```", re.DOTALL),
+    # Gemma 4 new-token format: <|tool_call>call:\n{"name":...,"arguments":...}\n<|end_of_turn|>
+    # (also matches a bare <|tool_call> followed by JSON without the literal "call:" prefix)
+    re.compile(r"<\|tool_call\|>\s*(?:call:\s*)?(\{.*?\})", re.DOTALL),
     re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL),
     re.compile(r"```json\s*(\{[^`]*?\"name\"\s*:[^`]*?\})\s*```", re.DOTALL),
 ]
