@@ -52,18 +52,21 @@ another run.
    — bf16 chain drift is reaching its limit; trace + bf16-acc tuning
    may tighten later.
 4. **P4** — trace capture (5× win expected per S2.6 precedent)
-5. ✅ **P5** — server-level API DONE. `forward_prefill_chunked_tp` exposed
-   from `server_gemma4_unified_ttnn.py`. End-to-end chat smoke proves
-   coherent text generation through the chunked → decode handoff.
-   - File: `experiments/cb/isolate/gemma4_chunked_prefill_chat_smoke.py`
-   - HTTP wire-up in flight via `TT_CB_CHUNKED_PREFILL=1` —
-     `cb_prefill_transplant` added in `server_gemma4_unified_cb.py`,
-     `TT_CB_USE_TRACE=0` auto-set to avoid decode-trace memory collision.
-     **Known bug**: chunked prefill writes to single-slot
-     `state.kv_caches_tt` + `state.page_table_tt`; CB decode reads from
-     multi-slot `state.cb_kv_caches_tt` + `state.cb_page_table_tt`. Need
-     to make `forward_prefill_chunked_tp` write to CB buffers when called
-     in CB context (~30 LOC).
+5. ✅ **P5 — HTTP serving DONE**.
+   `TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it TT_CB_CHUNKED_PREFILL=1
+   bash experiments/serve/scripts/serve_cb.sh start`
+   produces coherent OpenAI-API responses through chunked prefill +
+   CB decode handoff. Verified via curl POST to /v1/chat/completions
+   ("A **Tensix** processor is a specialized type of integrated
+   circuit…"). Path:
+   - `forward_prefill_chunked_tp` server-level entry routes cache writes
+     to CB buffers (`cb_kv_caches_tt`, `cb_page_table_tt`) when CB state
+     is set up, else to the single-slot caches (chat smoke path).
+   - `cb_prefill_transplant` in `server_gemma4_unified_cb.py` advances
+     `cb_cur_pos_buf[slot]` and `cb_rot_idxs_buf[slot]` to L for the
+     decode handoff.
+   - `TT_CB_USE_TRACE` auto-off when chunked+gemma4 (avoids decode-trace
+     memory collision with eager chunked allocations).
 6. (Deferred after #290 ships) tool-call / agentic — task #307
 
 ### Engineering lesson recorded
