@@ -170,6 +170,32 @@ After P4 trace capture, expect another ~5× → ~4.4s.
   **For now**: HTTP serving works via eager. TTFT 3-5s at L=512, ~22s at
   L=4032. Acceptable for chat demo. Trace would buy another ~3-5×.
 
+### P4 ladder probe SHIPPED 2026-06-10 (commit `c65b3c3`)
+
+`experiments/cb/isolate/gemma4_chunked_prefill_trace_ladder.py` runs
+the comparison without re-introducing the trace infrastructure in the
+production server. It executes both paths EAGERLY (no
+`begin_trace_capture`):
+- Path A: the proven `forward_prefill_chunked_tp` (last-row argmax).
+- Path B: a re-implementation of the traced-style graph (matmul over
+  all L rows, no softcap, host-side argmax on row L-1) reading tok+pos
+  from pre-allocated `state.prefill_tok_buf` / `prefill_pos_buf`.
+
+If Paths A and B agree on argmax and `cos(final[L-1]) ≥ 0.9999`, the
+graph is fine and the P4 bug lives in trace capture/replay (two-phase
+warmup vs decode trace, view lifetime under deallocate, replay
+synchronisation). If they disagree, the graph itself is wrong.
+
+Run:
+```bash
+ssh qb1 'cd ~/tt-xla && TT_GM4_TRACE_LADDER_L=128 \
+    .venv/bin/python -u \
+    experiments/cb/isolate/gemma4_chunked_prefill_trace_ladder.py'
+```
+Output → `.cache/gm4_trace_ladder/trace_ladder_L<L>_<ts>.json` with
+verdict + targeted diagnosis. Not run yet (debug tool, not a demo
+blocker).
+
 **P1 implementation choices (locked in scaffold)**:
 1. **SKIP K/V cache writes**. The forward math (matmul + norms + RoPE +
    causal SDPA) is identical whether or not we write the cache, because
