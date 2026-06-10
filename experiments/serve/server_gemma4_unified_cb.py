@@ -265,7 +265,7 @@ def cb_prefill_transplant(state, slot_s, L):
 
     rot = ttnn.to_torch(state.cb_rot_idxs_buf,
                         mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
-    rot_np = rot.reshape(state.cb_B, 1)[:state.cb_B].clone()
+    rot_np = rot.reshape(-1)[:state.cb_B].clone().reshape(state.cb_B, 1)
     rot_np[slot_s, 0] = int(L)
     rot_host = ttnn.from_torch(
         rot_np.to(torch.int32),
