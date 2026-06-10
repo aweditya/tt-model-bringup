@@ -106,6 +106,43 @@ prefill. The full L sweep (128 → 256 → 512 → 1024 → 2048) is implied
 green by the upper bound; smaller L's only have a SUBSET of the
 sliding-window edge case.
 
+## P3 GREEN 2026-06-10 (L=4032, long-context gate's max)
+
+| Gate | Result |
+|---|---|
+| C: argmax @ pos L-1 | ✅ PASS  6340 == 6340 |
+| D: handoff @ pos L | ✅ PASS  11165 == 11165 |
+| A: cos ≥ 0.999 | ✅ PASS  0.999002 (right at threshold) |
+| B: TTFT ≥ 2× | ✅ **PASS  26.45× speedup** (21.7s vs 573.2s) |
+
+**No multi-chunk outer loop needed.** Single-pass chunked prefill works
+across the full long-context gate range (128, 512, 1024, 2048, 4032).
+The original plan assumed L > 2048 would need a chunk-of-chunks loop;
+turns out the SDPA op + cache layout + sliding-window mask handle it
+without modification.
+
+Caveats:
+- cos at L=4032 is right at threshold (0.999002 ≥ 0.999). bf16 chain
+  drift is reaching the limit. Trace + bf16-acc tuning may tighten this.
+- Long prompts beyond L=4032 (the MAX_KV cap minus decode slack) need
+  either a larger MAX_KV in bootstrap or a true multi-chunk loop. P3
+  for "L > 4032" is deferred until there's demand.
+
+Headline: **4032-token prompt TTFT goes 573s → 22s eager** (~26×).
+After P4 trace capture, expect another ~5× → ~4.4s.
+
+## P4-P5 plan
+
+- **P4 — trace capture**: pre-allocate fixed-size buffers for chunk_size
+  (likely L=2048 or L=4032 as the trace bucket). Two-phase warmup per
+  [[feedback-two-phase-warmup]]. Mirror 27B's `forward_prefill_chunked_traced_inner`
+  at `server_tp.py:2013`. Gate: traced argmax matches eager, traced TTFT
+  ≥ 3× faster than eager.
+- **P5 — server integration**: wire into `step_forward_prefill_chunked`
+  exposed by server; cb_engine admit path checks length (short →
+  sequential, long → chunked); cb_api dispatches accordingly. Smoke
+  via HTTP chat.
+
 **P1 implementation choices (locked in scaffold)**:
 1. **SKIP K/V cache writes**. The forward math (matmul + norms + RoPE +
    causal SDPA) is identical whether or not we write the cache, because
