@@ -2431,6 +2431,284 @@ def step_forward_v02(state, tok_id, capture=None):
     return argmax
 
 
+# ── #290 chunked prefill — eager API ──────────────────────────────────
+# Parallel forward over L tokens in one pass (vs N sequential decode steps).
+# Validated correctness at L ∈ {128, 2048, 4032} via the
+# `gemma4_chunked_prefill_L128.py` gate probe (cos ≥ 0.999, argmax + handoff
+# both match sequential, 26–100× speedup).
+#
+# Key fixes vs naive port:
+#   1. SDPA per-KV-head split (decode-mirror) — `ttnn.transformer.scaled_dot_product_attention`
+#      non-paged op mis-routes Q→KV when NKV<NQ. Workaround: 2 SDPA calls
+#      per layer (NQ_per_call=2, NKV_per_call=1).
+#   2. Sliding-window kwarg — `sliding_window_size=SLIDING_WINDOW` (1024) on
+#      the sliding-layer SDPA. Required at L > 1024.
+#   3. Cache writes via paged_fill_cache inside the SDPA loop — gives
+#      bit-identical handoff to subsequent decode steps.
+
+
+def _apply_full_rope_seq(x_seq, cos_seq, sin_seq, Ltok, n_heads, head_dim):
+    """Multi-token RoPE. x_seq [L, nh, hd], cos/sin [L, hd] → [L, nh, hd].
+    Broadcasts cos/sin via [L, 1, hd] over the n_heads axis. Forks
+    `_apply_full_rope` (single-pos version) preserving the rotate-half-via-roll
+    optimization."""
+    half = head_dim // 2
+    swapped = ttnn.roll(x_seq, shifts=half, dim=-1)
+    cos_b = ttnn.reshape(cos_seq, [Ltok, 1, head_dim])
+    sin_b = ttnn.reshape(sin_seq, [Ltok, 1, head_dim])
+    x_cos = ttnn.mul(x_seq, cos_b)
+    x_rope = ttnn.addcmul(x_cos, swapped, sin_b, value=1.0)
+    ttnn.deallocate(x_cos); ttnn.deallocate(swapped)
+    return x_rope
+
+
+def _embed_and_lookup_rope_seq(state, token_ids):
+    """Embed L tokens → [1, L, HIDDEN] TILE bf16; lookup cos/sin tables at
+    positions [0..L-1] → 4-tuple ([L, HD_SLIDING] each for sliding+global).
+    Caller deallocates h + all four rope tensors after forward."""
+    Ltok = len(token_ids)
+
+    tok_tt = ttnn.from_torch(
+        torch.tensor([list(token_ids)], dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+    embed_rm = ttnn.embedding(tok_tt, state.embed_tt)
+    ttnn.deallocate(tok_tt)
+    embed_tile = ttnn.to_layout(embed_rm, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(embed_rm)
+    h = ttnn.multiply(embed_tile, EMBED_SCALE)
+    ttnn.deallocate(embed_tile)
+
+    pos_tt = ttnn.from_torch(
+        torch.tensor([list(range(Ltok))], dtype=torch.int32),
+        dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=state.mesh,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh),
+    )
+
+    def _lookup(table_tt, head_dim):
+        row_rm = ttnn.embedding(pos_tt, table_tt)
+        row_tile = ttnn.to_layout(row_rm, ttnn.TILE_LAYOUT)
+        ttnn.deallocate(row_rm)
+        return ttnn.reshape(row_tile, [Ltok, head_dim])
+
+    cos_s = _lookup(state.cos_sliding_tt, HEAD_DIM_SLIDING)
+    sin_s = _lookup(state.sin_sliding_tt, HEAD_DIM_SLIDING)
+    cos_g = _lookup(state.cos_global_tt, HEAD_DIM_GLOBAL)
+    sin_g = _lookup(state.sin_global_tt, HEAD_DIM_GLOBAL)
+    ttnn.deallocate(pos_tt)
+    return h, (cos_s, sin_s, cos_g, sin_g)
+
+
+def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
+    """Sliding-attention prefill at q_len=L. Forks `_layer_pos0_sliding_paged`
+    with the decode-mirror 2-call SDPA split (NQ_per_call=2/NKV_per_call=1)
+    + `sliding_window_size=SLIDING_WINDOW` + paged_fill_cache."""
+    cos_seq, sin_seq = rope
+
+    q = ttnn.matmul(h_norm_seq, w["q_proj"], compute_kernel_config=HIFI4)
+    k = ttnn.matmul(h_norm_seq, w["k_proj"], compute_kernel_config=HIFI4)
+    v = ttnn.matmul(h_norm_seq, w["v_proj"], compute_kernel_config=HIFI4)
+
+    q_h = ttnn.reshape(q, [Ltok, NQ_PER_CHIP, HEAD_DIM_SLIDING]); ttnn.deallocate(q)
+    k_h = ttnn.reshape(k, [Ltok, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING]); ttnn.deallocate(k)
+    v_h = ttnn.reshape(v, [Ltok, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING]); ttnn.deallocate(v)
+
+    q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    k_n_pre = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
+    v_n = ttnn.rms_norm(v_h, weight=state.ones_head_dim_sliding, epsilon=EPS)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h); ttnn.deallocate(v_h)
+
+    q_n = _apply_full_rope_seq(q_n_pre, cos_seq, sin_seq, Ltok, NQ_PER_CHIP, HEAD_DIM_SLIDING)
+    ttnn.deallocate(q_n_pre)
+    k_n = _apply_full_rope_seq(k_n_pre, cos_seq, sin_seq, Ltok, NKV_PER_CHIP_SLIDING, HEAD_DIM_SLIDING)
+    ttnn.deallocate(k_n_pre)
+
+    Q_HALF = NQ_PER_CHIP // NKV_PER_CHIP_SLIDING
+    q_perm = ttnn.permute(q_n, (1, 0, 2)); ttnn.deallocate(q_n)
+    k_perm = ttnn.permute(k_n, (1, 0, 2)); ttnn.deallocate(k_n)
+    v_perm = ttnn.permute(v_n, (1, 0, 2)); ttnn.deallocate(v_n)
+
+    layer_caches = state.kv_caches_tt[layer_idx]
+    attn_outs = []
+    for kv_idx in range(NKV_PER_CHIP_SLIDING):
+        kc, vc = layer_caches[kv_idx]
+        q_half = ttnn.slice(q_perm, [kv_idx * Q_HALF, 0, 0],
+                             [(kv_idx + 1) * Q_HALF, Ltok, HEAD_DIM_SLIDING])
+        q_for = ttnn.reshape(q_half, [1, Q_HALF, Ltok, HEAD_DIM_SLIDING])
+        k_one = ttnn.slice(k_perm, [kv_idx, 0, 0], [kv_idx + 1, Ltok, HEAD_DIM_SLIDING])
+        k_for = ttnn.reshape(k_one, [1, 1, Ltok, HEAD_DIM_SLIDING])
+        v_one = ttnn.slice(v_perm, [kv_idx, 0, 0], [kv_idx + 1, Ltok, HEAD_DIM_SLIDING])
+        v_for = ttnn.reshape(v_one, [1, 1, Ltok, HEAD_DIM_SLIDING])
+
+        ttnn.experimental.paged_fill_cache(kc, k_for, state.page_table_tt, batch_idx=0)
+        ttnn.experimental.paged_fill_cache(vc, v_for, state.page_table_tt, batch_idx=0)
+
+        attn_i = ttnn.transformer.scaled_dot_product_attention(
+            q_for, k_for, v_for,
+            is_causal=True, scale=1.0,
+            sliding_window_size=SLIDING_WINDOW,
+            compute_kernel_config=state.sdpa_compute_kernel_config,
+        )
+        attn_outs.append(attn_i)
+    ttnn.deallocate(q_perm); ttnn.deallocate(k_perm); ttnn.deallocate(v_perm)
+
+    attn_out = ttnn.concat(attn_outs, dim=1)
+    for a in attn_outs: ttnn.deallocate(a)
+    attn_perm = ttnn.permute(attn_out, (0, 2, 1, 3)); ttnn.deallocate(attn_out)
+    attn_flat = ttnn.reshape(attn_perm, [Ltok, NQ_PER_CHIP * HEAD_DIM_SLIDING])
+    ttnn.deallocate(attn_perm)
+
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh); ttnn.deallocate(partial)
+    return out
+
+
+def _layer_prefill_global(state, h_norm_seq, w, layer_idx, rope, Ltok):
+    """Global-attention prefill at q_len=L. NKV=1, head_dim=512, p-RoPE
+    inline via global cos/sin tables, V aliases K_raw. 2-call SDPA split
+    (NQ_per_call=2 against the single KV head)."""
+    cos_seq, sin_seq = rope
+
+    q = ttnn.matmul(h_norm_seq, w["q_proj"], compute_kernel_config=HIFI4)
+    k = ttnn.matmul(h_norm_seq, w["k_proj"], compute_kernel_config=HIFI4)
+
+    q_h = ttnn.reshape(q, [Ltok, NQ_PER_CHIP, HEAD_DIM_GLOBAL]); ttnn.deallocate(q)
+    k_h = ttnn.reshape(k, [Ltok, NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL]); ttnn.deallocate(k)
+    v_raw = ttnn.clone(k_h)
+
+    q_n_pre = ttnn.rms_norm(q_h, weight=w["q_norm"], epsilon=EPS)
+    k_n_pre = ttnn.rms_norm(k_h, weight=w["k_norm"], epsilon=EPS)
+    v_n = ttnn.rms_norm(v_raw, weight=state.ones_head_dim_global, epsilon=EPS)
+    ttnn.deallocate(q_h); ttnn.deallocate(k_h); ttnn.deallocate(v_raw)
+
+    q_n = _apply_full_rope_seq(q_n_pre, cos_seq, sin_seq, Ltok, NQ_PER_CHIP, HEAD_DIM_GLOBAL)
+    ttnn.deallocate(q_n_pre)
+    k_n = _apply_full_rope_seq(k_n_pre, cos_seq, sin_seq, Ltok, NUM_KV_HEADS_GLOBAL, HEAD_DIM_GLOBAL)
+    ttnn.deallocate(k_n_pre)
+
+    Q_HALF = NQ_PER_CHIP // 2
+    q_perm = ttnn.permute(q_n, (1, 0, 2)); ttnn.deallocate(q_n)
+    k_perm = ttnn.permute(k_n, (1, 0, 2)); ttnn.deallocate(k_n)
+    v_perm = ttnn.permute(v_n, (1, 0, 2)); ttnn.deallocate(v_n)
+
+    k_for = ttnn.reshape(k_perm, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
+    v_for = ttnn.reshape(v_perm, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
+
+    kc, vc = state.kv_caches_tt[layer_idx][0]
+    ttnn.experimental.paged_fill_cache(kc, k_for, state.page_table_tt, batch_idx=0)
+    ttnn.experimental.paged_fill_cache(vc, v_for, state.page_table_tt, batch_idx=0)
+
+    attn_outs = []
+    for q_grp in range(2):
+        q_half = ttnn.slice(q_perm, [q_grp * Q_HALF, 0, 0],
+                             [(q_grp + 1) * Q_HALF, Ltok, HEAD_DIM_GLOBAL])
+        q_for = ttnn.reshape(q_half, [1, Q_HALF, Ltok, HEAD_DIM_GLOBAL])
+        attn_i = ttnn.transformer.scaled_dot_product_attention(
+            q_for, k_for, v_for,
+            is_causal=True, scale=1.0,
+            compute_kernel_config=state.sdpa_compute_kernel_config,
+        )
+        attn_outs.append(attn_i)
+    ttnn.deallocate(q_perm); ttnn.deallocate(k_perm); ttnn.deallocate(v_perm)
+    ttnn.deallocate(k_for); ttnn.deallocate(v_for)
+
+    attn_out = ttnn.concat(attn_outs, dim=1)
+    for a in attn_outs: ttnn.deallocate(a)
+    attn_perm = ttnn.permute(attn_out, (0, 2, 1, 3)); ttnn.deallocate(attn_out)
+    attn_flat = ttnn.reshape(attn_perm, [Ltok, NQ_PER_CHIP * HEAD_DIM_GLOBAL])
+    ttnn.deallocate(attn_perm)
+
+    partial = ttnn.matmul(attn_flat, w["o_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(attn_flat)
+    out = all_reduce_tt(partial, state.mesh); ttnn.deallocate(partial)
+    return out
+
+
+def _layer_prefill(state, h_in, layer_idx, rope_seq, Ltok):
+    """Full prefill layer (sandwich norm + attn + MLP + layer_scalar). Forks
+    `_layer_forward_pos0_paged` minus the DRAM-sharded MLP path (matmul-gelu
+    fused default is leading-dim agnostic, matches 27B prefill precedent)."""
+    w = state.per_layer_tt[layer_idx]
+    lt = state.layer_types[layer_idx]
+
+    h_norm = ttnn.rms_norm(h_in, weight=w["input_layernorm"], epsilon=EPS)
+    if lt == "sliding_attention":
+        mixer = _layer_prefill_sliding(state, h_norm, w, layer_idx,
+                                        (rope_seq[0], rope_seq[1]), Ltok)
+    else:
+        mixer = _layer_prefill_global(state, h_norm, w, layer_idx,
+                                       (rope_seq[2], rope_seq[3]), Ltok)
+    ttnn.deallocate(h_norm)
+
+    post_attn = ttnn.rms_norm(mixer, weight=w["post_attention_layernorm"], epsilon=EPS)
+    ttnn.deallocate(mixer)
+    h_after_attn = ttnn.add(h_in, post_attn); ttnn.deallocate(post_attn)
+
+    pre_ff = ttnn.rms_norm(h_after_attn, weight=w["pre_feedforward_layernorm"], epsilon=EPS)
+    gelu_gate = ttnn.matmul(pre_ff, w["gate_proj"], compute_kernel_config=HIFI4, activation="gelu")
+    up = ttnn.matmul(pre_ff, w["up_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(pre_ff)
+    mid = ttnn.mul(gelu_gate, up); ttnn.deallocate(gelu_gate); ttnn.deallocate(up)
+    mlp_partial = ttnn.matmul(mid, w["down_proj"], compute_kernel_config=HIFI4)
+    ttnn.deallocate(mid)
+    mlp_out = all_reduce_tt(mlp_partial, state.mesh); ttnn.deallocate(mlp_partial)
+
+    post_ff = ttnn.rms_norm(mlp_out, weight=w["post_feedforward_layernorm"], epsilon=EPS)
+    ttnn.deallocate(mlp_out)
+
+    _layer_scalar_act = [ttnn.UnaryWithParam(
+        ttnn.UnaryOpType.MUL_UNARY_SFPU, float(w["layer_scalar"]))]
+    h_out = ttnn.add(h_after_attn, post_ff, activations=_layer_scalar_act)
+    ttnn.deallocate(h_after_attn); ttnn.deallocate(post_ff)
+    return h_out
+
+
+def forward_prefill_chunked_tp(state, token_ids):
+    """Server-level chunked-prefill entry. Processes the whole L-token prompt
+    in one parallel forward, writes K/V to paged cache at positions 0..L-1,
+    advances cur_pos_buf to L (so the next decode step starts at the right
+    place), and returns the argmax token id at position L-1.
+
+    Forks `step_forward_prefill` from
+    `experiments/cb/isolate/gemma4_chunked_prefill_L128.py` (#290 gate probe).
+    Correctness validated at L ∈ {128, 2048, 4032} via 4 gates: cos ≥ 0.999,
+    argmax match, TTFT ≥ 2×, handoff argmax @ pos L matches sequential.
+    """
+    Ltok = len(token_ids)
+    h, rope_seq = _embed_and_lookup_rope_seq(state, token_ids)
+
+    for layer_idx in range(NUM_LAYERS):
+        h_new = _layer_prefill(state, h, layer_idx, rope_seq, Ltok)
+        ttnn.deallocate(h); h = h_new
+
+    for t in rope_seq: ttnn.deallocate(t)
+
+    final = ttnn.rms_norm(h, weight=state.final_norm_tt, epsilon=EPS)
+    ttnn.deallocate(h)
+
+    last_row = ttnn.slice(final, [0, Ltok - 1, 0], [1, Ltok, HIDDEN])
+    ttnn.deallocate(final)
+
+    # Stash last-position hidden for spec-dec compatibility (same convention as
+    # step_forward_v03).
+    _final_np = _readback_replicated(last_row, state.mesh).reshape(1, 1, HIDDEN).astype(np.float32)
+    state.last_target_hidden_prev = state.last_target_hidden_cur
+    state.last_target_hidden_cur = _final_np
+
+    argmax_tt, _ = _lm_head_argmax(state, last_row, capture_logits=False)
+    ttnn.deallocate(last_row)
+    arr = ttnn.to_torch(argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+    ttnn.deallocate(argmax_tt)
+    argmax = int(arr.reshape(-1)[0].item())
+
+    # Advance cur_pos to L so the next decode step starts at the right
+    # position. The cache is already written for positions 0..L-1.
+    _set_pos(state, Ltok)
+    return argmax
+
+
 # ── v0.4 traced decode ────────────────────────────────────────────────
 # Mirrors 27B prod (`experiments/serve/server_tp.py:1587-1694, 2142-2186`).
 # Pre-allocate `tok_buf` + `cur_pos_buf` + `rot_idxs_buf` in bootstrap;
