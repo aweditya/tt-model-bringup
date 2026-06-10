@@ -5,7 +5,45 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## CURRENT STATE 2026-06-10 (PRE-COMPACTION SUMMARY)
+## DEMO READY 2026-06-10
+
+Two backends live in parallel; pick whichever is hot.
+
+| Host | Model | Demo path |
+|---|---|---|
+| qb1 | Gemma 4 12B IT | OpenAI HTTP (multi-client) → `scripts/chat.py --tools` |
+| qb2 | Nemotron-3 Nano 30B-A3B | dev harness → trigger probes (no chat UI yet) |
+
+### qb1 — chat demo (PRIMARY, READY)
+```bash
+# server — TT_CB_SLOTS=1 is mandatory for correctness.
+ssh qb1 'TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it \
+        TT_CB_CHUNKED_PREFILL=1 TT_CB_SLOTS=1 TT_CB_TOPK_K=0 \
+        bash ~/tt-xla/experiments/serve/scripts/serve_cb.sh start'
+
+# tunnel + chat client (laptop, after `/health` returns 200)
+ssh -L 8000:localhost:8000 qb1   # in one window
+python3 scripts/chat.py --tools  # in another (or several!)
+```
+**Why slots=1, not 4?** TT_CB_SLOTS=4 with N concurrent requests
+returns coherent text only for slot 0; slots 1-3 produce char-collapse
+garbage (`성-111…`, `"/>.__--111…`). Same family as 35B B>1 empty-slot
+poison (#162). cb_engine still serves multiple chat.py clients
+correctly — requests are FIFO-queued. Sequential multi-client works;
+true parallel B>1 needs a separate fix (file as next task; not a
+demo blocker).
+
+### qb2 — Nemotron-3 backup demo (NOT READY YET)
+Weights downloading to qb2 HF cache (`models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`).
+~60GB total. Once landed:
+```bash
+bash scripts/run_harness_tmux.sh nm3 qb2     # ~108s bootstrap
+ssh qb2 tmux attach -t nm3
+ssh qb2 'touch ~/tt-xla/.cache/nm3_runtime/trig/v033_nstep_chain_smoke'
+ssh qb2 'cat ~/tt-xla/.cache/nm3_runtime/trig/last.log'
+```
+Nemotron warm decode ~260 ms/tok eager (~3.8 tok/s) post-vocab-shard.
+No HTTP server; harness is the demo surface (trigger-file based).
 
 ### #290 Gemma 4 chunked prefill — substantively complete
 
@@ -16,19 +54,8 @@ Read top to bottom; everything else is linked.
 | P2 (L=2048) | ✅ | cos 0.999615, **100× speedup** (294s→2.9s) |
 | P3 (L=4032) | ✅ | cos 0.999002, 26× speedup (573s→22s) |
 | **P5 HTTP serving** | ✅ | **Real OpenAI API serves coherent chat via chunked prefill** |
-| P4 trace capture | infrastructure landed, ⚠️ disabled | first-token garble; needs ladder debug |
-| Tool calls (#307) | ✅ chat.py ready | Gemma 4 `<|tool_call>` pattern added |
-
-### Launch command (everything required)
-```bash
-ssh qb1 'TT_BACKEND=gemma4_12b TT_GEMMA4_VARIANT=it \
-        TT_CB_CHUNKED_PREFILL=1 TT_CB_SLOTS=1 TT_CB_TOPK_K=0 \
-        bash ~/tt-xla/experiments/serve/scripts/serve_cb.sh start'
-```
-Local chat client (after `ssh -L 8000:localhost:8000 qb1`):
-```bash
-python3 scripts/chat.py --tools
-```
+| P4 trace capture | infrastructure landed, ⚠️ disabled | first-token garble; ladder probe shipped (#308) |
+| Tool calls (#307) | ✅ chat.py + cb_api ready | `<|tool_call>` preserved through decode, parser handles 4 formats |
 
 ### P4 trace status — important context for resumption
 - All infrastructure landed: pre-allocated `state.prefill_tok_buf` /
