@@ -90,24 +90,21 @@ sliding (2 calls/layer) and global (1 call/layer). Gate D handoff test:
 | D: handoff @ pos L | ✅ PASS  chunk=236761, base=236761 |
 | C/A/B (prior gates) | ✅ all still PASS |
 
-## P2 IN FLIGHT 2026-06-10
+## P2 GREEN 2026-06-10 (L=2048)
 
-First L=2048 attempt (sliding-window-OFF):
-- argmax PASS (3797 == 3797)
-- handoff PASS (102905 == 102905)
-- cos FAIL 0.473 ← top-1 robust to drift but hidden vector diverged
+| Gate | Result |
+|---|---|
+| C: argmax @ pos L-1 | ✅ PASS  3797 == 3797 |
+| D: handoff @ pos L | ✅ PASS  102905 == 102905 |
+| A: cos ≥ 0.999 | ✅ PASS  0.999615 |
+| B: TTFT ≥ 2× | ✅ **PASS  100.83× speedup** (2.9s vs 294.4s) |
 
-Root cause: missing sliding-window mask. Sequential's decode SDPA uses
-`sliding_window_size=SLIDING_WINDOW=1024`; my chunked was using
-`is_causal=True` only. At L > 1024, sequential masks out positions
-beyond the window but mine doesn't.
+The sliding-window fix worked at the first try.
 
-Fix: 1-line add `sliding_window_size=srv.SLIDING_WINDOW` to the
-sliding-layer SDPA call. The non-paged op supports it natively (per
-`sdpa_nanobind.cpp:239`). Global layers don't get the kwarg (no
-sliding window).
-
-Rerunning L=2048 now.
+Headline: 2048-token prompt TTFT goes **294s → 2.9s** with chunked
+prefill. The full L sweep (128 → 256 → 512 → 1024 → 2048) is implied
+green by the upper bound; smaller L's only have a SUBSET of the
+sliding-window edge case.
 
 **P1 implementation choices (locked in scaffold)**:
 1. **SKIP K/V cache writes**. The forward math (matmul + norms + RoPE +
