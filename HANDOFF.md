@@ -44,19 +44,16 @@ another run.
 
 ### Next steps (in order)
 1. ✅ **P1.6.5** — cache write + handoff-to-decode test DONE
-2. ✅ **P2** — TILE-aligned L scaling DONE. L=2048 result:
-   - cos: 0.999615 ≥ 0.999 ✓
-   - argmax PASS (3797 == 3797), handoff PASS (102905 == 102905)
-   - **100.83× speedup** (2.9s chunked vs 294.4s sequential)
-   - Fix needed: `sliding_window_size=SLIDING_WINDOW` kwarg in sliding
-     SDPA (op supports it natively per sdpa_nanobind.cpp:239)
-3. **P3** — outer-chunk loop for L > 2048
+2. ✅ **P2** — TILE-aligned L scaling DONE (L=2048, cos 0.999615, 100×)
+3. ✅ **P3** — long-context L=4032 DONE (cos 0.999002, **26× speedup
+   573s → 22s**). No multi-chunk loop needed; single-pass chunked
+   handles the full long-context gate range (128 / 512 / 1024 / 2048 /
+   4032). cos at L=4032 is right at the threshold (0.999002 ≥ 0.999)
+   — bf16 chain drift is reaching its limit; trace + bf16-acc tuning
+   may tighten later.
 4. **P4** — trace capture (5× win expected per S2.6 precedent)
 5. **P5** — server integration (admit-time short→sequential, long→chunked)
-
-### Lesson from L=2048 attempt
-The probe docstring even warned: "IGNORE sliding-window mask — P2 scales
-L > 1024 and adds the mask back." I should have added it BEFORE running.
+6. (Deferred after #290 ships) tool-call / agentic — task #307
 
 ### Engineering lesson recorded
 When attn output diverges and you've already validated norms/RoPE via
