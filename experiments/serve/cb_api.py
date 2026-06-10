@@ -72,6 +72,33 @@ def _build_sampling(body: dict) -> Optional[dict]:
     }
 
 
+# Specials that are pure framing noise the chat client should never see.
+# When tools are enabled we decode with skip_special_tokens=False so
+# `<|tool_call|>` / `<|tool_response|>` survive into the stream — but
+# we still want to hide the dialog-frame specials.
+_DECODE_NOISE_TOKENS = (
+    "<bos>", "<eos>",
+    "<start_of_turn>user", "<start_of_turn>model", "<start_of_turn>",
+    "<end_of_turn>",
+    "<|im_start|>", "<|im_end|>",          # Qwen
+    "<|end_of_text|>", "<|begin_of_text|>",
+)
+
+
+def _strip_decode_noise(text: str) -> str:
+    """Strip framing specials but keep tool-call markers.
+
+    The model's `<end_of_turn>` (or the equivalent) marks the END of
+    its generation — when it fires, cb_engine stops on EOS membership
+    and the next event is the finish_reason. We still want to hide it
+    from the visible text because it's framing, not content.
+    """
+    for tok in _DECODE_NOISE_TOKENS:
+        if tok in text:
+            text = text.replace(tok, "")
+    return text
+
+
 def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None,
                bootstrap_status: Optional[dict] = None):
     """Construct the FastAPI app whose handlers close over `state` for engine
@@ -167,11 +194,19 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None,
             return "stop"
         return "length"
 
-    async def _complete(prompt, body: dict):
+    async def _complete(prompt, body: dict, tools_enabled: bool = False):
         """Internal entry point. `prompt` is either a list[int] (already-tokenised
         — what chat_completions passes; bypasses the chat-template
         re-encode round-trip that defeated slot-level PC for Gemma 4)
-        or a str (raw /v1/completions input — we tokenise here)."""
+        or a str (raw /v1/completions input — we tokenise here).
+
+        `tools_enabled` flips the decode path so the new-token tool-call
+        markers (Gemma 4 `<|tool_call|>` / `<|tool_response|>`) survive
+        into the client text stream. Default-stripping them silently
+        defeats the chat.py parser regex — the model emits the marker,
+        skip_special_tokens=True swallows it, parser sees plain JSON
+        without delimiter, miss. See `gemma4_tool_call_probe.py` §4.
+        """
         eng = state.get("engine")
         if eng is None:
             return JSONResponse(status_code=503, content={"error": "engine not ready"})
@@ -186,6 +221,10 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None,
         stream = bool(body.get("stream", False))
         model = body.get("model", model_id)
         sampling = _build_sampling(body)
+        # When tools are wired we want the literal `<|tool_call|>` /
+        # `<|tool_response|>` markers in the output; without tools, strip
+        # all specials for clean chat text.
+        skip_specials = not tools_enabled
 
         try:
             handle = eng.submit(prompt_ids, max_new=max_tokens, sampling=sampling,
@@ -203,7 +242,9 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None,
                 text_so_far = ""
                 async for tid in _drain_handle(handle, on_cancel=lambda: eng.cancel(handle.rid)):
                     gen_ids.append(tid)
-                    full = tok.decode(gen_ids, skip_special_tokens=True)
+                    full = tok.decode(gen_ids, skip_special_tokens=skip_specials)
+                    if not skip_specials:
+                        full = _strip_decode_noise(full)
                     delta = full[len(text_so_far):]
                     text_so_far = full
                     if delta:
@@ -216,16 +257,18 @@ def _build_app(state: dict, model_id: str = DEFAULT_MODEL_ID, lifespan=None,
         gen_ids: list[int] = []
         async for tid in _drain_handle(handle):
             gen_ids.append(tid)
-        text = tok.decode(gen_ids, skip_special_tokens=True)
+        text = tok.decode(gen_ids, skip_special_tokens=skip_specials)
+        if not skip_specials:
+            text = _strip_decode_noise(text)
         return _chat_completion(text, model, len(prompt_ids), len(gen_ids),
                                 _finish_reason(eos_id, handle, gen_ids))
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: dict):
         tok = state["tok"]
-        prompt = _messages_to_prompt(tok, body.get("messages", []),
-                                      tools=body.get("tools"))
-        return await _complete(prompt, body)
+        tools = body.get("tools")
+        prompt = _messages_to_prompt(tok, body.get("messages", []), tools=tools)
+        return await _complete(prompt, body, tools_enabled=bool(tools))
 
     @app.post("/v1/completions")
     async def completions(body: dict):
