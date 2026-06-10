@@ -345,8 +345,16 @@ def _build_app_with_default_lifespan():
         chunked_prefill = os.environ.get("TT_CB_CHUNKED_PREFILL", "0") == "1"
         prefix_cache = os.environ.get("TT_CB_PREFIX_CACHE", "0") == "1"
         prefix_ttl_s = float(os.environ.get("TT_CB_PREFIX_TTL_S", "300"))
+        # TT_CB_USE_TRACE: opt-out from the captured decode trace. Required when
+        # eager (allocation-full) chunked prefill is on for a backend that has
+        # no traced-prefill twin (e.g. Gemma 4 P5 — eager chunked allocates at
+        # runtime, collides with the decode trace's reserved memory → garbage
+        # output). Default ON to keep prior behavior; OFF auto when the
+        # eager-chunked-but-no-prefill-trace combo is detected.
+        _use_trace_default = "0" if (chunked_prefill and TT_BACKEND == "gemma4_12b") else "1"
+        use_trace = os.environ.get("TT_CB_USE_TRACE", _use_trace_default) == "1"
         engine = CBEngine(st, slots=slots, max_new_cap=max_new_cap,
-                          eos_id=eos_id, sampling=True,
+                          eos_id=eos_id, sampling=True, use_trace=use_trace,
                           max_inflight=max_inflight, topk_k=topk_k,
                           chunked_prefill=chunked_prefill,
                           prefix_cache=prefix_cache,

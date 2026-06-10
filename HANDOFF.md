@@ -56,8 +56,14 @@ another run.
    from `server_gemma4_unified_ttnn.py`. End-to-end chat smoke proves
    coherent text generation through the chunked → decode handoff.
    - File: `experiments/cb/isolate/gemma4_chunked_prefill_chat_smoke.py`
-   - Full cb_engine HTTP integration needs Gemma-4-specific
-     `cb_prefill_transplant` (separate workstream).
+   - HTTP wire-up in flight via `TT_CB_CHUNKED_PREFILL=1` —
+     `cb_prefill_transplant` added in `server_gemma4_unified_cb.py`,
+     `TT_CB_USE_TRACE=0` auto-set to avoid decode-trace memory collision.
+     **Known bug**: chunked prefill writes to single-slot
+     `state.kv_caches_tt` + `state.page_table_tt`; CB decode reads from
+     multi-slot `state.cb_kv_caches_tt` + `state.cb_page_table_tt`. Need
+     to make `forward_prefill_chunked_tp` write to CB buffers when called
+     in CB context (~30 LOC).
 6. (Deferred after #290 ships) tool-call / agentic — task #307
 
 ### Engineering lesson recorded
