@@ -743,6 +743,12 @@ def bootstrap(state, log=None):
     # for each per layer.
     state.MAX_KV = MAX_KV
     state.sdpa_block_size = 32  # tile-height; matches 35B
+    # #290 P5: cb_scheduler reads this to decide chunked-vs-decode prefill
+    # routing — prompts L ≤ prefill_chunk_size go through chunked
+    # (forward_prefill_chunked_tp); longer fall back to the 1-tok/iter decode
+    # path. 4032 is the long-context gate's max-validated L (MAX_KV=4096
+    # minus 64-pos decode slack).
+    state.prefill_chunk_size = 4032
     # cur_pos_buf: int32 [1] device-resident — kernel asserts INT32 at
     # `paged_update_cache_device_operation.cpp:112`. rot_idxs_buf: uint32 [1]
     # for ttnn.embedding into the cos/sin tables. Both pre-allocated ONCE
@@ -2665,16 +2671,23 @@ def _layer_prefill(state, h_in, layer_idx, rope_seq, Ltok):
     return h_out
 
 
-def forward_prefill_chunked_tp(state, token_ids):
+def forward_prefill_chunked_tp(state, token_ids, capture_logits=False):
     """Server-level chunked-prefill entry. Processes the whole L-token prompt
     in one parallel forward, writes K/V to paged cache at positions 0..L-1,
     advances cur_pos_buf to L (so the next decode step starts at the right
-    place), and returns the argmax token id at position L-1.
+    place).
 
-    Forks `step_forward_prefill` from
-    `experiments/cb/isolate/gemma4_chunked_prefill_L128.py` (#290 gate probe).
-    Correctness validated at L ∈ {128, 2048, 4032} via 4 gates: cos ≥ 0.999,
-    argmax match, TTFT ≥ 2×, handoff argmax @ pos L matches sequential.
+    capture_logits=False (default): returns the argmax token id (int) at
+    position L-1. Used by direct callers (chat scripts, smoke tests).
+
+    capture_logits=True: returns last-position logits as np.float32 of shape
+    [1, VOCAB]. Matches the cb_scheduler contract — the scheduler indexes
+    `cap[-1]` to get the [VOCAB] logits.
+
+    Forks `step_forward_prefill` from `experiments/cb/isolate/
+    gemma4_chunked_prefill_L128.py` (#290 gate probe). Correctness validated
+    at L ∈ {128, 2048, 4032} via 4 gates: cos ≥ 0.999, argmax match, TTFT
+    ≥ 2×, handoff argmax @ pos L matches sequential.
     """
     Ltok = len(token_ids)
     h, rope_seq = _embed_and_lookup_rope_seq(state, token_ids)
@@ -2697,8 +2710,16 @@ def forward_prefill_chunked_tp(state, token_ids):
     state.last_target_hidden_prev = state.last_target_hidden_cur
     state.last_target_hidden_cur = _final_np
 
-    argmax_tt, _ = _lm_head_argmax(state, last_row, capture_logits=False)
+    argmax_tt, full_logits_tt = _lm_head_argmax(state, last_row,
+                                                  capture_logits=capture_logits)
     ttnn.deallocate(last_row)
+
+    logits_np = None
+    if capture_logits and full_logits_tt is not None:
+        logits_np = _readback_replicated(full_logits_tt, state.mesh).astype(
+            np.float32).reshape(1, -1)
+        ttnn.deallocate(full_logits_tt)
+
     arr = ttnn.to_torch(argmax_tt, mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
     ttnn.deallocate(argmax_tt)
     argmax = int(arr.reshape(-1)[0].item())
@@ -2706,7 +2727,23 @@ def forward_prefill_chunked_tp(state, token_ids):
     # Advance cur_pos to L so the next decode step starts at the right
     # position. The cache is already written for positions 0..L-1.
     _set_pos(state, Ltok)
+
+    if capture_logits:
+        return logits_np
     return argmax
+
+
+def _reset_state_buffers(state):
+    """cb_scheduler contract: called between requests to clear per-query state.
+
+    Gemma 4 has NO recurrent state (no DeltaNet, no Mamba); the KV cache is
+    paged and self-overwrites on the next `paged_fill_cache` /
+    `paged_fused_update_cache` write. Position buffers get overwritten by
+    `_set_pos` inside the next forward. So this is a near-no-op — kept as a
+    named entry point because cb_scheduler calls `base._reset_state_buffers`
+    unconditionally.
+    """
+    pass
 
 
 # ── v0.4 traced decode ────────────────────────────────────────────────

@@ -235,6 +235,45 @@ def update_input_buffers_batched(state, token_ids, cur_positions):
     ttnn.copy_host_to_device_tensor(rot_host, state.cb_rot_idxs_buf)
 
 
+# ── #290 P5: chunked-prefill → CB-slot transplant ─────────────────────
+
+def cb_prefill_transplant(state, slot_s, L):
+    """Move chunked-prefill state into CB slot `slot_s` at position L.
+
+    Called by cb_scheduler after `forward_prefill_chunked_tp` writes the
+    paged K/V cache for positions 0..L-1 and advances `state.cur_pos_buf`
+    (single-slot) to L. For Gemma 4 there is NO recurrent state (no
+    DeltaNet, no Mamba) to transplant; the paged K/V is already in the
+    slot's cache pages and only the CB position buffers need to point at
+    pos=L so the next decode step reads the right cache slot.
+
+    Specifically:
+    - cb_cur_pos_buf[slot_s] = L → next paged_sdpa_decode reads K/V[0..L-1].
+    - cb_rot_idxs_buf[slot_s] = L → RoPE lookup at the right row.
+    """
+    if not (0 <= slot_s < state.cb_B):
+        raise ValueError(f"slot_s={slot_s} out of range [0, {state.cb_B})")
+    cur = ttnn.to_torch(state.cb_cur_pos_buf,
+                        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+    cur_np = cur.reshape(-1)[:state.cb_B].clone()
+    cur_np[slot_s] = int(L)
+    cur_host = ttnn.from_torch(
+        cur_np.to(torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    ttnn.copy_host_to_device_tensor(cur_host, state.cb_cur_pos_buf)
+
+    rot = ttnn.to_torch(state.cb_rot_idxs_buf,
+                        mesh_composer=ttnn.ConcatMeshToTensor(state.mesh, dim=0))
+    rot_np = rot.reshape(state.cb_B, 1)[:state.cb_B].clone()
+    rot_np[slot_s, 0] = int(L)
+    rot_host = ttnn.from_torch(
+        rot_np.to(torch.int32),
+        layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.uint32,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(state.mesh))
+    ttnn.copy_host_to_device_tensor(rot_host, state.cb_rot_idxs_buf)
+
+
 # ── Batched forward ──────────────────────────────────────────────────
 def _apply_full_rope_b(x_bnD, cos_1D, sin_1D, n_heads, head_dim):
     """Batched RoPE. x_bnD [B, n_heads, head_dim]; cos/sin [B, 1, head_dim]
