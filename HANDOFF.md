@@ -5,16 +5,18 @@ Read top to bottom; everything else is linked.
 
 ---
 
-## CURRENT STATE 2026-06-10 (#290 P1 — ✅ ALL THREE GATES PASS)
+## CURRENT STATE 2026-06-10 (#290 P1 + P1.6.5 — ✅ ALL 4 GATES PASS)
 
-**Active workstream: #290 P1 chunked prefill — DONE.**
+**Active workstream: #290 P1 chunked prefill + cache handoff — DONE.
+Next is P2 (L scaling).**
 
-### Final gate result (L=128, full 48-layer chain)
+### Final gate result (L=128, full 48-layer chain, cache writes ON)
 | Gate | Result |
 |---|---|
-| C: argmax | ✅ PASS  chunk=1091, base=1091 |
+| C: argmax @ pos L-1 | ✅ PASS  chunk=1091, base=1091 |
+| D: handoff @ pos L | ✅ PASS  chunk=236761, base=236761 |
 | A: cos ≥ 0.999 | ✅ PASS  0.999234 |
-| B: TTFT ≥ 2× | ✅ PASS  9.45× speedup (2.0s vs 19.3s) |
+| B: TTFT ≥ 2× | ✅ PASS  14.18× speedup (1.4s vs 19.4s) |
 
 ### The fix
 Both sliding AND global attention layers use a per-KV-head SDPA split
@@ -41,9 +43,9 @@ another run.
   — extended capture dict with q_rope_out / k_rope_out / attn_out
 
 ### Next steps (in order)
-1. **P1.6.5** — cache write + handoff-to-decode test (proves prefill's
-   K/V are correctly readable by subsequent decode steps)
-2. **P2** — TILE-aligned L scaling (L=128 → 256 → 512 → 1024 → 2048)
+1. ✅ **P1.6.5** — cache write + handoff-to-decode test DONE
+2. **P2** — TILE-aligned L scaling (L=128 → 256 → 512 → 1024 → 2048).
+   Same probe + 4 gates, just increase L. Expect to hold all gates green.
 3. **P3** — outer-chunk loop for L > 2048
 4. **P4** — trace capture (5× win expected per S2.6 precedent)
 5. **P5** — server integration (admit-time short→sequential, long→chunked)
