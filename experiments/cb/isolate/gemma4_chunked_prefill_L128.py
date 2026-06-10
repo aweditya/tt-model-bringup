@@ -20,8 +20,8 @@ Reuse map:
   multi-position with [L, n_heads, head_dim] x [L, head_dim] broadcast.
 
 P1 SCOPE
-- SKIP K/V cache writes (correctness gate validates the forward math only;
-  cache write + handoff is P1.6.5, after the gate is green).
+- K/V cache writes via paged_fill_cache inside the SDPA per-KV-head loop
+  (P1.6.5 — gate D validates handoff to subsequent decode step at pos L).
 - IGNORE sliding-window mask — at L=128 every position sees all prior
   tokens within SLIDING_WINDOW=1024, so causal == sliding-causal. P2
   scales L > 1024 and adds the mask back.
@@ -186,8 +186,10 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
     v_perm = ttnn.permute(v_n, (1, 0, 2))
     ttnn.deallocate(v_n)
 
+    layer_caches = state.kv_caches_tt[layer_idx]  # list of (kc, vc) per KV head
     attn_outs = []
     for kv_idx in range(NKV_PER_CHIP_SLIDING):
+        kc, vc = layer_caches[kv_idx]
         q_half = ttnn.slice(q_perm, [kv_idx * Q_HALF, 0, 0],
                              [(kv_idx + 1) * Q_HALF, Ltok, HEAD_DIM_SLIDING])
         q_for = ttnn.reshape(q_half, [1, Q_HALF, Ltok, HEAD_DIM_SLIDING])
@@ -197,6 +199,14 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
         v_one = ttnn.slice(v_perm, [kv_idx, 0, 0],
                             [kv_idx + 1, Ltok, HEAD_DIM_SLIDING])
         v_for = ttnn.reshape(v_one, [1, 1, Ltok, HEAD_DIM_SLIDING])
+
+        # Write K_rope, V_norm to cache (positions 0..L-1). Forks 27B's
+        # gated_attn_step_prefill_tp:1812 pattern. paged_fill_cache writes
+        # the full sequence range in one op; the cache page table maps
+        # positions to block slots.
+        ttnn.experimental.paged_fill_cache(kc, k_for, state.page_table_tt, batch_idx=0)
+        ttnn.experimental.paged_fill_cache(vc, v_for, state.page_table_tt, batch_idx=0)
+
         attn_i = ttnn.transformer.scaled_dot_product_attention(
             q_for, k_for, v_for,
             is_causal=True,
@@ -278,6 +288,12 @@ def _layer_prefill_global(state, h_norm_seq, w, layer_idx, rope, Ltok):
     # K/V are shared across both calls (single global KV head).
     k_for = ttnn.reshape(k_perm, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
     v_for = ttnn.reshape(v_perm, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
+
+    # Write K_rope, V_norm to cache (NKV=1 → single cache). Same
+    # paged_fill_cache pattern as sliding.
+    kc, vc = state.kv_caches_tt[layer_idx][0]
+    ttnn.experimental.paged_fill_cache(kc, k_for, state.page_table_tt, batch_idx=0)
+    ttnn.experimental.paged_fill_cache(vc, v_for, state.page_table_tt, batch_idx=0)
 
     attn_outs = []
     for q_grp in range(2):
@@ -444,30 +460,35 @@ def main():
     assert len(token_ids) == L, f"build_prompt returned {len(token_ids)} != {L}"
     log(f"  prompt: {len(token_ids)} tokens, first 6 = {token_ids[:6]}")
 
-    log("STAGE 3: baseline sequential prefill (ground truth)…")
+    log("STAGE 3: baseline sequential prefill + 1 step (ground truth)…")
     base_argmax, base_wall, base_hidden = baseline_sequential(state, token_ids)
-    log(f"  baseline last-argmax = {base_argmax}, wall = {base_wall:.1f}s")
-    log(f"  baseline hidden shape = {base_hidden.shape if base_hidden is not None else 'None'}")
+    log(f"  baseline last-argmax (pos {L - 1}) = {base_argmax}, wall = {base_wall:.1f}s")
+    # One more sequential step at pos L using the predicted token. State's
+    # cache now holds K/V[0..L] from sequential decode writes.
+    baseline_argmax_at_L = srv.step_forward_v031(state, tok_id=int(base_argmax), pos=L)
+    log(f"  baseline argmax (pos {L}) = {baseline_argmax_at_L}")
 
-    log("STAGE 4: chunked prefill…")
-    # Reset the cache before the chunked path — it was written by the
-    # sequential baseline. We don't write the cache in the chunked path
-    # (P1 scope), but resetting prevents the readback in the LM head from
-    # accidentally consuming stale state. The reset is also a stress
-    # check for the bootstrap-time cache allocation.
-    # Actually — the cache write happens in _layer_pos0_*, NOT in the
-    # forward output. final / argmax depend only on the forward math.
-    # So the cache state doesn't affect this gate.
+    log("STAGE 4: chunked prefill (writes cache 0..L-1)…")
     t0 = time.time()
     chunk_argmax, chunk_hidden = step_forward_prefill(state, token_ids,
                                                      capture_hidden=True)
     chunk_wall = time.time() - t0
-    log(f"  chunked last-argmax = {chunk_argmax}, wall = {chunk_wall:.1f}s")
+    log(f"  chunked last-argmax (pos {L - 1}) = {chunk_argmax}, wall = {chunk_wall:.1f}s")
+    # 1 sequential step at pos L using the chunked-predicted token. This
+    # exercises the cache handoff: the decode SDPA at pos L reads K/V[0..L-1]
+    # from chunked's cache writes + the freshly-written K/V[L] from this
+    # step. If chunked wrote correct K/V values, this argmax matches baseline.
+    chunked_argmax_at_L = srv.step_forward_v031(state, tok_id=int(chunk_argmax), pos=L)
+    log(f"  chunked argmax (pos {L}) = {chunked_argmax_at_L}")
 
     log("STAGE 5: gates")
     pass_argmax = (chunk_argmax == base_argmax)
-    log(f"  GATE C (argmax): {'PASS' if pass_argmax else 'FAIL'} "
+    log(f"  GATE C (argmax @ pos L-1): {'PASS' if pass_argmax else 'FAIL'} "
         f"(chunk={chunk_argmax} base={base_argmax})")
+
+    pass_handoff = (chunked_argmax_at_L == baseline_argmax_at_L)
+    log(f"  GATE D (handoff @ pos L): {'PASS' if pass_handoff else 'FAIL'} "
+        f"(chunk={chunked_argmax_at_L} base={baseline_argmax_at_L})")
 
     cos_score = cosine(base_hidden, chunk_hidden)
     pass_cos = cos_score >= 0.999
@@ -480,7 +501,7 @@ def main():
         f"(speedup={speedup:.2f}x, threshold=2.0x)")
 
     log("=" * 72)
-    all_pass = pass_argmax and pass_cos and pass_perf
+    all_pass = pass_argmax and pass_handoff and pass_cos and pass_perf
     log(f"OVERALL: {'PASS' if all_pass else 'FAIL'}")
     log("=" * 72)
     return 0 if all_pass else 1
