@@ -2535,7 +2535,13 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
     k_perm = ttnn.permute(k_n, (1, 0, 2)); ttnn.deallocate(k_n)
     v_perm = ttnn.permute(v_n, (1, 0, 2)); ttnn.deallocate(v_n)
 
-    layer_caches = state.kv_caches_tt[layer_idx]
+    # CB scheduler uses cb_kv_caches_tt + cb_page_table_tt; direct callers
+    # (chat smoke, isolation probe) use kv_caches_tt + page_table_tt. Route
+    # based on whether CB state was set up.
+    _cb = getattr(state, "cb_kv_caches_tt", None) is not None
+    layer_caches = (state.cb_kv_caches_tt[layer_idx] if _cb
+                    else state.kv_caches_tt[layer_idx])
+    page_table = state.cb_page_table_tt if _cb else state.page_table_tt
     attn_outs = []
     for kv_idx in range(NKV_PER_CHIP_SLIDING):
         kc, vc = layer_caches[kv_idx]
@@ -2547,8 +2553,8 @@ def _layer_prefill_sliding(state, h_norm_seq, w, layer_idx, rope, Ltok):
         v_one = ttnn.slice(v_perm, [kv_idx, 0, 0], [kv_idx + 1, Ltok, HEAD_DIM_SLIDING])
         v_for = ttnn.reshape(v_one, [1, 1, Ltok, HEAD_DIM_SLIDING])
 
-        ttnn.experimental.paged_fill_cache(kc, k_for, state.page_table_tt, batch_idx=0)
-        ttnn.experimental.paged_fill_cache(vc, v_for, state.page_table_tt, batch_idx=0)
+        ttnn.experimental.paged_fill_cache(kc, k_for, page_table, batch_idx=0)
+        ttnn.experimental.paged_fill_cache(vc, v_for, page_table, batch_idx=0)
 
         attn_i = ttnn.transformer.scaled_dot_product_attention(
             q_for, k_for, v_for,
@@ -2602,8 +2608,12 @@ def _layer_prefill_global(state, h_norm_seq, w, layer_idx, rope, Ltok):
     k_for = ttnn.reshape(k_perm, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
     v_for = ttnn.reshape(v_perm, [1, NUM_KV_HEADS_GLOBAL, Ltok, HEAD_DIM_GLOBAL])
 
-    kc, vc = state.kv_caches_tt[layer_idx][0]
-    ttnn.experimental.paged_fill_cache(kc, k_for, state.page_table_tt, batch_idx=0)
+    # Route cache writes to CB buffers when scheduler is active (see sliding).
+    _cb = getattr(state, "cb_kv_caches_tt", None) is not None
+    kc, vc = (state.cb_kv_caches_tt[layer_idx][0] if _cb
+              else state.kv_caches_tt[layer_idx][0])
+    page_table = state.cb_page_table_tt if _cb else state.page_table_tt
+    ttnn.experimental.paged_fill_cache(kc, k_for, page_table, batch_idx=0)
     ttnn.experimental.paged_fill_cache(vc, v_for, state.page_table_tt, batch_idx=0)
 
     attn_outs = []
