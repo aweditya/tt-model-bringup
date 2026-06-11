@@ -117,6 +117,36 @@ Two permanent files (forks of existing utilities, per reuse mandate):
 Existing infra used: `step_forward_v03`'s capture dict already
 supported per-layer hidden — zero forward-code change needed.
 
+### Active research workstreams (background agents landed deliverables)
+
+- **#314 long-decode bug — 3-zone pattern + logits inversion**.
+  `scripts/inspect_ladder_npz.py` reveals: layers 0-1 cos ~0.91,
+  layers 2-11 collapse to 0.1-0.5, layers 12-39 recover to 0.85-0.95,
+  layers 40-47 catastrophic (layer 47 cos = -0.04), cos_logits = -0.919
+  (**structurally INVERTED** from HF, not just noisy). Next probe:
+  correlate cos zones with `state.layer_types[i]` (sliding vs global).
+  This is NOT bf16 drift; it's a structural bug in late layers /
+  final_norm with possible sign flip.
+
+- **#316 DiffusionGemma P0 feasibility DONE**
+  (`research/diffusiongemma_p0_feasibility_2026-06-10.md`).
+  Bidirectional SDPA fits at our shapes (`is_causal=False + attn_mask`
+  supported, GQA constraint passes). Shared expert ALREADY in 35B
+  (`_moe_shared_expert`). Real new TT code is ~240 LOC. Memory at
+  L=256k = 6.9 GiB/chip on TP=4. **Bringup verdict revised: ~2-3 weeks**
+  (was 5-7 in scope doc).
+
+- **#321 qwen36 tool-call probe + #322 Hermes parser design DONE**
+  (`experiments/utils/qwen36_tool_call_probe.py` +
+  `research/agentic_harness_hermes_parser_2026-06-10.md`).
+  State machine + ~80 LOC sketch ready; integration site is
+  `cb_api.py:sse()`. After parser ships, harness scope (#323 → #324)
+  is "own Claude-Code-like TUI" (not opencode adapter, per user).
+
+- **#315 / #320 repo cleanup IN FLIGHT** (background agent). 25+
+  archive commits so far moving JAX/PJRT legacy + STALE plans into
+  `archive/`. No deletes; one `git mv` per commit for revertability.
+
 ### qb2 — Nemotron-3 backup demo (NOT READY YET)
 Weights downloading to qb2 HF cache (`models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`).
 ~60GB total. Once landed:
