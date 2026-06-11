@@ -66,7 +66,9 @@ update it whenever a new lesson lands.
 | **v0.1.1-3** | L0 sub-ops one at a time (q/k/v_proj → q/k/v_norm → RoPE → SDPA → o_proj → MLP) | cos ≥ 0.999 at each sub-op vs HF |
 | **v0.2** | All N layers + final_norm + lm_head + softcap | argmax matches HF at pos 0 |
 | **v0.3** | KV cache + paged SDPA + multi-step decode | argmax matches HF for tokens 0..5 |
-| **v0.3.3** | Long context (cos ladder at L=200+, needle haystack) | argmax match ≥ 90%; median cos ≥ 0.99 |
+| **v0.3.2** | **Per-step per-layer DECODE cosine ladder vs HF (N≥50 steps)** — fork `experiments/utils/cosine_ladder_hf_<model>.py` + `experiments/cb/isolate/<model>_long_decode_vs_hf_ladder.py`. Teacher-force HF's decode_ids through our forward, capture per-layer hidden via `step_forward_v0X(capture=...)`, cosine per (step, layer) | **min per-layer cos ≥ 0.99 across all N steps**, argmax-match ≥ 95%, cos_logits ≥ 0.99. **DO NOT SKIP** — argmax-match alone hides catastrophic hidden-state drift ([[feedback-argmax-hides-hidden-state-drift]]) |
+| **v0.3.3** | Long INPUT context (cos ladder at L=200+, needle haystack) | argmax match ≥ 90%; median cos ≥ 0.99 |
+| **v0.3.4** | **300-token generation smoke** — `python3 scripts/chat.py` or `chat_curl.py` with `--max 300 --temp 0.4 --top-p 0.9`; structural coherence check (`longest_run < 50 chars`, `tail_100_uniq > 5`). | No `####` / `***` / repetition collapse in 300 tokens |
 | **v0.4** | Trace capture (two-phase warmup; `forward_token_inner` reads only state buffers) | 100 traced steps == 100 eager token-for-token |
 | **v1.0-v1.6** | Continuous batching: setup → batched embed/RoPE → batched attention → end-to-end → 3a/3b/3c gates at B=2 → B=4 | All 3a/3b/3c PASS at B=4 |
 | **v2** | HTTP wire-up: register in `cb_api.BACKENDS` + `cb_scheduler._BACKEND_MODULES`, tokenizer + chat template | `curl /v1/chat/completions` returns sensible text |
