@@ -1,12 +1,21 @@
 # Model bringup recipe (Tenstorrent Blackhole, Qwen3.6/Gemma 4 lineage)
 
-This doc captures *what makes a new-model bringup go from weeks to days*.
-Every new model should follow this recipe. Keep it concise (~200 lines) and
-update it whenever a new lesson lands.
+What makes a new-model bringup go from weeks to days. Follow it for every
+new model. Keep it concise (~200 lines); update it whenever a new lesson
+lands.
 
-> **The one rule above all rules**: every new file or function must cite the
-> existing pattern it forks. Three new models (27B, 35B-A3B, Gemma 4 12B)
+> **The one rule above all rules**: every new file or function must cite
+> the existing pattern it forks. Three models (27B, 35B-A3B, Gemma 4 12B)
 > were brought up faster each time because nothing was reinvented.
+
+## Table of contents
+
+1. [Before you write any code](#1-before-you-write-any-code)
+2. [The staging ladder](#2-the-staging-ladder-mandatory)
+3. [Infrastructure that pays for itself](#3-infrastructure-that-pays-for-itself-many-times-over)
+4. [Diagnostic recipe](#4-diagnostic-recipe-when-a-forward-is-broken)
+5. [Why bringup got faster](#5-why-bringup-got-faster-the-meta-lesson)
+6. [When to deviate](#6-when-to-deviate)
 
 ------------------------------------------------------------------------
 
