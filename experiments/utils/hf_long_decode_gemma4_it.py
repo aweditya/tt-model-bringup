@@ -87,12 +87,20 @@ def main() -> int:
 
     # Render via the IT chat template so the prompt structure matches
     # exactly what cb_api / scripts/chat.py would see on the wire.
+    # Newer transformers return a BatchEncoding even with tokenize=True+
+    # return_tensors="pt"; normalise to a tensor for .generate().
     messages = [{"role": "user", "content": args.prompt}]
-    chat_ids = tok.apply_chat_template(
+    enc = tok.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True,
         return_tensors="pt",
     )
-    log(f"prompt tokens = {chat_ids.shape[-1]}")
+    if hasattr(enc, "input_ids"):
+        chat_ids = enc["input_ids"]
+    elif isinstance(enc, dict):
+        chat_ids = enc["input_ids"]
+    else:
+        chat_ids = enc
+    log(f"prompt tokens = {int(chat_ids.shape[-1])}")
 
     log("generating…")
     t0 = time.time()

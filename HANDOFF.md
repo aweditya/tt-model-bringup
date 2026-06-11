@@ -40,19 +40,36 @@ garbage. **Root cause LOCALISED 2026-06-10**:
 Filed audit (#313): 11 bugs total across the multi-slot codepath; the
 4 listed in the bug task are HIGH-confidence root causes.
 
-### Long-decode collapse (2026-06-10 finding)
-gemma4 chat at `What is Tenstorrent?` collapses to `####` repeat
-~150 tokens in. Persists at temp=0.4 + top_p=0.9 → not greedy
-degeneracy. Hypothesis ranking:
-1. Bug B above (global V mis-routing) is active even at slot 0 — likely
-   contributor to decode-time drift.
-2. bf16 chain noise compounding through 48 layers × hundreds of decode
-   steps eventually flips an argmax.
-3. (Ruled out by sampling test): pure greedy-degeneracy loop.
+### Long-decode collapse (2026-06-10 RESOLVED to "kernel-side bug")
+gemma4 chat at `What is Tenstorrent?` collapses to `####`/`***`/
+paragraph-repeat ~100-200 tokens into the answer. Persists at temp=0.4
+and temp=0.7 across 3 seeds — **not greedy degeneracy**.
 
-We do NOT have an HF reference at >8 decode tokens for any model in
-this repo. All correctness gates capped at 5-8 token chains.
-Filed as task #314 with proxy + HF probe plan.
+**HF reference (the decisive test) — COHERENT at 300 tokens.**
+`experiments/utils/hf_long_decode_gemma4_it.py` ran on qb1 CPU,
+same prompt + temp=0.4 + top_p=0.9 + seed=42, max_new=300 with the
+real `.venv-gemma4` (transformers 5.10.0.dev0). Result: 1428 chars,
+longest run 3 chars, 26 unique chars in trailing 100, no
+degenerate-repeat signal. Sample output reads as a full structured
+explanation with sections, factually correct (Grayskull, Wormhole,
+spatial architecture). **Model is fine — our impl drifts.**
+
+Baseline saved at `.cache/hf_long_decode_gemma4_it/baseline/`.
+
+Hypothesis ranking now (post-HF):
+1. **bf16 chain drift compounding** — most likely. 48 layers × 200
+   decode steps × bf16 epsilon nudges argmax into a degenerate basin.
+   Different seeds → different attractors (`*`, `#`, paragraph rep) is
+   consistent with this.
+2. **Stale cache read at later positions** — possible. Bug B (global
+   V mis-routing) was a confirmed bug but its fix didn't restore
+   coherence, so the smoking gun is elsewhere.
+3. **RoPE drift / position embed table read** — possible at higher
+   positions.
+
+Next probe: build a position-by-position ttnn-vs-HF cosine ladder at
+long decode (~100 steps) to find WHERE coherence diverges. Filed as
+#314 follow-up.
 
 ### qb2 — Nemotron-3 backup demo (NOT READY YET)
 Weights downloading to qb2 HF cache (`models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`).

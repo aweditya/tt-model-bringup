@@ -1,0 +1,17 @@
+{
+  "prompt": "What is Tenstorrent?",
+  "model_id": "google/gemma-4-12B-it",
+  "max_new": 300,
+  "temperature": 0.4,
+  "top_p": 0.9,
+  "seed": 42,
+  "n_prompt_tokens": 19,
+  "n_gen_tokens": 300,
+  "n_chars": 1428,
+  "longest_run_char": "#",
+  "longest_run_len": 3,
+  "tail_100_unique_chars": 26,
+  "hash_count": 6,
+  "wall_seconds": 118.6,
+  "verdict": "COHERENT (no degenerate-repeat signal)"
+}

@@ -1,0 +1,15 @@
+**Tenstorrent** is a high-performance computing (HPC) and AI hardware company that designs and manufactures specialized AI accelerators (chips) and the software stacks required to run them.
+
+Think of Tenstorrent as a competitor to NVIDIA, but with a different architectural philosophy. While NVIDIA focuses on GPUs (Graphics Processing Units), Tenstorrent focuses on **spatial architectures** and **AI-specific processing.**
+
+Here are the key pillars that define Tenstorrent:
+
+### 1. The Architecture: "Spatial" Computing
+Unlike traditional CPUs or GPUs, which follow a "von Neumann" architecture (where instructions are fetched and executed in a linear sequence), Tenstorrent uses a **Spatial Architecture**.
+*   **How it works:** Instead of moving data back and forth between a processor and memory (which creates a bottleneck), Tenstorrent’s chips allow data to flow directly from one processing element to the next.
+*   **The Benefit:** This mimics how the human brain processes information more closely than a standard computer. It significantly reduces power consumption and increases speed for massive AI workloads like Large Language Models (LLMs).
+
+### 2. The "Grayskull" and "Wormhole" Chips
+Tenstorrent has released several notable hardware products:
+*   **Grayskull:** An early AI accelerator designed for high-performance inference and training.
+*   **Wormhole:** A more advanced chip designed for massive scale-out
