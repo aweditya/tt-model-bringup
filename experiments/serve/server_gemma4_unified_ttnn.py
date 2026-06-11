@@ -2756,6 +2756,27 @@ def _reset_state_buffers(state):
     pass
 
 
+def _sample_from_logits(logits, temperature, top_p, top_k, rng):
+    """cb_scheduler contract: host-side temp + top-k + top-p sampling from
+    1-D logits. Fork-verbatim of `server_tp._sample_from_logits` —
+    cb_scheduler's logits-trace sampling path calls `base._sample_from_logits`,
+    and gemma4 didn't have it (only the 27B backend did). Without this,
+    any request with temperature>0 crashed the engine with AttributeError
+    and the server shut down. temperature<=0 never reaches here (greedy =
+    traced argmax)."""
+    lg = logits.astype(np.float64) / max(temperature, 1e-6)
+    if top_k and 0 < top_k < lg.size:
+        lg[lg < np.partition(lg, -top_k)[-top_k]] = -np.inf
+    lg -= lg.max()
+    p = np.exp(lg); p /= p.sum()
+    if 0.0 < top_p < 1.0:
+        order = np.argsort(p)[::-1]
+        keep = order[:np.searchsorted(np.cumsum(p[order]), top_p) + 1]
+        masked = np.zeros_like(p); masked[keep] = p[keep]
+        p = masked / masked.sum()
+    return int(rng.choice(p.size, p=p))
+
+
 # ── v0.4 traced decode ────────────────────────────────────────────────
 # Mirrors 27B prod (`experiments/serve/server_tp.py:1587-1694, 2142-2186`).
 # Pre-allocate `tok_buf` + `cur_pos_buf` + `rot_idxs_buf` in bootstrap;
