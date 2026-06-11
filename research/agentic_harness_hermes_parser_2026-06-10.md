@@ -61,14 +61,14 @@ Qwen 3.6 can emit two `<tool_call>` blocks per turn. On each open we append to `
 
 ## 4. Concrete integration into `cb_api.py`
 
-Touch surface (3 small edits, no model code):
+Touch surface, no model code:
 
-- **`experiments/serve/cb_api.py:239-255`** — the `sse()` inner generator inside `_complete`. Today: `tok.decode(gen_ids, skip_special_tokens=skip_specials)` per step then yield `delta.content`. Wrap the per-delta string through a parser instance and yield whatever events the parser produces (`delta.content` or `delta.tool_calls`).
-- **`experiments/serve/cb_api.py:182-195`** — `_finish_reason` gains a third arm: if the parser closed at least one tool call, return `"tool_calls"` instead of `"stop"`.
-- **`experiments/serve/cb_api.py:271`** — `chat_completions` already passes `tools_enabled=bool(tools)`; add `parser_kind=` so dispatch picks Hermes for Qwen and Gemma's `<|tool_call|>` newtoken parser for Gemma 4 (P4 in the scope doc).
-- **`experiments/serve/openai_endpoint.py`** — `_chat_chunk` gains an optional `tool_calls=` arg to render the OpenAI delta shape; mirrors the existing `delta.content` path.
+- **`cb_api.py:239-255`** — `sse()` in `_complete`. Today yields `delta.content` per step. Wrap each delta through a parser instance and yield whichever events the parser emits.
+- **`cb_api.py:182-195`** — `_finish_reason` gains a third arm: parser-saw-closed-call ⇒ `"tool_calls"`.
+- **`cb_api.py:271`** — `chat_completions` passes `tools_enabled=bool(tools)`; add `parser_kind=` so backend dispatches Hermes (Qwen) vs newtoken (Gemma 4, P4).
+- **`openai_endpoint.py`** — `_chat_chunk` gains optional `tool_calls=` arg for the OpenAI delta shape.
 
-Non-streaming path (`cb_api.py:257-264`) feeds the same parser with the whole decoded string at once and emits the OpenAI `message.tool_calls` (non-delta) shape.
+Non-streaming path (`cb_api.py:257-264`) feeds the whole decoded string at once and emits the `message.tool_calls` non-delta shape.
 
 ---
 
