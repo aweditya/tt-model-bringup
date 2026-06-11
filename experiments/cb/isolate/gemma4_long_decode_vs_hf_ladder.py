@@ -97,6 +97,14 @@ def main() -> int:
     log("bootstrapping gemma4…")
     state = type("S", (), {})()
     srv.bootstrap(state, log=log)
+    # step_forward_v03 + forward_prefill_chunked_tp both stash
+    # `last_target_hidden_cur`/`_prev` into state (Phase 3 spec-dec
+    # path). Direct callers (us) must pre-initialise to None or the
+    # first read raises AttributeError.
+    if not hasattr(state, "last_target_hidden_cur"):
+        state.last_target_hidden_cur = None
+    if not hasattr(state, "last_target_hidden_prev"):
+        state.last_target_hidden_prev = None
     log("bootstrap done")
 
     # Prefill the prompt via the production chunked-prefill path. This

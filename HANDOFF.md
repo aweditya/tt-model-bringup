@@ -71,6 +71,29 @@ Next probe: build a position-by-position ttnn-vs-HF cosine ladder at
 long decode (~100 steps) to find WHERE coherence diverges. Filed as
 #314 follow-up.
 
+### #314 LADDER VERDICT 2026-06-10 — systematic decode bug
+
+100-step teacher-forced ladder vs HF ground truth:
+- **first cos<0.99: step=0 layer=0 cos=0.913** (not bf16 drift — too
+  early)
+- **per-layer hidden cos near zero (0.05-0.2)** for layers 1-47 at
+  every step — TT hidden is essentially orthogonal to HF
+- **argmax-match rate 58/99 (58.5%)** — top-1 still mostly tracks
+  because logits have sharp peaks, but the underlying state is wrong
+- cos_logits range [-0.92, +0.99]
+
+Hypothesis: layer 0 cos ~0.91 → RoPE / Q/K projection at decode-time
+diverges; layer 1 cos ~0.06 → SDPA output unrelated → likely
+cache-read off-by-one or wrong sliding-window bound on the decode
+SDPA op. Bisection via per-sub-op decode ladder (extend
+`gemma4_chunked_prefill_ladder.py` pattern to decode) is the next
+step. Filed as #314 follow-up.
+
+Critical learning: our existing gates (argmax @ pos L, cosine on
+prefill) never compared per-layer hidden across DECODE steps. The
+bug has been there since gemma4 v0.3 — never caught because all
+short-decode gates only checked argmax flips, not magnitude.
+
 ### #314 ladder probes SHIPPED 2026-06-10
 
 Two permanent files (forks of existing utilities, per reuse mandate):
