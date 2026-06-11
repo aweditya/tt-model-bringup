@@ -2614,7 +2614,11 @@ def _layer_prefill_global(state, h_norm_seq, w, layer_idx, rope, Ltok):
               else state.kv_caches_tt[layer_idx][0])
     page_table = state.cb_page_table_tt if _cb else state.page_table_tt
     ttnn.experimental.paged_fill_cache(kc, k_for, page_table, batch_idx=0)
-    ttnn.experimental.paged_fill_cache(vc, v_for, state.page_table_tt, batch_idx=0)
+    # Bug B fix (#313): was state.page_table_tt (single-slot) even when CB
+    # is active — global V wrote to the wrong page table while K wrote to
+    # the CB one. K/V landing in different physical pages → SDPA reads
+    # mismatched K/V → decode coherence drift even at slot 0.
+    ttnn.experimental.paged_fill_cache(vc, v_for, page_table, batch_idx=0)
 
     attn_outs = []
     for q_grp in range(2):

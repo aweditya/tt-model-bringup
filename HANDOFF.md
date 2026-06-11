@@ -27,11 +27,32 @@ python3 scripts/chat.py --tools  # in another (or several!)
 ```
 **Why slots=1, not 4?** TT_CB_SLOTS=4 with N concurrent requests
 returns coherent text only for slot 0; slots 1-3 produce char-collapse
-garbage (`성-111…`, `"/>.__--111…`). Same family as 35B B>1 empty-slot
-poison (#162). cb_engine still serves multiple chat.py clients
-correctly — requests are FIFO-queued. Sequential multi-client works;
-true parallel B>1 needs a separate fix (file as next task; not a
-demo blocker).
+garbage. **Root cause LOCALISED 2026-06-10**:
+- `server_gemma4_unified_ttnn.py:2556-2557, 2616-2617` —
+  `paged_fill_cache(..., batch_idx=0)` hardcoded. Every chunked-prefill
+  K/V write lands in slot 0's pages regardless of which CB slot the
+  request targets. Slots 1+ decode from empty pages.
+- `server_gemma4_unified_ttnn.py:2617` — global-layer V write uses
+  `state.page_table_tt` (single-slot) instead of the local `page_table`
+  var. **Affects single-client coherence too** under CB — global K and
+  V land in different cache tables. Bug #313, fix in flight.
+
+Filed audit (#313): 11 bugs total across the multi-slot codepath; the
+4 listed in the bug task are HIGH-confidence root causes.
+
+### Long-decode collapse (2026-06-10 finding)
+gemma4 chat at `What is Tenstorrent?` collapses to `####` repeat
+~150 tokens in. Persists at temp=0.4 + top_p=0.9 → not greedy
+degeneracy. Hypothesis ranking:
+1. Bug B above (global V mis-routing) is active even at slot 0 — likely
+   contributor to decode-time drift.
+2. bf16 chain noise compounding through 48 layers × hundreds of decode
+   steps eventually flips an argmax.
+3. (Ruled out by sampling test): pure greedy-degeneracy loop.
+
+We do NOT have an HF reference at >8 decode tokens for any model in
+this repo. All correctness gates capped at 5-8 token chains.
+Filed as task #314 with proxy + HF probe plan.
 
 ### qb2 — Nemotron-3 backup demo (NOT READY YET)
 Weights downloading to qb2 HF cache (`models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`).
