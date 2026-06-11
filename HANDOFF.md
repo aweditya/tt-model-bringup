@@ -71,6 +71,29 @@ Next probe: build a position-by-position ttnn-vs-HF cosine ladder at
 long decode (~100 steps) to find WHERE coherence diverges. Filed as
 #314 follow-up.
 
+### #314 ladder probes SHIPPED 2026-06-10
+
+Two permanent files (forks of existing utilities, per reuse mandate):
+
+- `experiments/utils/cosine_ladder_hf_gemma4_it.py` — fork of
+  `cosine_ladder_hf_ref.py` (Qwen 27B variant). Greedy decode with KV
+  cache for N steps; saves per-step per-layer hidden + lm_head logits
+  as a single `ladder.npz` (~180MB at N=100). Ran on qb1 CPU in 38s
+  for 100 tokens (~2.6 tok/s). Output at
+  `.cache/cosine_ladder_hf_gemma4_it/<ts>/ladder.npz`.
+
+- `experiments/cb/isolate/gemma4_long_decode_vs_hf_ladder.py` —
+  ttnn-side ladder. Loads HF artifacts, prefills via
+  `forward_prefill_chunked_tp`, teacher-forces `decode_ids[0..N-1]`
+  through `step_forward_v03` with the existing `capture` dict
+  (`per_layer=True` → `layer_h[L]`, `final_norm`, `logits`, `argmax`).
+  Computes cos per (step, layer); reports first (step, layer) where
+  cos < threshold = drift onset. Verdict at
+  `.cache/gm4_long_decode_ladder/<ts>/verdict.json`.
+
+Existing infra used: `step_forward_v03`'s capture dict already
+supported per-layer hidden — zero forward-code change needed.
+
 ### qb2 — Nemotron-3 backup demo (NOT READY YET)
 Weights downloading to qb2 HF cache (`models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`).
 ~60GB total. Once landed:
